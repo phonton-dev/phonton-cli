@@ -51,7 +51,9 @@ use crossterm::terminal::{
 };
 use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
 use phonton_planner::{decompose_with_memory, Goal};
-use phonton_providers::{discover_models, pick_default_from_list, provider_for, Provider};
+use phonton_providers::{
+    discover_models, pick_default_from_list, provider_for, select_best_working_model, Provider,
+};
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_diff::DiffApplier;
 use phonton_store::Store;
@@ -2098,7 +2100,34 @@ fn default_model_for(provider: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration first so the rest of startup can use it.
-    let cfg = config::load().unwrap_or_default();
+    let mut cfg = config::load().unwrap_or_default();
+
+    // First-run / no-model-set flow: probe the configured key for a
+    // working model before we even draw the TUI. Bounded to ~6 seconds
+    // (discovery + up to 3 tiny pings) so cold start stays snappy. If
+    // the user already picked a model we leave it alone — they get to
+    // override the auto-pick from Settings via Ctrl+D anyway.
+    if cfg.provider.model.is_none() {
+        if let Some(api_key) = config::resolve_api_key(&cfg.provider) {
+            let detect = tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                select_best_working_model(
+                    &cfg.provider.name,
+                    &api_key,
+                    cfg.provider.base_url.as_deref(),
+                    3,
+                ),
+            )
+            .await;
+            if let Ok(Ok(Some(model))) = detect {
+                cfg.provider.model = Some(model);
+                // Persist so the next launch is instant. Best-effort —
+                // a broken HOME / readonly dotfile shouldn't abort
+                // startup.
+                let _ = config::save(&cfg);
+            }
+        }
+    }
 
     let mut app = App::new(&cfg);
     let store = Arc::new(std::sync::Mutex::new(Store::in_memory()?));
@@ -2318,20 +2347,42 @@ async fn run_app<B: Backend>(
                                     Some(format!("Detecting models for {provider_name}…"));
                                 let tx2 = tx.clone();
                                 tokio::spawn(async move {
-                                    let res = discover_models(
+                                    // List the catalogue first — needed
+                                    // for the summary regardless of
+                                    // probe outcome.
+                                    let list_res = discover_models(
                                         &provider_name,
                                         &key,
                                         base.as_deref(),
                                     )
                                     .await;
-                                    let payload = match res {
+                                    let payload = match list_res {
                                         Ok(models) if models.is_empty() => Err(format!(
                                             "✗ {provider_name}: key valid but no models accessible."
                                         )),
                                         Ok(models) => {
-                                            let picked =
-                                                pick_default_from_list(&provider_name, &models)
-                                                    .unwrap_or_else(|| models[0].clone());
+                                            // Probe top candidates so we
+                                            // pick a model the key can
+                                            // actually call right now,
+                                            // not just one in the
+                                            // catalogue.
+                                            let probed = select_best_working_model(
+                                                &provider_name,
+                                                &key,
+                                                base.as_deref(),
+                                                3,
+                                            )
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                            let picked = probed
+                                                .or_else(|| {
+                                                    pick_default_from_list(
+                                                        &provider_name,
+                                                        &models,
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| models[0].clone());
                                             let preview: Vec<String> =
                                                 models.iter().take(5).cloned().collect();
                                             let more = if models.len() > 5 {
@@ -2340,7 +2391,7 @@ async fn run_app<B: Backend>(
                                                 String::new()
                                             };
                                             let summary = format!(
-                                                "✓ {} models found. Picked `{}`. Sample: {}{}",
+                                                "✓ {} models found. Picked `{}` (probed). Sample: {}{}",
                                                 models.len(),
                                                 picked,
                                                 preview.join(", "),

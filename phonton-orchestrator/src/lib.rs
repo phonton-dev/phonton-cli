@@ -36,7 +36,15 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 /// Retries permitted at the same tier before the orchestrator escalates.
-pub const MAX_RETRIES_PER_TIER: u8 = 2;
+///
+/// One retry (i.e. two total attempts at a tier) catches the common
+/// "model produced a bad first cut, fed the verify error back and the
+/// second cut compiles" pattern without burning a long tail of attempts
+/// when the tier simply cannot solve the subtask. The previous value of
+/// `2` (three attempts) routinely cost users ~60s before failing on
+/// free-tier keys; shorter tails make failure cheap and escalation
+/// arrive sooner.
+pub const MAX_RETRIES_PER_TIER: u8 = 1;
 
 /// Escalations permitted before the orchestrator surfaces a hard failure.
 pub const MAX_ESCALATIONS: u8 = 3;

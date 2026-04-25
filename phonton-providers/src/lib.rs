@@ -205,40 +205,196 @@ async fn discover_ollama(http: &Client, base: &str) -> Result<Vec<String>> {
 /// Pick a sensible default model from a discovered list for a given
 /// provider name. Returns `None` if the list is empty.
 ///
-/// The heuristic prefers cheap-fast models a free-tier key is most likely
-/// to have access to — `flash` for Gemini, `mini` / `haiku` elsewhere —
-/// then falls back to whatever's first.
+/// The heuristic prefers the most-capable model a typical free-tier key
+/// has access to, and falls back through cheaper / older variants. Code
+/// generation needs reasoning depth, so for Gemini we prefer `2.5-pro`
+/// over `flash` even though flash is faster — the verify-failure cost
+/// of a weaker model far outweighs the latency saving on retries.
+///
+/// Models with `preview`, `experimental`, `thinking`, or `tts` in the
+/// name are filtered out: previews break unpredictably, audio models
+/// don't speak the chat-completions shape we use, and "thinking" models
+/// are pay-per-thought even on otherwise-free tiers.
 pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
     if models.is_empty() {
         return None;
     }
+    let filtered: Vec<&String> = models
+        .iter()
+        .filter(|m| {
+            let lc = m.to_lowercase();
+            !lc.contains("preview")
+                && !lc.contains("experiment")
+                && !lc.contains("vision")
+                && !lc.contains("audio")
+                && !lc.contains("tts")
+                && !lc.contains("embedding")
+                && !lc.contains("aqa")
+                && !lc.contains("imagen")
+                && !lc.contains("veo")
+                && !lc.contains("learnlm")
+        })
+        .collect();
+    let all_refs: Vec<&String> = models.iter().collect();
+    let pool: &[&String] = if filtered.is_empty() { &all_refs } else { &filtered };
+
     let preferences: &[&str] = match name {
         "gemini" => &[
-            "gemini-flash-latest",
+            // Strongest free-tier code generators first.
+            "gemini-2.5-pro",
+            "gemini-2.0-pro",
             "gemini-2.5-flash",
             "gemini-2.0-flash",
+            "gemini-flash-latest",
+            "gemini-pro-latest",
+            "gemini-1.5-pro",
             "gemini-1.5-flash",
+            "pro",
             "flash",
         ],
-        "anthropic" => &["claude-haiku-4-5", "haiku", "claude-sonnet-4-5", "sonnet"],
-        "openai" => &["gpt-4o-mini", "gpt-4.1-mini", "mini", "gpt-4o"],
-        "openrouter" => &["openai/gpt-4o-mini", "anthropic/claude-haiku", "mini"],
-        "groq" => &["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama"],
-        "deepseek" => &["deepseek-chat", "deepseek-coder"],
-        "xai" | "grok" => &["grok-2-mini", "grok-2", "grok"],
-        "together" => &[
-            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-            "Llama-3.3",
+        "anthropic" => &[
+            "claude-sonnet-4-5",
+            "claude-opus-4",
+            "claude-haiku-4-5",
+            "sonnet",
+            "haiku",
+            "opus",
+        ],
+        "openai" => &[
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1-mini",
+            "o4-mini",
+            "mini",
+        ],
+        "openrouter" => &[
+            "anthropic/claude-sonnet",
+            "openai/gpt-4o",
+            "google/gemini-2.5-pro",
+            "openai/gpt-4o-mini",
+            "anthropic/claude-haiku",
+        ],
+        "groq" => &[
+            "llama-3.3-70b-versatile",
+            "llama-3.1-70b",
+            "mixtral",
+            "llama-3.1-8b-instant",
             "llama",
         ],
+        "deepseek" => &["deepseek-chat", "deepseek-coder", "deepseek"],
+        "xai" | "grok" => &["grok-2", "grok-beta", "grok"],
+        "together" => &[
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "Qwen/Qwen2.5-Coder-32B-Instruct",
+            "Llama-3.3",
+            "Llama-3.1-70B",
+            "llama",
+        ],
+        "agentrouter" => &["claude-sonnet", "gpt-4o", "claude-haiku"],
         _ => &[],
     };
     for needle in preferences {
-        if let Some(m) = models.iter().find(|m| m.contains(needle)) {
-            return Some(m.clone());
+        if let Some(m) = pool.iter().find(|m| m.to_lowercase().contains(&needle.to_lowercase())) {
+            return Some((*m).clone());
         }
     }
-    models.first().cloned()
+    pool.first().map(|m| (*m).clone())
+}
+
+/// Discover the model list, then ping each of the top candidates with a
+/// tiny chat request and return the first that answers successfully.
+///
+/// This is the "smart" picker the CLI uses on startup and on Settings →
+/// Detect: a discovered model in the catalogue is not the same as a
+/// model your key is *quota-allowed* to call right now (free-tier keys
+/// frequently lie). Probing weeds out the rate-limited / region-locked
+/// entries before the orchestrator wastes a goal on them.
+///
+/// Probes at most `max_probe` candidates (default 3) to keep the up-
+/// front cost bounded — discovery + 3 tiny pings is typically <2s.
+pub async fn select_best_working_model(
+    name: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    max_probe: usize,
+) -> Result<Option<String>> {
+    let models = discover_models(name, api_key, base_url).await?;
+    if models.is_empty() {
+        return Ok(None);
+    }
+    let preferred = pick_default_from_list(name, &models);
+
+    // Ranked candidate list: the heuristic pick first, then everything
+    // else that survives the same filter ordering.
+    let mut ordered: Vec<String> = Vec::new();
+    if let Some(p) = preferred {
+        ordered.push(p);
+    }
+    for m in &models {
+        if !ordered.iter().any(|x| x == m) {
+            ordered.push(m.clone());
+        }
+    }
+
+    let probe_n = max_probe.max(1).min(ordered.len());
+    for cand in ordered.iter().take(probe_n) {
+        let cfg = match name {
+            "anthropic" => ProviderConfig::Anthropic {
+                api_key: api_key.into(),
+                model: cand.clone(),
+            },
+            "openai" => ProviderConfig::OpenAI {
+                api_key: api_key.into(),
+                model: cand.clone(),
+            },
+            "openrouter" => ProviderConfig::OpenRouter {
+                api_key: api_key.into(),
+                model: cand.clone(),
+            },
+            "agentrouter" => ProviderConfig::AgentRouter {
+                api_key: api_key.into(),
+                model: cand.clone(),
+            },
+            "gemini" => ProviderConfig::Gemini {
+                api_key: api_key.into(),
+                model: cand.clone(),
+            },
+            "ollama" => ProviderConfig::Ollama {
+                base_url: base_url.unwrap_or("http://localhost:11434").into(),
+                model: cand.clone(),
+            },
+            "deepseek" | "xai" | "grok" | "groq" | "together" | "custom"
+            | "openai-compatible" => {
+                let url = match name {
+                    "deepseek" => "https://api.deepseek.com/v1".to_string(),
+                    "xai" | "grok" => "https://api.x.ai/v1".to_string(),
+                    "groq" => "https://api.groq.com/openai/v1".to_string(),
+                    "together" => "https://api.together.xyz/v1".to_string(),
+                    _ => base_url.unwrap_or("").trim_end_matches('/').to_string(),
+                };
+                if url.is_empty() {
+                    continue;
+                }
+                ProviderConfig::OpenAiCompatible {
+                    name: name.into(),
+                    api_key: api_key.into(),
+                    model: cand.clone(),
+                    base_url: url,
+                }
+            }
+            _ => continue,
+        };
+        let provider = provider_for(cfg);
+        // Tight, single-token-ish probe. We don't care about the content,
+        // only that the call returns Ok.
+        if provider.call("ping", "ok", &[]).await.is_ok() {
+            return Ok(Some(cand.clone()));
+        }
+    }
+    // Nothing answered — fall back to the heuristic pick so the user
+    // sees *something* in the Model field rather than silence.
+    Ok(pick_default_from_list(name, &models))
 }
 
 /// System-prompt length threshold above which the Anthropic adaptor attaches
