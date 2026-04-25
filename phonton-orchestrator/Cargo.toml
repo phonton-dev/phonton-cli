@@ -1,0 +1,18 @@
+[package]
+name = "phonton-orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phonton-types  = { path = "../phonton-types" }
+phonton-verify = { path = "../phonton-verify" }
+phonton-memory = { path = "../phonton-memory" }
+phonton-diff   = { path = "../phonton-diff" }
+anyhow         = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+async-trait    = "0.1"
+petgraph       = "0.6"
+
+[dev-dependencies]
+tokio = { workspace = true }

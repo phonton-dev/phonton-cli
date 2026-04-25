@@ -1,0 +1,13 @@
+[package]
+name = "phonton-context"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phonton-types     = { path = "../phonton-types" }
+phonton-providers = { path = "../phonton-providers" }
+anyhow            = { workspace = true }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
+async-trait       = "0.1"
+tiktoken-rs       = "0.5"

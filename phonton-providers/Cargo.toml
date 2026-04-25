@@ -1,0 +1,19 @@
+[package]
+name = "phonton-providers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phonton-types = { path = "../phonton-types" }
+anyhow        = { workspace = true }
+serde         = { workspace = true }
+tokio         = { workspace = true }
+async-trait   = "0.1"
+reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json    = "1"
+
+[features]
+# Gate network-hitting tests behind an explicit feature flag. Enable with
+# `cargo test -p phonton-providers --features live-tests` and ensure
+# `ANTHROPIC_API_KEY` is in the environment.
+live-tests = []

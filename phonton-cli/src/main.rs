@@ -1,0 +1,2729 @@
+//! Terminal entry point — Ratatui task board for Phonton.
+//!
+//! Three-pane layout, Goal/Task/Ask modes, live `GlobalState` streamed from
+//! the orchestrator over a `watch` channel:
+//!
+//! ```text
+//! ┌─ Goals ──────────┬─ Active subtasks / verify log ───────────────────┐
+//! │ ▸ goal one       │ [running]  Implement parse_callsites  (Cheap)    │
+//! │ ▪ goal two       │ [verifying] attempt 2                            │
+//! │                  │ [done]     Write integration tests for ...       │
+//! │                  │                                                  │
+//! │                  │ tokens: 1.2k / budget ∞  |  baseline 5.0k  (-76%)│
+//! ├──────────────────┴──────────────────────────────────────────────────┤
+//! │ goal › _                                                            │
+//! └─────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Modes:
+//! - **Goal** (default): Enter queues the typed goal for planning + running.
+//! - **Task**: single-subtask fast path — reuses the same orchestration spine.
+//! - **Ask**: `Ctrl+;` toggles a side panel for stateless Q&A that does
+//!   *not* touch active-goal context. (The spec calls for `Cmd+;`; on
+//!   POSIX terminals we bind the equivalent Ctrl chord, which most
+//!   keymaps surface the same way.)
+//!
+//! The CLI owns an orchestrator handle and a stub [`WorkerDispatcher`] that
+//! produces a trivial diff per subtask — this is intentional. Wiring a real
+//! provider is a configuration choice the user makes via
+//! Provider configuration is loaded from `~/.phonton/config.toml` (see
+//! [`config::load`]) and falls back to environment variables when the file
+//! is absent. The contract the TUI depends on is the
+//! `watch::Receiver<GlobalState>`.
+
+mod config;
+mod trust;
+
+use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+};
+use crossterm::cursor::SetCursorStyle;
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
+use phonton_planner::{decompose_with_memory, Goal};
+use phonton_providers::{discover_models, pick_default_from_list, provider_for, Provider};
+use phonton_sandbox::{ExecutionGuard, Sandbox};
+use phonton_diff::DiffApplier;
+use phonton_store::Store;
+use phonton_types::{
+    BudgetLimits, DiffHunk, DiffLine, EventRecord, GlobalState, OrchestratorMessage, ProviderConfig as ApiProviderConfig, Subtask,
+    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, VerifyLayer, VerifyResult,
+};
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
+use tokio::sync::{broadcast, mpsc, watch};
+
+// ---------------------------------------------------------------------------
+// Visual identity
+// ---------------------------------------------------------------------------
+
+// Curated palette — cool slate base with cyan→violet gradient accents.
+const ACCENT: Color = Color::Rgb(99, 179, 237);     // cyan-300
+const ACCENT_HI: Color = Color::Rgb(160, 215, 250); // cyan-200 highlight
+const SUCCESS: Color = Color::Rgb(72, 199, 142);
+const WARN: Color = Color::Rgb(246, 173, 85);
+const DANGER: Color = Color::Rgb(252, 129, 74);
+const MUTED: Color = Color::Rgb(113, 128, 150);
+const DIM: Color = Color::Rgb(74, 85, 104);
+const BG_PANEL: Color = Color::Rgb(26, 32, 44);
+const BG_DEEP: Color = Color::Rgb(18, 22, 33);
+const VIOLET: Color = Color::Rgb(159, 122, 234);
+#[allow(dead_code)]
+const PINK: Color = Color::Rgb(237, 100, 166);
+
+// Gradient endpoints used by the logo / accents.
+const GRAD_A: (u8, u8, u8) = (99, 179, 237);   // cyan
+const GRAD_B: (u8, u8, u8) = (159, 122, 234);  // violet
+const GRAD_C: (u8, u8, u8) = (237, 100, 166);  // pink
+
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+const LOGO: &[&str] = &[
+    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
+    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
+    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
+    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
+];
+
+const LOGO_WIDTH_THRESHOLD: u16 = 100;
+
+// ---------------------------------------------------------------------------
+// Visual helpers — gradient + pill primitives
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let v = a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0);
+    v.round().clamp(0.0, 255.0) as u8
+}
+
+/// Linearly interpolate between two RGB colors.
+fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
+    Color::Rgb(lerp_u8(a.0, b.0, t), lerp_u8(a.1, b.1, t), lerp_u8(a.2, b.2, t))
+}
+
+/// Three-stop gradient (a → b → c) sampled at t ∈ [0, 1].
+fn grad3(t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        grad(GRAD_A, GRAD_B, t * 2.0)
+    } else {
+        grad(GRAD_B, GRAD_C, (t - 0.5) * 2.0)
+    }
+}
+
+/// Build a horizontally-gradient-colored line from `text`. `phase` shifts the
+/// gradient to produce a subtle shimmer when called per frame.
+fn gradient_line(text: &str, phase: f32, bold: bool) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len().max(1) as f32;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
+    let modifier = if bold { Modifier::BOLD } else { Modifier::empty() };
+    for (i, ch) in chars.into_iter().enumerate() {
+        if ch == ' ' {
+            spans.push(Span::raw(" "));
+            continue;
+        }
+        let mut t = (i as f32) / n + phase;
+        t = t - t.floor();
+        let color = grad3(t);
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default().fg(color).add_modifier(modifier),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Render text as a "pill" — small inline badge with a colored bg.
+fn pill(text: &str, bg: Color, fg: Color) -> Span<'static> {
+    Span::styled(
+        format!(" {} ", text),
+        Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Build a unicode progress bar of `width` cells, filled `filled_frac` of the
+/// way through with the cyan→violet gradient.
+fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
+    let frac = filled_frac.clamp(0.0, 1.0);
+    let total_eighths = (frac * (width as f32) * 8.0).round() as usize;
+    let full = total_eighths / 8;
+    let rem = total_eighths % 8;
+    let partials = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let mut spans = Vec::with_capacity(width);
+    for i in 0..width {
+        let t = if width <= 1 { 0.0 } else { i as f32 / (width as f32 - 1.0) };
+        let color = grad3(t);
+        if i < full {
+            spans.push(Span::styled("█".to_string(), Style::default().fg(color)));
+        } else if i == full && rem > 0 {
+            let ch = partials[rem - 1];
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+        } else {
+            spans.push(Span::styled("·".to_string(), Style::default().fg(DIM)));
+        }
+    }
+    spans
+}
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
+
+/// Interaction mode. Maps 1:1 to the positioning-document's task-board
+/// vocabulary: goal mode is the default, ask mode is a side channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Typing a goal to decompose + run.
+    Goal,
+    /// Typing a direct single subtask (same orchestration path).
+    Task,
+    /// Side-channel Q&A — isolated context, doesn't touch goals.
+    Ask,
+    /// Settings screen.
+    Settings,
+    /// Command palette for quick actions.
+    CommandPalette,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsField {
+    Provider,
+    Model,
+    ApiKey,
+    BaseUrl,
+    MaxTokens,
+    MaxUsdCents,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsState {
+    pub active_field: SettingsField,
+    pub provider: String,
+    pub model: String,
+    pub api_key: String,
+    pub base_url: String,
+    pub max_tokens: String,
+    pub max_usd_cents: String,
+    pub message: Option<String>,
+}
+
+impl SettingsState {
+    pub fn new(cfg: &crate::config::Config) -> Self {
+        Self {
+            active_field: SettingsField::Provider,
+            provider: cfg.provider.name.clone(),
+            model: cfg.provider.model.clone().unwrap_or_default(),
+            api_key: cfg.provider.api_key.clone().unwrap_or_default(),
+            base_url: cfg.provider.base_url.clone().unwrap_or_default(),
+            max_tokens: cfg.budget.max_tokens.map(|t| t.to_string()).unwrap_or_default(),
+            max_usd_cents: cfg.budget.max_usd_cents.map(|c| c.to_string()).unwrap_or_default(),
+            message: None,
+        }
+    }
+}
+
+/// A queued or running top-level goal entry in the left panel.
+#[derive(Debug, Clone)]
+pub struct GoalEntry {
+    /// Free-form goal text the user typed.
+    pub description: String,
+    /// Latest status snapshot seen on the watch channel for this goal.
+    pub status: TaskStatus,
+    /// Most recent `GlobalState` snapshot, if any — drives the centre pane.
+    pub state: Option<GlobalState>,
+    /// Stable task id — used to correlate Flight Log events with the goal.
+    pub task_id: TaskId,
+    /// Every [`EventRecord`] observed for this goal, oldest first.
+    pub flight_log: Vec<EventRecord>,
+    /// Index into `state.checkpoints` the user is hovering over in the
+    /// checkpoint picker. `None` when the picker has no focus.
+    pub checkpoint_cursor: Option<usize>,
+}
+
+impl GoalEntry {
+    fn new(description: String) -> Self {
+        Self {
+            description,
+            status: TaskStatus::Queued,
+            state: None,
+            task_id: TaskId::new(),
+            flight_log: Vec::new(),
+            checkpoint_cursor: None,
+        }
+    }
+}
+
+/// Complete TUI app state.
+///
+/// Deliberately owns no terminal/IO handles — pure data, so it can be
+/// rendered in unit tests via [`ratatui::backend::TestBackend`] without
+/// touching a real terminal.
+#[derive(Debug, Clone)]
+pub struct App {
+    /// Active mode — drives the input bar legend and Enter semantics.
+    pub mode: Mode,
+    /// Goal list, in insertion order. Index 0 is the newest.
+    pub goals: Vec<GoalEntry>,
+    /// The goal currently highlighted in the left pane (index into `goals`).
+    pub selected: usize,
+    /// Goal-bar input buffer.
+    pub goal_input: String,
+    /// Ask-mode input buffer, preserved across mode toggles.
+    pub ask_input: String,
+    /// Most recent ask-mode answer, for display in the side panel.
+    pub ask_answer: Option<String>,
+    /// True while an ask-mode provider call is in flight; drives the
+    /// thinking spinner in the Ask panel.
+    pub ask_pending: bool,
+    /// When `true`, the render loop exits on the next frame.
+    pub should_quit: bool,
+    /// Monotonic tick counter driving the running-tag spinner animation.
+    pub spinner_frame: usize,
+    /// True when the Flight Log panel is open. Toggled by Shift+L.
+    pub flight_log_open: bool,
+    /// Settings modal state.
+    pub settings: SettingsState,
+    /// Command palette input.
+    pub palette_input: String,
+    /// Command palette selected index.
+    pub palette_selected: usize,
+    /// Mode to restore after closing the palette.
+    pub prev_mode: Mode,
+    /// Caret position (in chars) inside `goal_input`.
+    pub goal_cursor: usize,
+    /// Caret position (in chars) inside `ask_input`.
+    pub ask_cursor: usize,
+    /// Session-best token savings percentage (vs naive baseline). Updated
+    /// whenever a goal completes with a higher savings rate than seen before.
+    pub best_savings_pct: Option<i64>,
+    /// Flash counter — non-zero for a few ticks after a new personal best
+    /// is set, driving the savings line highlight. Decremented each tick.
+    pub new_best_ticks: u8,
+}
+
+impl App {
+    pub fn new(cfg: &crate::config::Config) -> Self {
+        Self {
+            mode: Mode::Goal,
+            goals: Vec::new(),
+            selected: 0,
+            goal_input: String::new(),
+            ask_input: String::new(),
+            ask_answer: None,
+            ask_pending: false,
+            should_quit: false,
+            spinner_frame: 0,
+            flight_log_open: false,
+            settings: SettingsState::new(cfg),
+            palette_input: String::new(),
+            palette_selected: 0,
+            prev_mode: Mode::Goal,
+            goal_cursor: 0,
+            ask_cursor: 0,
+            best_savings_pct: None,
+            new_best_ticks: 0,
+        }
+    }
+}
+
+/// Insert a character at a char-index position in `s`. Returns the new
+/// caret position (one past the inserted char).
+fn insert_char_at(s: &mut String, char_idx: usize, c: char) -> usize {
+    let byte_idx = s
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    s.insert(byte_idx, c);
+    char_idx + 1
+}
+
+/// Delete the character immediately before the caret. Returns the new caret.
+fn delete_char_before(s: &mut String, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    let new_idx = char_idx - 1;
+    let start = s.char_indices().nth(new_idx).map(|(b, _)| b).unwrap_or(0);
+    let end = s
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    s.replace_range(start..end, "");
+    new_idx
+}
+
+/// Delete the word (and trailing whitespace) immediately before the caret.
+fn delete_word_before(s: &mut String, char_idx: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = char_idx.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    let start = s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(0);
+    let end = s
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    s.replace_range(start..end, "");
+    i
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let default_cfg = crate::config::Config {
+            provider: crate::config::ProviderConfig {
+                name: "anthropic".to_string(),
+                api_key: None,
+                model: None,
+                base_url: None,
+            },
+            budget: crate::config::BudgetConfig {
+                max_tokens: None,
+                max_usd_cents: None,
+            },
+        };
+        Self::new(&default_cfg)
+    }
+}
+
+impl App {
+    /// Currently highlighted goal, if any.
+    pub fn current_goal(&self) -> Option<&GoalEntry> {
+        self.goals.get(self.selected)
+    }
+
+    /// Apply a `GlobalState` snapshot to the goal at `index`. Updates both
+    /// the per-goal cached state and the task-level status.
+    pub fn apply_state(&mut self, index: usize, state: GlobalState) {
+        // Check for a new session-best savings percentage before storing.
+        if state.estimated_naive_tokens > 0 {
+            let pct = savings_pct(&state);
+            if let Some(p) = pct {
+                let is_new_best = self.best_savings_pct.map_or(true, |best| p > best);
+                if is_new_best {
+                    self.best_savings_pct = Some(p);
+                    self.new_best_ticks = 12;
+                }
+            }
+        }
+        if let Some(g) = self.goals.get_mut(index) {
+            g.status = state.task_status.clone();
+            g.state = Some(state);
+        }
+    }
+
+    /// Append a flight-log event to the goal at `index`.
+    pub fn apply_event(&mut self, index: usize, event: EventRecord) {
+        if let Some(g) = self.goals.get_mut(index) {
+            g.flight_log.push(event);
+        }
+    }
+
+    /// Translate a key event into a state transition. Pure function so the
+    /// key-handling logic is unit-testable without a terminal.
+    ///
+    /// Returns `Some(Intent)` when the caller should act on the outside
+    /// world (queue a new goal, issue an ask, exit).
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        // Global shortcuts first, regardless of mode.
+        if matches!(key.code, KeyCode::Esc) {
+            if self.flight_log_open {
+                self.flight_log_open = false;
+                return None;
+            }
+            if self.mode == Mode::Ask || self.mode == Mode::Settings || self.mode == Mode::CommandPalette {
+                self.mode = Mode::Goal;
+                return None;
+            }
+            self.should_quit = true;
+            return Some(Intent::Quit);
+        }
+
+        // Handle '/' as the command trigger (like gemini cli / slash commands)
+        if matches!(key.code, KeyCode::Char('/')) && self.mode != Mode::CommandPalette && self.mode != Mode::Ask && self.mode != Mode::Settings {
+            self.prev_mode = self.mode;
+            self.mode = Mode::CommandPalette;
+            self.palette_input.clear();
+            self.palette_selected = 0;
+            return None;
+        }
+
+        // We keep simple shortcuts like Shift+L for the flight log but remove
+        // complex Ctrl combinations as requested.
+        let is_l = matches!(key.code, KeyCode::Char('L')) || 
+                  (matches!(key.code, KeyCode::Char('l')) && key.modifiers.contains(KeyModifiers::SHIFT));
+        
+        if is_l && !matches!(self.mode, Mode::Ask | Mode::Settings | Mode::CommandPalette) {
+            self.flight_log_open = !self.flight_log_open;
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.should_quit = true;
+                    return Some(Intent::Quit);
+                }
+                // Cmd/Ctrl+; toggles the Ask side panel.
+                KeyCode::Char(';') => {
+                    self.mode = if self.mode == Mode::Ask { Mode::Goal } else { Mode::Ask };
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        match self.mode {
+            Mode::Goal | Mode::Task => self.handle_goal_key(key),
+            Mode::Ask => self.handle_ask_key(key),
+            Mode::Settings => self.handle_settings_key(key),
+            Mode::CommandPalette => self.handle_palette_key(key),
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        let all_options = vec![
+            "Goal Mode",
+            "Task Mode",
+            "Ask Mode",
+            "Settings",
+            "Toggle Log",
+            "Clear History",
+            "Quit",
+        ];
+
+        let filtered_options: Vec<&str> = if self.palette_input.is_empty() {
+            all_options.clone()
+        } else {
+            all_options
+                .iter()
+                .filter(|opt| opt.to_lowercase().contains(&self.palette_input.to_lowercase()))
+                .copied()
+                .collect()
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = self.prev_mode;
+                None
+            }
+            KeyCode::Enter => {
+                if filtered_options.is_empty() {
+                    return None;
+                }
+                let selected = filtered_options[self.palette_selected % filtered_options.len()];
+                match selected {
+                    "Goal Mode" => {
+                        self.mode = Mode::Goal;
+                    }
+                    "Task Mode" => {
+                        self.mode = Mode::Task;
+                    }
+                    "Ask Mode" => {
+                        self.mode = Mode::Ask;
+                    }
+                    "Settings" => {
+                        self.mode = Mode::Settings;
+                    }
+                    "Toggle Log" => {
+                        self.flight_log_open = !self.flight_log_open;
+                        self.mode = self.prev_mode;
+                    }
+                    "Clear History" => {
+                        self.goals.clear();
+                        self.selected = 0;
+                        self.mode = Mode::Goal;
+                    }
+                    "Quit" => {
+                        self.should_quit = true;
+                        return Some(Intent::Quit);
+                    }
+                    _ => {}
+                }
+                None
+            }
+            KeyCode::Up => {
+                self.palette_selected = self.palette_selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                if !filtered_options.is_empty() {
+                    self.palette_selected = (self.palette_selected + 1).min(filtered_options.len() - 1);
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                self.palette_input.push(c);
+                self.palette_selected = 0;
+                None
+            }
+            KeyCode::Backspace => {
+                self.palette_input.pop();
+                self.palette_selected = 0;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_goal_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        // Ctrl+Up / Ctrl+Down navigate the checkpoint picker inside the
+        // currently selected goal.  'r' triggers a rollback to the
+        // cursor-highlighted checkpoint.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(g) = self.goals.get_mut(self.selected) {
+                        let max = g.state.as_ref().map(|s| s.checkpoints.len()).unwrap_or(0);
+                        if max > 0 {
+                            let cur = g.checkpoint_cursor.unwrap_or(0);
+                            g.checkpoint_cursor = Some(cur.saturating_sub(1));
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Down => {
+                    if let Some(g) = self.goals.get_mut(self.selected) {
+                        let max = g.state.as_ref().map(|s| s.checkpoints.len()).unwrap_or(0);
+                        if max > 0 {
+                            let cur = g.checkpoint_cursor.unwrap_or(0);
+                            g.checkpoint_cursor = Some((cur + 1).min(max.saturating_sub(1)));
+                        }
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        // Ctrl+W deletes the word before the caret.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+            self.goal_cursor = delete_word_before(&mut self.goal_input, self.goal_cursor);
+            return None;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                let text = std::mem::take(&mut self.goal_input);
+                self.goal_cursor = 0;
+                if text.trim().is_empty() {
+                    return None;
+                }
+                self.goals.insert(0, GoalEntry::new(text.clone()));
+                self.selected = 0;
+                Some(Intent::QueueGoal(text))
+            }
+            KeyCode::Backspace => {
+                self.goal_cursor = delete_char_before(&mut self.goal_input, self.goal_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.goal_cursor = self.goal_cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                if self.goal_cursor < char_count(&self.goal_input) {
+                    self.goal_cursor += 1;
+                }
+                None
+            }
+            KeyCode::Home => {
+                self.goal_cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.goal_cursor = char_count(&self.goal_input);
+                None
+            }
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < self.goals.len() {
+                    self.selected += 1;
+                }
+                None
+            }
+            KeyCode::Char('r') if self.goal_input.is_empty() => {
+                // Rollback shortcut — only when the goal bar is empty so the
+                // user can still type words starting with 'r' normally.
+                let goal_index = self.selected;
+                if let Some(g) = self.goals.get(goal_index) {
+                    if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref()) {
+                        if let Some(cp) = state.checkpoints.get(cursor) {
+                            return Some(Intent::Rollback {
+                                goal_index,
+                                to_seq: cp.seq,
+                            });
+                        }
+                    }
+                }
+                self.goal_cursor = insert_char_at(&mut self.goal_input, self.goal_cursor, 'r');
+                None
+            }
+            KeyCode::Char(c) => {
+                self.goal_cursor = insert_char_at(&mut self.goal_input, self.goal_cursor, c);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_ask_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+            self.ask_cursor = delete_word_before(&mut self.ask_input, self.ask_cursor);
+            return None;
+        }
+        match key.code {
+            KeyCode::Enter => {
+                let q = std::mem::take(&mut self.ask_input);
+                self.ask_cursor = 0;
+                if q.trim().is_empty() {
+                    return None;
+                }
+                Some(Intent::Ask(q))
+            }
+            KeyCode::Backspace => {
+                self.ask_cursor = delete_char_before(&mut self.ask_input, self.ask_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.ask_cursor = self.ask_cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                if self.ask_cursor < char_count(&self.ask_input) {
+                    self.ask_cursor += 1;
+                }
+                None
+            }
+            KeyCode::Home => {
+                self.ask_cursor = 0;
+                None
+            }
+            KeyCode::End => {
+                self.ask_cursor = char_count(&self.ask_input);
+                None
+            }
+            KeyCode::Char(c) => {
+                self.ask_cursor = insert_char_at(&mut self.ask_input, self.ask_cursor, c);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        // Simple shortcuts: Enter to save, Esc to cancel (handled globally).
+
+        // Ctrl+T: smoke-test the configured provider/key/model.
+        // Ctrl+D: auto-detect which models the configured key can access
+        // and pre-fill the Model field with the best pick. Both run
+        // off-thread in the event loop so the UI stays live.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    return Some(Intent::TestConnection);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    return Some(Intent::DetectModels);
+                }
+                _ => {}
+            }
+        }
+
+        // When Provider field is active, allow cycling with arrows for ease of use.
+        if self.settings.active_field == SettingsField::Provider {
+            if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                let providers = crate::config::KNOWN_PROVIDERS;
+                if !providers.is_empty() {
+                    let cur = providers
+                        .iter()
+                        .position(|p| *p == self.settings.provider)
+                        .unwrap_or(0);
+                    let delta = if matches!(key.code, KeyCode::Right) { 1 } else { providers.len() - 1 };
+                    let next = (cur + delta) % providers.len();
+                    self.settings.provider = providers[next].to_string();
+                    self.settings.message = None;
+                }
+                return None;
+            }
+        }
+
+        match key.code {
+            KeyCode::Enter => {
+                return Some(Intent::SaveSettings);
+            }
+            KeyCode::Tab => {
+                self.settings.active_field = match self.settings.active_field {
+                    SettingsField::Provider => SettingsField::Model,
+                    SettingsField::Model => SettingsField::ApiKey,
+                    SettingsField::ApiKey => SettingsField::BaseUrl,
+                    SettingsField::BaseUrl => SettingsField::MaxTokens,
+                    SettingsField::MaxTokens => SettingsField::MaxUsdCents,
+                    SettingsField::MaxUsdCents => SettingsField::Provider,
+                };
+                None
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.settings.active_field = match self.settings.active_field {
+                    SettingsField::Provider => SettingsField::MaxUsdCents,
+                    SettingsField::Model => SettingsField::Provider,
+                    SettingsField::ApiKey => SettingsField::Model,
+                    SettingsField::BaseUrl => SettingsField::ApiKey,
+                    SettingsField::MaxTokens => SettingsField::BaseUrl,
+                    SettingsField::MaxUsdCents => SettingsField::MaxTokens,
+                };
+                None
+            }
+            KeyCode::Down => {
+                self.settings.active_field = match self.settings.active_field {
+                    SettingsField::Provider => SettingsField::Model,
+                    SettingsField::Model => SettingsField::ApiKey,
+                    SettingsField::ApiKey => SettingsField::BaseUrl,
+                    SettingsField::BaseUrl => SettingsField::MaxTokens,
+                    SettingsField::MaxTokens => SettingsField::MaxUsdCents,
+                    SettingsField::MaxUsdCents => SettingsField::Provider,
+                };
+                None
+            }
+            KeyCode::Backspace => {
+                match self.settings.active_field {
+                    SettingsField::Provider => { self.settings.provider.pop(); }
+                    SettingsField::Model => { self.settings.model.pop(); }
+                    SettingsField::ApiKey => { self.settings.api_key.pop(); }
+                    SettingsField::BaseUrl => { self.settings.base_url.pop(); }
+                    SettingsField::MaxTokens => { self.settings.max_tokens.pop(); }
+                    SettingsField::MaxUsdCents => { self.settings.max_usd_cents.pop(); }
+                }
+                self.settings.message = None;
+                None
+            }
+            KeyCode::Char(c) => {
+                match self.settings.active_field {
+                    SettingsField::Provider => { self.settings.provider.push(c); }
+                    SettingsField::Model => { self.settings.model.push(c); }
+                    SettingsField::ApiKey => { self.settings.api_key.push(c); }
+                    SettingsField::BaseUrl => { self.settings.base_url.push(c); }
+                    SettingsField::MaxTokens => { if c.is_ascii_digit() { self.settings.max_tokens.push(c); } }
+                    SettingsField::MaxUsdCents => { if c.is_ascii_digit() { self.settings.max_usd_cents.push(c); } }
+                }
+                self.settings.message = None;
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Side-effecting actions the event loop must execute on the app's behalf.
+///
+/// Kept as an enum so [`App::handle_key`] stays pure and the driver decides
+/// how to issue them (spawn an orchestrator task, call the ask provider,
+/// teardown, etc.).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Intent {
+    /// User submitted a goal — caller should spawn an orchestration task.
+    QueueGoal(String),
+    /// User submitted an ask-mode question. Isolated from goal context.
+    Ask(String),
+    /// User triggered a rollback to a specific checkpoint seq for the
+    /// currently selected goal.
+    Rollback { goal_index: usize, to_seq: u32 },
+    /// Save settings.
+    SaveSettings,
+    /// Test the configured provider/model/api-key by issuing one tiny
+    /// chat request. Result lands back in `SettingsState::message`.
+    TestConnection,
+    /// Discover models accessible to the configured provider/api-key.
+    /// On success the first sensible model is written into the Model
+    /// field; the full list is summarised in `SettingsState::message`.
+    DetectModels,
+    /// User accepted the workspace-trust prompt — proceed into the TUI.
+    AcceptTrust,
+    /// User declined trust. Caller should exit cleanly.
+    DeclineTrust,
+    /// Quit the TUI.
+    Quit,
+}
+
+// ---------------------------------------------------------------------------
+// Token-savings rendering
+// ---------------------------------------------------------------------------
+
+/// Render the token/savings summary surfaced at the bottom of the centre
+/// pane. Plain-text form — pulled out so it's unit-testable. The live TUI
+/// uses [`render_savings_line_styled`] for the colored version.
+pub fn render_savings_line(state: Option<&GlobalState>) -> String {
+    let Some(s) = state else {
+        return "  ⚡ — tok  |  saved — vs naive  |  Σ baseline: —".into();
+    };
+    let pct = savings_pct(s);
+    let pct_txt = pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "—".into());
+    format!(
+        "  ⚡ {} tok  |  saved {} vs naive  |  Σ baseline: {}",
+        s.tokens_used, pct_txt, s.estimated_naive_tokens
+    )
+}
+
+fn savings_pct(s: &GlobalState) -> Option<i64> {
+    if s.estimated_naive_tokens == 0 {
+        return None;
+    }
+    let diff = s.estimated_naive_tokens as i64 - s.tokens_used as i64;
+    Some(((diff as f64 / s.estimated_naive_tokens as f64) * 100.0).round() as i64)
+}
+
+/// Styled version of [`render_savings_line`]. Colors the savings percentage
+/// according to how much we saved: SUCCESS when >50%, WARN when 10–50%.
+/// When `new_best_ticks > 0` an amber "★ best!" flash is appended so the
+/// user knows they just beat their session record.
+pub fn render_savings_line_styled(
+    state: Option<&GlobalState>,
+    best_savings_pct: Option<i64>,
+    new_best_ticks: u8,
+) -> Line<'static> {
+    let Some(s) = state else {
+        return Line::from(Span::styled(
+            "  ⚡ — tok  |  saved — vs naive  |  Σ baseline: —",
+            Style::default().fg(MUTED),
+        ));
+    };
+    let pct = savings_pct(s);
+    let (pct_txt, pct_style) = match pct {
+        Some(p) if p > 50 => (format!("{p}%"), Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+        Some(p) if p >= 10 => (format!("{p}%"), Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+        Some(p) => (format!("{p}%"), Style::default().fg(MUTED)),
+        None => ("—".into(), Style::default().fg(MUTED)),
+    };
+    let best_span = match best_savings_pct {
+        Some(b) if new_best_ticks > 0 => Span::styled(
+            format!("  ★ new best {b}%!"),
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ),
+        Some(b) => Span::styled(
+            format!("  best {b}%"),
+            Style::default().fg(MUTED),
+        ),
+        None => Span::raw(""),
+    };
+    // Gradient mini-gauge showing how much of the naive baseline we've
+    // saved (full bar = 100% savings, empty bar = no savings).
+    let frac = pct.map(|p| (p as f32 / 100.0).clamp(0.0, 1.0)).unwrap_or(0.0);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("  ⚡ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled(
+        format!("{} tok", s.tokens_used),
+        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled("  saved ", Style::default().fg(MUTED)));
+    spans.push(Span::styled(pct_txt, pct_style));
+    spans.push(Span::raw("  "));
+    spans.extend(gradient_bar(frac, 14));
+    spans.push(Span::styled(
+        format!("  vs Σ {}", s.estimated_naive_tokens),
+        Style::default().fg(MUTED),
+    ));
+    spans.push(best_span);
+    Line::from(spans)
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Top-level frame renderer. Public so integration tests can render the
+/// whole UI into a [`ratatui::backend::TestBackend`] and assert.
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    // Once a goal is queued, collapse the giant ASCII logo down to a slim
+    // one-line header so the work area gets the screen real estate.
+    let want_full_logo = app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD;
+    let splash_h: u16 = if want_full_logo {
+        LOGO.len() as u16 + 1
+    } else {
+        1
+    };
+
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(splash_h),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let splash_row = outer[0];
+    let body = outer[1];
+    let input_row = outer[2];
+    let footer_row = outer[3];
+
+    render_splash(frame, splash_row, app);
+
+    let body_chunks: Vec<Rect> = if app.mode == Mode::Ask {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(45),
+                Constraint::Percentage(30),
+            ])
+            .split(body)
+            .to_vec()
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .split(body)
+            .to_vec()
+    };
+
+    render_goals(frame, body_chunks[0], app);
+    if app.flight_log_open {
+        render_flight_log(frame, body_chunks[1], app);
+    } else {
+        render_centre(frame, body_chunks[1], app);
+    }
+    if app.mode == Mode::Ask {
+        render_ask(frame, body_chunks[2], app);
+    }
+    render_input(frame, input_row, app);
+    render_footer(frame, footer_row, app);
+
+    if app.mode == Mode::Settings {
+        render_settings(frame, area, app);
+    }
+    if app.mode == Mode::CommandPalette {
+        render_palette(frame, area, app);
+    }
+}
+
+fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
+    // Slowly drifting phase so the logo gradient gently shimmers.
+    let phase = (app.spinner_frame as f32) * 0.012;
+    if area.height >= LOGO.len() as u16 + 1 && area.width >= LOGO_WIDTH_THRESHOLD {
+        let lines: Vec<Line> = LOGO
+            .iter()
+            .enumerate()
+            .map(|(row_idx, row)| {
+                // Per-row phase shift gives the gradient a soft diagonal feel.
+                gradient_line(row, phase + (row_idx as f32) * 0.04, true)
+            })
+            .collect();
+        let p = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(BG_DEEP));
+        frame.render_widget(p, area);
+    } else {
+        // Compact one-line header — gradient "phonton" + dim subtitle.
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled("✦ ", Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD)),
+        ];
+        let title_chars: Vec<char> = "phonton".chars().collect();
+        let n = title_chars.len() as f32;
+        for (i, ch) in title_chars.into_iter().enumerate() {
+            let t = (i as f32) / (n - 1.0).max(1.0);
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
+        spans.push(Span::styled("agentic dev environment", Style::default().fg(MUTED)));
+        let p = Paragraph::new(Line::from(spans))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(BG_DEEP));
+        frame.render_widget(p, area);
+    }
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let key = Style::default().bg(DIM).fg(ACCENT_HI).add_modifier(Modifier::BOLD);
+    let txt = Style::default().fg(MUTED);
+    let dim = Style::default().fg(DIM);
+    let sep = Span::styled("  ·  ", dim);
+
+    let spans: Vec<Span<'static>> = match app.mode {
+        Mode::Goal | Mode::Task => vec![
+            Span::styled("Enter", key), Span::styled(" run  ", txt),
+            sep.clone(),
+            Span::styled("/", key), Span::styled(" commands  ", txt),
+            sep.clone(),
+            Span::styled("Ctrl+;", key), Span::styled(" ask  ", txt),
+            sep.clone(),
+            Span::styled("Shift+L", key), Span::styled(" flight log  ", txt),
+            sep.clone(),
+            Span::styled("↑↓", key), Span::styled(" goals  ", txt),
+            sep,
+            Span::styled("Esc", key), Span::styled(" quit", txt),
+        ],
+        Mode::Ask => vec![
+            Span::styled("Enter", key), Span::styled(" send  ", txt),
+            sep.clone(),
+            Span::styled("Ctrl+;", key), Span::styled(" close ask  ", txt),
+            sep,
+            Span::styled("Esc", key), Span::styled(" cancel", txt),
+        ],
+        Mode::Settings => vec![
+            Span::styled("Enter", key), Span::styled(" save  ", txt),
+            sep.clone(),
+            Span::styled("Tab", key), Span::styled(" next field  ", txt),
+            sep.clone(),
+            Span::styled("←→", key), Span::styled(" cycle provider  ", txt),
+            sep,
+            Span::styled("Esc", key), Span::styled(" cancel", txt),
+        ],
+        Mode::CommandPalette => vec![
+            Span::styled("type", key), Span::styled(" filter  ", txt),
+            sep.clone(),
+            Span::styled("↑↓", key), Span::styled(" select  ", txt),
+            sep.clone(),
+            Span::styled("Enter", key), Span::styled(" run  ", txt),
+            sep,
+            Span::styled("Esc", key), Span::styled(" close", txt),
+        ],
+    };
+
+    let p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    frame.render_widget(p, area);
+}
+
+fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
+    let all_options = vec![
+        "Goal Mode",
+        "Task Mode",
+        "Ask Mode",
+        "Settings",
+        "Toggle Log",
+        "Clear History",
+        "Quit",
+    ];
+
+    let filtered_options: Vec<&str> = if app.palette_input.is_empty() {
+        all_options.clone()
+    } else {
+        all_options
+            .iter()
+            .filter(|opt| opt.to_lowercase().contains(&app.palette_input.to_lowercase()))
+            .copied()
+            .collect()
+    };
+
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled("◆ ", Style::default().fg(VIOLET)),
+            Span::styled(
+                "Command Palette",
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Thick)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+
+    let popup_w = 40;
+    let popup_h = (all_options.len() as u16 + 4).max(8);
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w.min(area.width),
+        height: popup_h.min(area.height),
+    };
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+
+    let inner = popup_area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 2 });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Search
+            Constraint::Length(1), // Separator
+            Constraint::Min(1),    // List
+        ])
+        .split(inner);
+
+    let search_p = Paragraph::new(Line::from(vec![
+        Span::styled("/ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw(&app.palette_input),
+    ]));
+    frame.render_widget(search_p, chunks[0]);
+    frame.render_widget(Paragraph::new("─".repeat(inner.width as usize)).style(Style::default().fg(MUTED)), chunks[1]);
+
+    let list_items: Vec<ListItem> = filtered_options
+        .iter()
+        .enumerate()
+        .map(|(i, &opt)| {
+            let selected = i == app.palette_selected % filtered_options.len().max(1);
+            let (marker, style) = if selected {
+                ("▍ ", Style::default().fg(BG_DEEP).bg(ACCENT_HI).add_modifier(Modifier::BOLD))
+            } else {
+                ("  ", Style::default().fg(MUTED))
+            };
+            ListItem::new(Line::from(format!("{marker}{opt}")))
+                .style(style)
+        })
+        .collect();
+
+    if filtered_options.is_empty() {
+        frame.render_widget(Paragraph::new("  (no matches)").style(Style::default().fg(MUTED)), chunks[2]);
+    } else {
+        let list = List::new(list_items);
+        frame.render_widget(list, chunks[2]);
+    }
+}
+
+fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = app
+        .goals
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let selected = i == app.selected;
+            let (marker, base_style) = if selected {
+                ("▍ ", Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD))
+            } else {
+                ("  ", Style::default().fg(MUTED))
+            };
+            let mut spans = vec![Span::styled(marker, base_style)];
+            spans.extend(status_tag_spans(&g.status, app.spinner_frame));
+            // Parallel-worker indicator: one spinner glyph per concurrently
+            // active subtask, capped at 5 so the sidebar stays readable.
+            // Each glyph is drawn at a different phase of the spinner so
+            // the row visibly *moves* — making it obvious that multiple
+            // workers are in flight at once, not just one.
+            let active_count = g
+                .state
+                .as_ref()
+                .map(|s| s.active_workers.len())
+                .unwrap_or(0);
+            if active_count > 0 {
+                spans.push(Span::raw(" "));
+                let visible = active_count.min(5);
+                for i in 0..visible {
+                    let ch = SPINNER[(app.spinner_frame.wrapping_add(i * 2)) % SPINNER.len()];
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if active_count > visible {
+                    spans.push(Span::styled(
+                        format!("+{}", active_count - visible),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+            }
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(short(&g.description, 40), base_style));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let goal_count = app.goals.len();
+    let title_text = if goal_count == 0 {
+        " Goals ".to_string()
+    } else {
+        format!(" Goals ({}) ", goal_count)
+    };
+    let goals_focused = matches!(app.mode, Mode::Goal | Mode::Task);
+    let goals_border = if goals_focused { ACCENT } else { DIM };
+    let goals_border_type = if goals_focused {
+        ratatui::widgets::BorderType::Thick
+    } else {
+        ratatui::widgets::BorderType::Rounded
+    };
+    let list = List::new(items)
+        .style(Style::default().bg(BG_PANEL))
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    title_text,
+                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(goals_border_type)
+                .border_style(Style::default().fg(goals_border))
+                .style(Style::default().bg(BG_PANEL)),
+        );
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(5)])
+        .split(area);
+
+    frame.render_widget(list, chunks[0]);
+
+    let sys_info = vec![
+        Line::from(vec![
+            Span::styled(" ◆ ", Style::default().fg(ACCENT)),
+            Span::styled("provider  ", Style::default().fg(MUTED)),
+            Span::styled(&app.settings.provider, Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" ⌬ ", Style::default().fg(VIOLET)),
+            Span::styled("model     ", Style::default().fg(MUTED)),
+            Span::styled(
+                if app.settings.model.is_empty() { "(default)" } else { &app.settings.model },
+                Style::default().fg(ACCENT_HI),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" ▣ ", Style::default().fg(if app.flight_log_open { SUCCESS } else { DIM })),
+            Span::styled("log       ", Style::default().fg(MUTED)),
+            Span::styled(
+                if app.flight_log_open { "Open" } else { "Closed" },
+                Style::default().fg(if app.flight_log_open { SUCCESS } else { MUTED }),
+            ),
+        ]),
+    ];
+    let sys_p = Paragraph::new(sys_info)
+        .style(Style::default().bg(BG_PANEL))
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " System ",
+                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(DIM))
+                .style(Style::default().bg(BG_PANEL)),
+        );
+    frame.render_widget(sys_p, chunks[1]);
+}
+
+fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled("◉ ", Style::default().fg(SUCCESS)),
+            Span::styled(
+                "Active",
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(DIM))
+        .style(Style::default().bg(BG_PANEL));
+
+    let Some(g) = app.current_goal() else {
+        let label = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(MUTED);
+        let example = Style::default().fg(Color::White);
+        let mut welcome_spans: Vec<Span<'static>> = vec![Span::styled("  Welcome to ", muted)];
+        let title_chars: Vec<char> = "phonton".chars().collect();
+        let n = title_chars.len() as f32;
+        for (i, ch) in title_chars.into_iter().enumerate() {
+            let t = (i as f32) / (n - 1.0).max(1.0);
+            welcome_spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
+            ));
+        }
+        welcome_spans.push(Span::styled(".", muted));
+        let lines = vec![
+            Line::raw(""),
+            Line::from(welcome_spans),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "  Type a goal below and press Enter — it will be planned, executed",
+                muted,
+            )),
+            Line::from(Span::styled(
+                "  by parallel workers, and verified before any diff lands.",
+                muted,
+            )),
+            Line::raw(""),
+            Line::from(Span::styled("  Try one of:", label)),
+            Line::from(vec![
+                Span::styled("    ▸ ", Style::default().fg(grad3(0.0)).add_modifier(Modifier::BOLD)),
+                Span::styled("Add a Cargo command for running tests in CI", example),
+            ]),
+            Line::from(vec![
+                Span::styled("    ▸ ", Style::default().fg(grad3(0.5)).add_modifier(Modifier::BOLD)),
+                Span::styled("Refactor render_input into smaller helpers", example),
+            ]),
+            Line::from(vec![
+                Span::styled("    ▸ ", Style::default().fg(grad3(1.0)).add_modifier(Modifier::BOLD)),
+                Span::styled("Write integration tests for the orchestrator", example),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled("  Shortcuts:", label)),
+            Line::from(vec![
+                Span::styled("    /", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("       command palette", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("    Ctrl+;", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("  toggle Ask side panel", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("    Shift+L", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(" open the Flight Log", muted),
+            ]),
+            Line::from(vec![
+                Span::styled("    Esc", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled("     quit", muted),
+            ]),
+        ];
+        let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+        frame.render_widget(p, area);
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "goal: ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(g.description.clone()),
+    ]));
+    lines.push(Line::raw(""));
+
+    if let Some(state) = &g.state {
+        for w in &state.active_workers {
+            let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(short(&w.subtask_description, 50)));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("({})", w.model_tier),
+                Style::default().fg(MUTED),
+            ));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::raw(""));
+        lines.push(render_savings_line_styled(
+            Some(state),
+            app.best_savings_pct,
+            app.new_best_ticks,
+        ));
+
+        // Checkpoint picker — one line per landed subtask, newest last.
+        // Marked with a "↶ N" tag for "Rollback to step N" — the actual
+        // rollback is dispatched through the orchestrator's control
+        // channel (see `OrchestratorMessage::RollbackRequest`); this
+        // panel only surfaces the picker.
+        if !state.checkpoints.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Checkpoints ({} — Ctrl+↑↓ select, 'r' rollback):",
+                    state.checkpoints.len()
+                ),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            let cursor = g.checkpoint_cursor;
+            for (i, cp) in state.checkpoints.iter().enumerate() {
+                let oid_short: String = cp.commit_oid.chars().take(8).collect();
+                let is_selected = cursor == Some(i);
+                let marker_style = if is_selected {
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(ACCENT)
+                };
+                let marker = if is_selected {
+                    format!("  ▶ #{:>2}  ", cp.seq)
+                } else {
+                    format!("  ↶ #{:>2}  ", cp.seq)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(
+                        format!("{}  ", oid_short),
+                        Style::default().fg(MUTED),
+                    ),
+                    Span::raw(short(&cp.message, 50)),
+                ]));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "(waiting for first state snapshot…)",
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
+    frame.render_widget(p, area);
+}
+
+/// Render the Flight Log — raw [`EventRecord`] stream for the currently
+/// selected goal. Toggleable with Shift+L, dismissable with Esc.
+fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Flight Log (Shift+L to close) ",
+            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(VIOLET));
+
+    let Some(g) = app.current_goal() else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "No goal selected.",
+            Style::default().fg(MUTED),
+        )))
+        .block(block);
+        frame.render_widget(p, area);
+        return;
+    };
+
+    if g.flight_log.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "(no events yet — the orchestrator hasn't reported any state changes)",
+            Style::default().fg(MUTED),
+        )))
+        .block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    // Keep only what will fit, newest last (scrolling stream semantics).
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let start = g.flight_log.len().saturating_sub(inner_h.max(1));
+    let lines: Vec<Line> = g.flight_log[start..]
+        .iter()
+        .map(|rec| {
+            let (color, tag) = event_style(rec);
+            Line::from(vec![
+                Span::styled(
+                    format!("{:>10} ", fmt_ts(rec.timestamp_ms)),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(
+                    format!("{:<14}", tag),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(rec.render_line()),
+            ])
+        })
+        .collect();
+
+    let p = Paragraph::new(lines).block(block);
+    frame.render_widget(p, area);
+}
+
+fn event_style(rec: &EventRecord) -> (Color, &'static str) {
+    use phonton_types::OrchestratorEvent as E;
+    match &rec.event {
+        E::TaskStarted { .. } => (ACCENT, "task-started"),
+        E::TaskCompleted { .. } => (SUCCESS, "task-done"),
+        E::TaskFailed { .. } => (DANGER, "task-failed"),
+        E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
+        E::SubtaskCompleted { .. } => (SUCCESS, "subtask-done"),
+        E::SubtaskFailed { .. } => (DANGER, "subtask-fail"),
+        E::VerifyPass { .. } => (SUCCESS, "verify-pass"),
+        E::VerifyFail { .. } => (WARN, "verify-fail"),
+        E::VerifyEscalated { .. } => (WARN, "escalate"),
+        E::TokenMilestone { .. } => (MUTED, "tokens"),
+        E::CheckpointCreated { .. } => (SUCCESS, "checkpoint"),
+        E::RollbackPerformed { .. } => (WARN, "rollback"),
+    }
+}
+
+/// Format a unix-epoch millisecond timestamp as `HH:MM:SS` local-ish time.
+/// Avoids pulling in `chrono`; good enough for a log viewer.
+fn fmt_ts(ms: u64) -> String {
+    let secs = ms / 1000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Ask mode (Ctrl+; to close, Esc to cancel)",
+            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+    if app.ask_pending {
+        let frame_ch = SPINNER[app.spinner_frame % SPINNER.len()];
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{frame_ch} "),
+                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("thinking…", Style::default().fg(MUTED)),
+        ]));
+    } else if let Some(ans) = &app.ask_answer {
+        lines.push(Line::from(Span::styled(
+            "A:",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for l in ans.lines() {
+            lines.push(Line::raw(l.to_string()));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "(no answer yet)",
+            Style::default().fg(MUTED),
+        )));
+    }
+    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .title(Span::styled(
+                " Ask ",
+                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(VIOLET)),
+    );
+    frame.render_widget(p, area);
+}
+
+fn render_input(frame: &mut Frame, area: Rect, app: &App) {
+    let (icon, mode_label, buf, cursor) = match app.mode {
+        Mode::Goal => ("›", " GOAL ", &app.goal_input, app.goal_cursor),
+        Mode::Task => ("›", " TASK ", &app.goal_input, app.goal_cursor),
+        Mode::Ask => ("?", " ASK ", &app.ask_input, app.ask_cursor),
+        Mode::Settings => ("⚙", " SETTINGS ", &app.goal_input, app.goal_cursor),
+        Mode::CommandPalette => ("/", " COMMAND ", &app.goal_input, app.goal_cursor),
+    };
+
+    let mode_style = match app.mode {
+        Mode::Goal => Style::default().bg(ACCENT).fg(BG_PANEL).add_modifier(Modifier::BOLD),
+        Mode::Task => Style::default().bg(WARN).fg(BG_PANEL).add_modifier(Modifier::BOLD),
+        Mode::Ask => Style::default().bg(VIOLET).fg(BG_PANEL).add_modifier(Modifier::BOLD),
+        Mode::Settings => Style::default().bg(ACCENT).fg(BG_PANEL).add_modifier(Modifier::BOLD),
+        Mode::CommandPalette => Style::default().bg(ACCENT).fg(BG_PANEL).add_modifier(Modifier::BOLD),
+    };
+
+    let border_color = match app.mode {
+        Mode::Ask => VIOLET,
+        Mode::Task => WARN,
+        _ => ACCENT,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Thick)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(BG_DEEP));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Split inner row: prompt on the left, right-aligned mode badge on the right.
+    let badge_w = mode_label.chars().count() as u16;
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(badge_w)])
+        .split(inner);
+
+    let prompt_prefix = format!("▍ {icon} ");
+    let prompt_prefix_w = prompt_prefix.chars().count() as u16;
+
+    // Horizontal scroll so the caret is always visible inside the input slot.
+    let input_width = row[0].width.saturating_sub(prompt_prefix_w) as usize;
+    let total_chars = char_count(buf);
+    let cursor_clamped = cursor.min(total_chars);
+    let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
+    let visible: String = buf
+        .chars()
+        .skip(scroll)
+        .take(input_width.max(1))
+        .collect();
+
+    let prompt = Paragraph::new(Line::from(vec![
+        Span::styled(
+            prompt_prefix,
+            Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(visible, Style::default().fg(ACCENT_HI)),
+    ]))
+    .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(prompt, row[0]);
+
+    let badge = Paragraph::new(Line::from(Span::styled(mode_label, mode_style)))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(badge, row[1]);
+
+    // Place the terminal caret. Settings/Palette draw their own input; we
+    // skip the caret there to avoid two cursors fighting for visibility.
+    if !matches!(app.mode, Mode::Settings | Mode::CommandPalette) {
+        let cx = row[0].x + prompt_prefix_w + (cursor_clamped - scroll) as u16;
+        let cy = row[0].y;
+        if cx < row[0].x + row[0].width {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
+}
+
+/// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
+/// the running-state animation; callers increment it once per tick.
+fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> {
+    match s {
+        TaskStatus::Queued => vec![pill("queued", DIM, ACCENT_HI)],
+        TaskStatus::Planning => vec![pill("plan", ACCENT, BG_DEEP)],
+        TaskStatus::Running {
+            completed, total, ..
+        } => {
+            let ch = SPINNER[spinner_frame % SPINNER.len()];
+            vec![
+                Span::styled(
+                    format!("{ch} "),
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                ),
+                pill(&format!("run {completed}/{total}"), WARN, BG_DEEP),
+            ]
+        }
+        TaskStatus::Reviewing { .. } => vec![pill("review", VIOLET, BG_DEEP)],
+        TaskStatus::Done { .. } => vec![pill("done", SUCCESS, BG_DEEP)],
+        TaskStatus::Failed { .. } => vec![pill("fail", DANGER, BG_DEEP)],
+        TaskStatus::Paused { limit, observed, ceiling } => {
+            vec![pill(&format!("paused — {limit} {observed}/{ceiling}"), WARN, BG_DEEP)]
+        }
+        TaskStatus::Rejected => vec![Span::styled(
+            " rej ",
+            Style::default()
+                .bg(DIM)
+                .fg(MUTED)
+                .add_modifier(Modifier::CROSSED_OUT),
+        )],
+    }
+}
+
+fn short(s: &str, n: usize) -> String {
+    if s.chars().count() > n {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// Helper for rendering a `SubtaskStatus` using the same taxonomy as a
+/// `TaskStatus` — lets the centre pane reuse [`status_tag`] on workers.
+trait SubtaskStatusExt {
+    fn status_as_task(&self) -> TaskStatus;
+}
+impl SubtaskStatusExt for phonton_types::WorkerState {
+    fn status_as_task(&self) -> TaskStatus {
+        match &self.status {
+            SubtaskStatus::Queued => TaskStatus::Queued,
+            SubtaskStatus::Ready => TaskStatus::Queued,
+            SubtaskStatus::Dispatched | SubtaskStatus::Running { .. } => TaskStatus::Running {
+                active_subtasks: vec![self.subtask_id],
+                completed: 0,
+                total: 1,
+            },
+            SubtaskStatus::Done { .. } => TaskStatus::Done {
+                tokens_used: self.tokens_used,
+                wall_time_ms: 0,
+            },
+            SubtaskStatus::Failed { reason, .. } => TaskStatus::Failed {
+                reason: reason.clone(),
+                failed_subtask: Some(self.subtask_id),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub dispatcher — the CLI drives the orchestrator without a real provider
+// ---------------------------------------------------------------------------
+
+/// Trivial dispatcher: every subtask "succeeds" with a one-line Rust diff.
+/// A real install wires the worker crate in instead; this keeps the CLI
+/// runnable out of the box without an API key on disk.
+///
+/// Holds an [`Arc<Sandbox>`] even though the stub diff path never executes
+/// commands — the field is present so the real `WorkerDispatcher` that
+/// replaces this struct slots in without changing the CLI construction
+/// site. The sandbox is scoped to the orchestrator's working directory.
+pub struct StubDispatcher {
+    #[allow(dead_code)]
+    sandbox: Arc<Sandbox>,
+}
+
+impl StubDispatcher {
+    pub fn new(sandbox: Arc<Sandbox>) -> Self {
+        Self { sandbox }
+    }
+}
+
+#[async_trait]
+impl WorkerDispatcher for StubDispatcher {
+    async fn dispatch(
+        &self,
+        subtask: Subtask,
+        _prior_errors: Vec<String>,
+        _attempt: u8,
+    ) -> Result<SubtaskResult> {
+        let hunks = vec![DiffHunk {
+            file_path: format!("phonton-types/src/stub_{}.rs", subtask.id).into(),
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Added("fn stub() -> u32 { 0 }".into())],
+        }];
+        Ok(SubtaskResult {
+            id: subtask.id,
+            status: SubtaskStatus::Done {
+                tokens_used: 120,
+                diff_hunk_count: hunks.len(),
+            },
+            diff_hunks: hunks,
+            model_tier: subtask.model_tier,
+            verify_result: VerifyResult::Pass {
+                layer: VerifyLayer::Syntax,
+            },
+            provider: phonton_types::ProviderKind::Anthropic,
+            model_name: String::new(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event loop
+// ---------------------------------------------------------------------------
+
+/// Incoming event for the event loop — either a user key or an async
+/// state update the driver received on one of the watch channels.
+enum LoopEvent {
+    Key(KeyEvent),
+    StateUpdate(usize, GlobalState),
+    AskAnswer(String),
+    /// One-shot result of a Settings-panel "Test connection" round-trip.
+    /// Carries the formatted ✓/✗ message that lands in
+    /// `SettingsState::message`.
+    TestResult(String),
+    /// One-shot result of a Settings-panel "Detect models" round-trip.
+    /// `Ok((picked_model, summary))` rewrites the Model field and
+    /// reports; `Err(msg)` reports failure only.
+    DetectResult(Result<(String, String), String>),
+    FlightEvent(usize, EventRecord),
+    Tick,
+}
+
+/// Per-goal control channel sender, stored so the event loop can dispatch
+/// rollback requests to the right orchestrator instance.
+struct GoalControl {
+    /// Sender end of the orchestrator's control channel.
+    control_tx: mpsc::Sender<OrchestratorMessage>,
+}
+
+/// Shared registry mapping goal index → control handle.
+type ControlRegistry = Arc<std::sync::Mutex<HashMap<usize, GoalControl>>>;
+
+/// Load a provider for ask-mode (stateless Q&A) using the config file or
+/// env vars. Returns `None` when no key is available.
+fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
+    let api_key = config::resolve_api_key(&cfg.provider)?;
+    let model = cfg
+        .provider
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for(&cfg.provider.name));
+    let provider_cfg = make_api_provider_config(&cfg.provider.name, api_key, model)?;
+    Some(Arc::from(provider_for(provider_cfg)))
+}
+
+/// Build an [`ApiProviderConfig`] from the provider name, resolved key, and
+/// model. Returns `None` for unknown provider names.
+fn make_api_provider_config(
+    name: &str,
+    api_key: String,
+    model: String,
+) -> Option<ApiProviderConfig> {
+    make_api_provider_config_with_url(name, api_key, model, None)
+}
+
+/// Same as [`make_api_provider_config`], but accepts an optional `base_url`
+/// override used by `OpenAiCompatible` (DeepSeek, xAI, Groq, custom
+/// gateways). Ignored for providers with fixed endpoints.
+fn make_api_provider_config_with_url(
+    name: &str,
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+) -> Option<ApiProviderConfig> {
+    match name {
+        "anthropic" => Some(ApiProviderConfig::Anthropic { api_key, model }),
+        "openai" => Some(ApiProviderConfig::OpenAI { api_key, model }),
+        "openrouter" => Some(ApiProviderConfig::OpenRouter { api_key, model }),
+        "gemini" => Some(ApiProviderConfig::Gemini { api_key, model }),
+        "agentrouter" => Some(ApiProviderConfig::AgentRouter { api_key, model }),
+        "ollama" => Some(ApiProviderConfig::Ollama {
+            base_url: base_url.unwrap_or_else(|| "http://localhost:11434".into()),
+            model,
+        }),
+        // Friendly aliases for common OpenAI-compatible endpoints. Users
+        // who pick these don't need to type a base URL.
+        "deepseek" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "deepseek".into(),
+            api_key,
+            model,
+            base_url: base_url
+                .unwrap_or_else(|| "https://api.deepseek.com/v1".into()),
+        }),
+        "xai" | "grok" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "xai".into(),
+            api_key,
+            model,
+            base_url: base_url.unwrap_or_else(|| "https://api.x.ai/v1".into()),
+        }),
+        "groq" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "groq".into(),
+            api_key,
+            model,
+            base_url: base_url
+                .unwrap_or_else(|| "https://api.groq.com/openai/v1".into()),
+        }),
+        "together" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "together".into(),
+            api_key,
+            model,
+            base_url: base_url
+                .unwrap_or_else(|| "https://api.together.xyz/v1".into()),
+        }),
+        // Fully custom: caller must supply `base_url`. Without one the
+        // request would have nowhere to go, so return None.
+        "custom" | "openai-compatible" => base_url.map(|url| {
+            ApiProviderConfig::OpenAiCompatible {
+                name: "custom".into(),
+                api_key,
+                model,
+                base_url: url,
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Smoke-test a provider configuration end-to-end.
+///
+/// Builds the provider via `make_api_provider_config_with_url`, issues a
+/// single tiny chat request, and returns either the model's reply (for
+/// the success message) or a string description of the failure. Lives
+/// here rather than in `phonton-providers` because the resolution of
+/// "what backend the user picked from a string" is CLI-specific.
+async fn test_provider(
+    name: String,
+    api_key: String,
+    model: String,
+    base_url: Option<String>,
+) -> Result<String, String> {
+    if api_key.trim().is_empty() && name != "ollama" {
+        return Err("no API key — paste one in the API Key field or set the env var".into());
+    }
+    let cfg = make_api_provider_config_with_url(&name, api_key, model, base_url)
+        .ok_or_else(|| format!("unknown provider `{name}`"))?;
+    let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
+    let resp = provider
+        .call(
+            "You are a terse assistant.",
+            "Reply with exactly: ok",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(resp.content)
+}
+
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .title(Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled("⚙ ", Style::default().fg(VIOLET)),
+            Span::styled(
+                "Settings",
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", Style::default()),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Thick)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+
+    // Calculate popup area
+    let popup_w = 70;
+    let popup_h = 24; // Slightly taller for extra fields
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w.min(area.width),
+        height: popup_h.min(area.height),
+    };
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(block, popup_area);
+
+    let inner = popup_area.inner(ratatui::layout::Margin { vertical: 2, horizontal: 2 });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Provider
+            Constraint::Length(3), // Model
+            Constraint::Length(3), // API Key
+            Constraint::Length(3), // Base URL
+            Constraint::Length(3), // Max Tokens
+            Constraint::Length(3), // Max USD Cents
+            Constraint::Min(1),    // Message
+            Constraint::Length(2), // Instructions
+        ])
+        .split(inner);
+
+    let field_style = |f: SettingsField| {
+        if app.settings.active_field == f {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        }
+    };
+
+    // Provider (with cycling indicator)
+    let provider_text = if app.settings.active_field == SettingsField::Provider {
+        format!("◀ {} ▶", app.settings.provider)
+    } else {
+        app.settings.provider.clone()
+    };
+    let provider_p = Paragraph::new(provider_text)
+        .block(Block::default().borders(Borders::ALL).title(" Provider (Arrows to cycle) ").border_style(field_style(SettingsField::Provider)));
+    frame.render_widget(provider_p, chunks[0]);
+
+    let model_p = Paragraph::new(app.settings.model.as_str())
+        .block(Block::default().borders(Borders::ALL).title(" Model Override (optional) ").border_style(field_style(SettingsField::Model)));
+    frame.render_widget(model_p, chunks[1]);
+
+    let masked_key = if app.settings.api_key.is_empty() { String::new() } else { "*".repeat(app.settings.api_key.len()) };
+    let key_p = Paragraph::new(masked_key)
+        .block(Block::default().borders(Borders::ALL).title(" API Key (leave empty for env var) ").border_style(field_style(SettingsField::ApiKey)));
+    frame.render_widget(key_p, chunks[2]);
+
+    let url_p = Paragraph::new(app.settings.base_url.as_str())
+        .block(Block::default().borders(Borders::ALL).title(" Base URL (for self-hosted/proxy) ").border_style(field_style(SettingsField::BaseUrl)));
+    frame.render_widget(url_p, chunks[3]);
+
+    let tokens_p = Paragraph::new(app.settings.max_tokens.as_str())
+        .block(Block::default().borders(Borders::ALL).title(" Max Tokens per Session (Budget) ").border_style(field_style(SettingsField::MaxTokens)));
+    frame.render_widget(tokens_p, chunks[4]);
+
+    let cents_p = Paragraph::new(app.settings.max_usd_cents.as_str())
+        .block(Block::default().borders(Borders::ALL).title(" Max Cents per Session (Budget) ").border_style(field_style(SettingsField::MaxUsdCents)));
+    frame.render_widget(cents_p, chunks[5]);
+
+    if let Some(msg) = &app.settings.message {
+        let msg_p = Paragraph::new(msg.as_str()).style(Style::default().fg(SUCCESS)).alignment(Alignment::Center);
+        frame.render_widget(msg_p, chunks[6]);
+    }
+
+    let instructions = Paragraph::new(Line::from(vec![
+        Span::styled("Tab/Arrows", Style::default().fg(ACCENT)),
+        Span::raw(" nav  |  "),
+        Span::styled("Enter", Style::default().fg(ACCENT)),
+        Span::raw(" save  |  "),
+        Span::styled("Ctrl+T", Style::default().fg(ACCENT)),
+        Span::raw(" test  |  "),
+        Span::styled("Ctrl+D", Style::default().fg(ACCENT)),
+        Span::raw(" detect  |  "),
+        Span::styled("Esc", Style::default().fg(ACCENT)),
+        Span::raw(" cancel"),
+    ])).alignment(Alignment::Center);
+    frame.render_widget(instructions, chunks[7]);
+}
+
+/// Default model per provider when none is specified in config.
+///
+/// These are the cheapest reasonable picks per backend so a user with no
+/// model preference still gets sensible behaviour. Override in Settings.
+fn default_model_for(provider: &str) -> String {
+    match provider {
+        "anthropic" => "claude-haiku-4-5-20251001".into(),
+        "openai" => "gpt-4o-mini".into(),
+        "openrouter" => "openai/gpt-4o-mini".into(),
+        // `gemini-flash-latest` is an always-current alias that points at
+        // whichever flash model is generally available on free-tier keys.
+        // `gemini-2.5-flash` exists on most keys but the alias avoids
+        // surprises when Google rotates the GA model. The Gemini provider
+        // also auto-routes to a working model on 404 (see
+        // `phonton-providers::GeminiProvider`).
+        "gemini" => "gemini-flash-latest".into(),
+        "agentrouter" => "claude-sonnet-4-5".into(),
+        "ollama" => "llama3.2:3b".into(),
+        "deepseek" => "deepseek-chat".into(),
+        "xai" | "grok" => "grok-2-mini".into(),
+        "groq" => "llama-3.3-70b-versatile".into(),
+        "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+        _ => "unknown".into(),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Load configuration first so the rest of startup can use it.
+    let cfg = config::load().unwrap_or_default();
+
+    let mut app = App::new(&cfg);
+    let store = Arc::new(std::sync::Mutex::new(Store::in_memory()?));
+    let ask_provider = load_ask_provider(&cfg);
+    // Sandbox scoped to the orchestrator's working directory (CWD at
+    // launch). Shared across every spawned goal so tool-execution policy
+    // is uniform across the session.
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // Workspace-trust gate. Before we touch the terminal, confirm the
+    // user wants Phonton operating in this folder. Skips silently if
+    // the workspace was previously trusted or `PHONTON_TRUST_ALL=1` is
+    // set. On decline we exit before entering the alternate screen so
+    // the user's normal terminal stays clean.
+    if !trust::prompt_if_needed(&working_dir)? {
+        return Ok(());
+    }
+
+    let sandbox = Arc::new(Sandbox::new(working_dir.clone(), "phonton-cli".to_string()));
+    let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, SetCursorStyle::SteadyBar)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(64);
+    spawn_input_task(evt_tx.clone());
+
+    let result = run_app(
+        &mut terminal,
+        &mut app,
+        &mut evt_rx,
+        evt_tx.clone(),
+        store,
+        ask_provider,
+        sandbox,
+        controls,
+        cfg,
+        working_dir,
+    )
+    .await;
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        SetCursorStyle::DefaultUserShape,
+    )?;
+    terminal.show_cursor()?;
+    result
+}
+
+fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
+    std::thread::spawn(move || loop {
+        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(Event::Key(k)) = event::read() {
+                // IMPORTANT: Filter for 'Press' events only. Windows and some
+                // modern terminal emulators send 'Release' events too. If we
+                // handle both, the user sees "double input" (e.g. 'ww').
+                if k.kind == event::KeyEventKind::Press {
+                    if tx.blocking_send(LoopEvent::Key(k)).is_err() {
+                        break;
+                    }
+                }
+            }
+        } else if tx.blocking_send(LoopEvent::Tick).is_err() {
+            break;
+        }
+    });
+}
+
+async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mut mpsc::Receiver<LoopEvent>,
+    tx: mpsc::Sender<LoopEvent>,
+    store: Arc<std::sync::Mutex<Store>>,
+    ask_provider: Option<Arc<dyn Provider>>,
+    sandbox: Arc<Sandbox>,
+    controls: ControlRegistry,
+    mut cfg: config::Config,
+    working_dir: std::path::PathBuf,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| render(f, app))?;
+        let Some(evt) = rx.recv().await else { break };
+        match evt {
+            LoopEvent::Tick => {
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                if app.new_best_ticks > 0 {
+                    app.new_best_ticks -= 1;
+                }
+            }
+            LoopEvent::Key(k) => {
+                if let Some(intent) = app.handle_key(k) {
+                    match intent {
+                        Intent::Quit => break,
+                        Intent::QueueGoal(text) => {
+                            // `handle_key` inserts the goal at index 0.
+                            let task_id = app
+                                .goals
+                                .first()
+                                .map(|g| g.task_id)
+                                .unwrap_or_else(TaskId::new);
+                            spawn_goal(
+                                0,
+                                task_id,
+                                text,
+                                &tx,
+                                &store,
+                                &sandbox,
+                                &controls,
+                                &cfg,
+                                &working_dir,
+                            )
+                            .await;
+                        }
+                        Intent::Rollback { goal_index, to_seq } => {
+                            if let Ok(reg) = controls.lock() {
+                                if let Some(gc) = reg.get(&goal_index) {
+                                    let _ = gc.control_tx.try_send(
+                                        OrchestratorMessage::RollbackRequest { to_seq },
+                                    );
+                                }
+                            }
+                        }
+                        Intent::SaveSettings => {
+                            cfg.provider.name = app.settings.provider.clone();
+                            cfg.provider.model = if app.settings.model.is_empty() { None } else { Some(app.settings.model.clone()) };
+                            cfg.provider.api_key = if app.settings.api_key.is_empty() { None } else { Some(app.settings.api_key.clone()) };
+                            cfg.provider.base_url = if app.settings.base_url.is_empty() { None } else { Some(app.settings.base_url.clone()) };
+                            cfg.budget.max_tokens = app.settings.max_tokens.parse().ok();
+                            cfg.budget.max_usd_cents = app.settings.max_usd_cents.parse().ok();
+
+                            match config::save(&cfg) {
+                                Ok(_) => app.settings.message = Some("Settings saved.".into()),
+                                Err(e) => app.settings.message = Some(format!("Error saving: {e}")),
+                            }
+                        }
+                        Intent::TestConnection => {
+                            // Spawn the smoke test off-thread so the UI
+                            // doesn't freeze during the round-trip.
+                            let provider_name = app.settings.provider.clone();
+                            let model = if app.settings.model.is_empty() {
+                                default_model_for(&provider_name)
+                            } else {
+                                app.settings.model.clone()
+                            };
+                            let key = if app.settings.api_key.is_empty() {
+                                let stub = config::ProviderConfig {
+                                    name: provider_name.clone(),
+                                    api_key: None,
+                                    model: None,
+                                    base_url: None,
+                                };
+                                config::resolve_api_key(&stub).unwrap_or_default()
+                            } else {
+                                app.settings.api_key.clone()
+                            };
+                            let base = if app.settings.base_url.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.base_url.clone())
+                            };
+                            app.settings.message =
+                                Some(format!("Testing {provider_name} with model {model}…"));
+                            let tx2 = tx.clone();
+                            tokio::spawn(async move {
+                                let result = test_provider(
+                                    provider_name.clone(),
+                                    key,
+                                    model,
+                                    base,
+                                )
+                                .await;
+                                // Re-use the AskAnswer channel as a generic
+                                // "string back to settings" — main loop
+                                // routes it onto settings.message when in
+                                // settings mode.
+                                let msg = match result {
+                                    Ok(reply) => format!(
+                                        "✓ Connected — got reply ({} chars). Key works.",
+                                        reply.len()
+                                    ),
+                                    Err(e) => format!("✗ Connection failed: {e}"),
+                                };
+                                let _ = tx2.send(LoopEvent::TestResult(msg)).await;
+                            });
+                        }
+                        Intent::DetectModels => {
+                            let provider_name = app.settings.provider.clone();
+                            let key = if app.settings.api_key.is_empty() {
+                                let stub = config::ProviderConfig {
+                                    name: provider_name.clone(),
+                                    api_key: None,
+                                    model: None,
+                                    base_url: None,
+                                };
+                                config::resolve_api_key(&stub).unwrap_or_default()
+                            } else {
+                                app.settings.api_key.clone()
+                            };
+                            let base = if app.settings.base_url.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.base_url.clone())
+                            };
+                            if key.trim().is_empty() && provider_name != "ollama" {
+                                app.settings.message = Some(
+                                    "Detect failed: no API key in field or env var.".into(),
+                                );
+                            } else {
+                                app.settings.message =
+                                    Some(format!("Detecting models for {provider_name}…"));
+                                let tx2 = tx.clone();
+                                tokio::spawn(async move {
+                                    let res = discover_models(
+                                        &provider_name,
+                                        &key,
+                                        base.as_deref(),
+                                    )
+                                    .await;
+                                    let payload = match res {
+                                        Ok(models) if models.is_empty() => Err(format!(
+                                            "✗ {provider_name}: key valid but no models accessible."
+                                        )),
+                                        Ok(models) => {
+                                            let picked =
+                                                pick_default_from_list(&provider_name, &models)
+                                                    .unwrap_or_else(|| models[0].clone());
+                                            let preview: Vec<String> =
+                                                models.iter().take(5).cloned().collect();
+                                            let more = if models.len() > 5 {
+                                                format!(" … (+{} more)", models.len() - 5)
+                                            } else {
+                                                String::new()
+                                            };
+                                            let summary = format!(
+                                                "✓ {} models found. Picked `{}`. Sample: {}{}",
+                                                models.len(),
+                                                picked,
+                                                preview.join(", "),
+                                                more
+                                            );
+                                            Ok((picked, summary))
+                                        }
+                                        Err(e) => Err(format!("✗ Detect failed: {e}")),
+                                    };
+                                    let _ = tx2.send(LoopEvent::DetectResult(payload)).await;
+                                });
+                            }
+                        }
+                        Intent::AcceptTrust | Intent::DeclineTrust => {
+                            // Trust prompt is handled before the TUI loop
+                            // starts; if we ever see one in here it is
+                            // a no-op.
+                        }
+                        Intent::Ask(q) => {
+                            // Stateless ask: no orchestrator involvement,
+                            // no goal context, no memory write.
+                            let tx2 = tx.clone();
+                            let provider = ask_provider.clone();
+                            app.ask_pending = true;
+                            app.ask_answer = None;
+                            tokio::spawn(async move {
+                                let a = match provider {
+                                    Some(p) => match p
+                                        .call(
+                                            "You are a helpful coding assistant.",
+                                            &q,
+                                            &[],
+                                        )
+                                        .await
+                                    {
+                                        Ok(resp) => resp.content,
+                                        Err(e) => format!("ask failed: {e}"),
+                                    },
+                                    None => "Set ANTHROPIC_API_KEY or OPENAI_API_KEY \
+                                        to enable ask mode."
+                                        .to_string(),
+                                };
+                                let _ = tx2.send(LoopEvent::AskAnswer(a)).await;
+                            });
+                        }
+                    }
+                }
+            }
+            LoopEvent::StateUpdate(idx, state) => app.apply_state(idx, state),
+            LoopEvent::FlightEvent(idx, ev) => app.apply_event(idx, ev),
+            LoopEvent::AskAnswer(a) => {
+                app.ask_pending = false;
+                app.ask_answer = Some(a);
+            }
+            LoopEvent::TestResult(msg) => {
+                app.settings.message = Some(msg);
+            }
+            LoopEvent::DetectResult(res) => match res {
+                Ok((picked, summary)) => {
+                    app.settings.model = picked;
+                    app.settings.message = Some(summary);
+                }
+                Err(msg) => {
+                    app.settings.message = Some(msg);
+                }
+            },
+        }
+        if app.should_quit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn spawn_goal(
+    goal_index: usize,
+    task_id: TaskId,
+    text: String,
+    tx: &mpsc::Sender<LoopEvent>,
+    store: &Arc<std::sync::Mutex<Store>>,
+    sandbox: &Arc<Sandbox>,
+    controls: &ControlRegistry,
+    cfg: &config::Config,
+    working_dir: &std::path::PathBuf,
+) {
+    let store_guard = match store.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let plan_result =
+        decompose_with_memory(&Goal::new(text.clone()), &*store_guard, None).await;
+    drop(store_guard);
+    let plan = match plan_result {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let (state_tx, mut state_rx) = watch::channel(GlobalState {
+        task_status: TaskStatus::Planning,
+        active_workers: Vec::new(),
+        tokens_used: 0,
+        tokens_budget: None,
+        estimated_naive_tokens: plan.estimated_total_tokens,
+        checkpoints: Vec::new(),
+    });
+
+    // Broadcast channel for structured telemetry. Capacity is generous so
+    // a slow TUI subscriber never drops events from the store writer.
+    let (event_tx, _) = broadcast::channel::<EventRecord>(1024);
+    let mut event_rx_ui = event_tx.subscribe();
+    let mut event_rx_store = event_tx.subscribe();
+
+    let naive = plan.estimated_total_tokens;
+
+    let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) = config::resolve_api_key(&cfg.provider) {
+        let provider_name = cfg.provider.name.clone();
+        let model = cfg.provider.model.clone().unwrap_or_else(|| default_model_for(&provider_name));
+        
+        let factory = move || {
+            let provider_cfg = make_api_provider_config(&provider_name, api_key.clone(), model.clone())
+                .expect("unknown provider config");
+            provider_for(provider_cfg)
+        };
+        
+        let guard = ExecutionGuard::new(working_dir.clone());
+        let d = phonton_worker::dispatcher::RealDispatcher::new(
+            factory,
+            guard,
+            sandbox.clone()
+        );
+        Arc::new(d)
+    } else {
+        Arc::new(StubDispatcher::new(sandbox.clone()))
+    };
+
+    // Wire phonton-diff so the orchestrator takes a checkpoint commit
+    // after every subtask passes verify.
+    let diff_applier = DiffApplier::open(working_dir)
+        .ok()
+        .map(|d| Arc::new(std::sync::Mutex::new(d)));
+
+    // Control channel for rollback requests from the UI.
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<OrchestratorMessage>(8);
+    if let Ok(mut reg) = controls.lock() {
+        reg.insert(goal_index, GoalControl { control_tx: ctrl_tx });
+    }
+
+    let limits = BudgetLimits {
+        max_tokens: cfg.budget.max_tokens,
+        max_usd_micros: cfg.budget.max_usd_micros(),
+    };
+    let budget_guard = BudgetGuard::new(limits);
+
+    let mut orch = Orchestrator::new(dispatcher)
+        .with_naive_baseline(naive)
+        .with_budget_guard(budget_guard)
+        .with_event_sink(task_id, text.clone(), event_tx)
+        .with_control_channel(ctrl_rx);
+    if let Some(da) = diff_applier {
+        orch = orch.with_diff_applier(da);
+    }
+
+    // Drive the orchestrator and forward every `GlobalState` update.
+    let tx_updates = tx.clone();
+    tokio::spawn(async move {
+        while state_rx.changed().await.is_ok() {
+            let s = state_rx.borrow().clone();
+            if tx_updates
+                .send(LoopEvent::StateUpdate(goal_index, s))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // Forward events to the TUI Flight Log.
+    let tx_events = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match event_rx_ui.recv().await {
+                Ok(rec) => {
+                    if tx_events
+                        .send(LoopEvent::FlightEvent(goal_index, rec))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Persist every event — rusqlite is sync, so hop onto spawn_blocking
+    // whenever we have a record to write.
+    let store_for_events = store.clone();
+    tokio::spawn(async move {
+        loop {
+            match event_rx_store.recv().await {
+                Ok(rec) => {
+                    let store = store_for_events.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(g) = store.lock() {
+                            let _ = g.append_event(&rec);
+                        }
+                    })
+                    .await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let _ = orch.run_task(plan, state_tx).await;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn typing_a_goal_appends_to_buffer() {
+        let mut app = App::default();
+        for c in "add fn foo".chars() {
+            assert!(app.handle_key(key(c)).is_none());
+        }
+        assert_eq!(app.goal_input, "add fn foo");
+    }
+
+    #[test]
+    fn enter_queues_a_goal_and_clears_input() {
+        let mut app = App::default();
+        for c in "hello".chars() {
+            app.handle_key(key(c));
+        }
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(intent, Some(Intent::QueueGoal("hello".into())));
+        assert_eq!(app.goals.len(), 1);
+        assert_eq!(app.goal_input, "");
+    }
+
+    #[test]
+    fn enter_on_empty_is_a_noop() {
+        let mut app = App::default();
+        let r = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(r.is_none());
+        assert_eq!(app.goals.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_semicolon_toggles_ask_mode() {
+        let mut app = App::default();
+        assert_eq!(app.mode, Mode::Goal);
+        app.handle_key(ctrl(';'));
+        assert_eq!(app.mode, Mode::Ask);
+        app.handle_key(ctrl(';'));
+        assert_eq!(app.mode, Mode::Goal);
+    }
+
+    #[test]
+    fn ask_enter_emits_ask_intent_without_touching_goals() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("parent goal".into()));
+        app.handle_key(ctrl(';'));
+        for c in "what now".chars() {
+            app.handle_key(key(c));
+        }
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(intent, Some(Intent::Ask("what now".into())));
+        // Ask must not pollute the existing goal list.
+        assert_eq!(app.goals.len(), 1);
+        assert_eq!(app.goals[0].description, "parent goal");
+    }
+
+    #[test]
+    fn esc_from_ask_returns_to_goal_without_quitting() {
+        let mut app = App::default();
+        app.handle_key(ctrl(';'));
+        assert_eq!(app.mode, Mode::Ask);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, Mode::Goal);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_from_goal_quits() {
+        let mut app = App::default();
+        let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(r, Some(Intent::Quit));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn arrow_keys_move_selection() {
+        let mut app = App::default();
+        app.goals
+            .extend(["a", "b", "c"].iter().map(|s| GoalEntry::new((*s).into())));
+        app.selected = 0;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected, 2); // clamp
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn savings_line_shows_percent_when_baseline_known() {
+        let s = GlobalState {
+            task_status: TaskStatus::Queued,
+            active_workers: Vec::new(),
+            tokens_used: 200,
+            tokens_budget: None,
+            estimated_naive_tokens: 1000,
+            checkpoints: Vec::new(),
+        };
+        let line = render_savings_line(Some(&s));
+        assert!(line.contains("200"));
+        assert!(line.contains("1000"));
+        assert!(line.contains("80%"));
+    }
+
+    #[test]
+    fn savings_line_handles_missing_state() {
+        let line = render_savings_line(None);
+        assert!(line.contains("baseline"));
+    }
+
+    #[test]
+    fn renders_without_panicking_on_empty_state() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn renders_with_active_goal_and_savings() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("add function foo".into()));
+        app.apply_state(
+            0,
+            GlobalState {
+                task_status: TaskStatus::Running {
+                    active_subtasks: Vec::new(),
+                    completed: 1,
+                    total: 2,
+                },
+                active_workers: Vec::new(),
+                tokens_used: 150,
+                tokens_budget: None,
+                estimated_naive_tokens: 500,
+                checkpoints: Vec::new(),
+            },
+        );
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("add function foo"));
+        assert!(dump.contains("baseline: 500"));
+    }
+
+}

@@ -1,0 +1,12 @@
+[package]
+name = "phonton-diff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+git2 = "0.18"
+anyhow = { workspace = true }
+phonton-types = { path = "../phonton-types" }
+
+[dev-dependencies]
+tempfile = "3"

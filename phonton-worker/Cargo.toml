@@ -1,0 +1,21 @@
+[package]
+name = "phonton-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phonton-types        = { path = "../phonton-types" }
+phonton-providers    = { path = "../phonton-providers" }
+phonton-verify       = { path = "../phonton-verify" }
+phonton-store        = { path = "../phonton-store" }
+phonton-memory       = { path = "../phonton-memory" }
+phonton-index        = { path = "../phonton-index" }
+phonton-sandbox      = { path = "../phonton-sandbox" }
+phonton-orchestrator = { path = "../phonton-orchestrator" }
+anyhow               = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true }
+tracing              = { workspace = true }
+async-trait          = "0.1"
+regex                = "1"
+reqwest              = { version = "0.12", default-features = false, features = ["rustls-tls"] }

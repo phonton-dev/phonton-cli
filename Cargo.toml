@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "phonton-types",
+    "phonton-index",
+    "phonton-orchestrator",
+    "phonton-planner",
+    "phonton-context",
+    "phonton-worker",
+    "phonton-diff",
+    "phonton-verify",
+    "phonton-memory",
+    "phonton-providers",
+    "phonton-sandbox",
+    "phonton-store",
+    "phonton-cli",
+    "phonton-desktop",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio     = { version = "1", features = ["full"] }
+serde     = { version = "1", features = ["derive"] }
+anyhow    = "1"
+thiserror = "1"
+tracing   = "0.1"
+uuid      = { version = "1", features = ["v4", "serde"] }

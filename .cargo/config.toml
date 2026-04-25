@@ -1,0 +1,18 @@
+# Cargo workspace configuration.
+
+[alias]
+# Run `cargo install-phonton` from the workspace root to (re)install the CLI.
+install-phonton = "install --path phonton-cli --force"
+
+# On Windows, libgit2-sys uses Win32 Crypto / Security / Registry APIs
+# that the linker must pull in explicitly when building test binaries.
+# Without these, test harnesses for crates that transitively link libgit2
+# (phonton-diff, phonton-orchestrator) fail with LNK2019 on:
+#   __imp_CryptAcquireContextA, __imp_GetNamedSecurityInfoW, etc.
+[target.'cfg(windows)']
+rustflags = [
+    "-C", "link-arg=advapi32.lib",
+    "-C", "link-arg=crypt32.lib",
+    "-C", "link-arg=secur32.lib",
+    "-C", "link-arg=ntdll.lib",
+]

@@ -1,0 +1,19 @@
+[package]
+name = "phonton-planner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+phonton-types  = { path = "../phonton-types" }
+phonton-store  = { path = "../phonton-store" }
+phonton-memory = { path = "../phonton-memory" }
+phonton-providers = { path = "../phonton-providers" }
+anyhow        = { workspace = true }
+tracing       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = "1"
+async-trait   = "0.1"
+regex         = "1"
+
+[dev-dependencies]
+tokio         = { workspace = true }
