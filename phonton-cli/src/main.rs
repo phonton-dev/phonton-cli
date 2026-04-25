@@ -41,9 +41,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::execute;
 use crossterm::terminal::{
@@ -216,6 +214,52 @@ pub enum SettingsField {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModelPickerState {
+    /// Full list fetched from the provider's models endpoint.
+    pub all_models: Vec<String>,
+    /// Subset matching the live filter text.
+    pub filtered: Vec<String>,
+    /// Cursor within `filtered`.
+    pub selected: usize,
+    /// Scroll offset for the visible window.
+    pub scroll: usize,
+    /// Typing in the picker filters by this string.
+    pub filter: String,
+    /// True while the background fetch is in-flight.
+    pub loading: bool,
+}
+
+impl Default for ModelPickerState {
+    fn default() -> Self {
+        Self {
+            all_models: Vec::new(),
+            filtered: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            filter: String::new(),
+            loading: false,
+        }
+    }
+}
+
+impl ModelPickerState {
+    pub fn rebuild_filter(&mut self) {
+        let lc = self.filter.to_lowercase();
+        self.filtered = if lc.is_empty() {
+            self.all_models.clone()
+        } else {
+            self.all_models
+                .iter()
+                .filter(|m| m.to_lowercase().contains(&lc))
+                .cloned()
+                .collect()
+        };
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.selected);
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SettingsState {
     pub active_field: SettingsField,
     pub provider: String,
@@ -225,6 +269,12 @@ pub struct SettingsState {
     pub max_tokens: String,
     pub max_usd_cents: String,
     pub message: Option<String>,
+    /// Whether the model picker overlay is visible.
+    pub picker_open: bool,
+    pub picker: ModelPickerState,
+    /// Status of the last model validation: None = untested,
+    /// Some(true) = passed, Some(false) = failed.
+    pub model_ok: Option<bool>,
 }
 
 impl SettingsState {
@@ -238,6 +288,9 @@ impl SettingsState {
             max_tokens: cfg.budget.max_tokens.map(|t| t.to_string()).unwrap_or_default(),
             max_usd_cents: cfg.budget.max_usd_cents.map(|c| c.to_string()).unwrap_or_default(),
             message: None,
+            picker_open: false,
+            picker: ModelPickerState::default(),
+            model_ok: None,
         }
     }
 }
@@ -742,12 +795,62 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        // Simple shortcuts: Enter to save, Esc to cancel (handled globally).
+        // --- Model picker overlay navigation ---
+        // When the picker is open it consumes all keys so nothing leaks
+        // to the field-navigation layer below.
+        if self.settings.picker_open {
+            match key.code {
+                KeyCode::Esc => {
+                    self.settings.picker_open = false;
+                    self.settings.picker.filter.clear();
+                    self.settings.picker.rebuild_filter();
+                }
+                KeyCode::Enter => {
+                    if let Some(m) = self.settings.picker.filtered.get(self.settings.picker.selected) {
+                        self.settings.model = m.clone();
+                        self.settings.model_ok = None;
+                        self.settings.message = Some(format!("Model set to `{m}`. Ctrl+T to test."));
+                    }
+                    self.settings.picker_open = false;
+                    self.settings.picker.filter.clear();
+                    self.settings.picker.rebuild_filter();
+                }
+                KeyCode::Up => {
+                    if self.settings.picker.selected > 0 {
+                        self.settings.picker.selected -= 1;
+                        if self.settings.picker.selected < self.settings.picker.scroll {
+                            self.settings.picker.scroll = self.settings.picker.selected;
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    let max = self.settings.picker.filtered.len().saturating_sub(1);
+                    if self.settings.picker.selected < max {
+                        self.settings.picker.selected += 1;
+                        const VISIBLE: usize = 8;
+                        if self.settings.picker.selected >= self.settings.picker.scroll + VISIBLE {
+                            self.settings.picker.scroll = self.settings.picker.selected + 1 - VISIBLE;
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.settings.picker.filter.pop();
+                    self.settings.picker.selected = 0;
+                    self.settings.picker.scroll = 0;
+                    self.settings.picker.rebuild_filter();
+                }
+                KeyCode::Char(c) => {
+                    self.settings.picker.filter.push(c);
+                    self.settings.picker.selected = 0;
+                    self.settings.picker.scroll = 0;
+                    self.settings.picker.rebuild_filter();
+                }
+                _ => {}
+            }
+            return None;
+        }
 
-        // Ctrl+T: smoke-test the configured provider/key/model.
-        // Ctrl+D: auto-detect which models the configured key can access
-        // and pre-fill the Model field with the best pick. Both run
-        // off-thread in the event loop so the UI stays live.
+        // --- Global shortcuts (active regardless of focused field) ---
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('t') | KeyCode::Char('T') => {
@@ -760,7 +863,7 @@ impl App {
             }
         }
 
-        // When Provider field is active, allow cycling with arrows for ease of use.
+        // --- Provider field: left/right cycles the provider list ---
         if self.settings.active_field == SettingsField::Provider {
             if matches!(key.code, KeyCode::Left | KeyCode::Right) {
                 let providers = crate::config::KNOWN_PROVIDERS;
@@ -772,9 +875,20 @@ impl App {
                     let delta = if matches!(key.code, KeyCode::Right) { 1 } else { providers.len() - 1 };
                     let next = (cur + delta) % providers.len();
                     self.settings.provider = providers[next].to_string();
+                    // Clear cached model list when provider changes.
+                    self.settings.picker.all_models.clear();
+                    self.settings.picker.filtered.clear();
+                    self.settings.model_ok = None;
                     self.settings.message = None;
                 }
                 return None;
+            }
+        }
+
+        // --- Model field: Enter opens the picker ---
+        if self.settings.active_field == SettingsField::Model {
+            if key.code == KeyCode::Enter {
+                return Some(Intent::OpenModelPicker);
             }
         }
 
@@ -818,7 +932,10 @@ impl App {
             KeyCode::Backspace => {
                 match self.settings.active_field {
                     SettingsField::Provider => { self.settings.provider.pop(); }
-                    SettingsField::Model => { self.settings.model.pop(); }
+                    SettingsField::Model => {
+                        self.settings.model.pop();
+                        self.settings.model_ok = None;
+                    }
                     SettingsField::ApiKey => { self.settings.api_key.pop(); }
                     SettingsField::BaseUrl => { self.settings.base_url.pop(); }
                     SettingsField::MaxTokens => { self.settings.max_tokens.pop(); }
@@ -830,7 +947,10 @@ impl App {
             KeyCode::Char(c) => {
                 match self.settings.active_field {
                     SettingsField::Provider => { self.settings.provider.push(c); }
-                    SettingsField::Model => { self.settings.model.push(c); }
+                    SettingsField::Model => {
+                        self.settings.model.push(c);
+                        self.settings.model_ok = None;
+                    }
                     SettingsField::ApiKey => { self.settings.api_key.push(c); }
                     SettingsField::BaseUrl => { self.settings.base_url.push(c); }
                     SettingsField::MaxTokens => { if c.is_ascii_digit() { self.settings.max_tokens.push(c); } }
@@ -867,6 +987,9 @@ pub enum Intent {
     /// On success the first sensible model is written into the Model
     /// field; the full list is summarised in `SettingsState::message`.
     DetectModels,
+    /// Open the model picker overlay and kick off a background model
+    /// list fetch if the list is empty.
+    OpenModelPicker,
     /// User accepted the workspace-trust prompt — proceed into the TUI.
     AcceptTrust,
     /// User declined trust. Caller should exit cleanly.
@@ -1839,6 +1962,9 @@ enum LoopEvent {
     /// `Ok((picked_model, summary))` rewrites the Model field and
     /// reports; `Err(msg)` reports failure only.
     DetectResult(Result<(String, String), String>),
+    /// Background model-list fetch completed for the picker overlay.
+    /// Carries the full list on success or an error string.
+    ModelsLoaded(Result<Vec<String>, String>),
     FlightEvent(usize, EventRecord),
     Tick,
 }
@@ -1984,9 +2110,8 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(BG_DEEP));
 
-    // Calculate popup area
-    let popup_w = 70;
-    let popup_h = 24; // Slightly taller for extra fields
+    let popup_w = 72u16;
+    let popup_h = 24u16;
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
         y: area.y + (area.height.saturating_sub(popup_h)) / 2,
@@ -2020,55 +2145,245 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    // Provider (with cycling indicator)
+    // Provider row — left/right arrow cycles
     let provider_text = if app.settings.active_field == SettingsField::Provider {
         format!("◀ {} ▶", app.settings.provider)
     } else {
         app.settings.provider.clone()
     };
-    let provider_p = Paragraph::new(provider_text)
-        .block(Block::default().borders(Borders::ALL).title(" Provider (Arrows to cycle) ").border_style(field_style(SettingsField::Provider)));
+    let provider_p = Paragraph::new(provider_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Provider (← → to cycle) ")
+            .border_style(field_style(SettingsField::Provider)),
+    );
     frame.render_widget(provider_p, chunks[0]);
 
-    let model_p = Paragraph::new(app.settings.model.as_str())
-        .block(Block::default().borders(Borders::ALL).title(" Model Override (optional) ").border_style(field_style(SettingsField::Model)));
+    // Model row — show validation badge + hint for the picker
+    let model_status = match app.settings.model_ok {
+        Some(true) => Span::styled(" ✓", Style::default().fg(SUCCESS)),
+        Some(false) => Span::styled(" ✗", Style::default().fg(DANGER)),
+        None => Span::raw(""),
+    };
+    let model_title = if app.settings.active_field == SettingsField::Model {
+        " Model (Enter = pick list, Ctrl+T = test) "
+    } else {
+        " Model "
+    };
+    let model_line = Line::from(vec![
+        Span::raw(app.settings.model.as_str()),
+        model_status,
+    ]);
+    let model_p = Paragraph::new(model_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(model_title)
+            .border_style(field_style(SettingsField::Model)),
+    );
     frame.render_widget(model_p, chunks[1]);
 
-    let masked_key = if app.settings.api_key.is_empty() { String::new() } else { "*".repeat(app.settings.api_key.len()) };
-    let key_p = Paragraph::new(masked_key)
-        .block(Block::default().borders(Borders::ALL).title(" API Key (leave empty for env var) ").border_style(field_style(SettingsField::ApiKey)));
+    // API key row — masked
+    let masked_key = if app.settings.api_key.is_empty() {
+        String::new()
+    } else {
+        "*".repeat(app.settings.api_key.len())
+    };
+    let key_p = Paragraph::new(masked_key).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" API Key (leave empty for env var) ")
+            .border_style(field_style(SettingsField::ApiKey)),
+    );
     frame.render_widget(key_p, chunks[2]);
 
-    let url_p = Paragraph::new(app.settings.base_url.as_str())
-        .block(Block::default().borders(Borders::ALL).title(" Base URL (for self-hosted/proxy) ").border_style(field_style(SettingsField::BaseUrl)));
+    let url_p = Paragraph::new(app.settings.base_url.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Base URL (self-hosted / proxy) ")
+            .border_style(field_style(SettingsField::BaseUrl)),
+    );
     frame.render_widget(url_p, chunks[3]);
 
-    let tokens_p = Paragraph::new(app.settings.max_tokens.as_str())
-        .block(Block::default().borders(Borders::ALL).title(" Max Tokens per Session (Budget) ").border_style(field_style(SettingsField::MaxTokens)));
+    let tokens_p = Paragraph::new(app.settings.max_tokens.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Max Tokens / Session ")
+            .border_style(field_style(SettingsField::MaxTokens)),
+    );
     frame.render_widget(tokens_p, chunks[4]);
 
-    let cents_p = Paragraph::new(app.settings.max_usd_cents.as_str())
-        .block(Block::default().borders(Borders::ALL).title(" Max Cents per Session (Budget) ").border_style(field_style(SettingsField::MaxUsdCents)));
+    let cents_p = Paragraph::new(app.settings.max_usd_cents.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Max Cents / Session ")
+            .border_style(field_style(SettingsField::MaxUsdCents)),
+    );
     frame.render_widget(cents_p, chunks[5]);
 
     if let Some(msg) = &app.settings.message {
-        let msg_p = Paragraph::new(msg.as_str()).style(Style::default().fg(SUCCESS)).alignment(Alignment::Center);
+        let colour = if msg.starts_with('✗') { DANGER } else { SUCCESS };
+        let msg_p = Paragraph::new(msg.as_str())
+            .style(Style::default().fg(colour))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
         frame.render_widget(msg_p, chunks[6]);
     }
 
     let instructions = Paragraph::new(Line::from(vec![
-        Span::styled("Tab/Arrows", Style::default().fg(ACCENT)),
-        Span::raw(" nav  |  "),
+        Span::styled("Tab", Style::default().fg(ACCENT)),
+        Span::raw(" nav  "),
         Span::styled("Enter", Style::default().fg(ACCENT)),
-        Span::raw(" save  |  "),
+        Span::raw(" save  "),
         Span::styled("Ctrl+T", Style::default().fg(ACCENT)),
-        Span::raw(" test  |  "),
+        Span::raw(" test  "),
         Span::styled("Ctrl+D", Style::default().fg(ACCENT)),
-        Span::raw(" detect  |  "),
+        Span::raw(" detect  "),
         Span::styled("Esc", Style::default().fg(ACCENT)),
-        Span::raw(" cancel"),
-    ])).alignment(Alignment::Center);
+        Span::raw(" close"),
+    ]))
+    .alignment(Alignment::Center);
     frame.render_widget(instructions, chunks[7]);
+
+    // --- Model picker overlay ---
+    if app.settings.picker_open {
+        render_model_picker(frame, popup_area, app);
+    }
+}
+
+/// Renders the model-picker list as an overlay anchored below the Model
+/// field inside the settings popup.
+fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
+    // Position: same x as settings popup, just below the Model field
+    // (which sits at y+5 inside the popup). Height = 12 rows.
+    const VISIBLE: usize = 8;
+    let picker_w = settings_area.width;
+    let picker_h = (VISIBLE as u16) + 4; // list rows + borders + filter + count
+    let picker_y = (settings_area.y + 7).min(
+        settings_area
+            .y
+            .saturating_add(settings_area.height)
+            .saturating_sub(picker_h),
+    );
+    let picker_area = Rect {
+        x: settings_area.x,
+        y: picker_y,
+        width: picker_w,
+        height: picker_h.min(settings_area.height),
+    };
+
+    frame.render_widget(Clear, picker_area);
+
+    let picker = &app.settings.picker;
+
+    // Title: loading spinner or count
+    let title = if picker.loading {
+        let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
+        format!(" {spinner} Fetching models… ")
+    } else {
+        let n = picker.filtered.len();
+        let total = picker.all_models.len();
+        if picker.filter.is_empty() {
+            format!(" {n} models — type to filter ")
+        } else {
+            format!(" {n}/{total} — filter: {} ", picker.filter)
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(title.as_str())
+        .border_style(Style::default().fg(VIOLET))
+        .style(Style::default().bg(BG_DEEP));
+
+    frame.render_widget(block, picker_area);
+
+    let inner = picker_area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 1 });
+
+    if picker.loading {
+        let p = Paragraph::new("Fetching…")
+            .style(Style::default().fg(MUTED))
+            .alignment(Alignment::Center);
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    if picker.filtered.is_empty() {
+        let msg = if picker.all_models.is_empty() {
+            "No models found"
+        } else {
+            "No matches"
+        };
+        let p = Paragraph::new(msg)
+            .style(Style::default().fg(MUTED))
+            .alignment(Alignment::Center);
+        frame.render_widget(p, inner);
+        return;
+    }
+
+    let scroll = picker.scroll;
+    let selected = picker.selected;
+    let cur_model = &app.settings.model;
+
+    let visible_models: Vec<ListItem> = picker
+        .filtered
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(VISIBLE)
+        .map(|(i, m)| {
+            let is_selected = i == selected;
+            let is_current = m == cur_model;
+            let prefix = if is_current { "● " } else { "  " };
+            let label = format!("{prefix}{m}");
+            let style = if is_selected {
+                Style::default()
+                    .fg(BG_DEEP)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(SUCCESS)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(label).style(style)
+        })
+        .collect();
+
+    // Scroll indicator on the right edge
+    let total = picker.filtered.len();
+    let scroll_info = if total > VISIBLE {
+        format!(
+            "↑↓ {}/{}",
+            selected + 1,
+            total
+        )
+    } else {
+        String::new()
+    };
+    if !scroll_info.is_empty() {
+        let info_p = Paragraph::new(scroll_info.as_str())
+            .style(Style::default().fg(DIM))
+            .alignment(Alignment::Right);
+        // render in the last line of inner
+        let info_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(info_p, info_area);
+    }
+
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    };
+
+    let list = List::new(visible_models);
+    frame.render_widget(list, list_area);
 }
 
 /// Default model per provider when none is specified in config.
@@ -2151,7 +2466,7 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, SetCursorStyle::SteadyBar)?;
+    execute!(stdout, EnterAlternateScreen, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2176,7 +2491,6 @@ async fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture,
         SetCursorStyle::DefaultUserShape,
     )?;
     terminal.show_cursor()?;
@@ -2405,6 +2719,48 @@ async fn run_app<B: Backend>(
                                 });
                             }
                         }
+                        Intent::OpenModelPicker => {
+                            app.settings.picker_open = true;
+                            app.settings.picker.filter.clear();
+                            app.settings.picker.selected = 0;
+                            app.settings.picker.scroll = 0;
+                            // If we already have a list, just open it.
+                            // Otherwise kick off a background fetch.
+                            if !app.settings.picker.all_models.is_empty() {
+                                app.settings.picker.rebuild_filter();
+                            } else {
+                                app.settings.picker.loading = true;
+                                app.settings.picker.filtered.clear();
+                                let provider_name = app.settings.provider.clone();
+                                let key = if app.settings.api_key.is_empty() {
+                                    let stub = config::ProviderConfig {
+                                        name: provider_name.clone(),
+                                        api_key: None,
+                                        model: None,
+                                        base_url: None,
+                                    };
+                                    config::resolve_api_key(&stub).unwrap_or_default()
+                                } else {
+                                    app.settings.api_key.clone()
+                                };
+                                let base = if app.settings.base_url.is_empty() {
+                                    None
+                                } else {
+                                    Some(app.settings.base_url.clone())
+                                };
+                                let tx2 = tx.clone();
+                                tokio::spawn(async move {
+                                    let res = discover_models(
+                                        &provider_name,
+                                        &key,
+                                        base.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                    let _ = tx2.send(LoopEvent::ModelsLoaded(res)).await;
+                                });
+                            }
+                        }
                         Intent::AcceptTrust | Intent::DeclineTrust => {
                             // Trust prompt is handled before the TUI loop
                             // starts; if we ever see one in here it is
@@ -2447,15 +2803,39 @@ async fn run_app<B: Backend>(
                 app.ask_answer = Some(a);
             }
             LoopEvent::TestResult(msg) => {
+                app.settings.model_ok = Some(msg.starts_with('✓'));
                 app.settings.message = Some(msg);
             }
             LoopEvent::DetectResult(res) => match res {
                 Ok((picked, summary)) => {
-                    app.settings.model = picked;
+                    app.settings.model = picked.clone();
+                    app.settings.model_ok = None;
+                    // Also populate the picker cache with the probed list
+                    // so the user can open it immediately without another
+                    // fetch.
                     app.settings.message = Some(summary);
                 }
                 Err(msg) => {
                     app.settings.message = Some(msg);
+                }
+            },
+            LoopEvent::ModelsLoaded(res) => {
+                app.settings.picker.loading = false;
+                match res {
+                    Ok(models) => {
+                        // Pre-select the currently configured model in
+                        // the list so the cursor starts on it.
+                        let cur = &app.settings.model;
+                        let sel = models.iter().position(|m| m == cur).unwrap_or(0);
+                        app.settings.picker.all_models = models;
+                        app.settings.picker.selected = sel;
+                        app.settings.picker.scroll = sel.saturating_sub(3);
+                        app.settings.picker.rebuild_filter();
+                    }
+                    Err(e) => {
+                        app.settings.picker_open = false;
+                        app.settings.message = Some(format!("✗ Could not fetch models: {e}"));
+                    }
                 }
             },
         }
