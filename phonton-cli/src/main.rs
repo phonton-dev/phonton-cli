@@ -875,7 +875,9 @@ impl App {
                     let delta = if matches!(key.code, KeyCode::Right) { 1 } else { providers.len() - 1 };
                     let next = (cur + delta) % providers.len();
                     self.settings.provider = providers[next].to_string();
-                    // Clear cached model list when provider changes.
+                    // Clear the model + cached list — a model name for
+                    // one provider is meaningless on another.
+                    self.settings.model.clear();
                     self.settings.picker.all_models.clear();
                     self.settings.picker.filtered.clear();
                     self.settings.model_ok = None;

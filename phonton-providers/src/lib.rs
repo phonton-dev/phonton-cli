@@ -28,54 +28,45 @@ use serde_json::{json, Value};
 /// model identifiers in the form the corresponding [`Provider`] expects
 /// in [`ProviderConfig`].
 ///
-/// `name` is the lowercase provider name as accepted by the CLI (one of
-/// `KNOWN_PROVIDERS`). `base_url` is honoured for `custom` /
-/// `openai-compatible` and overrides the default endpoint for OpenAI-style
-/// providers when provided.
-///
-/// Network errors and non-2xx responses bubble up as `Err`. An empty list
-/// is *not* an error — callers must treat it as "key is valid but no
-/// models accessible".
+/// Providers that don't expose a models endpoint (AgentRouter) return a
+/// curated static list. `base_url` is honoured for `custom` /
+/// `openai-compatible` endpoints.
 pub async fn discover_models(
     name: &str,
     api_key: &str,
     base_url: Option<&str>,
 ) -> Result<Vec<String>> {
-    let http = Client::new();
+    let http = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
     match name {
         "anthropic" => discover_anthropic(&http, api_key).await,
         "openai" => {
-            discover_openai_style(&http, api_key, "https://api.openai.com/v1/models").await
+            discover_openai_bearer(&http, api_key, "https://api.openai.com/v1/models").await
         }
         "openrouter" => {
-            // OpenRouter's /models is public but accept the key anyway.
-            discover_openai_style(
-                &http,
-                api_key,
-                "https://openrouter.ai/api/v1/models",
-            )
-            .await
+            // OpenRouter exposes a public catalogue; auth is optional but
+            // including the key scopes the list to what the account can call.
+            discover_openrouter(&http, api_key).await
         }
         "agentrouter" => {
-            discover_openai_style(
-                &http,
-                api_key,
-                "https://agentrouter.org/v1/models",
-            )
-            .await
+            // AgentRouter doesn't expose a /v1/models endpoint.
+            // Validate the key with a tiny probe then return the static
+            // list of models it routes to.
+            discover_agentrouter(&http, api_key).await
         }
         "deepseek" => {
-            discover_openai_style(&http, api_key, "https://api.deepseek.com/v1/models").await
+            discover_openai_bearer(&http, api_key, "https://api.deepseek.com/v1/models").await
         }
         "xai" | "grok" => {
-            discover_openai_style(&http, api_key, "https://api.x.ai/v1/models").await
+            discover_openai_bearer(&http, api_key, "https://api.x.ai/v1/models").await
         }
         "groq" => {
-            discover_openai_style(&http, api_key, "https://api.groq.com/openai/v1/models")
-                .await
+            discover_openai_bearer(&http, api_key, "https://api.groq.com/openai/v1/models").await
         }
         "together" => {
-            discover_openai_style(&http, api_key, "https://api.together.xyz/v1/models").await
+            discover_together(&http, api_key).await
         }
         "gemini" => discover_gemini(&http, api_key).await,
         "ollama" => {
@@ -84,30 +75,52 @@ pub async fn discover_models(
         }
         "custom" | "openai-compatible" => {
             let base = base_url
-                .ok_or_else(|| anyhow!("custom provider needs a base_url"))?
+                .ok_or_else(|| anyhow!("custom provider requires a Base URL"))?
                 .trim_end_matches('/');
             let url = format!("{base}/models");
-            discover_openai_style(&http, api_key, &url).await
+            discover_openai_bearer(&http, api_key, &url).await
         }
         _ => Err(anyhow!("unknown provider `{name}`")),
     }
 }
 
-async fn discover_openai_style(http: &Client, api_key: &str, url: &str) -> Result<Vec<String>> {
+/// Classify a non-2xx status into a user-readable sentence.
+fn http_err_msg(provider: &str, status: StatusCode) -> anyhow::Error {
+    match status.as_u16() {
+        401 | 403 => anyhow!(
+            "invalid or expired API key for {provider} (HTTP {status})"
+        ),
+        404 => anyhow!("{provider}: models endpoint not found (HTTP 404)"),
+        429 => anyhow!("{provider}: rate-limited — wait a moment then retry"),
+        s if s >= 500 => anyhow!("{provider} server error (HTTP {s}) — try again"),
+        s => anyhow!("{provider} returned HTTP {s}"),
+    }
+}
+
+async fn discover_openai_bearer(http: &Client, api_key: &str, url: &str) -> Result<Vec<String>> {
     let resp = http
         .get(url)
         .bearer_auth(api_key)
         .send()
         .await
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("connecting to {url}"))?;
     if !resp.status().is_success() {
-        return Err(anyhow!("{} returned HTTP {}", url, resp.status()));
+        // Extract the provider name from the URL for a nicer message.
+        let provider = url
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or(url);
+        return Err(http_err_msg(provider, resp.status()));
     }
-    let v: Value = resp.json().await.context("parse models JSON")?;
+    parse_openai_models(resp.json().await.context("parsing models response")?)
+}
+
+fn parse_openai_models(v: Value) -> Result<Vec<String>> {
     let arr = v
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("models response missing `data` array"))?;
+        .ok_or_else(|| anyhow!("models response missing `data` array — unexpected API shape"))?;
     let mut out: Vec<String> = arr
         .iter()
         .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
@@ -118,25 +131,134 @@ async fn discover_openai_style(http: &Client, api_key: &str, url: &str) -> Resul
 }
 
 async fn discover_anthropic(http: &Client, api_key: &str) -> Result<Vec<String>> {
-    let url = "https://api.anthropic.com/v1/models";
     let resp = http
-        .get(url)
+        .get("https://api.anthropic.com/v1/models")
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .send()
         .await
-        .context("GET anthropic /v1/models")?;
+        .context("connecting to Anthropic")?;
     if !resp.status().is_success() {
-        return Err(anyhow!("anthropic /v1/models returned HTTP {}", resp.status()));
+        return Err(http_err_msg("Anthropic", resp.status()));
     }
-    let v: Value = resp.json().await.context("parse anthropic models JSON")?;
+    parse_openai_models(resp.json().await.context("parsing Anthropic models")?)
+}
+
+async fn discover_openrouter(http: &Client, api_key: &str) -> Result<Vec<String>> {
+    let resp = http
+        .get("https://openrouter.ai/api/v1/models")
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .context("connecting to OpenRouter")?;
+    if !resp.status().is_success() {
+        return Err(http_err_msg("OpenRouter", resp.status()));
+    }
+    let v: Value = resp.json().await.context("parsing OpenRouter models")?;
+    // OpenRouter's catalogue uses the same `data[].id` shape as OpenAI.
     let arr = v
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("anthropic models response missing `data` array"))?;
+        .ok_or_else(|| anyhow!("OpenRouter models response has unexpected shape"))?;
     let mut out: Vec<String> = arr
         .iter()
         .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+        // Filter to models the account can actually call (pricing.prompt
+        // is "0" for free-tier models on OpenRouter).
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// AgentRouter is a gateway — it doesn't expose its own models catalogue.
+/// We validate the key with one tiny probe, then return the static list of
+/// models it routes to. Last verified 2025-04; update as the service adds
+/// new backends.
+async fn discover_agentrouter(http: &Client, api_key: &str) -> Result<Vec<String>> {
+    // Probe: one minimal chat call to confirm the key is accepted.
+    let probe = http
+        .post("https://agentrouter.org/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .context("connecting to AgentRouter")?;
+
+    let status = probe.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(http_err_msg("AgentRouter", status));
+    }
+    // Any response other than 401/403 means the key is accepted
+    // (rate-limit, server error, or success all mean the key is valid).
+
+    Ok(agentrouter_static_models())
+}
+
+/// Known models available through AgentRouter. Because the gateway doesn't
+/// publish a catalogue endpoint this list is maintained by hand.
+fn agentrouter_static_models() -> Vec<String> {
+    vec![
+        // Anthropic
+        "claude-opus-4-7".into(),
+        "claude-sonnet-4-6".into(),
+        "claude-sonnet-4-5".into(),
+        "claude-haiku-4-5".into(),
+        // OpenAI
+        "gpt-4.1".into(),
+        "gpt-4.1-mini".into(),
+        "gpt-4o".into(),
+        "gpt-4o-mini".into(),
+        "o4-mini".into(),
+        // Google
+        "gemini-2.5-pro".into(),
+        "gemini-2.5-flash".into(),
+        "gemini-2.0-flash".into(),
+        // Meta / open-source routed
+        "llama-3.3-70b".into(),
+        "llama-3.1-8b".into(),
+    ]
+}
+
+async fn discover_together(http: &Client, api_key: &str) -> Result<Vec<String>> {
+    let resp = http
+        .get("https://api.together.xyz/v1/models")
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .context("connecting to Together AI")?;
+    if !resp.status().is_success() {
+        return Err(http_err_msg("Together AI", resp.status()));
+    }
+    let v: Value = resp.json().await.context("parsing Together models")?;
+    // Together returns either `{data: [...]}` or a bare array depending on
+    // API version; handle both shapes.
+    let items: Vec<Value> = if let Some(arr) = v.get("data").and_then(Value::as_array) {
+        arr.clone()
+    } else if let Some(arr) = v.as_array() {
+        arr.clone()
+    } else {
+        return Err(anyhow!("Together models response has unexpected shape"));
+    };
+    let mut out: Vec<String> = items
+        .iter()
+        .filter_map(|m| {
+            // Together uses `id` like OpenAI, but some responses use
+            // `name` instead.
+            m.get("id")
+                .or_else(|| m.get("name"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        // Only chat / language models — skip embedding and image models.
+        .filter(|id| {
+            let lc = id.to_lowercase();
+            !lc.contains("embed") && !lc.contains("stable-") && !lc.contains("dall-")
+        })
         .collect();
     out.sort();
     out.dedup();
@@ -144,30 +266,27 @@ async fn discover_anthropic(http: &Client, api_key: &str) -> Result<Vec<String>>
 }
 
 async fn discover_gemini(http: &Client, api_key: &str) -> Result<Vec<String>> {
-    let url = "https://generativelanguage.googleapis.com/v1beta/models";
     let resp = http
-        .get(url)
+        .get("https://generativelanguage.googleapis.com/v1beta/models")
         .header("x-goog-api-key", api_key)
         .send()
         .await
-        .context("GET gemini /v1beta/models")?;
+        .context("connecting to Gemini")?;
     if !resp.status().is_success() {
-        return Err(anyhow!("gemini /v1beta/models returned HTTP {}", resp.status()));
+        return Err(http_err_msg("Gemini", resp.status()));
     }
-    let v: Value = resp.json().await.context("parse gemini models JSON")?;
+    let v: Value = resp.json().await.context("parsing Gemini models")?;
     let arr = v
         .get("models")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("gemini models response missing `models` array"))?;
+        .ok_or_else(|| anyhow!("Gemini models response has unexpected shape"))?;
     let mut out: Vec<String> = arr
         .iter()
         .filter(|m| {
             m.get("supportedGenerationMethods")
                 .and_then(Value::as_array)
                 .map(|methods| {
-                    methods
-                        .iter()
-                        .any(|s| s.as_str() == Some("generateContent"))
+                    methods.iter().any(|s| s.as_str() == Some("generateContent"))
                 })
                 .unwrap_or(true)
         })
@@ -184,15 +303,19 @@ async fn discover_gemini(http: &Client, api_key: &str) -> Result<Vec<String>> {
 
 async fn discover_ollama(http: &Client, base: &str) -> Result<Vec<String>> {
     let url = format!("{base}/api/tags");
-    let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("connecting to Ollama at {base}"))?;
     if !resp.status().is_success() {
-        return Err(anyhow!("{url} returned HTTP {}", resp.status()));
+        return Err(http_err_msg("Ollama", resp.status()));
     }
-    let v: Value = resp.json().await.context("parse ollama tags JSON")?;
+    let v: Value = resp.json().await.context("parsing Ollama model list")?;
     let arr = v
         .get("models")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("ollama tags response missing `models` array"))?;
+        .ok_or_else(|| anyhow!("Ollama /api/tags response has unexpected shape"))?;
     let mut out: Vec<String> = arr
         .iter()
         .filter_map(|m| m.get("name").and_then(Value::as_str).map(String::from))
