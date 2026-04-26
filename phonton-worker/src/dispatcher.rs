@@ -23,7 +23,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use phonton_orchestrator::WorkerDispatcher;
 use phonton_sandbox::{ExecutionGuard, Sandbox};
-use phonton_types::{Subtask, SubtaskResult};
+use phonton_types::{ModelTier, Subtask, SubtaskResult};
 
 use crate::Worker;
 
@@ -36,8 +36,9 @@ use crate::Worker;
 /// `phonton_providers::Provider` is not `Clone`, and the orchestrator may
 /// dispatch many subtasks concurrently.
 pub struct RealDispatcher {
-    /// Factory: produces a provider box for each dispatch.
-    provider_factory: Arc<dyn Fn() -> Box<dyn phonton_providers::Provider> + Send + Sync>,
+    /// Factory: produces a provider box for each dispatch, given the
+    /// requested model tier.
+    provider_factory: Arc<dyn Fn(ModelTier) -> Box<dyn phonton_providers::Provider> + Send + Sync>,
     /// Guard shared across all dispatches for this goal.
     guard: ExecutionGuard,
     /// Sandbox shared across all dispatches for this goal.
@@ -49,11 +50,15 @@ pub struct RealDispatcher {
 impl RealDispatcher {
     /// Construct a dispatcher backed by a provider factory.
     ///
-    /// The factory is called once per `dispatch` invocation. This lets
-    /// multiple concurrent workers each own their provider state without
-    /// requiring `Clone` or interior mutability.
+    /// The factory is called once per `dispatch` invocation with the
+    /// subtask's assigned [`ModelTier`]. This lets multiple concurrent
+    /// workers each own their provider state without requiring `Clone`
+    /// or interior mutability.
     pub fn new(
-        provider_factory: impl Fn() -> Box<dyn phonton_providers::Provider> + Send + Sync + 'static,
+        provider_factory: impl Fn(ModelTier) -> Box<dyn phonton_providers::Provider>
+            + Send
+            + Sync
+            + 'static,
         guard: ExecutionGuard,
         sandbox: Arc<Sandbox>,
     ) -> Self {
@@ -81,7 +86,7 @@ impl WorkerDispatcher for RealDispatcher {
         prior_errors: Vec<String>,
         _attempt: u8,
     ) -> Result<SubtaskResult> {
-        let provider = (self.provider_factory)();
+        let provider = (self.provider_factory)(subtask.model_tier);
         let mut worker = Worker::new(provider, self.guard.clone())
             .with_sandbox(Arc::clone(&self.sandbox));
 

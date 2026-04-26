@@ -372,6 +372,8 @@ pub struct App {
     /// Flash counter — non-zero for a few ticks after a new personal best
     /// is set, driving the savings line highlight. Decremented each tick.
     pub new_best_ticks: u8,
+    /// True when the help overlay is visible. Toggled by `?`.
+    pub help_open: bool,
 }
 
 impl App {
@@ -395,6 +397,17 @@ impl App {
             ask_cursor: 0,
             best_savings_pct: None,
             new_best_ticks: 0,
+            help_open: false,
+        }
+    }
+
+    /// Remove the currently-selected goal, if any. Keeps `selected` valid.
+    pub fn delete_selected_goal(&mut self) {
+        if self.selected < self.goals.len() {
+            self.goals.remove(self.selected);
+            if self.selected >= self.goals.len() {
+                self.selected = self.goals.len().saturating_sub(1);
+            }
         }
     }
 }
@@ -510,6 +523,10 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Global shortcuts first, regardless of mode.
         if matches!(key.code, KeyCode::Esc) {
+            if self.help_open {
+                self.help_open = false;
+                return None;
+            }
             if self.flight_log_open {
                 self.flight_log_open = false;
                 return None;
@@ -520,6 +537,20 @@ impl App {
             }
             self.should_quit = true;
             return Some(Intent::Quit);
+        }
+
+        // `?` toggles the help overlay anywhere it isn't legitimate text input.
+        if matches!(key.code, KeyCode::Char('?'))
+            && !matches!(self.mode, Mode::Ask | Mode::Settings | Mode::CommandPalette)
+            && self.goal_input.is_empty()
+        {
+            self.help_open = !self.help_open;
+            return None;
+        }
+        // While help is up, swallow keystrokes so they don't leak into the
+        // input buffer behind it. Esc handled above.
+        if self.help_open {
+            return None;
         }
 
         // Handle '/' as the command trigger (like gemini cli / slash commands)
@@ -551,6 +582,15 @@ impl App {
                     self.mode = if self.mode == Mode::Ask { Mode::Goal } else { Mode::Ask };
                     return None;
                 }
+                // Ctrl+D deletes the highlighted goal (only meaningful in
+                // Goal/Task mode; in Ask/Settings the input swallows it).
+                KeyCode::Char('d')
+                    if matches!(self.mode, Mode::Goal | Mode::Task)
+                        && !self.goals.is_empty() =>
+                {
+                    self.delete_selected_goal();
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -570,6 +610,8 @@ impl App {
             "Ask Mode",
             "Settings",
             "Toggle Log",
+            "Help",
+            "Delete Selected Goal",
             "Clear History",
             "Quit",
         ];
@@ -609,6 +651,14 @@ impl App {
                     }
                     "Toggle Log" => {
                         self.flight_log_open = !self.flight_log_open;
+                        self.mode = self.prev_mode;
+                    }
+                    "Help" => {
+                        self.help_open = true;
+                        self.mode = self.prev_mode;
+                    }
+                    "Delete Selected Goal" => {
+                        self.delete_selected_goal();
                         self.mode = self.prev_mode;
                     }
                     "Clear History" => {
@@ -1153,6 +1203,83 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.mode == Mode::CommandPalette {
         render_palette(frame, area, app);
     }
+    if app.help_open {
+        render_help(frame, area);
+    }
+}
+
+/// Centred modal listing every keybinding in one place. Toggled by `?`,
+/// dismissed with `?` again or `Esc`. Drawn last so it always sits on top.
+fn render_help(frame: &mut Frame, area: Rect) {
+    let rows: &[(&str, &str)] = &[
+        ("Enter",     "submit goal / question"),
+        ("/",         "open the command palette"),
+        ("?",         "toggle this help"),
+        ("Ctrl+;",    "toggle the Ask side panel"),
+        ("Shift+L",   "toggle the Flight Log"),
+        ("Ctrl+D",    "delete the selected goal"),
+        ("Ctrl+W",    "delete the previous word in the input"),
+        ("↑ / ↓",     "move selection in Goals (or palette)"),
+        ("← / →",     "move caret in the input bar"),
+        ("Home / End","jump to start/end of the input"),
+        ("Ctrl+↑↓",   "move the checkpoint cursor"),
+        ("r",         "rollback to the highlighted checkpoint (input empty)"),
+        ("Ctrl+C",    "quit immediately"),
+        ("Esc",       "close overlay / cancel / quit"),
+    ];
+
+    // Fit the modal to the longest description so wrapping never bites.
+    let longest = rows
+        .iter()
+        .map(|(k, v)| k.chars().count() + v.chars().count() + 4)
+        .max()
+        .unwrap_or(40);
+    let popup_w = (longest as u16 + 6).min(area.width.saturating_sub(2)).max(40);
+    let popup_h = (rows.len() as u16 + 6).min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Keyboard Shortcuts ",
+            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(block.clone(), popup_area);
+    let inner = block.inner(popup_area);
+
+    let key_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(8);
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 2);
+    lines.push(Line::raw(""));
+    for (k, v) in rows {
+        let pad = " ".repeat(key_w.saturating_sub(k.chars().count()));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{}{}", k, pad),
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled((*v).to_string(), Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  press ? or Esc to close",
+        Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+    )));
+
+    let p = Paragraph::new(lines).style(Style::default().bg(BG_DEEP));
+    frame.render_widget(p, inner);
 }
 
 fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
@@ -1206,11 +1333,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             sep.clone(),
             Span::styled("/", key), Span::styled(" commands  ", txt),
             sep.clone(),
+            Span::styled("?", key), Span::styled(" help  ", txt),
+            sep.clone(),
             Span::styled("Ctrl+;", key), Span::styled(" ask  ", txt),
             sep.clone(),
-            Span::styled("Shift+L", key), Span::styled(" flight log  ", txt),
+            Span::styled("Shift+L", key), Span::styled(" log  ", txt),
             sep.clone(),
-            Span::styled("↑↓", key), Span::styled(" goals  ", txt),
+            Span::styled("Ctrl+D", key), Span::styled(" del  ", txt),
             sep,
             Span::styled("Esc", key), Span::styled(" quit", txt),
         ],
@@ -1990,33 +2119,51 @@ fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
         .model
         .clone()
         .unwrap_or_else(|| default_model_for(&cfg.provider.name));
-    let provider_cfg = make_api_provider_config(&cfg.provider.name, api_key, model)?;
+    let provider_cfg = make_api_provider_config(
+        &cfg.provider.name,
+        api_key,
+        model,
+        cfg.provider.base_url.clone(),
+    )?;
     Some(Arc::from(provider_for(provider_cfg)))
 }
 
-/// Build an [`ApiProviderConfig`] from the provider name, resolved key, and
-/// model. Returns `None` for unknown provider names.
+/// Build an [`ApiProviderConfig`] from the provider name, resolved key,
+/// model, and optional base URL. Returns `None` for unknown provider names.
+///
+/// When `base_url` is set for `openai` / `openrouter`, the request is
+/// routed through the OpenAI-compatible adaptor instead of the hard-coded
+/// endpoint — this is what makes self-hosted proxies (LiteLLM, vLLM,
+/// LM Studio) actually receive traffic.
 fn make_api_provider_config(
-    name: &str,
-    api_key: String,
-    model: String,
-) -> Option<ApiProviderConfig> {
-    make_api_provider_config_with_url(name, api_key, model, None)
-}
-
-/// Same as [`make_api_provider_config`], but accepts an optional `base_url`
-/// override used by `OpenAiCompatible` (DeepSeek, xAI, Groq, custom
-/// gateways). Ignored for providers with fixed endpoints.
-fn make_api_provider_config_with_url(
     name: &str,
     api_key: String,
     model: String,
     base_url: Option<String>,
 ) -> Option<ApiProviderConfig> {
+    // Empty-string base URLs come from the Settings panel when the user
+    // hasn't typed anything — treat them as "unset".
+    let base_url = base_url.filter(|s| !s.trim().is_empty());
     match name {
         "anthropic" => Some(ApiProviderConfig::Anthropic { api_key, model }),
-        "openai" => Some(ApiProviderConfig::OpenAI { api_key, model }),
-        "openrouter" => Some(ApiProviderConfig::OpenRouter { api_key, model }),
+        "openai" => match &base_url {
+            Some(url) => Some(ApiProviderConfig::OpenAiCompatible {
+                name: "openai".into(),
+                api_key,
+                model,
+                base_url: url.clone(),
+            }),
+            None => Some(ApiProviderConfig::OpenAI { api_key, model }),
+        },
+        "openrouter" => match &base_url {
+            Some(url) => Some(ApiProviderConfig::OpenAiCompatible {
+                name: "openrouter".into(),
+                api_key,
+                model,
+                base_url: url.clone(),
+            }),
+            None => Some(ApiProviderConfig::OpenRouter { api_key, model }),
+        },
         "gemini" => Some(ApiProviderConfig::Gemini { api_key, model }),
         "agentrouter" => Some(ApiProviderConfig::AgentRouter { api_key, model }),
         "ollama" => Some(ApiProviderConfig::Ollama {
@@ -2029,8 +2176,7 @@ fn make_api_provider_config_with_url(
             name: "deepseek".into(),
             api_key,
             model,
-            base_url: base_url
-                .unwrap_or_else(|| "https://api.deepseek.com/v1".into()),
+            base_url: base_url.unwrap_or_else(|| "https://api.deepseek.com/v1".into()),
         }),
         "xai" | "grok" => Some(ApiProviderConfig::OpenAiCompatible {
             name: "xai".into(),
@@ -2042,25 +2188,21 @@ fn make_api_provider_config_with_url(
             name: "groq".into(),
             api_key,
             model,
-            base_url: base_url
-                .unwrap_or_else(|| "https://api.groq.com/openai/v1".into()),
+            base_url: base_url.unwrap_or_else(|| "https://api.groq.com/openai/v1".into()),
         }),
         "together" => Some(ApiProviderConfig::OpenAiCompatible {
             name: "together".into(),
             api_key,
             model,
-            base_url: base_url
-                .unwrap_or_else(|| "https://api.together.xyz/v1".into()),
+            base_url: base_url.unwrap_or_else(|| "https://api.together.xyz/v1".into()),
         }),
         // Fully custom: caller must supply `base_url`. Without one the
         // request would have nowhere to go, so return None.
-        "custom" | "openai-compatible" => base_url.map(|url| {
-            ApiProviderConfig::OpenAiCompatible {
-                name: "custom".into(),
-                api_key,
-                model,
-                base_url: url,
-            }
+        "custom" | "openai-compatible" => base_url.map(|url| ApiProviderConfig::OpenAiCompatible {
+            name: "custom".into(),
+            api_key,
+            model,
+            base_url: url,
         }),
         _ => None,
     }
@@ -2082,7 +2224,7 @@ async fn test_provider(
     if api_key.trim().is_empty() && name != "ollama" {
         return Err("no API key — paste one in the API Key field or set the env var".into());
     }
-    let cfg = make_api_provider_config_with_url(&name, api_key, model, base_url)
+    let cfg = make_api_provider_config(&name, api_key, model, base_url)
         .ok_or_else(|| format!("unknown provider `{name}`"))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
     let resp = provider
@@ -2414,8 +2556,159 @@ fn default_model_for(provider: &str) -> String {
     }
 }
 
+/// Print the `phonton --help` text. Plain stdout — runs before the TUI
+/// touches the terminal, so it composes with shell pipes / `less`.
+fn print_help() {
+    println!(
+        "phonton — agentic dev environment\n\
+         \n\
+         USAGE:\n  \
+         phonton [SUBCOMMAND]\n\
+         \n\
+         SUBCOMMANDS:\n  \
+         (none)            Launch the interactive TUI (default)\n  \
+         ask <question>    One-shot Q&A using the configured provider\n  \
+         config path       Print the resolved config file path\n  \
+         config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
+         config show       Dump the resolved config as TOML\n  \
+         version           Print version and exit\n  \
+         help              Print this help and exit\n\
+         \n\
+         FLAGS:\n  \
+         -h, --help        Same as `help`\n  \
+         -V, --version     Same as `version`\n\
+         \n\
+         CONFIG:\n  \
+         Settings live in ~/.phonton/config.toml. Override the provider key with\n  \
+         ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n"
+    );
+}
+
+fn print_version() {
+    println!("phonton {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Handle CLI subcommands that exit before the TUI launches.
+/// Returns `Ok(true)` if a subcommand was handled (caller should exit),
+/// `Ok(false)` if the TUI should launch normally.
+async fn handle_cli_args() -> Result<bool> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Ok(false);
+    }
+    match args[0].as_str() {
+        "-h" | "--help" | "help" => {
+            print_help();
+            Ok(true)
+        }
+        "-V" | "--version" | "version" => {
+            print_version();
+            Ok(true)
+        }
+        "config" => {
+            let sub = args.get(1).map(|s| s.as_str()).unwrap_or("path");
+            match sub {
+                "path" => {
+                    match config::config_path() {
+                        Some(p) => println!("{}", p.display()),
+                        None => {
+                            eprintln!("phonton: could not resolve config path (HOME unset?)");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "edit" => {
+                    let path = config::config_path().ok_or_else(|| {
+                        anyhow::anyhow!("could not resolve config path")
+                    })?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    if !path.exists() {
+                        // Seed with current resolved config so the editor opens
+                        // a non-empty buffer with the keys the user can tweak.
+                        let cfg = config::load().unwrap_or_default();
+                        let _ = config::save(&cfg);
+                    }
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+                        if cfg!(windows) { "notepad".into() } else { "nano".into() }
+                    });
+                    let status = std::process::Command::new(&editor).arg(&path).status();
+                    match status {
+                        Ok(s) if s.success() => {}
+                        Ok(s) => {
+                            eprintln!("phonton: {} exited with {}", editor, s);
+                            std::process::exit(s.code().unwrap_or(1));
+                        }
+                        Err(e) => {
+                            eprintln!("phonton: failed to launch {}: {}", editor, e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "show" => {
+                    let cfg = config::load().unwrap_or_default();
+                    match toml::to_string_pretty(&cfg) {
+                        Ok(s) => println!("{}", s),
+                        Err(e) => {
+                            eprintln!("phonton: failed to serialize config: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!("phonton: unknown `config` subcommand: {}\n", other);
+                    print_help();
+                    std::process::exit(2);
+                }
+            }
+            Ok(true)
+        }
+        "ask" => {
+            let question = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();
+            if question.trim().is_empty() {
+                eprintln!("phonton: `ask` requires a question.\n  e.g. phonton ask \"how do I add a feature flag?\"");
+                std::process::exit(2);
+            }
+            let cfg = config::load().unwrap_or_default();
+            let provider = load_ask_provider(&cfg).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no provider configured — set an API key (e.g. ANTHROPIC_API_KEY) \
+                     or run `phonton` and configure one in Settings"
+                )
+            })?;
+            match provider
+                .call("You are a helpful coding assistant.", &question, &[])
+                .await
+            {
+                Ok(resp) => {
+                    println!("{}", resp.content);
+                    Ok(true)
+                }
+                Err(e) => {
+                    eprintln!("phonton ask: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        other if other.starts_with('-') => {
+            eprintln!("phonton: unknown flag {}\n", other);
+            print_help();
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!("phonton: unknown subcommand `{}`\n", other);
+            print_help();
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if handle_cli_args().await? {
+        return Ok(());
+    }
     // Load configuration first so the rest of startup can use it.
     let mut cfg = config::load().unwrap_or_default();
 
@@ -2530,6 +2823,11 @@ async fn run_app<B: Backend>(
     mut cfg: config::Config,
     working_dir: std::path::PathBuf,
 ) -> Result<()> {
+    // Mutable so Save Settings can swap in a freshly-built provider after
+    // the user changes the API key / model / provider in the TUI. Without
+    // this the Ask side panel would keep using the original credentials
+    // until the user restarted the CLI.
+    let mut ask_provider = ask_provider;
     loop {
         terminal.draw(|f| render(f, app))?;
         let Some(evt) = rx.recv().await else { break };
@@ -2581,8 +2879,21 @@ async fn run_app<B: Backend>(
                             cfg.budget.max_tokens = app.settings.max_tokens.parse().ok();
                             cfg.budget.max_usd_cents = app.settings.max_usd_cents.parse().ok();
 
+                            // Swap the in-memory ask provider so the next
+                            // Ctrl+; question uses the new credentials
+                            // immediately — without this Save would only
+                            // affect goals (which read cfg per-spawn) and
+                            // leave Ask stuck on the startup provider.
+                            ask_provider = load_ask_provider(&cfg);
+
                             match config::save(&cfg) {
-                                Ok(_) => app.settings.message = Some("Settings saved.".into()),
+                                Ok(_) => {
+                                    let where_ = match ask_provider {
+                                        Some(_) => "Settings saved — Ask + new goals use them now.",
+                                        None => "Settings saved — but no working API key resolved yet (Ask disabled).",
+                                    };
+                                    app.settings.message = Some(where_.into());
+                                }
                                 Err(e) => app.settings.message = Some(format!("Error saving: {e}")),
                             }
                         }
@@ -2890,10 +3201,11 @@ async fn spawn_goal(
 
     let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) = config::resolve_api_key(&cfg.provider) {
         let provider_name = cfg.provider.name.clone();
-        let model = cfg.provider.model.clone().unwrap_or_else(|| default_model_for(&provider_name));
+        let base_url = cfg.provider.base_url.clone();
         
-        let factory = move || {
-            let provider_cfg = make_api_provider_config(&provider_name, api_key.clone(), model.clone())
+        let factory = move |tier: phonton_types::ModelTier| {
+            let model = phonton_providers::model_for_tier(&provider_name, tier);
+            let provider_cfg = make_api_provider_config(&provider_name, api_key.clone(), model, base_url.clone())
                 .expect("unknown provider config");
             provider_for(provider_cfg)
         };
@@ -3156,7 +3468,8 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("add function foo"));
-        assert!(dump.contains("baseline: 500"));
+        // Rendered savings line shows "vs Σ <baseline>" — match the live wording.
+        assert!(dump.contains("vs Σ 500") || dump.contains("baseline: 500"));
     }
 
 }

@@ -19,10 +19,53 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use phonton_types::{
-    LLMResponse, ModelMetricsSnapshot, ProviderConfig, ProviderError, ProviderKind, SliceOrigin,
+    LLMResponse, ModelMetricsSnapshot, ModelTier, ProviderConfig, ProviderError, ProviderKind,
+    SliceOrigin,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+
+/// Maps a provider name and a requested [`ModelTier`] to a concrete model
+/// identifier.
+///
+/// This is the heart of Phonton's multi-tier routing. For each tier, we
+/// pick the best-performing model in its price class as of April 2026.
+pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
+    match provider {
+        "anthropic" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5-20251001".into(),
+            ModelTier::Standard => "claude-sonnet-4-5-20251001".into(),
+            ModelTier::Frontier => "claude-opus-4-7-20260115".into(),
+        },
+        "openai" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "gpt-4o-mini".into(),
+            ModelTier::Standard => "gpt-4o".into(),
+            ModelTier::Frontier => "gpt-5.2-preview".into(),
+        },
+        "gemini" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "gemini-2.0-flash".into(),
+            ModelTier::Standard => "gemini-2.5-flash".into(),
+            ModelTier::Frontier => "gemini-2.5-pro".into(),
+        },
+        "deepseek" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
+            ModelTier::Standard => "deepseek-chat".into(),
+            ModelTier::Frontier => "deepseek-reasoner".into(),
+        },
+        "groq" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "llama-3.3-70b-versatile".into(),
+            ModelTier::Standard => "llama-3.3-70b-versatile".into(),
+            ModelTier::Frontier => "llama-3.3-70b-versatile".into(),
+        },
+        "together" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+            ModelTier::Standard => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+            ModelTier::Frontier => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+        },
+        "ollama" => "llama3.2:3b".into(),
+        _ => "unknown".into(),
+    }
+}
 
 /// Discover the list of models a given API key has access to. Returns
 /// model identifiers in the form the corresponding [`Provider`] expects
@@ -525,9 +568,11 @@ pub async fn select_best_working_model(
 /// worth the eventual read savings.
 const ANTHROPIC_CACHE_MIN_CHARS: usize = 1024;
 
-/// Classify an HTTP status code into a [`ProviderError`]. Used by the
-/// Anthropic adaptor — other adaptors can reuse it when they grow error
-/// maps of their own.
+/// Classify an HTTP status code into a [`ProviderError`]. Kept for tests
+/// and as the structured shape callers may want when they care about
+/// kind-level differentiation; the live adaptors prefer
+/// [`annotate_http_error`] which preserves the upstream body.
+#[allow(dead_code)]
 fn classify_http(status: StatusCode) -> ProviderError {
     match status.as_u16() {
         429 => ProviderError::RateLimit,
@@ -535,6 +580,39 @@ fn classify_http(status: StatusCode) -> ProviderError {
         s if s >= 500 => ProviderError::ServerError(s),
         s => ProviderError::ParseFail(format!("unexpected status {s}")),
     }
+}
+
+/// Build an `anyhow::Error` that combines the classified status with the
+/// upstream response body. The body often carries the actionable detail
+/// ("Invalid API key", "model not found", "insufficient quota") that a
+/// bare status code hides.
+///
+/// `body` is truncated to a reasonable preview so a 50KB HTML 503 page
+/// doesn't overflow the TUI.
+fn annotate_http_error(provider: &str, status: StatusCode, body: &str) -> anyhow::Error {
+    // Try to pull `error.message` out of standard JSON error envelopes
+    // (OpenAI, Anthropic, Gemini, DeepSeek, xAI, Together, Groq all use
+    // `{"error": {"message": "..."}}`); fall back to the raw body.
+    let detail = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.pointer("/message"))
+                .or_else(|| v.pointer("/error"))
+                .and_then(|x| x.as_str().map(String::from))
+                .or_else(|| Some(v.to_string()))
+        })
+        .unwrap_or_else(|| body.to_string());
+    let preview: String = detail.chars().take(400).collect();
+    let hint = match status.as_u16() {
+        401 => " (check the API key — wrong, expired, or revoked)",
+        403 => " (key rejected — wrong provider or insufficient permissions)",
+        404 => " (endpoint or model not found — check provider/model name and base URL)",
+        429 => " (rate-limited — wait and retry, or check quota)",
+        s if s >= 500 => " (provider server error — retry shortly)",
+        _ => "",
+    };
+    anyhow!("{provider} HTTP {}{hint}: {preview}", status.as_u16())
 }
 
 // ---------------------------------------------------------------------------
@@ -845,9 +923,13 @@ impl Provider for AnthropicProvider {
         } else {
             json!({ "type": "text", "text": system })
         };
+        // 8192 is the highest `max_tokens` value every current Claude model
+        // accepts (haiku 3.5 caps here; sonnet 4.x/opus go higher). Going
+        // above this would 400 on haiku, going below this throws away
+        // headroom on the bigger models for normal-length completions.
         let body = json!({
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "system": [system_block],
             "messages": [{ "role": "user", "content": user }],
         });
@@ -863,8 +945,10 @@ impl Provider for AnthropicProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if !http_resp.status().is_success() {
-            return Err(classify_http(http_resp.status()).into());
+        let status = http_resp.status();
+        if !status.is_success() {
+            let body = http_resp.text().await.unwrap_or_default();
+            return Err(annotate_http_error("Anthropic", status, &body));
         }
 
         let resp: Value = http_resp
@@ -989,9 +1073,21 @@ impl Provider for OpenAiCompatibleProvider {
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse> {
         let system = build_system_prompt(system, slice_origins);
+        // OpenAI's *current* spec uses `max_completion_tokens` and o1/o3/o4
+        // *reject* `max_tokens` outright. Every other OpenAI-compat provider
+        // (DeepSeek, xAI, Together, Groq's deprecated path, OpenRouter,
+        // AgentRouter, vLLM, LM Studio, …) was built against the original
+        // spec and either ignores `max_completion_tokens` (silently truncating
+        // to a tiny default) or rejects it as an unknown field. Picking the
+        // right key per back-end is what makes "BYOK" actually work.
+        let token_key = if self.kind == ProviderKind::OpenAI {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
         let body = json!({
             "model": self.model,
-            "max_completion_tokens": 4096,
+            token_key: 4096,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user },
@@ -1006,7 +1102,11 @@ impl Provider for OpenAiCompatibleProvider {
             .json(&body);
 
         if self.kind == ProviderKind::OpenRouter {
-            req = req.header("X-OpenRouter-Title", "Phonton");
+            // OpenRouter's recommended attribution headers — these don't
+            // affect routing but make rate-limit dashboards readable.
+            req = req
+                .header("HTTP-Referer", "https://github.com/phonton/phonton")
+                .header("X-Title", "Phonton");
         }
 
         let http_resp = req
@@ -1014,8 +1114,13 @@ impl Provider for OpenAiCompatibleProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        if !http_resp.status().is_success() {
-            return Err(classify_http(http_resp.status()).into());
+        let status = http_resp.status();
+        if !status.is_success() {
+            // Surface the upstream error body so users see *why* (e.g.
+            // "Invalid API key", "model not found", "insufficient quota")
+            // instead of a bare HTTP code.
+            let body = http_resp.text().await.unwrap_or_default();
+            return Err(annotate_http_error(self.kind.to_string().as_str(), status, &body));
         }
 
         let resp: Value = http_resp
@@ -1144,8 +1249,10 @@ impl Provider for GeminiProvider {
             }
         }
 
-        if !http_resp.status().is_success() {
-            return Err(classify_http(http_resp.status()).into());
+        let status = http_resp.status();
+        if !status.is_success() {
+            let body = http_resp.text().await.unwrap_or_default();
+            return Err(annotate_http_error("Gemini", status, &body));
         }
 
         let resp: Value = http_resp
@@ -1378,6 +1485,69 @@ mod tests {
             model: "openai/gpt-5.2".into(),
         });
         assert_eq!(p.kind(), ProviderKind::OpenRouter);
+    }
+
+    /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`
+    /// (and o1/o3/o4 *reject* `max_tokens`); every other OpenAI-compat
+    /// back-end (DeepSeek, xAI, Together, Groq, OpenRouter, AgentRouter,
+    /// vLLM, LM Studio) was built against the original spec and either
+    /// ignores `max_completion_tokens` (silently truncating to a tiny
+    /// default) or rejects it as unknown. This test pins the per-kind
+    /// branching so a refactor can't quietly regress every non-OpenAI
+    /// provider.
+    #[tokio::test]
+    async fn openai_compat_uses_max_tokens_for_non_openai() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        async fn body_capture_server(saw_max_tokens: Arc<AtomicBool>, saw_max_completion: Arc<AtomicBool>) -> SocketAddr {
+            // Tiny TCP listener that reads one HTTP request, records which
+            // token field the caller sent, and answers a valid chat shape.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if raw.contains("\"max_tokens\"") {
+                        saw_max_tokens.store(true, Ordering::SeqCst);
+                    }
+                    if raw.contains("\"max_completion_tokens\"") {
+                        saw_max_completion.store(true, Ordering::SeqCst);
+                    }
+                    let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+            addr
+        }
+
+        // Non-OpenAI compat (e.g. DeepSeek / xAI / Together) → must send `max_tokens`.
+        let saw_mt = Arc::new(AtomicBool::new(false));
+        let saw_mc = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
+        let endpoint = format!("http://{}/chat/completions", addr);
+        let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
+        let _ = p.call("sys", "u", &[]).await;
+        assert!(saw_mt.load(Ordering::SeqCst), "non-OpenAI compat must send max_tokens");
+        assert!(!saw_mc.load(Ordering::SeqCst), "non-OpenAI compat must NOT send max_completion_tokens");
+
+        // OpenAI proper → must send `max_completion_tokens`.
+        let saw_mt = Arc::new(AtomicBool::new(false));
+        let saw_mc = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
+        let endpoint = format!("http://{}/chat/completions", addr);
+        let p = OpenAiCompatibleProvider::new("k".into(), "m".into(), &endpoint, ProviderKind::OpenAI);
+        let _ = p.call("sys", "u", &[]).await;
+        assert!(saw_mc.load(Ordering::SeqCst), "OpenAI proper must send max_completion_tokens");
+        assert!(!saw_mt.load(Ordering::SeqCst), "OpenAI proper must NOT send max_tokens (rejected by o-series)");
     }
 
     /// Live round-trip against the real Anthropic Messages API. Gated behind
