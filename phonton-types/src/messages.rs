@@ -8,7 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Checkpoint, CodeSlice, ModelTier, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
+    Checkpoint, CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskId, SubtaskResult,
+    SubtaskStatus, TaskStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,6 +35,22 @@ pub enum OrchestratorMessage {
         id: SubtaskId,
         /// Running total of tokens this subtask has consumed.
         tokens_so_far: u64,
+    },
+    /// Worker is actively waiting for an LLM response.
+    SubtaskThinking {
+        /// Subtask that is thinking.
+        id: SubtaskId,
+        /// Model name being called.
+        model_name: String,
+    },
+    /// Worker/dispatcher selected semantic-index context for a subtask.
+    ContextSelected {
+        /// Subtask receiving the selected context.
+        id: SubtaskId,
+        /// Review-safe summary of each selected slice.
+        slices: Vec<ContextAttribution>,
+        /// Sum of slice token counts where known.
+        total_token_count: usize,
     },
     /// Worker finished a subtask successfully.
     SubtaskDone {
@@ -148,4 +165,7 @@ pub struct WorkerState {
     pub tokens_used: u64,
     /// Current lifecycle state of the subtask.
     pub status: SubtaskStatus,
+    /// True if the worker is actively waiting for an LLM response.
+    #[serde(default)]
+    pub is_thinking: bool,
 }

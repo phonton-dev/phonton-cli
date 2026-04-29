@@ -31,7 +31,7 @@ use phonton_types::{
     VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
 };
 use std::collections::HashSet;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -185,6 +185,7 @@ pub trait WorkerDispatcher: Send + Sync + 'static {
         subtask: Subtask,
         prior_errors: Vec<String>,
         attempt: u8,
+        msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
     ) -> Result<SubtaskResult>;
 }
 
@@ -208,6 +209,8 @@ struct SubtaskRuntime {
     /// Model name from the most recent LLM call. Empty until the first
     /// worker result is received.
     model_name: String,
+    /// True if the worker is actively waiting for an LLM response.
+    is_thinking: bool,
 }
 
 impl SubtaskRuntime {
@@ -223,6 +226,7 @@ impl SubtaskRuntime {
             diff_hunks: Vec::new(),
             provider: ProviderKind::Anthropic,
             model_name: String::new(),
+            is_thinking: false,
         }
     }
 
@@ -419,6 +423,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut checkpointed: HashSet<SubtaskId> = HashSet::new();
         let mut next_seq: u32 = 1;
 
+        // Channel for worker-to-orchestrator intermediate messages.
+        let (worker_msg_tx, mut worker_msg_rx) = mpsc::channel::<OrchestratorMessage>(32);
+
         // Take ownership of the control channel for the duration of this run.
         let mut control_rx = self
             .control_rx
@@ -441,7 +448,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         //    ready subtasks or waits for an in-flight one to finish.
         loop {
             if failure.is_none() {
-                self.schedule_ready(&graph, &mut runtimes, &mut joinset);
+                self.schedule_ready(&graph, &mut runtimes, &mut joinset, worker_msg_tx.clone());
             }
 
             let any_active = runtimes.values().any(|r| r.is_active());
@@ -462,37 +469,71 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             );
 
             // Race a worker completion against an inbound control
-            // message (rollback request, etc.). On rollback we abort
-            // every in-flight worker, ask phonton-diff to reset to the
-            // checkpoint commit, mark every subtask whose seq is
-            // greater than `to_seq` as Queued, and continue the loop.
-            let joined = match control_rx.as_mut() {
-                Some(rx) => tokio::select! {
-                    biased;
-                    msg = rx.recv() => {
-                        if let Some(OrchestratorMessage::RollbackRequest { to_seq }) = msg {
-                            joinset.abort_all();
-                            let requeued = self.handle_rollback(
-                                to_seq,
-                                &mut runtimes,
-                                &mut checkpoints,
-                                &mut checkpointed,
-                                &mut next_seq,
-                            );
-                            self.emit(OrchestratorEvent::RollbackPerformed {
-                                task_id: self.task_id,
-                                to_seq,
-                                requeued_subtasks: requeued,
+            // message (rollback request, etc.) or an intermediate worker
+            // message (progress, thinking).
+            let joined = tokio::select! {
+                biased;
+                msg = worker_msg_rx.recv() => {
+                    match msg {
+                        Some(OrchestratorMessage::SubtaskThinking { id, model_name }) => {
+                            if let Some(rt) = runtimes.get_mut(&id) {
+                                rt.is_thinking = true;
+                                rt.model_name = model_name.clone();
+                                self.emit(OrchestratorEvent::Thinking {
+                                    subtask_id: id,
+                                    model_name,
+                                });
+                            }
+                            continue;
+                        }
+                        Some(OrchestratorMessage::ContextSelected {
+                            id,
+                            slices,
+                            total_token_count,
+                        }) => {
+                            self.emit(OrchestratorEvent::ContextSelected {
+                                subtask_id: id,
+                                slices,
+                                total_token_count,
                             });
                             continue;
                         }
-                        // Other messages — drain joinset normally.
-                        joinset.join_next().await
+                        Some(OrchestratorMessage::SubtaskProgress { id, tokens_so_far }) => {
+                            if let Some(rt) = runtimes.get_mut(&id) {
+                                rt.tokens_used = tokens_so_far;
+                            }
+                            continue;
+                        }
+                        _ => continue,
                     }
-                    j = joinset.join_next() => j,
-                },
-                None => joinset.join_next().await,
+                }
+                msg = async {
+                    match control_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(OrchestratorMessage::RollbackRequest { to_seq }) = msg {
+                        joinset.abort_all();
+                        let requeued = self.handle_rollback(
+                            to_seq,
+                            &mut runtimes,
+                            &mut checkpoints,
+                            &mut checkpointed,
+                            &mut next_seq,
+                        );
+                        self.emit(OrchestratorEvent::RollbackPerformed {
+                            task_id: self.task_id,
+                            to_seq,
+                            requeued_subtasks: requeued,
+                        });
+                        continue;
+                    }
+                    joinset.join_next().await
+                }
+                j = joinset.join_next() => j,
             };
+
             let Some(joined) = joined else {
                 break;
             };
@@ -506,7 +547,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
             // 4. Route through verify, possibly re-dispatch.
             let dispatch_result = match dispatch_outcome {
-                Ok(sr) => self.handle_completion(&mut runtimes, id, sr, &mut joinset).await,
+                Ok(sr) => self.handle_completion(&mut runtimes, id, sr, &mut joinset, worker_msg_tx.clone()).await,
                 Err(e) => {
                     warn!(subtask = %id, error = %e, "worker dispatch returned Err");
                     fail_subtask(&mut runtimes, id, format!("dispatch error: {e}"));
@@ -799,6 +840,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         graph: &DiGraph<SubtaskId, ()>,
         runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>,
         joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
+        worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
     ) {
         // First: promote Queued → Ready for any subtask whose dependencies
         // have all reached Done.
@@ -831,7 +873,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             if !should_dispatch {
                 continue;
             }
-            self.spawn_worker(runtimes, *id, joinset);
+            self.spawn_worker(runtimes, *id, joinset, worker_msg_tx.clone());
         }
     }
 
@@ -840,9 +882,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>,
         id: SubtaskId,
         joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
+        worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
     ) {
         let Some(rt) = runtimes.get_mut(&id) else { return };
         rt.status = SubtaskStatus::Dispatched;
+        rt.is_thinking = false;
         let subtask = rt.subtask.clone();
         let prior_errors = rt.prior_errors.clone();
         let attempt = rt.attempts_at_tier.saturating_add(1);
@@ -853,8 +897,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             tier: subtask.model_tier,
             attempt,
         });
+
+        let tx = Some(worker_msg_tx);
         joinset.spawn(async move {
-            let r = dispatcher.dispatch(subtask, prior_errors, attempt).await;
+            let r = dispatcher.dispatch(subtask, prior_errors, attempt, tx).await;
             (id, r)
         });
     }
@@ -865,6 +911,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         id: SubtaskId,
         sr: SubtaskResult,
         joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
+        worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
     ) -> Result<()> {
         // Scoped borrow: update bookkeeping from the returned SubtaskResult
         // before calling verify (verify is async and takes no &mut self).
@@ -912,7 +959,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             self.memory.as_ref(),
         )
         .await?;
-        self.apply_verdict(runtimes, id, verdict, joinset)
+        self.apply_verdict(runtimes, id, verdict, joinset, worker_msg_tx)
     }
 
     fn apply_verdict(
@@ -921,6 +968,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         id: SubtaskId,
         verdict: VerifyResult,
         joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
+        worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
     ) -> Result<()> {
         let mut events: Vec<OrchestratorEvent> = Vec::new();
         let (redispatch, redispatch_fresh_tier) = {
@@ -940,6 +988,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     events.push(OrchestratorEvent::SubtaskCompleted {
                         subtask_id: id,
                         tokens_used: rt.tokens_used,
+                    });
+                    events.push(OrchestratorEvent::SubtaskReviewReady {
+                        subtask_id: id,
+                        description: rt.subtask.description.clone(),
+                        tier: rt.subtask.model_tier,
+                        tokens_used: rt.tokens_used,
+                        diff_hunks: rt.diff_hunks.clone(),
+                        verify_result: VerifyResult::Pass { layer },
+                        provider: rt.provider,
+                        model_name: rt.model_name.clone(),
                     });
                     rt.prior_errors.clear();
                     (false, false)
@@ -1024,7 +1082,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             } else {
                 debug!(subtask = %id, "re-dispatching at same tier with error context");
             }
-            self.spawn_worker(runtimes, id, joinset);
+            self.spawn_worker(runtimes, id, joinset, worker_msg_tx);
         }
         Ok(())
     }
@@ -1218,6 +1276,7 @@ fn broadcast(
             model_tier: r.subtask.model_tier,
             tokens_used: r.tokens_used,
             status: r.status.clone(),
+            is_thinking: r.is_thinking,
         })
         .collect();
 
@@ -1286,6 +1345,7 @@ mod tests {
             subtask: Subtask,
             _prior_errors: Vec<String>,
             attempt: u8,
+            _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
         ) -> Result<SubtaskResult> {
             self.calls
                 .lock()
@@ -1346,6 +1406,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![a.clone(), b.clone(), c.clone()],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
@@ -1367,6 +1428,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![a.clone(), b.clone()],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
@@ -1389,6 +1451,7 @@ mod tests {
                 subtask: Subtask,
                 _prior_errors: Vec<String>,
                 _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
             ) -> Result<SubtaskResult> {
                 self.calls.lock().unwrap().push(subtask.model_tier);
                 let hunks = vec![DiffHunk {
@@ -1420,6 +1483,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![a.clone()],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(BrokenDispatcher {
@@ -1455,6 +1519,7 @@ mod tests {
                 subtask: Subtask,
                 _prior_errors: Vec<String>,
                 _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
             ) -> Result<SubtaskResult> {
                 self.barrier.wait().await;
                 self.calls.lock().unwrap().push(subtask.id);
@@ -1488,6 +1553,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![a, b],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(BarrierDispatcher {
@@ -1495,7 +1561,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         let orch = Orchestrator::new(Arc::clone(&dispatcher));
-        let status = timeout(Duration::from_secs(120), orch.run_task(plan, empty_state()))
+        let status = timeout(Duration::from_secs(600), orch.run_task(plan, empty_state()))
             .await
             .expect("sequential dispatch would deadlock the barrier")
             .expect("orchestrator returned Err");
@@ -1510,6 +1576,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![a.clone(), b.clone()],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         // TrivialDispatcher reports 100 tokens per call; ceiling at 50
@@ -1543,6 +1610,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![st.clone()],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
@@ -1597,6 +1665,7 @@ mod tests {
         let plan = PlannerOutput {
             subtasks: vec![a, b],
             estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());

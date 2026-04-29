@@ -643,6 +643,12 @@ pub trait Provider: Send + Sync {
 
     /// Which back-end this adaptor targets.
     fn kind(&self) -> ProviderKind;
+
+    /// The name of the model this provider is configured to call.
+    fn model(&self) -> String;
+
+    /// Return a boxed clone of this provider.
+    fn clone_box(&self) -> Box<dyn Provider>;
 }
 
 /// Construct the appropriate adaptor for a [`ProviderConfig`].
@@ -856,6 +862,16 @@ impl MeteredProvider {
     }
 }
 
+impl Clone for MeteredProvider {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone_box(),
+            metrics: self.metrics.clone(),
+            key: self.key.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for MeteredProvider {
     async fn call(
@@ -875,6 +891,14 @@ impl Provider for MeteredProvider {
     fn kind(&self) -> ProviderKind {
         self.inner.kind()
     }
+
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -884,6 +908,7 @@ impl Provider for MeteredProvider {
 /// Adaptor for the Anthropic Messages API. Honours `cache_control`
 /// breakpoints in caller-supplied prompts and surfaces
 /// `cache_read_input_tokens` as `cached_tokens`.
+#[derive(Clone)]
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
@@ -897,7 +922,10 @@ impl AnthropicProvider {
         Self {
             api_key,
             model,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -991,6 +1019,14 @@ impl Provider for AnthropicProvider {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Anthropic
     }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,6 +1037,7 @@ impl Provider for AnthropicProvider {
 ///
 /// OpenAI and OpenRouter share this wire shape: Bearer auth, a `messages`
 /// array, and `choices[0].message.content` in the response.
+#[derive(Clone)]
 pub struct OpenAiCompatibleProvider {
     api_key: String,
     model: String,
@@ -1059,7 +1096,10 @@ impl OpenAiCompatibleProvider {
             model,
             endpoint: endpoint.to_string(),
             kind,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -1158,6 +1198,14 @@ impl Provider for OpenAiCompatibleProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
     }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,13 +1217,14 @@ impl Provider for OpenAiCompatibleProvider {
 /// Gemini exposes `cachedContentTokenCount` on responses that read from a
 /// pre-created cached-content handle; we surface it as `cached_tokens`.
 /// When no cache is in play the field is absent and we report `0`.
+#[derive(Clone)]
 pub struct GeminiProvider {
     api_key: String,
-    /// Wrapped in `RwLock` so that on the first 404 (model not found for
+    /// Wrapped in `Arc<RwLock>` so that on the first 404 (model not found for
     /// this key, common on free-tier Google AI Studio accounts) we can
     /// transparently rewrite to a working model and retry — without the
     /// caller having to reconfigure anything.
-    model: RwLock<String>,
+    model: Arc<RwLock<String>>,
     http: Client,
 }
 
@@ -1184,8 +1233,11 @@ impl GeminiProvider {
     pub fn new(api_key: String, model: String) -> Self {
         Self {
             api_key,
-            model: RwLock::new(model),
-            http: Client::new(),
+            model: Arc::new(RwLock::new(model)),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -1220,16 +1272,76 @@ impl Provider for GeminiProvider {
         user: &str,
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse> {
-        let system = build_system_prompt(system, slice_origins);
-        let body = json!({
-            "system_instruction": { "parts": [{ "text": system }] },
-            "contents": [{
+        let system_full = build_system_prompt(system, slice_origins);
+        let model = self.current_model();
+        let is_gemma = model.contains("gemma");
+        let is_json = system.to_lowercase().contains("json") || user.to_lowercase().contains("json");
+
+        let mut contents = Vec::new();
+
+        if is_gemma {
+            // Gemma (and other small models) often ignore 'system_instruction'
+            // when the task is broad. We force obedience via few-shotting
+            // and by repeating the system prompt in the user's turn.
+            if is_json {
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{ "text": format!("SYSTEM: You are a software task decomposer. Respond ONLY with a JSON array.\n\nUSER: Break 'add logging' into subtasks.") }]
+                }));
+                contents.push(json!({
+                    "role": "model",
+                    "parts": [{ "text": "[{\"description\": \"Add logging crate\", \"model_tier\": \"Standard\", \"depends_on\": []}]" }]
+                }));
+            } else {
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{ "text": format!("SYSTEM: {}\n\nUSER: add a comment to lib.rs", system_full) }]
+                }));
+                contents.push(json!({
+                    "role": "model",
+                    "parts": [{ "text": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,1 +1,2 @@\n+// Phonton\n pub fn init() {}" }]
+                }));
+            }
+
+            let final_user_text = if is_json {
+                format!("USER: {}", user)
+            } else {
+                // Extreme "jail" for chatty models in worker mode.
+                // We repeat the critical rules at the end of the user turn
+                // because models like Gemma weight the end of the prompt heavily.
+                format!(
+                    "USER TASK: {}\n\n\
+                     STRICT RULES:\n\
+                     - NO PROSE\n\
+                     - NO PREAMBLE\n\
+                     - NO CODE FENCES (```)\n\
+                     - START IMMEDIATELY WITH `--- a/` OR `--- /dev/null`\n\n\
+                     START DIFF:",
+                    user
+                )
+            };
+
+            contents.push(json!({
+                "role": "user",
+                "parts": [{ "text": final_user_text }]
+            }));
+        } else {
+            contents.push(json!({
                 "role": "user",
                 "parts": [{ "text": user }],
-            }],
+            }));
+        }
+
+        let body = json!({
+            "system_instruction": { "parts": [{ "text": system_full }] },
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.1,
+                "topP": 0.95,
+                "responseMimeType": if is_json { "application/json" } else { "text/plain" },
+            }
         });
 
-        let model = self.current_model();
         let mut http_resp = self.raw_generate(&model, &body).await?;
 
         // Free-tier keys frequently reject the configured model with 404.
@@ -1292,6 +1404,14 @@ impl Provider for GeminiProvider {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Gemini
     }
+
+    fn model(&self) -> String {
+        self.current_model()
+    }
+
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,6 +1420,7 @@ impl Provider for GeminiProvider {
 
 /// Adaptor for a local Ollama daemon. No prompt caching; `cached_tokens`
 /// is always `0`. Uses the non-streaming `/api/chat` shape for simplicity.
+#[derive(Clone)]
 pub struct OllamaProvider {
     base_url: String,
     model: String,
@@ -1313,7 +1434,10 @@ impl OllamaProvider {
         Self {
             base_url,
             model,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -1372,6 +1496,14 @@ impl Provider for OllamaProvider {
 
     fn kind(&self) -> ProviderKind {
         ProviderKind::Ollama
+    }
+
+    fn model(&self) -> String {
+        self.model.clone()
+    }
+
+    fn clone_box(&self) -> Box<dyn Provider> {
+        Box::new(self.clone())
     }
 }
 

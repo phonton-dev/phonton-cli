@@ -2,7 +2,7 @@
 //! HNSW-based vector retrieval over extracted symbols.
 
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use phonton_types::{CodeSlice, SliceOrigin};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -64,10 +64,10 @@ fn extract_fallback(source: &str, file_path: &Path) -> Vec<CodeSlice> {
         symbols.push(CodeSlice {
             file_path: file_path.to_path_buf(),
             symbol_name: name,
+            token_count: estimate_tokens(&signature),
             signature,
             docstring: None,
             callsites: Vec::new(),
-            token_count: 0, // Fallback slices have unknown tokens.
             origin: SliceOrigin::Fallback,
         });
     }
@@ -94,13 +94,14 @@ fn collect_symbols(
         if kinds.contains(&child.kind()) {
             if let Some(symbol_name) = extract_name(child, source) {
                 let signature = extract_signature(child, source);
+                let token_count = estimate_tokens(&signature);
                 out.push(CodeSlice {
                     file_path: file_path.to_path_buf(),
                     symbol_name,
                     signature,
                     docstring: None,
                     callsites: Vec::new(),
-                    token_count: 0, // In v1 we defer precise token counting.
+                    token_count,
                     origin: SliceOrigin::Semantic,
                 });
             }
@@ -123,18 +124,30 @@ fn extract_signature(node: tree_sitter::Node, source: &[u8]) -> String {
     text[..400].to_string()
 }
 
+fn estimate_tokens(text: &str) -> usize {
+    let chars = text.chars().count();
+    if chars == 0 {
+        0
+    } else {
+        chars.div_ceil(4).max(1)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Semantic retrieval: embeddings + HNSW
 // ---------------------------------------------------------------------------
 
 /// Dimension of `all-MiniLM-L6-v2` sentence embeddings.
+#[cfg(feature = "semantic")]
 pub const EMBED_DIM: usize = 384;
 
 /// Wrapper around a loaded fastembed `TextEmbedding` model.
+#[cfg(feature = "semantic")]
 pub struct Embedder {
     model: fastembed::TextEmbedding,
 }
 
+#[cfg(feature = "semantic")]
 impl Embedder {
     /// Load `all-MiniLM-L6-v2`. On first call this downloads and caches
     /// the ONNX weights under the platform's fastembed cache dir.
@@ -151,11 +164,12 @@ impl Embedder {
         let docs: Vec<&str> = texts.to_vec();
         self.model
             .embed(docs, None)
-            .map_err(|e| anyhow!("fastembed: {e}"))
+            .map_err(|e| anyhow::anyhow!("fastembed: {e}"))
     }
 }
 
 /// HNSW index over [`CodeSlice`]s, keyed by insertion order.
+#[cfg(feature = "semantic")]
 pub struct SemanticIndex {
     index: usearch::Index,
     slots: Vec<CodeSlice>,
@@ -164,6 +178,7 @@ pub struct SemanticIndex {
     pub file_hashes: std::collections::HashMap<PathBuf, u64>,
 }
 
+#[cfg(feature = "semantic")]
 impl SemanticIndex {
     /// Build a new empty index with cosine distance over `dim`-dim vectors.
     pub fn new(dim: usize) -> Self {
@@ -187,7 +202,7 @@ impl SemanticIndex {
     /// Add one slice + its precomputed embedding.
     pub fn add(&mut self, slice: CodeSlice, embedding: Vec<f32>) -> Result<()> {
         if embedding.len() != self.dim {
-            return Err(anyhow!(
+            return Err(anyhow::anyhow!(
                 "embedding dim {} != index dim {}",
                 embedding.len(),
                 self.dim
@@ -197,11 +212,11 @@ impl SemanticIndex {
         if self.index.capacity() <= self.slots.len() {
             self.index
                 .reserve(self.slots.len().saturating_add(64))
-                .map_err(|e| anyhow!("usearch reserve: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("usearch reserve: {e}"))?;
         }
         self.index
             .add(key, &embedding)
-            .map_err(|e| anyhow!("usearch add: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("usearch add: {e}"))?;
         self.slots.push(slice);
         self.embeddings.push(embedding);
         Ok(())
@@ -374,11 +389,25 @@ pub fn discover_nexus_config(start: &Path) -> Result<Option<NexusConfig>> {
 /// the whole index. The local `root` is always indexed first, so its
 /// slices land at the front of the slot list (slight stability win for
 /// near-tie searches).
+#[cfg(feature = "semantic")]
 pub async fn index_workspace_with_nexus(
     root: &Path,
     config: &NexusConfig,
 ) -> Result<SemanticIndex> {
     let embedder = Embedder::new()?;
+    index_workspace_with_nexus_using_embedder(root, config, &embedder).await
+}
+
+/// Build a Nexus-aware index using a caller-owned embedder.
+///
+/// This avoids loading the ONNX model twice when the same caller will also
+/// use the embedder for query-time retrieval.
+#[cfg(feature = "semantic")]
+pub async fn index_workspace_with_nexus_using_embedder(
+    root: &Path,
+    config: &NexusConfig,
+    embedder: &Embedder,
+) -> Result<SemanticIndex> {
     let mut index = SemanticIndex::new(EMBED_DIM);
     let mut all_slices: Vec<CodeSlice> = Vec::new();
 
@@ -433,8 +462,18 @@ pub async fn index_workspace_with_nexus(
 
 /// Walk `root`, extract symbols from all Rust/Python/TypeScript sources,
 /// embed their signatures in batches of 32, and return an HNSW index.
+#[cfg(feature = "semantic")]
 pub async fn index_workspace(root: &Path) -> Result<SemanticIndex> {
     let embedder = Embedder::new()?;
+    index_workspace_using_embedder(root, &embedder).await
+}
+
+/// Build a single-workspace index using a caller-owned embedder.
+#[cfg(feature = "semantic")]
+pub async fn index_workspace_using_embedder(
+    root: &Path,
+    embedder: &Embedder,
+) -> Result<SemanticIndex> {
     let mut files: Vec<PathBuf> = Vec::new();
     collect_source_files(root, &mut files)?;
 
@@ -466,6 +505,7 @@ pub async fn index_workspace(root: &Path) -> Result<SemanticIndex> {
 }
 
 /// Embed `goal` and return the top-`k` most relevant indexed slices.
+#[cfg(feature = "semantic")]
 pub async fn query_relevant_slices(
     index: &SemanticIndex,
     embedder: &Embedder,
@@ -485,6 +525,7 @@ pub async fn query_relevant_slices(
     index.search(&query, k)
 }
 
+#[cfg(any(feature = "semantic", test))]
 fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -513,6 +554,7 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// Watch the given `root` directory for changes, extracting and re-embedding
 /// symbols for changed supported source files dynamically.
+#[cfg(feature = "semantic")]
 pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
     use notify::{Watcher, RecursiveMode, Event};
     use std::time::Duration;
@@ -588,8 +630,10 @@ pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "semantic")]
     use phonton_types::{CodeSlice, SliceOrigin};
 
+    #[cfg(feature = "semantic")]
     fn synth(name: &str, sig: &str) -> CodeSlice {
         CodeSlice {
             file_path: PathBuf::from(format!("{name}.rs")),
@@ -711,6 +755,20 @@ mod tests {
         assert!(out[0].ends_with("lib.rs"));
     }
 
+    #[test]
+    fn extracted_symbols_have_token_counts() {
+        let slices = extract_symbols(
+            "pub fn save_tokens(input: &str) -> usize { input.len() }",
+            Path::new("src/lib.rs"),
+        );
+        assert!(!slices.is_empty());
+        assert!(
+            slices.iter().all(|s| s.token_count > 0),
+            "all extracted slices should carry a non-zero token estimate: {slices:?}"
+        );
+    }
+
+    #[cfg(feature = "semantic")]
     #[test]
     #[ignore = "downloads ~90MB ONNX model on first run"]
     fn semantic_search_ranks_related_first() {

@@ -47,5 +47,9 @@ fn extracts_symbols_from_phonton_types() {
             !s.symbol_name.is_empty(),
             "symbol with empty name found: {s:?}"
         );
+        assert!(
+            s.token_count > 0,
+            "symbol should carry token estimate: {s:?}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! [`WorkerDispatcher`] implementation that wraps [`phonton_worker::Worker`].
+﻿//! [`WorkerDispatcher`] implementation that wraps [`phonton_worker::Worker`].
 //!
 //! This is the production bridge between the orchestrator's dispatch contract
 //! and the real LLM call / verify / retry loop. The CLI uses
@@ -23,16 +23,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use phonton_orchestrator::WorkerDispatcher;
 use phonton_sandbox::{ExecutionGuard, Sandbox};
-use phonton_types::{ModelTier, Subtask, SubtaskResult};
+use phonton_types::{CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskResult};
 
 use crate::Worker;
 
 /// Production dispatcher: each `dispatch` call constructs a fresh [`Worker`]
 /// bound to the configured provider and runs the subtask through the full
-/// LLM → verify → retry loop.
+/// LLM â†’ verify â†’ retry loop.
 ///
 /// The provider is stored as a factory function rather than a boxed trait
-/// object so each dispatch gets its own owned `Box<dyn Provider>` —
+/// object so each dispatch gets its own owned `Box<dyn Provider>` â€”
 /// `phonton_providers::Provider` is not `Clone`, and the orchestrator may
 /// dispatch many subtasks concurrently.
 pub struct RealDispatcher {
@@ -43,8 +43,12 @@ pub struct RealDispatcher {
     guard: ExecutionGuard,
     /// Sandbox shared across all dispatches for this goal.
     sandbox: Arc<Sandbox>,
-    /// Optional memory store — wired through to the worker when present.
+    /// Optional memory store â€” wired through to the worker when present.
     memory: Option<phonton_memory::MemoryStore>,
+    /// Shared context manager for all workers in this dispatch session.
+    context: Arc<tokio::sync::Mutex<phonton_context::ContextManager>>,
+    /// Optional semantic index used to retrieve per-subtask context.
+    semantic: Option<Arc<crate::SemanticContext>>,
 }
 
 impl RealDispatcher {
@@ -62,11 +66,22 @@ impl RealDispatcher {
         guard: ExecutionGuard,
         sandbox: Arc<Sandbox>,
     ) -> Self {
+        let provider = provider_factory(ModelTier::Cheap);
+        let counter = phonton_context::TiktokenCounter::new().unwrap_or_else(|_| {
+            panic!("failed to load tiktoken counter");
+        });
+        let context = phonton_context::ContextManager::new(
+            Arc::from(provider.clone_box()),
+            crate::DEFAULT_WINDOW_LIMIT,
+        ).with_counter(Arc::new(counter));
+
         Self {
             provider_factory: Arc::new(provider_factory),
             guard,
             sandbox,
             memory: None,
+            context: Arc::new(tokio::sync::Mutex::new(context)),
+            semantic: None,
         }
     }
 
@@ -74,6 +89,13 @@ impl RealDispatcher {
     /// rejected-approach records that the planner reads on the next goal.
     pub fn with_memory(mut self, memory: phonton_memory::MemoryStore) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a prebuilt semantic context. Each dispatch queries it for
+    /// the top relevant slices and passes those slices into the worker.
+    pub fn with_semantic_context(mut self, semantic: Arc<crate::SemanticContext>) -> Self {
+        self.semantic = Some(semantic);
         self
     }
 }
@@ -85,27 +107,35 @@ impl WorkerDispatcher for RealDispatcher {
         subtask: Subtask,
         prior_errors: Vec<String>,
         _attempt: u8,
+        msg_tx: Option<tokio::sync::mpsc::Sender<phonton_types::messages::OrchestratorMessage>>,
     ) -> Result<SubtaskResult> {
         let provider = (self.provider_factory)(subtask.model_tier);
+        let context_slices = self.select_context(&subtask).await;
+        if let Some(tx) = &msg_tx {
+            let slices: Vec<ContextAttribution> =
+                context_slices.iter().map(ContextAttribution::from).collect();
+            let total_token_count = slices.iter().map(|s| s.token_count).sum();
+            let _ = tx
+                .send(phonton_types::messages::OrchestratorMessage::ContextSelected {
+                    id: subtask.id,
+                    slices,
+                    total_token_count,
+                })
+                .await;
+        }
         let mut worker = Worker::new(provider, self.guard.clone())
-            .with_sandbox(Arc::clone(&self.sandbox));
+            .with_sandbox(Arc::clone(&self.sandbox))
+            .with_context_manager(Arc::clone(&self.context));
+
+        if let Some(tx) = msg_tx {
+            worker = worker.with_msg_tx(tx);
+        }
 
         if let Some(memory) = self.memory.clone() {
             worker = worker.with_memory_store(memory);
         }
 
-        // Thread prior_errors back into the context slices as a synthetic
-        // "previous errors" slice — the worker's prompt renderer already
-        // handles a non-empty `prior_errors` list.
-        let context_slices = if prior_errors.is_empty() {
-            Vec::new()
-        } else {
-            // The worker renders prior_errors separately from context_slices;
-            // nothing to inject into slices here, but we preserve the hook.
-            Vec::new()
-        };
-
-        // The worker's `execute` method runs the full LLM → verify → retry
+        // The worker's `execute` method runs the full LLM â†’ verify â†’ retry
         // loop and returns a SubtaskResult with a VerifyResult already set.
         // The orchestrator re-verifies independently per its own invariant.
         let mut result = worker.execute(subtask, context_slices).await?;
@@ -116,5 +146,20 @@ impl WorkerDispatcher for RealDispatcher {
         result.diff_hunks.retain(|_| true); // no-op, keeps the compiler happy
 
         Ok(result)
+    }
+}
+
+impl RealDispatcher {
+    async fn select_context(&self, subtask: &Subtask) -> Vec<CodeSlice> {
+        let Some(semantic) = &self.semantic else {
+            return Vec::new();
+        };
+        phonton_index::query_relevant_slices(
+            &semantic.index,
+            &semantic.embedder,
+            &subtask.description,
+            5,
+        )
+        .await
     }
 }

@@ -17,6 +17,7 @@ phonton-providers    = { path = "../phonton-providers" }
 phonton-sandbox      = { path = "../phonton-sandbox" }
 phonton-diff         = { path = "../phonton-diff" }
 phonton-worker       = { path = "../phonton-worker" }
+phonton-index        = { path = "../phonton-index", features = ["semantic"] }
 anyhow               = { workspace = true }
 tokio                = { workspace = true }
 tracing              = { workspace = true }
@@ -34,4 +35,3 @@ integration-tests = []
 [dev-dependencies]
 tempfile = "3"
 git2 = "0.18"
-

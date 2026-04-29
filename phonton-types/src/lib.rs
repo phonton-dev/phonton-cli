@@ -363,6 +363,34 @@ pub struct CodeSlice {
     pub origin: SliceOrigin,
 }
 
+/// Small, review-safe summary of a context slice selected for a subtask.
+///
+/// Unlike [`CodeSlice`], this is meant for telemetry and review output:
+/// it records *what* influenced the worker without persisting full source
+/// snippets into every event row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextAttribution {
+    /// Source file that provided context.
+    pub file_path: PathBuf,
+    /// Symbol chosen from that file.
+    pub symbol_name: String,
+    /// How the slice was produced.
+    pub origin: SliceOrigin,
+    /// Token count reported by the index, or `0` when unknown.
+    pub token_count: usize,
+}
+
+impl From<&CodeSlice> for ContextAttribution {
+    fn from(slice: &CodeSlice) -> Self {
+        Self {
+            file_path: slice.file_path.clone(),
+            symbol_name: slice.symbol_name.clone(),
+            origin: slice.origin,
+            token_count: slice.token_count,
+        }
+    }
+}
+
 /// Provenance of a [`CodeSlice`].
 ///
 /// Recorded so downstream consumers (planner, worker) can reason about
@@ -623,6 +651,9 @@ pub struct PlannerOutput {
     /// Planner's pre-execution token estimate for the full task. Compared
     /// against `GlobalState::tokens_used` to report savings to the user.
     pub estimated_total_tokens: u64,
+    /// Estimated tokens a naive (non-Phonton) baseline would have spent.
+    /// Used by the UI to show the "X% saved" headline.
+    pub naive_baseline_tokens: u64,
     /// Honest-signal coverage summary surfaced to the UI alongside the plan.
     /// See `01-architecture/failure-modes.md` Risk 2.
     pub coverage_summary: CoverageSummary,

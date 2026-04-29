@@ -149,6 +149,15 @@ impl ContextManager {
             .sum()
     }
 
+    /// Render all frames into a single string for LLM consumption.
+    pub fn render(&self) -> String {
+        self.frames
+            .iter()
+            .map(frame_content)
+            .collect::<Vec<&str>>()
+            .join("\n\n")
+    }
+
     /// Configured token ceiling.
     pub fn limit_tokens(&self) -> usize {
         self.limit_tokens
@@ -298,16 +307,17 @@ mod tests {
     use std::sync::Mutex;
 
     /// Test provider: returns a fixed summary and records every call.
+    #[derive(Clone)]
     struct StubProvider {
         summary: String,
-        calls: Mutex<usize>,
+        calls: Arc<Mutex<usize>>,
     }
 
     impl StubProvider {
         fn new(summary: &str) -> Self {
             Self {
                 summary: summary.into(),
-                calls: Mutex::new(0),
+                calls: Arc::new(Mutex::new(0)),
             }
         }
     }
@@ -334,6 +344,14 @@ mod tests {
 
         fn kind(&self) -> ProviderKind {
             ProviderKind::Anthropic
+        }
+
+        fn model(&self) -> String {
+            "stub".into()
+        }
+
+        fn clone_box(&self) -> Box<dyn Provider> {
+            Box::new(self.clone())
         }
     }
 

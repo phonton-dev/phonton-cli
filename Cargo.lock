@@ -2282,6 +2282,7 @@ dependencies = [
  "dirs 5.0.1",
  "git2",
  "phonton-diff",
+ "phonton-index",
  "phonton-orchestrator",
  "phonton-planner",
  "phonton-providers",
@@ -2458,6 +2459,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "phonton-context",
  "phonton-index",
  "phonton-memory",
  "phonton-orchestrator",

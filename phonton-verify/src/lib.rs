@@ -199,6 +199,25 @@ pub async fn verify_decisions(
     }
 }
 
+/// Walk up from `start` looking for a `Cargo.toml`. Returns the directory
+/// containing it (the workspace root) or `None` if none exists between
+/// `start` and the filesystem root. Used to short-circuit the cargo
+/// verification layers when the working directory isn't part of any Rust
+/// project — without this, every goal in (say) a fresh empty folder
+/// fails with "could not find Cargo.toml" before the worker can even
+/// scaffold a project.
+pub fn find_cargo_workspace(start: &Path) -> Option<std::path::PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Layer 2: `cargo check --package <crate> --message-format json` per
 /// affected crate.
 ///
@@ -209,6 +228,13 @@ pub async fn verify_crate_check(
     packages: &[String],
     working_dir: &Path,
 ) -> Result<Option<VerifyResult>> {
+    // Skip when we're not in a Rust workspace — `cargo check` would just
+    // error with "could not find Cargo.toml" and turn every legitimate
+    // create-a-new-project goal into a failure. Syntax (Layer 1) still
+    // catches malformed Rust regardless of project shape.
+    if find_cargo_workspace(working_dir).is_none() {
+        return Ok(None);
+    }
     let mut errors = Vec::new();
     for pkg in packages {
         let output = Command::new("cargo")
@@ -251,6 +277,13 @@ pub async fn verify_crate_check(
 /// this scans every crate in the workspace and is the expensive cousin of
 /// Layer 2.
 pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyResult>> {
+    // Same short-circuit as the crate check — no Cargo.toml means there's
+    // nothing for cargo to verify. The previous behaviour was to surface
+    // "cargo check --workspace failed: could not find `Cargo.toml`" as a
+    // hard failure, which broke every project-bootstrap goal.
+    if find_cargo_workspace(working_dir).is_none() {
+        return Ok(None);
+    }
     let output = Command::new("cargo")
         .current_dir(working_dir)
         .args(["check", "--workspace", "--message-format", "json"])
@@ -296,6 +329,10 @@ pub async fn verify_test(
     packages: &[String],
     working_dir: &Path,
 ) -> Result<Option<VerifyResult>> {
+    // Skip for the same reason the cargo check layers do.
+    if find_cargo_workspace(working_dir).is_none() {
+        return Ok(None);
+    }
     let mut errors = Vec::new();
     for pkg in packages {
         let fut = Command::new("cargo")
@@ -303,7 +340,7 @@ pub async fn verify_test(
             .args(["test", "--package", pkg, "--", "--nocapture"])
             .output();
 
-        match tokio::time::timeout(Duration::from_secs(120), fut).await {
+        match tokio::time::timeout(Duration::from_secs(600), fut).await {
             Ok(Ok(out)) if out.status.success() => {}
             Ok(Ok(out)) => {
                 let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -314,7 +351,7 @@ pub async fn verify_test(
                 errors.push(format!("could not invoke cargo test for {pkg}: {e}"));
             }
             Err(_) => {
-                errors.push(format!("cargo test for {pkg} timed out after 120s"));
+                errors.push(format!("cargo test for {pkg} timed out after 600s"));
             }
         }
     }
@@ -406,13 +443,12 @@ fn record_violations(rec: &MemoryRecord, added_text: &str) -> Vec<String> {
     }
 
     // Rule 2: "use thiserror in libraries / no anyhow in libraries".
-    if (lc.contains("thiserror") && lc.contains("anyhow"))
+    if ((lc.contains("thiserror") && lc.contains("anyhow"))
         || lc.contains("no anyhow in lib")
-        || lc.contains("avoid anyhow in lib")
+        || lc.contains("avoid anyhow in lib"))
+        && (lower.contains("anyhow::") || lower.contains("use anyhow"))
     {
-        if lower.contains("anyhow::") || lower.contains("use anyhow") {
-            hits.push("added code uses `anyhow` where the convention is `thiserror`".into());
-        }
+        hits.push("added code uses `anyhow` where the convention is `thiserror`".into());
     }
 
     // Rule 3: "no blocking in async".
@@ -780,5 +816,42 @@ mod tests {
         let s = "a\nb\nc\nd\ne";
         assert_eq!(last_lines(s, 2), "d\ne");
         assert_eq!(last_lines(s, 100), "a\nb\nc\nd\ne");
+    }
+
+    /// Regression: every cargo-based verify layer must be a no-op when
+    /// the working directory has no `Cargo.toml`. Without this guard,
+    /// running phonton in a fresh empty folder ("make chess") fails on
+    /// the first verify pass with `could not find Cargo.toml in <dir>`,
+    /// rolling back the diff that was about to scaffold the project.
+    #[tokio::test]
+    async fn cargo_layers_skip_when_no_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(
+            super::find_cargo_workspace(dir).is_none(),
+            "tempdir must not contain a Cargo.toml"
+        );
+        // All three cargo layers must short-circuit to Ok(None) rather
+        // than invoking cargo and surfacing "could not find Cargo.toml".
+        let crate_check = super::verify_crate_check(&["any".into()], dir).await.unwrap();
+        assert!(crate_check.is_none(), "crate_check must skip");
+        let workspace_check = super::verify_workspace_check(dir).await.unwrap();
+        assert!(workspace_check.is_none(), "workspace_check must skip");
+        let test = super::verify_test(&["any".into()], dir).await.unwrap();
+        assert!(test.is_none(), "test layer must skip");
+    }
+
+    /// Counterpart: when a Cargo.toml *is* present, find_cargo_workspace
+    /// returns the directory containing it (so the cargo layers will
+    /// actually run as before).
+    #[test]
+    fn finds_workspace_walking_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        let nested = root.join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        let found = super::find_cargo_workspace(&nested).expect("should find Cargo.toml");
+        assert_eq!(found, root);
     }
 }

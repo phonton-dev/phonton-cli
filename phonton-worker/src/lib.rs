@@ -28,12 +28,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use phonton_context::{ContextManager, TiktokenCounter};
 use phonton_providers::Provider;
 use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
-    CodeSlice, DiffHunk, DiffLine, MemoryRecord, ModelTier, SliceOrigin, Subtask, SubtaskId,
-    SubtaskResult, SubtaskStatus, TaskId, VerifyResult,
+    CodeSlice, ContextFrame, DiffHunk, DiffLine, MemoryRecord, ModelTier, SliceOrigin, Subtask,
+    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, VerifyLayer, VerifyResult,
 };
 use regex::Regex;
 use tracing::{debug, warn};
@@ -48,6 +49,9 @@ pub mod dispatcher;
 
 /// Maximum verification attempts before escalating model tier.
 pub const MAX_ATTEMPTS: u8 = 3;
+
+/// Default token limit for the context window.
+pub const DEFAULT_WINDOW_LIMIT: usize = 120_000;
 
 // ---------------------------------------------------------------------------
 // Worker
@@ -70,6 +74,9 @@ pub struct Worker {
     memory: Option<phonton_memory::MemoryStore>,
     task_id: Option<TaskId>,
     semantic: Option<Arc<SemanticContext>>,
+    msg_tx: Option<tokio::sync::mpsc::Sender<phonton_types::messages::OrchestratorMessage>>,
+    /// Context window manager.
+    context: Arc<tokio::sync::Mutex<ContextManager>>,
 }
 
 /// Bundle of the embedder + prebuilt index used to surface relevant
@@ -91,6 +98,18 @@ impl Worker {
             guard.project_root().to_path_buf(),
             "worker".to_string(),
         ));
+
+        let counter = TiktokenCounter::new().unwrap_or_else(|_| {
+            // Fallback to char heuristic if tiktoken fails to load.
+            // In a real build this should be unwrapped.
+            panic!("failed to load tiktoken counter");
+        });
+
+        let context = ContextManager::new(
+            Arc::from(provider.clone_box()),
+            DEFAULT_WINDOW_LIMIT,
+        ).with_counter(Arc::new(counter));
+
         Self {
             provider,
             guard,
@@ -99,7 +118,19 @@ impl Worker {
             memory: None,
             task_id: None,
             semantic: None,
+            msg_tx: None,
+            context: Arc::new(tokio::sync::Mutex::new(context)),
         }
+    }
+
+    /// Attach a message sender to the worker so it can emit intermediate
+    /// telemetry (like "Thinking...") to the orchestrator.
+    pub fn with_msg_tx(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<phonton_types::messages::OrchestratorMessage>,
+    ) -> Self {
+        self.msg_tx = Some(tx);
+        self
     }
 
     /// Replace the worker's sandbox with a caller-supplied one. Typically
@@ -123,6 +154,12 @@ impl Worker {
     /// giving the next planner run visibility into completed work.
     pub fn with_memory_store(mut self, memory: phonton_memory::MemoryStore) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach a context manager to the worker.
+    pub fn with_context_manager(mut self, context: Arc<tokio::sync::Mutex<ContextManager>>) -> Self {
+        self.context = context;
         self
     }
 
@@ -181,7 +218,6 @@ impl Worker {
         context_slices: Vec<CodeSlice>,
     ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
-        let origins: Vec<SliceOrigin> = context_slices.iter().map(|s| s.origin).collect();
         let system_prompt = base_system_prompt();
 
         let relevant_slices: Vec<CodeSlice> = match &self.semantic {
@@ -196,11 +232,23 @@ impl Worker {
             }
             None => Vec::new(),
         };
+        let origins: Vec<SliceOrigin> = context_slices
+            .iter()
+            .chain(relevant_slices.iter())
+            .map(|s| s.origin)
+            .collect();
+
+        // Ensure system prompt is in context (Verbatim, priority 10).
+        // Only push if it's not already the first frame.
+        {
+            let mut ctx = self.context.lock().await;
+            if ctx.frames().is_empty() {
+                ctx.push(ContextFrame::Verbatim(system_prompt.clone())).await?;
+            }
+        }
 
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
-        // Track the provider/model from the most recent LLM call so
-        // SubtaskResult can carry them for BudgetGuard pricing.
         let mut last_provider = phonton_types::ProviderKind::Anthropic;
         let mut last_model_name = String::new();
 
@@ -208,9 +256,25 @@ impl Worker {
             let user_prompt =
                 render_user_prompt(&subtask, &context_slices, &relevant_slices, &last_errors);
 
+            if let Some(tx) = &self.msg_tx {
+                let _ = tx.try_send(phonton_types::messages::OrchestratorMessage::SubtaskThinking {
+                    id: subtask.id,
+                    model_name: self.provider.model(),
+                });
+            }
+
+            // Render current context + new user prompt. We don't push the
+            // user prompt into the manager until we get a successful
+            // response, to avoid polluting the history with failed attempts
+            // that will be superseded by the error-retry prompt.
+            let full_prompt = {
+                let ctx = self.context.lock().await;
+                format!("{}\n\n{}", ctx.render(), user_prompt)
+            };
+
             let response = self
                 .provider
-                .call(&system_prompt, &user_prompt, &origins)
+                .call(&system_prompt, &full_prompt, &origins)
                 .await?;
             last_provider = response.provider;
             last_model_name = response.model_name.clone();
@@ -218,17 +282,64 @@ impl Worker {
                 .saturating_add(response.input_tokens)
                 .saturating_add(response.output_tokens);
 
-            let hunks = parse_unified_diff(&response.content)?;
+            if let Some(tx) = &self.msg_tx {
+                let _ = tx.try_send(phonton_types::messages::OrchestratorMessage::SubtaskProgress {
+                    id: subtask.id,
+                    tokens_so_far: total_tokens,
+                });
+            }
+
+            let hunks = match parse_unified_diff(&response.content) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(attempt, error = %e, "worker could not parse diff; will retry with feedback");
+                    last_errors = vec![format!(
+                        "Your previous response could not be parsed as a unified diff. \
+                         Reply with ONLY a unified diff (no prose, no code fences). \
+                         Each file starts with `--- a/<path>` then `+++ b/<path>`, \
+                         followed by `@@ -old,n +new,n @@` hunk headers and \
+                         ` `/`+`/`-` line prefixes. Parser said: {e}"
+                    )];
+                    if attempt >= MAX_ATTEMPTS {
+                        return Ok(SubtaskResult {
+                            id: subtask.id,
+                            status: SubtaskStatus::Failed {
+                                reason: format!(
+                                    "model returned unparseable output after {MAX_ATTEMPTS} attempts: {e}"
+                                ),
+                                attempt,
+                            },
+                            diff_hunks: Vec::new(),
+                            model_tier,
+                            verify_result: VerifyResult::Fail {
+                                layer: VerifyLayer::Syntax,
+                                errors: vec![e.to_string()],
+                                attempt,
+                            },
+                            provider: last_provider,
+                            model_name: last_model_name,
+                        });
+                    }
+                    continue;
+                }
+            };
             debug!(attempt, hunks = hunks.len(), "worker received diff");
 
             let verdict =
                 phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
             match verdict {
                 VerifyResult::Pass { layer } => {
-                    // Memory is a warm part of the loop: every passing
-                    // subtask gets a pass at decision extraction before
-                    // we return. Extraction failure is logged, not fatal —
-                    // the verified diff is what the user contracted for.
+                    // Success! Record this exchange in the shared context manager.
+                    // This is what allows subsequent subtasks to "remember"
+                    // what this subtask did.
+                    {
+                        let mut ctx = self.context.lock().await;
+                        ctx.push(ContextFrame::Summarizable {
+                            content: format!("USER: {}\n\nASSISTANT: {}", user_prompt, response.content),
+                            priority: 5, // SUMMARY_PRIORITY equivalent
+                        }).await?;
+                    }
+
                     if let Err(e) = self.persist_decisions(&subtask) {
                         warn!(error = %e, "failed to persist subtask decisions");
                     }
@@ -267,7 +378,6 @@ impl Worker {
                         "verify failed; will retry"
                     );
                     last_errors = errors;
-                    // Loop continues; next iteration re-prompts with errors.
                 }
                 VerifyResult::Escalate { reason } => {
                     return Ok(failed_result(
@@ -607,13 +717,20 @@ fn next_tier(t: ModelTier) -> ModelTier {
 /// never compressed. The diff-only constraint is hard-coded here per the
 /// rule in `phonton-brain/CLAUDE.md`.
 fn base_system_prompt() -> String {
-    "You are a Phonton worker. You produce code changes as unified diffs only.\n\
-     Output ONLY unified diff hunks of the form:\n\
-       --- a/<path>\n\
-       +++ b/<path>\n\
-       @@ -<old_start>,<old_count> +<new_start>,<new_count> @@\n\
-       <context/added/removed lines>\n\
-     Do not output unchanged code. Do not narrate. Do not explain.\n"
+    "You are a Phonton worker. You produce code changes as unified diffs ONLY.\n\
+     Your output must be a single, parseable unified diff. NO PROSE. NO COMMENTARY. NO EXPLANATION.\n\n\
+     EXAMPLE OF CREATING A NEW FILE `main.c`:\n\
+     --- /dev/null\n\
+     +++ b/main.c\n\
+     @@ -0,0 +1,1 @@\n\
+     +int main() { return 0; }\n\n\
+     CRITICAL RULES:\n\
+     1. START YOUR RESPONSE WITH `--- a/` OR `--- /dev/null`. DO NOT ADD ANY TEXT BEFORE IT.\n\
+     2. Do NOT wrap your output in markdown code fences (```diff).\n\
+     3. Do NOT explain what you are doing. Output the diff and nothing else.\n\
+     4. Do NOT include unchanged code in the diff unless it is for context (max 3 lines).\n\
+     5. If you have nothing to change, output an empty response.\n\
+     6. ANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n"
         .to_string()
 }
 
@@ -655,18 +772,55 @@ fn render_user_prompt(
             out.push('\n');
         }
     }
+
+    out.push_str("\n# CRITICAL\n");
+    out.push_str("Output the UNIFIED DIFF for the above subtask. START with `--- a/` or `--- /dev/null`. NO PREAMBLE. NO PROSE.\n");
+
     out
 }
 
 /// Minimal unified-diff parser. Sufficient for the model output the worker
 /// expects (one `--- a/ +++ b/` header per file, `@@` hunk headers, then
-/// ` `/`+`/`-` lines). Real-world edge cases — rename headers, binary
-/// markers — are deferred to `phonton-diff`.
+/// ` `/`+`/`-` lines).
+///
+/// Tolerant of common LLM idioms:
+/// * Fenced code blocks (```diff … ```, ```patch …, plain ```) are
+///   un-fenced before parsing — many models wrap the diff regardless of
+///   prompting.
+/// * Conversational prose before/after the diff is silently skipped.
+/// * A malformed `@@` header inside an otherwise-valid stream marks
+///   *just that hunk* invalid; the rest of the stream still parses. The
+///   first malformed-hunk reason is surfaced if zero hunks survive, so
+///   the caller can feed it back to the model on retry.
+///
+/// Returns `Err` only when there is **no** valid diff content at all.
+/// Real-world edge cases — rename headers, binary markers — are deferred
+/// to `phonton-diff`.
 pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
+    // Step 1: extract the diff body. If the response is wrapped in a
+    // fenced code block we want only what's between the fences. If it's
+    // plain text we use it as-is. Everything before the first diff
+    // marker (`---`, `+++ b/`, `@@`) is treated as preamble and dropped.
+    let body = unfence_diff(text);
+
+    // Explicit preamble stripping: find the first line that looks like
+    // a diff header and start from there.
+    let markers = ["--- ", "+++ ", "@@ "];
+    let mut start_idx = 0;
+    let lines_vec: Vec<&str> = body.lines().collect();
+    for (i, line) in lines_vec.iter().enumerate() {
+        if markers.iter().any(|m| line.starts_with(m)) {
+            start_idx = i;
+            break;
+        }
+    }
+    let body_trimmed = lines_vec[start_idx..].join("\n");
+
     let mut hunks: Vec<DiffHunk> = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut header: Option<(u32, u32, u32, u32)> = None;
     let mut lines: Vec<DiffLine> = Vec::new();
+    let mut last_parse_err: Option<String> = None;
 
     fn flush(
         hunks: &mut Vec<DiffHunk>,
@@ -688,8 +842,13 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
         }
     }
 
-    for raw in text.lines() {
+    for raw in body_trimmed.lines() {
         if let Some(rest) = raw.strip_prefix("+++ b/") {
+            flush(&mut hunks, &current_path, &header, &mut lines);
+            current_path = Some(PathBuf::from(rest.trim()));
+            header = None;
+        } else if let Some(rest) = raw.strip_prefix("+++ ") {
+            // Some models drop the `b/` prefix.
             flush(&mut hunks, &current_path, &header, &mut lines);
             current_path = Some(PathBuf::from(rest.trim()));
             header = None;
@@ -698,7 +857,17 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
             continue;
         } else if let Some(rest) = raw.strip_prefix("@@") {
             flush(&mut hunks, &current_path, &header, &mut lines);
-            header = Some(parse_hunk_header(rest)?);
+            // A bad header invalidates *only* this hunk — record the
+            // reason and keep scanning for the next valid one. This
+            // turns "model returned slightly wrong @@ counts" from a
+            // hard task failure into a recoverable retry-with-error.
+            match parse_hunk_header(rest) {
+                Ok(h) => header = Some(h),
+                Err(e) => {
+                    last_parse_err = Some(format!("malformed hunk header `{}`: {e}", raw.trim()));
+                    header = None;
+                }
+            }
         } else if header.is_some() {
             if let Some(s) = raw.strip_prefix('+') {
                 lines.push(DiffLine::Added(s.to_string()));
@@ -707,10 +876,57 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
             } else if let Some(s) = raw.strip_prefix(' ') {
                 lines.push(DiffLine::Context(s.to_string()));
             }
+            // Lines outside the +/-/space alphabet inside an open hunk
+            // are silently dropped (often a stray blank from the model).
         }
     }
     flush(&mut hunks, &current_path, &header, &mut lines);
+
+    if hunks.is_empty() {
+        // Nothing usable. Build a diagnostic that the worker can feed
+        // back to the model on retry — preview enough of the response
+        // for the user to see what went wrong without flooding the UI.
+        let preview: String = text.chars().take(200).collect();
+        let detail = match last_parse_err {
+            Some(reason) => reason,
+            None => "no `+++ b/<path>` or `@@` markers found".into(),
+        };
+        return Err(anyhow!(
+            "model output did not contain a parseable unified diff ({detail}). \
+             Got (first 200 chars): {preview:?}"
+        ));
+    }
+
     Ok(hunks)
+}
+
+/// Strip a single ```/```diff/```patch fenced code block out of `text`,
+/// returning its body. If no fence is present the original text is
+/// returned. If multiple fences are present the *first* one wins —
+/// in practice the model puts the diff in the first block and the rest
+/// is commentary.
+fn unfence_diff(text: &str) -> String {
+    let mut in_fence = false;
+    let mut captured = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !in_fence {
+            if trimmed.starts_with("```") {
+                in_fence = true;
+                continue;
+            }
+        } else {
+            if trimmed.starts_with("```") {
+                // End of the first fenced block — stop and return what
+                // we captured so trailing prose doesn't pollute the parse.
+                return captured;
+            }
+            captured.push_str(line);
+            captured.push('\n');
+        }
+    }
+    // No closing fence (or no fences at all) — fall back to the full text.
+    if captured.is_empty() { text.to_string() } else { captured }
 }
 
 /// Parse the `-old_start,old_count +new_start,new_count @@` portion of a

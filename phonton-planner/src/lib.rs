@@ -123,6 +123,7 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
     PlannerOutput {
         subtasks,
         estimated_total_tokens: estimate_tokens(&detections, goal),
+        naive_baseline_tokens: estimate_naive_tokens(&detections, goal),
         coverage_summary: CoverageSummary {
             new_functions,
             tests_planned,
@@ -155,6 +156,8 @@ pub struct SubtaskSpec {
 pub struct DecomposedPlan {
     pub subtasks: Vec<Subtask>,
     pub coverage_summary: CoverageSummary,
+    pub estimated_total_tokens: u64,
+    pub naive_baseline_tokens: u64,
 }
 
 /// Decompose `goal` via an LLM provider, falling back to [`decompose_regex`]
@@ -174,14 +177,35 @@ pub async fn decompose_with_llm(
 
     let response = provider.call(system, &user, &[]).await?;
     match parse_subtask_specs(&response.content) {
-        Ok(specs) if !specs.is_empty() && is_dag(&specs) => Ok(specs_to_plan(specs)),
+        Ok(specs) if !specs.is_empty() && is_dag(&specs) => {
+            let plan = specs_to_plan(specs);
+            let dets = detect_new_symbols(goal);
+            Ok(DecomposedPlan {
+                subtasks: plan.subtasks,
+                coverage_summary: plan.coverage_summary,
+                estimated_total_tokens: estimate_tokens(&dets, &Goal::new(goal)),
+                naive_baseline_tokens: estimate_naive_tokens(&dets, &Goal::new(goal)),
+            })
+        }
         Ok(_) => {
             warn!("LLM decomposer returned empty or cyclic plan; falling back to regex");
-            Ok(plan_to_decomposed(decompose_regex(&Goal::new(goal.to_string()))))
+            let fallback = decompose_regex(&Goal::new(goal.to_string()));
+            Ok(DecomposedPlan {
+                subtasks: fallback.subtasks,
+                coverage_summary: fallback.coverage_summary,
+                estimated_total_tokens: fallback.estimated_total_tokens,
+                naive_baseline_tokens: fallback.naive_baseline_tokens,
+            })
         }
         Err(e) => {
             warn!(error = %e, "LLM decomposer JSON parse failed; falling back to regex");
-            Ok(plan_to_decomposed(decompose_regex(&Goal::new(goal.to_string()))))
+            let fallback = decompose_regex(&Goal::new(goal.to_string()));
+            Ok(DecomposedPlan {
+                subtasks: fallback.subtasks,
+                coverage_summary: fallback.coverage_summary,
+                estimated_total_tokens: fallback.estimated_total_tokens,
+                naive_baseline_tokens: fallback.naive_baseline_tokens,
+            })
         }
     }
 }
@@ -303,13 +327,8 @@ fn specs_to_plan(specs: Vec<SubtaskSpec>) -> DecomposedPlan {
             new_functions,
             tests_planned,
         },
-    }
-}
-
-fn plan_to_decomposed(p: PlannerOutput) -> DecomposedPlan {
-    DecomposedPlan {
-        subtasks: p.subtasks,
-        coverage_summary: p.coverage_summary,
+        estimated_total_tokens: 0, // Filled in by caller
+        naive_baseline_tokens: 0,  // Filled in by caller
     }
 }
 
@@ -357,7 +376,8 @@ pub async fn decompose_with_memory(
         let llm_plan = decompose_with_llm(&goal.description, p, &memory_context).await?;
         return Ok(PlannerOutput {
             subtasks: llm_plan.subtasks,
-            estimated_total_tokens: 0,
+            estimated_total_tokens: llm_plan.estimated_total_tokens,
+            naive_baseline_tokens: llm_plan.naive_baseline_tokens,
             coverage_summary: llm_plan.coverage_summary,
         });
     }
@@ -475,8 +495,9 @@ fn memory_keywords(goal: &str) -> Vec<String> {
 fn is_stopword(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
-        "the" | "and" | "with" | "for" | "into" | "that" | "this" |
-        "from" | "when" | "then" | "also"
+        "a" | "an" | "the" | "and" | "with" | "for" | "into" | "that" | "this" |
+        "from" | "when" | "then" | "also" | "base" | "basic" | "skeletal" |
+        "initial" | "simple" | "project" | "everything" | "anything"
     )
 }
 
@@ -575,6 +596,18 @@ fn estimate_tokens(detections: &[Detection], goal: &Goal) -> u64 {
     base + per_impl * impls + per_test * tests
 }
 
+/// Crude naive baseline estimate. Assumes a stateless agent would load
+/// the entire relevant file set for every turn.
+fn estimate_naive_tokens(detections: &[Detection], goal: &Goal) -> u64 {
+    // 30k input tokens is a typical "whole file load" payload for a medium
+    // repo turn. 5k output for the inevitable narration and whole-file
+    // rewrites.
+    let per_turn = 35_000u64;
+    let turns = detections.len().max(1) as u64;
+    let tests = if goal.no_tests { 0 } else { detections.len() as u64 };
+    (turns + tests) * per_turn
+}
+
 // ---------------------------------------------------------------------------
 // Task classification (for dynamic routing)
 // ---------------------------------------------------------------------------
@@ -610,22 +643,38 @@ pub fn detect_new_symbols(text: &str) -> Vec<Detection> {
     //   "define enum VerifyLayer"
     let re = Regex::new(
         r"(?ix)
-        \b(?:add|create|implement|introduce|write|define|build)\b
+        \b(?P<verb>add|create|implement|introduce|write|define|build|make)\b
         [^\.\n]{0,40}?
-        \b(?P<kind>function|fn|struct|enum|trait|method|module|type)\b
-        [\s:`'(]*
-        (?P<name>[A-Za-z_][A-Za-z0-9_]*)
+        (?:
+            \b(?P<kind>function|fn|struct|enum|trait|method|module|type)\b
+            [\s:`'(]*
+            (?P<name>[A-Za-z_][A-Za-z0-9_]*)
+        |
+            \b(?P<generic_name>[A-Za-z_][A-Za-z0-9_]{2,})\b
+        )
         ",
     )
     .expect("planner regex is well-formed");
 
     let mut out: Vec<Detection> = Vec::new();
     for caps in re.captures_iter(text) {
-        let kind = normalise_kind(&caps["kind"]);
-        let name = caps["name"].to_string();
-        // Skip the kind word itself if the regex grabbed it as a name
-        // (shouldn't happen with the alternation above, but cheap to guard).
-        if is_kind_word(&name) {
+        let kind = caps.name("kind")
+            .map(|m| normalise_kind(m.as_str()))
+            .unwrap_or_else(|| "feature".to_string());
+
+        let name = if let Some(n) = caps.name("name") {
+            n.as_str().to_string()
+        } else if let Some(n) = caps.name("generic_name") {
+            let n_str = n.as_str();
+            if is_stopword(n_str) {
+                continue;
+            }
+            n_str.to_string()
+        } else {
+            continue;
+        };
+
+        if name.is_empty() || is_kind_word(&name) {
             continue;
         }
         let det = Detection { kind, name };
@@ -845,6 +894,7 @@ mod tests {
     // LLM decomposer tests
     // -----------------------------------------------------------------
 
+    #[derive(Clone)]
     struct MockProvider {
         response: String,
     }
@@ -868,7 +918,15 @@ mod tests {
             })
         }
         fn kind(&self) -> phonton_types::ProviderKind {
-            phonton_types::ProviderKind::Anthropic
+            phonton_types::ProviderKind::OpenAI
+        }
+
+        fn model(&self) -> String {
+            "mock".into()
+        }
+
+        fn clone_box(&self) -> Box<dyn Provider> {
+            Box::new(self.clone())
         }
     }
 

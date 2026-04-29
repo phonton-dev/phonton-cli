@@ -9,9 +9,10 @@ phonton-providers    = { path = "../phonton-providers" }
 phonton-verify       = { path = "../phonton-verify" }
 phonton-store        = { path = "../phonton-store" }
 phonton-memory       = { path = "../phonton-memory" }
-phonton-index        = { path = "../phonton-index" }
+phonton-index        = { path = "../phonton-index", features = ["semantic"] }
 phonton-sandbox      = { path = "../phonton-sandbox" }
 phonton-orchestrator = { path = "../phonton-orchestrator" }
+phonton-context      = { path = "../phonton-context" }
 anyhow               = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true }

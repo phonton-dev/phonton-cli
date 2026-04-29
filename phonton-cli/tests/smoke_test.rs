@@ -1,17 +1,17 @@
 #![cfg(feature = "integration-tests")]
 
 use anyhow::Result;
+use async_trait::async_trait;
 use phonton_orchestrator::{Orchestrator, WorkerDispatcher};
 use phonton_planner::{decompose_with_memory, Goal};
 use phonton_store::Store;
 use phonton_types::{
-    DiffHunk, DiffLine, Subtask, SubtaskResult, SubtaskStatus, VerifyLayer,
-    VerifyResult,
+    DiffHunk, DiffLine, OrchestratorMessage, ProviderKind, Subtask, SubtaskResult, SubtaskStatus,
+    VerifyLayer, VerifyResult,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
-use async_trait::async_trait;
 
 pub struct StubDispatcher;
 
@@ -22,6 +22,7 @@ impl WorkerDispatcher for StubDispatcher {
         subtask: Subtask,
         _prior_errors: Vec<String>,
         _attempt: u8,
+        _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
     ) -> Result<SubtaskResult> {
         let hunks = vec![DiffHunk {
             file_path: format!("src/stub_{}.rs", subtask.id).into(),
@@ -42,6 +43,8 @@ impl WorkerDispatcher for StubDispatcher {
             verify_result: VerifyResult::Pass {
                 layer: VerifyLayer::Syntax,
             },
+            provider: ProviderKind::Anthropic,
+            model_name: "test-stub".into(),
         })
     }
 }
@@ -51,12 +54,15 @@ async fn smoke_test_full_pipeline() -> Result<()> {
     // 1. Create a temp git repo with a single Rust file
     let dir = tempdir()?;
     let repo = git2::Repository::init(dir.path())?;
-    
+
     let src_dir = dir.path().join("src");
     std::fs::create_dir_all(&src_dir)?;
-    std::fs::write(src_dir.join("lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }")?;
-    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"smoke-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")?;
-    
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+    )?;
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"phonton-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [ \".\" ]\n")?;
+
     // Commit to git
     let mut index = repo.index()?;
     index.add_path(std::path::Path::new("src/lib.rs"))?;
@@ -75,7 +81,10 @@ async fn smoke_test_full_pipeline() -> Result<()> {
     let plan = decompose_with_memory(&goal, &store, None).await?;
 
     // 4. Assert plan has at least 1 subtask with "multiply"
-    assert!(plan.subtasks.iter().any(|s| s.description.to_lowercase().contains("multiply")));
+    assert!(plan
+        .subtasks
+        .iter()
+        .any(|s| s.description.to_lowercase().contains("multiply")));
 
     // 5. Create Orchestrator with StubDispatcher
     let dispatcher = Arc::new(StubDispatcher);
@@ -93,8 +102,11 @@ async fn smoke_test_full_pipeline() -> Result<()> {
     });
 
     // 6. Run orchestrator with the plan via timeout
-    let final_status = tokio::time::timeout(Duration::from_secs(30), orchestrator.run_task(plan, state_tx))
-        .await??;
+    let final_status = tokio::time::timeout(
+        Duration::from_secs(30),
+        orchestrator.run_task(plan, state_tx),
+    )
+    .await??;
 
     let state = state_rx.borrow().clone();
 

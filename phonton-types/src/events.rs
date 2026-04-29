@@ -11,7 +11,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ModelTier, SubtaskId, TaskId, VerifyLayer};
+use crate::{
+    ContextAttribution, DiffHunk, ModelTier, ProviderKind, SubtaskId, TaskId, VerifyResult,
+};
 
 /// Token threshold between successive [`OrchestratorEvent::TokenMilestone`]
 /// events. Chosen to be coarse enough to keep the flight log readable on
@@ -55,6 +57,26 @@ pub enum OrchestratorEvent {
         subtask_id: SubtaskId,
         tokens_used: u64,
     },
+    /// Review payload for a verified subtask. This is emitted only after
+    /// `phonton-verify` passes, so downstream UIs can treat it as the
+    /// durable "ready for human review" handoff.
+    SubtaskReviewReady {
+        subtask_id: SubtaskId,
+        description: String,
+        tier: ModelTier,
+        tokens_used: u64,
+        diff_hunks: Vec<DiffHunk>,
+        verify_result: VerifyResult,
+        provider: ProviderKind,
+        model_name: String,
+    },
+    /// Semantic-index context selected for a subtask before the worker
+    /// prompt was built. This makes the token/context claim inspectable.
+    ContextSelected {
+        subtask_id: SubtaskId,
+        slices: Vec<ContextAttribution>,
+        total_token_count: usize,
+    },
     /// A subtask hit terminal failure (retry + escalation budget exhausted).
     SubtaskFailed {
         subtask_id: SubtaskId,
@@ -64,12 +86,12 @@ pub enum OrchestratorEvent {
     /// `phonton-verify` returned `Pass` for a produced diff.
     VerifyPass {
         subtask_id: SubtaskId,
-        layer: VerifyLayer,
+        layer: crate::VerifyLayer,
     },
     /// `phonton-verify` returned `Fail`. The orchestrator may still retry.
     VerifyFail {
         subtask_id: SubtaskId,
-        layer: VerifyLayer,
+        layer: crate::VerifyLayer,
         errors: Vec<String>,
         attempt: u8,
     },
@@ -85,6 +107,12 @@ pub enum OrchestratorEvent {
         task_id: TaskId,
         tokens_used: u64,
         milestone: u64,
+    },
+    /// a worker is waiting for the LLM to reply. Surfaces as "thinking"
+    /// in the UI so the user knows why the task is hanging.
+    Thinking {
+        subtask_id: SubtaskId,
+        model_name: String,
     },
     /// A subtask landed and the orchestrator created a point-in-time
     /// checkpoint via `phonton-diff`. Surfaces the user-visible `seq`
@@ -124,12 +152,15 @@ impl EventRecord {
             OrchestratorEvent::TaskFailed { .. } => "task-failed",
             OrchestratorEvent::TaskCompleted { .. } => "task-done",
             OrchestratorEvent::SubtaskDispatched { .. } => "dispatch",
+            OrchestratorEvent::ContextSelected { .. } => "context",
             OrchestratorEvent::SubtaskCompleted { .. } => "subtask-done",
+            OrchestratorEvent::SubtaskReviewReady { .. } => "review-ready",
             OrchestratorEvent::SubtaskFailed { .. } => "subtask-failed",
             OrchestratorEvent::VerifyPass { .. } => "verify-pass",
             OrchestratorEvent::VerifyFail { .. } => "verify-fail",
             OrchestratorEvent::VerifyEscalated { .. } => "escalate",
             OrchestratorEvent::TokenMilestone { .. } => "tokens",
+            OrchestratorEvent::Thinking { .. } => "thinking",
             OrchestratorEvent::CheckpointCreated { .. } => "checkpoint",
             OrchestratorEvent::RollbackPerformed { .. } => "rollback",
         }
@@ -154,6 +185,28 @@ impl EventRecord {
             OrchestratorEvent::SubtaskCompleted { subtask_id, tokens_used } => {
                 format!("done {subtask_id} tokens={tokens_used}")
             }
+            OrchestratorEvent::ContextSelected {
+                subtask_id,
+                slices,
+                total_token_count,
+            } => {
+                format!(
+                    "context {subtask_id}: {} slices, {} indexed tokens",
+                    slices.len(),
+                    total_token_count
+                )
+            }
+            OrchestratorEvent::SubtaskReviewReady {
+                subtask_id,
+                diff_hunks,
+                verify_result,
+                ..
+            } => {
+                format!(
+                    "review ready {subtask_id}: {} hunks, verify={verify_result:?}",
+                    diff_hunks.len()
+                )
+            }
             OrchestratorEvent::SubtaskFailed { subtask_id, reason, attempt } => {
                 format!("fail {subtask_id} attempt={attempt}: {reason}")
             }
@@ -171,6 +224,9 @@ impl EventRecord {
             }
             OrchestratorEvent::TokenMilestone { tokens_used, milestone, .. } => {
                 format!("tokens crossed {milestone} — now at {tokens_used}")
+            }
+            OrchestratorEvent::Thinking { subtask_id, model_name } => {
+                format!("thinking {subtask_id} model={model_name}")
             }
             OrchestratorEvent::CheckpointCreated {
                 subtask_id,
