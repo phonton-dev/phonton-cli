@@ -1,0 +1,19 @@
+<svg width="160" height="160" viewBox="0 0 160 160" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Phonton CLI logo</title>
+  <desc id="desc">A cyan and violet geometric P mark for Phonton CLI.</desc>
+  <defs>
+    <linearGradient id="mark" x1="28" y1="20" x2="134" y2="142" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#31E7F2"/>
+      <stop offset="0.55" stop-color="#57B7FF"/>
+      <stop offset="1" stop-color="#9B7CFF"/>
+    </linearGradient>
+    <filter id="shadow" x="0" y="0" width="160" height="160" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000814" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <rect x="10" y="10" width="140" height="140" rx="34" fill="#0B111B"/>
+  <path d="M47 45C47 38.373 52.373 33 59 33H97C114.673 33 129 47.327 129 65C129 82.673 114.673 97 97 97H73V121C73 127.627 67.627 133 61 133H47V45Z" fill="url(#mark)" filter="url(#shadow)"/>
+  <path d="M73 57H96C100.418 57 104 60.582 104 65C104 69.418 100.418 73 96 73H73V57Z" fill="#0B111B" fill-opacity="0.96"/>
+  <path d="M73 97H96C100.418 97 104 100.582 104 105C104 109.418 100.418 113 96 113H73V97Z" fill="#0B111B" fill-opacity="0.96"/>
+  <path d="M47 45C47 38.373 52.373 33 59 33H73V133H47V45Z" fill="url(#mark)"/>
+</svg>

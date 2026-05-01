@@ -1,14 +1,31 @@
-# Phonton CLI
+<p align="center">
+  <img src="assets/readme/phonton-cli-logo.svg" width="92" alt="Phonton CLI logo">
+</p>
+
+<h1 align="center">Phonton CLI · v0.1.0</h1>
+
+<p align="center">
+  <strong>Verified code changes with repo memory.</strong><br>
+  A local-first agentic development environment for developers who want autonomous code changes without giving up review control.
+</p>
+
+<p align="center">
+  <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
+  <img alt="release" src="https://img.shields.io/badge/release-v0.1.0-6c63ff">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
+  <img alt="status" src="https://img.shields.io/badge/status-private_alpha-f97316">
+</p>
+
+---
+
+Phonton plans the work, routes it through local repo context, verifies changes before handoff, and keeps the result reviewable. The goal is not to be the loudest coding agent. The goal is to make AI-assisted development feel less reckless.
+
+> Current status: pre-1.0 private-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
 
 <p align="center">
   <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI task board showing plan, verify, and review columns">
 </p>
-
-Phonton CLI is a local-first agentic development environment for developers who want autonomous code changes without giving up review control.
-
-It plans the work, routes it through local repo context, verifies changes before handoff, and keeps the result reviewable. The goal is not to be the loudest coding agent. The goal is to make AI-assisted development feel less reckless.
-
-> Current status: pre-1.0 private-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
 
 ## Why Phonton
 

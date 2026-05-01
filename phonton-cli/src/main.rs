@@ -4359,12 +4359,12 @@ mod tests {
     #[test]
     fn detects_real_api_keys_but_not_goals() {
         // Provider-prefix keys must be caught.
-        assert!(looks_like_api_key("sk-ant-abcdef1234567890"));
-        assert!(looks_like_api_key("AIzaSyC-A7vyuC7DcCpwW6V7oxVMI9QwCvIoXs"));
-        assert!(looks_like_api_key("sk-proj-1234567890abcdef"));
-        assert!(looks_like_api_key("xai-1234567890abcdef"));
-        assert!(looks_like_api_key("gsk_1234567890abcdef"));
-        assert!(looks_like_api_key("key_CaQt2deyHSjWVAJbTGdXi"));
+        assert!(looks_like_api_key("sk-ant-FAKE_TEST_KEY_123456"));
+        assert!(looks_like_api_key("AIzaFAKE_TEST_KEY_1234567890"));
+        assert!(looks_like_api_key("sk-proj-FAKE_TEST_KEY_123456"));
+        assert!(looks_like_api_key("xai-FAKE_TEST_KEY_123456"));
+        assert!(looks_like_api_key("gsk_FAKE_TEST_KEY_123456"));
+        assert!(looks_like_api_key("key_FAKE_TEST_KEY_123456"));
 
         // Plausible goals must NOT be caught.
         assert!(!looks_like_api_key("make a chess game"));
@@ -4379,7 +4379,7 @@ mod tests {
     #[test]
     fn enter_with_api_key_redirects_to_settings() {
         let mut app = App::default();
-        for c in "sk-ant-totallyfakebuthasrightprefix".chars() {
+        for c in "sk-ant-FAKE_TEST_KEY_123456".chars() {
             app.handle_key(key(c));
         }
         let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

@@ -723,8 +723,8 @@ fn next_tier(t: ModelTier) -> ModelTier {
 // ---------------------------------------------------------------------------
 
 /// Base system prompt. Pinned `Verbatim` in the worker's context window —
-/// never compressed. The diff-only constraint is hard-coded here per the
-/// rule in `phonton-brain/CLAUDE.md`.
+/// never compressed. The diff-only constraint is hard-coded here because
+/// review and verification expect parseable unified diffs.
 fn base_system_prompt() -> String {
     "You are a Phonton worker. You produce code changes as unified diffs ONLY.\n\
      Your output must be a single, parseable unified diff. NO PROSE. NO COMMENTARY. NO EXPLANATION.\n\n\
