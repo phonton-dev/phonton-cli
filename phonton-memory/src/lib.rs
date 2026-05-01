@@ -87,7 +87,7 @@ impl MemoryStore {
         // Descending by score. Stable sort keeps insertion order (which
         // reflects recency, since we selected without an ORDER BY) as the
         // tiebreaker — slightly preferring older entries. Good enough.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(_, r)| r).collect())
     }
