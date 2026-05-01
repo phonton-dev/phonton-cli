@@ -308,7 +308,7 @@ impl Sandbox {
 
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::process::CommandExt;
+            tracing::debug!(task_id = %self.task_id, "linux sandbox: configuring namespaces");
             unsafe {
                 cmd.pre_exec(|| {
                     if let Err(e) = nix::sched::unshare(
