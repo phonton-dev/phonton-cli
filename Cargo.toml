@@ -17,6 +17,12 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/phonton-dev/phonton-cli"
+homepage = "https://phonton.dev"
+edition = "2021"
+
 [workspace.dependencies]
 tokio     = { version = "1", features = ["full"] }
 serde     = { version = "1", features = ["derive"] }

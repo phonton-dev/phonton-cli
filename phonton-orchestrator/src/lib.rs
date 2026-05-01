@@ -95,7 +95,12 @@ impl BudgetGuard {
 
     /// Register the price of `model` under `provider`. Without an entry
     /// the guard only enforces the token ceiling for that model.
-    pub fn with_price(mut self, provider: ProviderKind, model: &str, pricing: ModelPricing) -> Self {
+    pub fn with_price(
+        mut self,
+        provider: ProviderKind,
+        model: &str,
+        pricing: ModelPricing,
+    ) -> Self {
         self.pricing.insert((provider, model.to_string()), pricing);
         self
     }
@@ -353,10 +358,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
     /// a point-in-time checkpoint commit after every subtask passes
     /// verify. The applier is shared (`Arc<Mutex<...>>`) so the same
     /// instance can also be used to apply hunks elsewhere.
-    pub fn with_diff_applier(
-        mut self,
-        diff: Arc<Mutex<phonton_diff::DiffApplier>>,
-    ) -> Self {
+    pub fn with_diff_applier(mut self, diff: Arc<Mutex<phonton_diff::DiffApplier>>) -> Self {
         self.diff_applier = Some(diff);
         self
     }
@@ -427,11 +429,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let (worker_msg_tx, mut worker_msg_rx) = mpsc::channel::<OrchestratorMessage>(32);
 
         // Take ownership of the control channel for the duration of this run.
-        let mut control_rx = self
-            .control_rx
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
+        let mut control_rx = self.control_rx.lock().ok().and_then(|mut g| g.take());
 
         // Initial broadcast so UIs see the freshly planned task.
         broadcast(
@@ -547,7 +545,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
             // 4. Route through verify, possibly re-dispatch.
             let dispatch_result = match dispatch_outcome {
-                Ok(sr) => self.handle_completion(&mut runtimes, id, sr, &mut joinset, worker_msg_tx.clone()).await,
+                Ok(sr) => {
+                    self.handle_completion(
+                        &mut runtimes,
+                        id,
+                        sr,
+                        &mut joinset,
+                        worker_msg_tx.clone(),
+                    )
+                    .await
+                }
                 Err(e) => {
                     warn!(subtask = %id, error = %e, "worker dispatch returned Err");
                     fail_subtask(&mut runtimes, id, format!("dispatch error: {e}"));
@@ -569,7 +576,13 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 let newly_done: Vec<(SubtaskId, String, Vec<phonton_types::DiffHunk>)> = runtimes
                     .values()
                     .filter(|r| r.is_done() && !checkpointed.contains(&r.subtask.id))
-                    .map(|r| (r.subtask.id, r.subtask.description.clone(), r.diff_hunks.clone()))
+                    .map(|r| {
+                        (
+                            r.subtask.id,
+                            r.subtask.description.clone(),
+                            r.diff_hunks.clone(),
+                        )
+                    })
                     .collect();
                 for (sid, desc, hunks) in newly_done {
                     let seq = next_seq;
@@ -649,7 +662,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                                 .unwrap_or((ProviderKind::Anthropic, String::new()));
                             let _ = g.charge(charge_provider, &charge_model, delta, 0);
                         }
-                        if let BudgetDecision::Pause { limit, observed, ceiling } = g.decision() {
+                        if let BudgetDecision::Pause {
+                            limit,
+                            observed,
+                            ceiling,
+                        } = g.decision()
+                        {
                             paused = Some((id, limit, observed, ceiling));
                             joinset.abort_all();
                         }
@@ -674,7 +692,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         //    failure (the pause aborted the joinset so any failure that
         //    raced in is noise). Real failures take priority over nothing.
         let terminal = if let Some((_, limit, observed, ceiling)) = paused {
-            TaskStatus::Paused { limit, observed, ceiling }
+            TaskStatus::Paused {
+                limit,
+                observed,
+                ceiling,
+            }
         } else if let Some((fid, reason)) = failure {
             self.emit(OrchestratorEvent::TaskFailed {
                 task_id: self.task_id,
@@ -692,9 +714,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             });
             TaskStatus::Reviewing {
                 tokens_used,
-                estimated_savings_tokens: self
-                    .estimated_naive_tokens
-                    .saturating_sub(tokens_used),
+                estimated_savings_tokens: self.estimated_naive_tokens.saturating_sub(tokens_used),
             }
         };
         broadcast(
@@ -884,7 +904,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
         worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
     ) {
-        let Some(rt) = runtimes.get_mut(&id) else { return };
+        let Some(rt) = runtimes.get_mut(&id) else {
+            return;
+        };
         rt.status = SubtaskStatus::Dispatched;
         rt.is_thinking = false;
         let subtask = rt.subtask.clone();
@@ -900,7 +922,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
         let tx = Some(worker_msg_tx);
         joinset.spawn(async move {
-            let r = dispatcher.dispatch(subtask, prior_errors, attempt, tx).await;
+            let r = dispatcher
+                .dispatch(subtask, prior_errors, attempt, tx)
+                .await;
             (id, r)
         });
     }
@@ -921,7 +945,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 .ok_or_else(|| anyhow!("unknown subtask id {id}"))?;
             let worker_tokens = match &sr.status {
                 SubtaskStatus::Done { tokens_used, .. }
-                | SubtaskStatus::Running { tokens_so_far: tokens_used, .. } => *tokens_used,
+                | SubtaskStatus::Running {
+                    tokens_so_far: tokens_used,
+                    ..
+                } => *tokens_used,
                 _ => 0,
             };
             rt.tokens_used = rt.tokens_used.saturating_add(worker_tokens);
@@ -1119,11 +1146,7 @@ fn next_tier(t: ModelTier) -> ModelTier {
     }
 }
 
-fn fail_subtask(
-    runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>,
-    id: SubtaskId,
-    reason: String,
-) {
+fn fail_subtask(runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>, id: SubtaskId, reason: String) {
     if let Some(rt) = runtimes.get_mut(&id) {
         rt.status = SubtaskStatus::Failed {
             reason,
@@ -1165,7 +1188,9 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let is_new = file_hunks.iter().all(|h| h.old_count == 0 && h.old_start == 0)
+        let is_new = file_hunks
+            .iter()
+            .all(|h| h.old_count == 0 && h.old_start == 0)
             || !full.exists();
 
         if is_new {
@@ -1173,13 +1198,21 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
             let content: String = file_hunks
                 .iter()
                 .flat_map(|h| h.lines.iter())
-                .filter_map(|l| if let DiffLine::Added(s) = l { Some(s.as_str()) } else { None })
+                .filter_map(|l| {
+                    if let DiffLine::Added(s) = l {
+                        Some(s.as_str())
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             let _ = std::fs::write(&full, content);
         } else {
             // Existing file — apply line patches naively.
-            let Ok(original) = std::fs::read_to_string(&full) else { continue };
+            let Ok(original) = std::fs::read_to_string(&full) else {
+                continue;
+            };
             let mut out_lines: Vec<String> = original.lines().map(String::from).collect();
             // Apply hunks in reverse order so line offsets don't shift.
             let mut sorted = file_hunks.clone();
@@ -1187,8 +1220,16 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
             for hunk in sorted {
                 let start = hunk.new_start.saturating_sub(1) as usize;
                 let remove = hunk.old_count as usize;
-                let added: Vec<String> = hunk.lines.iter()
-                    .filter_map(|l| if let DiffLine::Added(s) = l { Some(s.clone()) } else { None })
+                let added: Vec<String> = hunk
+                    .lines
+                    .iter()
+                    .filter_map(|l| {
+                        if let DiffLine::Added(s) = l {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 let end = (start + remove).min(out_lines.len());
                 out_lines.splice(start..end, added);

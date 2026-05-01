@@ -1,37 +1,64 @@
 //! Semantic code index: tree-sitter parsing + heuristic fallbacks +
 //! HNSW-based vector retrieval over extracted symbols.
 
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use phonton_types::{CodeSlice, SliceOrigin};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Symbol kinds extracted from source files.
-const RUST_KINDS: &[&str] = &["function_item", "impl_item", "struct_item", "enum_item", "trait_item", "type_alias"];
+const RUST_KINDS: &[&str] = &[
+    "function_item",
+    "impl_item",
+    "struct_item",
+    "enum_item",
+    "trait_item",
+    "type_alias",
+];
 const PYTHON_KINDS: &[&str] = &["function_definition", "class_definition"];
-const TS_KINDS: &[&str] = &["function_declaration", "class_description", "interface_declaration", "method_definition"];
+const TS_KINDS: &[&str] = &[
+    "function_declaration",
+    "class_description",
+    "interface_declaration",
+    "method_definition",
+];
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Parse `source` and return a [`CodeSlice`] for every symbol found.
-/// 
+///
 /// Supported languages (Semantic): Rust, Python, TypeScript.
 /// Others: Fallback (regex heuristic).
 pub fn extract_symbols(source: &str, file_path: &Path) -> Vec<CodeSlice> {
     let ext = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    
+
     match ext {
         "rs" => extract_semantic(source, file_path, tree_sitter_rust::language(), RUST_KINDS),
-        "py" => extract_semantic(source, file_path, tree_sitter_python::language(), PYTHON_KINDS),
-        "ts" | "js" | "tsx" | "jsx" => extract_semantic(source, file_path, tree_sitter_typescript::language_typescript(), TS_KINDS),
+        "py" => extract_semantic(
+            source,
+            file_path,
+            tree_sitter_python::language(),
+            PYTHON_KINDS,
+        ),
+        "ts" | "js" | "tsx" | "jsx" => extract_semantic(
+            source,
+            file_path,
+            tree_sitter_typescript::language_typescript(),
+            TS_KINDS,
+        ),
         _ => extract_fallback(source, file_path),
     }
 }
 
-fn extract_semantic(source: &str, file_path: &Path, lang: tree_sitter::Language, kinds: &[&str]) -> Vec<CodeSlice> {
+fn extract_semantic(
+    source: &str,
+    file_path: &Path,
+    lang: tree_sitter::Language,
+    kinds: &[&str],
+) -> Vec<CodeSlice> {
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&lang).is_err() {
         return extract_fallback(source, file_path);
@@ -43,7 +70,13 @@ fn extract_semantic(source: &str, file_path: &Path, lang: tree_sitter::Language,
     };
 
     let mut symbols = Vec::new();
-    collect_symbols(tree.root_node(), source.as_bytes(), file_path, kinds, &mut symbols);
+    collect_symbols(
+        tree.root_node(),
+        source.as_bytes(),
+        file_path,
+        kinds,
+        &mut symbols,
+    );
     symbols
 }
 
@@ -51,12 +84,12 @@ fn extract_fallback(source: &str, file_path: &Path) -> Vec<CodeSlice> {
     let mut symbols = Vec::new();
     // Risk 3: line-based grep for common patterns.
     let re = Regex::new(r"(?m)^(?:pub\s+)?(?:fn|struct|enum|trait|class|def|function|interface)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-    
+
     for cap in re.captures_iter(source) {
         let name = cap[1].to_string();
         let full_match = cap.get(0).unwrap();
         let start = full_match.start();
-        
+
         // Grab a few lines of context.
         let end = (start + 200).min(source.len());
         let signature = source[start..end].to_string();
@@ -152,9 +185,9 @@ impl Embedder {
     /// Load `all-MiniLM-L6-v2`. On first call this downloads and caches
     /// the ONNX weights under the platform's fastembed cache dir.
     pub fn new() -> Result<Self> {
-        let model = fastembed::TextEmbedding::try_new(
-            fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2),
-        )
+        let model = fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
+            fastembed::EmbeddingModel::AllMiniLML6V2,
+        ))
         .context("loading all-MiniLM-L6-v2")?;
         Ok(Self { model })
     }
@@ -483,7 +516,7 @@ pub async fn index_workspace_using_embedder(
         let Ok(source) = std::fs::read_to_string(&file) else {
             continue;
         };
-        
+
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&source, &mut hasher);
         let hash = std::hash::Hasher::finish(&hasher);
@@ -530,8 +563,7 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
-    let entries = std::fs::read_dir(root)
-        .with_context(|| format!("reading {}", root.display()))?;
+    let entries = std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -556,18 +588,21 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// symbols for changed supported source files dynamically.
 #[cfg(feature = "semantic")]
 pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
-    use notify::{Watcher, RecursiveMode, Event};
-    use std::time::Duration;
+    use notify::{Event, RecursiveMode, Watcher};
     use std::collections::HashSet;
+    use std::time::Duration;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
             let _ = tx.send(event);
         }
-    }).expect("failed to create watcher");
-    
-    watcher.watch(root, RecursiveMode::Recursive).expect("failed to watch");
+    })
+    .expect("failed to create watcher");
+
+    watcher
+        .watch(root, RecursiveMode::Recursive)
+        .expect("failed to watch");
     let embedder = Embedder::new().expect("failed to load embedder");
 
     loop {
@@ -695,11 +730,7 @@ mod tests {
     #[test]
     fn discover_nexus_config_walks_upward() {
         let tmp = tempfile::tempdir().unwrap();
-        write(
-            tmp.path(),
-            "nexus.json",
-            r#"{ "version": 1, "repos": [] }"#,
-        );
+        write(tmp.path(), "nexus.json", r#"{ "version": 1, "repos": [] }"#);
         let nested = tmp.path().join("phonton-cli/src/deep");
         std::fs::create_dir_all(&nested).unwrap();
         let found = discover_nexus_config(&nested).unwrap();

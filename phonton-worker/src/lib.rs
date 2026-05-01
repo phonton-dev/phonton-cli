@@ -105,10 +105,8 @@ impl Worker {
             panic!("failed to load tiktoken counter");
         });
 
-        let context = ContextManager::new(
-            Arc::from(provider.clone_box()),
-            DEFAULT_WINDOW_LIMIT,
-        ).with_counter(Arc::new(counter));
+        let context = ContextManager::new(Arc::from(provider.clone_box()), DEFAULT_WINDOW_LIMIT)
+            .with_counter(Arc::new(counter));
 
         Self {
             provider,
@@ -158,7 +156,10 @@ impl Worker {
     }
 
     /// Attach a context manager to the worker.
-    pub fn with_context_manager(mut self, context: Arc<tokio::sync::Mutex<ContextManager>>) -> Self {
+    pub fn with_context_manager(
+        mut self,
+        context: Arc<tokio::sync::Mutex<ContextManager>>,
+    ) -> Self {
         self.context = context;
         self
     }
@@ -243,7 +244,8 @@ impl Worker {
         {
             let mut ctx = self.context.lock().await;
             if ctx.frames().is_empty() {
-                ctx.push(ContextFrame::Verbatim(system_prompt.clone())).await?;
+                ctx.push(ContextFrame::Verbatim(system_prompt.clone()))
+                    .await?;
             }
         }
 
@@ -257,10 +259,12 @@ impl Worker {
                 render_user_prompt(&subtask, &context_slices, &relevant_slices, &last_errors);
 
             if let Some(tx) = &self.msg_tx {
-                let _ = tx.try_send(phonton_types::messages::OrchestratorMessage::SubtaskThinking {
-                    id: subtask.id,
-                    model_name: self.provider.model(),
-                });
+                let _ = tx.try_send(
+                    phonton_types::messages::OrchestratorMessage::SubtaskThinking {
+                        id: subtask.id,
+                        model_name: self.provider.model(),
+                    },
+                );
             }
 
             // Render current context + new user prompt. We don't push the
@@ -283,10 +287,12 @@ impl Worker {
                 .saturating_add(response.output_tokens);
 
             if let Some(tx) = &self.msg_tx {
-                let _ = tx.try_send(phonton_types::messages::OrchestratorMessage::SubtaskProgress {
-                    id: subtask.id,
-                    tokens_so_far: total_tokens,
-                });
+                let _ = tx.try_send(
+                    phonton_types::messages::OrchestratorMessage::SubtaskProgress {
+                        id: subtask.id,
+                        tokens_so_far: total_tokens,
+                    },
+                );
             }
 
             let hunks = match parse_unified_diff(&response.content) {
@@ -325,8 +331,7 @@ impl Worker {
             };
             debug!(attempt, hunks = hunks.len(), "worker received diff");
 
-            let verdict =
-                phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
+            let verdict = phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
             match verdict {
                 VerifyResult::Pass { layer } => {
                     // Success! Record this exchange in the shared context manager.
@@ -335,9 +340,13 @@ impl Worker {
                     {
                         let mut ctx = self.context.lock().await;
                         ctx.push(ContextFrame::Summarizable {
-                            content: format!("USER: {}\n\nASSISTANT: {}", user_prompt, response.content),
+                            content: format!(
+                                "USER: {}\n\nASSISTANT: {}",
+                                user_prompt, response.content
+                            ),
                             priority: 5, // SUMMARY_PRIORITY equivalent
-                        }).await?;
+                        })
+                        .await?;
                     }
 
                     if let Err(e) = self.persist_decisions(&subtask) {
@@ -926,7 +935,11 @@ fn unfence_diff(text: &str) -> String {
         }
     }
     // No closing fence (or no fences at all) — fall back to the full text.
-    if captured.is_empty() { text.to_string() } else { captured }
+    if captured.is_empty() {
+        text.to_string()
+    } else {
+        captured
+    }
 }
 
 /// Parse the `-old_start,old_count +new_start,new_count @@` portion of a

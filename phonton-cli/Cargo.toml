@@ -1,7 +1,12 @@
 [package]
 name = "phonton-cli"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Local-first agentic development environment CLI for planned, verified, reviewable code changes."
+readme = "../README.md"
 
 [[bin]]
 name = "phonton"

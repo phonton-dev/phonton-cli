@@ -42,10 +42,7 @@ pub enum OrchestratorEvent {
         failed_subtask: Option<SubtaskId>,
     },
     /// Task walked the DAG to completion and is awaiting review.
-    TaskCompleted {
-        task_id: TaskId,
-        tokens_used: u64,
-    },
+    TaskCompleted { task_id: TaskId, tokens_used: u64 },
     /// A worker was dispatched for a subtask at the given tier/attempt.
     SubtaskDispatched {
         subtask_id: SubtaskId,
@@ -169,20 +166,35 @@ impl EventRecord {
     /// One-line human-readable rendering used by the TUI Flight Log panel.
     pub fn render_line(&self) -> String {
         match &self.event {
-            OrchestratorEvent::TaskStarted { goal, subtask_count, .. } => {
+            OrchestratorEvent::TaskStarted {
+                goal,
+                subtask_count,
+                ..
+            } => {
                 format!("task started — {subtask_count} subtasks — {goal}")
             }
-            OrchestratorEvent::TaskFailed { reason, failed_subtask, .. } => match failed_subtask {
+            OrchestratorEvent::TaskFailed {
+                reason,
+                failed_subtask,
+                ..
+            } => match failed_subtask {
                 Some(id) => format!("task failed at {id}: {reason}"),
                 None => format!("task failed: {reason}"),
             },
             OrchestratorEvent::TaskCompleted { tokens_used, .. } => {
                 format!("task completed — {tokens_used} tokens")
             }
-            OrchestratorEvent::SubtaskDispatched { subtask_id, tier, attempt } => {
+            OrchestratorEvent::SubtaskDispatched {
+                subtask_id,
+                tier,
+                attempt,
+            } => {
                 format!("dispatch {subtask_id} tier={tier} attempt={attempt}")
             }
-            OrchestratorEvent::SubtaskCompleted { subtask_id, tokens_used } => {
+            OrchestratorEvent::SubtaskCompleted {
+                subtask_id,
+                tokens_used,
+            } => {
                 format!("done {subtask_id} tokens={tokens_used}")
             }
             OrchestratorEvent::ContextSelected {
@@ -207,25 +219,46 @@ impl EventRecord {
                     diff_hunks.len()
                 )
             }
-            OrchestratorEvent::SubtaskFailed { subtask_id, reason, attempt } => {
+            OrchestratorEvent::SubtaskFailed {
+                subtask_id,
+                reason,
+                attempt,
+            } => {
                 format!("fail {subtask_id} attempt={attempt}: {reason}")
             }
             OrchestratorEvent::VerifyPass { subtask_id, layer } => {
                 format!("verify pass {subtask_id} layer={layer:?}")
             }
-            OrchestratorEvent::VerifyFail { subtask_id, layer, errors, attempt } => {
+            OrchestratorEvent::VerifyFail {
+                subtask_id,
+                layer,
+                errors,
+                attempt,
+            } => {
                 format!(
                     "verify fail {subtask_id} layer={layer:?} attempt={attempt}: {}",
                     errors.join("; ")
                 )
             }
-            OrchestratorEvent::VerifyEscalated { subtask_id, from, to, reason } => {
+            OrchestratorEvent::VerifyEscalated {
+                subtask_id,
+                from,
+                to,
+                reason,
+            } => {
                 format!("escalate {subtask_id} {from} → {to}: {reason}")
             }
-            OrchestratorEvent::TokenMilestone { tokens_used, milestone, .. } => {
+            OrchestratorEvent::TokenMilestone {
+                tokens_used,
+                milestone,
+                ..
+            } => {
                 format!("tokens crossed {milestone} — now at {tokens_used}")
             }
-            OrchestratorEvent::Thinking { subtask_id, model_name } => {
+            OrchestratorEvent::Thinking {
+                subtask_id,
+                model_name,
+            } => {
                 format!("thinking {subtask_id} model={model_name}")
             }
             OrchestratorEvent::CheckpointCreated {
@@ -242,9 +275,7 @@ impl EventRecord {
                 requeued_subtasks,
                 ..
             } => {
-                format!(
-                    "rollback to checkpoint #{to_seq} — {requeued_subtasks} subtasks requeued"
-                )
+                format!("rollback to checkpoint #{to_seq} — {requeued_subtasks} subtasks requeued")
             }
         }
     }

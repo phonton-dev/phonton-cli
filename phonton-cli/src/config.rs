@@ -96,8 +96,7 @@ pub struct BudgetConfig {
 impl BudgetConfig {
     /// Convert to micro-dollars for `BudgetLimits`.
     pub fn max_usd_micros(&self) -> Option<u64> {
-        self.max_usd_cents
-            .map(|c| c.saturating_mul(10_000)) // 1 cent = 10_000 µ$
+        self.max_usd_cents.map(|c| c.saturating_mul(10_000)) // 1 cent = 10_000 µ$
     }
 }
 

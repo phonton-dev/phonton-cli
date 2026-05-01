@@ -108,12 +108,12 @@ pub async fn discover_models(
         "groq" => {
             discover_openai_bearer(&http, api_key, "https://api.groq.com/openai/v1/models").await
         }
-        "together" => {
-            discover_together(&http, api_key).await
-        }
+        "together" => discover_together(&http, api_key).await,
         "gemini" => discover_gemini(&http, api_key).await,
         "ollama" => {
-            let base = base_url.unwrap_or("http://localhost:11434").trim_end_matches('/');
+            let base = base_url
+                .unwrap_or("http://localhost:11434")
+                .trim_end_matches('/');
             discover_ollama(&http, base).await
         }
         "custom" | "openai-compatible" => {
@@ -130,9 +130,7 @@ pub async fn discover_models(
 /// Classify a non-2xx status into a user-readable sentence.
 fn http_err_msg(provider: &str, status: StatusCode) -> anyhow::Error {
     match status.as_u16() {
-        401 | 403 => anyhow!(
-            "invalid or expired API key for {provider} (HTTP {status})"
-        ),
+        401 | 403 => anyhow!("invalid or expired API key for {provider} (HTTP {status})"),
         404 => anyhow!("{provider}: models endpoint not found (HTTP 404)"),
         429 => anyhow!("{provider}: rate-limited — wait a moment then retry"),
         s if s >= 500 => anyhow!("{provider} server error (HTTP {s}) — try again"),
@@ -329,7 +327,9 @@ async fn discover_gemini(http: &Client, api_key: &str) -> Result<Vec<String>> {
             m.get("supportedGenerationMethods")
                 .and_then(Value::as_array)
                 .map(|methods| {
-                    methods.iter().any(|s| s.as_str() == Some("generateContent"))
+                    methods
+                        .iter()
+                        .any(|s| s.as_str() == Some("generateContent"))
                 })
                 .unwrap_or(true)
         })
@@ -402,7 +402,11 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
         })
         .collect();
     let all_refs: Vec<&String> = models.iter().collect();
-    let pool: &[&String] = if filtered.is_empty() { &all_refs } else { &filtered };
+    let pool: &[&String] = if filtered.is_empty() {
+        &all_refs
+    } else {
+        &filtered
+    };
 
     let preferences: &[&str] = match name {
         "gemini" => &[
@@ -461,7 +465,10 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
         _ => &[],
     };
     for needle in preferences {
-        if let Some(m) = pool.iter().find(|m| m.to_lowercase().contains(&needle.to_lowercase())) {
+        if let Some(m) = pool
+            .iter()
+            .find(|m| m.to_lowercase().contains(&needle.to_lowercase()))
+        {
             return Some((*m).clone());
         }
     }
@@ -530,8 +537,7 @@ pub async fn select_best_working_model(
                 base_url: base_url.unwrap_or("http://localhost:11434").into(),
                 model: cand.clone(),
             },
-            "deepseek" | "xai" | "grok" | "groq" | "together" | "custom"
-            | "openai-compatible" => {
+            "deepseek" | "xai" | "grok" | "groq" | "together" | "custom" | "openai-compatible" => {
                 let url = match name {
                     "deepseek" => "https://api.deepseek.com/v1".to_string(),
                     "xai" | "grok" => "https://api.x.ai/v1".to_string(),
@@ -670,9 +676,9 @@ pub fn provider_for(config: ProviderConfig) -> Box<dyn Provider> {
         ProviderConfig::Ollama { base_url, model } => {
             Box::new(OllamaProvider::new(base_url, model))
         }
-        ProviderConfig::AgentRouter { api_key, model } => Box::new(
-            OpenAiCompatibleProvider::agentrouter(api_key, model),
-        ),
+        ProviderConfig::AgentRouter { api_key, model } => {
+            Box::new(OpenAiCompatibleProvider::agentrouter(api_key, model))
+        }
         ProviderConfig::OpenAiCompatible {
             name: _,
             api_key,
@@ -780,7 +786,9 @@ impl ModelMetrics {
     /// A zero `output_tokens` skips the latency update (division by zero
     /// would otherwise poison the EWMA).
     pub fn record_call(&self, key: &ModelKey, elapsed_ms: u64, output_tokens: u64) {
-        let Ok(mut map) = self.inner.lock() else { return };
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
         let entry = map.entry(key.clone()).or_default();
         entry.provider = Some(key.provider);
         entry.calls = entry.calls.saturating_add(1);
@@ -794,7 +802,9 @@ impl ModelMetrics {
     /// produced by `key`. `failed = true` means the verify layer rejected
     /// the diff (syntax, crate-check, workspace-check, or test failure).
     pub fn record_verification(&self, key: &ModelKey, failed: bool) {
-        let Ok(mut map) = self.inner.lock() else { return };
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
         let entry = map.entry(key.clone()).or_default();
         entry.provider = Some(key.provider);
         let sample = if failed { 1.0 } else { 0.0 };
@@ -858,7 +868,11 @@ pub struct MeteredProvider {
 impl MeteredProvider {
     /// Wrap `inner`, recording every call into `metrics` under `key`.
     pub fn new(inner: Box<dyn Provider>, metrics: ModelMetrics, key: ModelKey) -> Self {
-        Self { inner, metrics, key }
+        Self {
+            inner,
+            metrics,
+            key,
+        }
     }
 }
 
@@ -1160,7 +1174,11 @@ impl Provider for OpenAiCompatibleProvider {
             // "Invalid API key", "model not found", "insufficient quota")
             // instead of a bare HTTP code.
             let body = http_resp.text().await.unwrap_or_default();
-            return Err(annotate_http_error(self.kind.to_string().as_str(), status, &body));
+            return Err(annotate_http_error(
+                self.kind.to_string().as_str(),
+                status,
+                &body,
+            ));
         }
 
         let resp: Value = http_resp
@@ -1275,7 +1293,8 @@ impl Provider for GeminiProvider {
         let system_full = build_system_prompt(system, slice_origins);
         let model = self.current_model();
         let is_gemma = model.contains("gemma");
-        let is_json = system.to_lowercase().contains("json") || user.to_lowercase().contains("json");
+        let is_json =
+            system.to_lowercase().contains("json") || user.to_lowercase().contains("json");
 
         let mut contents = Vec::new();
 
@@ -1629,11 +1648,14 @@ mod tests {
     /// provider.
     #[tokio::test]
     async fn openai_compat_uses_max_tokens_for_non_openai() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        async fn body_capture_server(saw_max_tokens: Arc<AtomicBool>, saw_max_completion: Arc<AtomicBool>) -> SocketAddr {
+        async fn body_capture_server(
+            saw_max_tokens: Arc<AtomicBool>,
+            saw_max_completion: Arc<AtomicBool>,
+        ) -> SocketAddr {
             // Tiny TCP listener that reads one HTTP request, records which
             // token field the caller sent, and answers a valid chat shape.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1668,18 +1690,31 @@ mod tests {
         let endpoint = format!("http://{}/chat/completions", addr);
         let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
         let _ = p.call("sys", "u", &[]).await;
-        assert!(saw_mt.load(Ordering::SeqCst), "non-OpenAI compat must send max_tokens");
-        assert!(!saw_mc.load(Ordering::SeqCst), "non-OpenAI compat must NOT send max_completion_tokens");
+        assert!(
+            saw_mt.load(Ordering::SeqCst),
+            "non-OpenAI compat must send max_tokens"
+        );
+        assert!(
+            !saw_mc.load(Ordering::SeqCst),
+            "non-OpenAI compat must NOT send max_completion_tokens"
+        );
 
         // OpenAI proper → must send `max_completion_tokens`.
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
         let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
         let endpoint = format!("http://{}/chat/completions", addr);
-        let p = OpenAiCompatibleProvider::new("k".into(), "m".into(), &endpoint, ProviderKind::OpenAI);
+        let p =
+            OpenAiCompatibleProvider::new("k".into(), "m".into(), &endpoint, ProviderKind::OpenAI);
         let _ = p.call("sys", "u", &[]).await;
-        assert!(saw_mc.load(Ordering::SeqCst), "OpenAI proper must send max_completion_tokens");
-        assert!(!saw_mt.load(Ordering::SeqCst), "OpenAI proper must NOT send max_tokens (rejected by o-series)");
+        assert!(
+            saw_mc.load(Ordering::SeqCst),
+            "OpenAI proper must send max_completion_tokens"
+        );
+        assert!(
+            !saw_mt.load(Ordering::SeqCst),
+            "OpenAI proper must NOT send max_tokens (rejected by o-series)"
+        );
     }
 
     /// Live round-trip against the real Anthropic Messages API. Gated behind

@@ -2828,12 +2828,8 @@ async fn build_semantic_context(
         let embedder = phonton_index::Embedder::new()?;
         let index = match phonton_index::discover_nexus_config(&root) {
             Ok(Some(cfg)) => {
-                phonton_index::index_workspace_with_nexus_using_embedder(
-                    &root,
-                    &cfg,
-                    &embedder,
-                )
-                .await
+                phonton_index::index_workspace_with_nexus_using_embedder(&root, &cfg, &embedder)
+                    .await
             }
             Ok(None) => phonton_index::index_workspace_using_embedder(&root, &embedder).await,
             Err(e) => Err(e),
@@ -2844,15 +2840,12 @@ async fn build_semantic_context(
         }))
     };
 
-    match tokio::time::timeout(
-        Duration::from_secs(SEMANTIC_INDEX_TIMEOUT_SECS),
-        build,
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(SEMANTIC_INDEX_TIMEOUT_SECS), build).await {
         Ok(Ok(ctx)) => Some(ctx),
         Ok(Err(e)) => {
-            eprintln!("phonton: semantic index unavailable ({e}); continuing without indexed context");
+            eprintln!(
+                "phonton: semantic index unavailable ({e}); continuing without indexed context"
+            );
             None
         }
         Err(_) => {
@@ -4251,8 +4244,10 @@ mod tests {
 
     #[test]
     fn enter_in_task_mode_emits_direct_task_intent() {
-        let mut app = App::default();
-        app.mode = Mode::Task;
+        let mut app = App {
+            mode: Mode::Task,
+            ..App::default()
+        };
         for c in "write one focused test".chars() {
             app.handle_key(key(c));
         }

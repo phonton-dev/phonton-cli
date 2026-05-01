@@ -5,10 +5,7 @@ use phonton_index::extract_symbols;
 #[test]
 fn extracts_symbols_from_phonton_types() {
     // CARGO_MANIFEST_DIR is the phonton-index package root at compile time.
-    let source_path = format!(
-        "{}/../phonton-types/src/lib.rs",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let source_path = format!("{}/../phonton-types/src/lib.rs", env!("CARGO_MANIFEST_DIR"));
 
     let source = std::fs::read_to_string(&source_path)
         .unwrap_or_else(|e| panic!("could not read {source_path}: {e}"));

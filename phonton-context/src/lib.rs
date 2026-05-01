@@ -406,8 +406,12 @@ mod tests {
     async fn verbatim_is_never_evicted() {
         let provider = Arc::new(StubProvider::new("sum"));
         let mut ctx = ContextManager::new(provider.clone(), 100);
-        ctx.push(verbatim(&format!("SYSTEM: {}", big(30)))).await.unwrap();
-        ctx.push(verbatim(&format!("GOAL: {}", big(30)))).await.unwrap();
+        ctx.push(verbatim(&format!("SYSTEM: {}", big(30))))
+            .await
+            .unwrap();
+        ctx.push(verbatim(&format!("GOAL: {}", big(30))))
+            .await
+            .unwrap();
         // Now add a pile of low-priority summarizables.
         for _ in 0..4 {
             ctx.push(summ(&big(40), 1)).await.unwrap();
@@ -430,16 +434,18 @@ mod tests {
         let provider = Arc::new(StubProvider::new("sum"));
         let mut ctx = ContextManager::new(provider.clone(), 100);
         // One high-priority (9) frame — must survive.
-        ctx.push(summ(&format!("KEEP: {}", big(30)), 9)).await.unwrap();
+        ctx.push(summ(&format!("KEEP: {}", big(30)), 9))
+            .await
+            .unwrap();
         // Low-priority frames — should roll up once threshold crossed.
         for _ in 0..4 {
             ctx.push(summ(&big(100), 2)).await.unwrap();
         }
         // Expect: [keep, summary]  (exact sizes depend on ordering).
-        assert!(ctx.frames().iter().any(|f| matches!(
-            f,
-            ContextFrame::Summarizable { priority: 9, .. }
-        )));
+        assert!(ctx
+            .frames()
+            .iter()
+            .any(|f| matches!(f, ContextFrame::Summarizable { priority: 9, .. })));
         assert!(ctx.frames().iter().any(|f| matches!(
             f,
             ContextFrame::Summarizable { priority: p, content } if *p == SUMMARY_PRIORITY && content.starts_with("History Summary:")

@@ -15,8 +15,8 @@ pub mod providers;
 pub use events::{EventRecord, OrchestratorEvent, TOKEN_MILESTONE_INTERVAL};
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
-    BudgetDecision, BudgetLimits, LLMResponse, ModelMetricsSnapshot, ModelPricing,
-    ProviderConfig, ProviderError, ProviderKind,
+    BudgetDecision, BudgetLimits, LLMResponse, ModelMetricsSnapshot, ModelPricing, ProviderConfig,
+    ProviderError, ProviderKind,
 };
 
 // ---------------------------------------------------------------------------

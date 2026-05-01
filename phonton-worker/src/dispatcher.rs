@@ -1,4 +1,4 @@
-﻿//! [`WorkerDispatcher`] implementation that wraps [`phonton_worker::Worker`].
+//! [`WorkerDispatcher`] implementation that wraps [`phonton_worker::Worker`].
 //!
 //! This is the production bridge between the orchestrator's dispatch contract
 //! and the real LLM call / verify / retry loop. The CLI uses
@@ -73,7 +73,8 @@ impl RealDispatcher {
         let context = phonton_context::ContextManager::new(
             Arc::from(provider.clone_box()),
             crate::DEFAULT_WINDOW_LIMIT,
-        ).with_counter(Arc::new(counter));
+        )
+        .with_counter(Arc::new(counter));
 
         Self {
             provider_factory: Arc::new(provider_factory),
@@ -112,15 +113,19 @@ impl WorkerDispatcher for RealDispatcher {
         let provider = (self.provider_factory)(subtask.model_tier);
         let context_slices = self.select_context(&subtask).await;
         if let Some(tx) = &msg_tx {
-            let slices: Vec<ContextAttribution> =
-                context_slices.iter().map(ContextAttribution::from).collect();
+            let slices: Vec<ContextAttribution> = context_slices
+                .iter()
+                .map(ContextAttribution::from)
+                .collect();
             let total_token_count = slices.iter().map(|s| s.token_count).sum();
             let _ = tx
-                .send(phonton_types::messages::OrchestratorMessage::ContextSelected {
-                    id: subtask.id,
-                    slices,
-                    total_token_count,
-                })
+                .send(
+                    phonton_types::messages::OrchestratorMessage::ContextSelected {
+                        id: subtask.id,
+                        slices,
+                        total_token_count,
+                    },
+                )
                 .await;
         }
         let mut worker = Worker::new(provider, self.guard.clone())

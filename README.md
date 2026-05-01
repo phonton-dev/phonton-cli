@@ -1,72 +1,260 @@
-# Phonton
+# Phonton CLI
 
-Phonton is a local-first Agentic Development Environment (ADE), built specifically for deterministic, verified code generation. Unlike general-purpose agents, it is built on three strict pillars: verified output (code is checked by Cargo before surfacing), cross-session memory (preserving decisions and rejected approaches), and semantic codebase indexing. It supports a bring-your-own-key (BYOK) multi-provider architecture for maximum privacy and cost flexibility.
+<p align="center">
+  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI task board showing plan, verify, and review columns">
+</p>
+
+Phonton CLI is a local-first agentic development environment for developers who want autonomous code changes without giving up review control.
+
+It plans the work, routes it through local repo context, verifies changes before handoff, and keeps the result reviewable. The goal is not to be the loudest coding agent. The goal is to make AI-assisted development feel less reckless.
+
+> Current status: pre-1.0 private-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
+
+## Why Phonton
+
+Most coding agents start with chat. Phonton starts with the engineering loop:
+
+```mermaid
+flowchart LR
+    A["Goal"] --> B["Plan preview"]
+    B --> C["Repo-aware worker"]
+    C --> D["Verification gate"]
+    D --> E["Reviewable diff"]
+    E --> F["Memory and history"]
+    F --> B
+```
+
+That gives Phonton a different shape from an IDE assistant or a terminal chatbot:
+
+- **Review first:** plans and diffs are first-class surfaces, not buried in a conversation.
+- **Verification first:** generated work is expected to pass checks before it is treated as ready.
+- **Local first:** config, trust, store, memory, and repo context live on your machine.
+- **BYOK:** use your own provider account instead of routing every task through a Phonton-hosted model bill.
+- **Measured claims:** token and cost efficiency should be benchmarked per task, not guessed.
+
+## What Works Today
+
+- Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
+- `phonton doctor` setup diagnostics for config, provider key, store, trust, git, cargo, and Nexus config.
+- `phonton plan` preview for task DAGs before edits happen.
+- `phonton review` surfaces for verified diff review payloads, approvals, rejections, and rollback.
+- BYOK provider support through the provider layer, including Anthropic, OpenAI, OpenRouter, Gemini, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints.
+- Local store, memory, planner, worker, diff, sandbox, verification, and orchestration crates.
+- Semantic indexing behind the CLI stack for repo-aware workflows.
+
+## What Is Still Early
+
+Phonton is not yet as polished as Codex, Claude Code, Cursor, or Windsurf. It has fewer integrations, less onboarding polish, narrower public documentation, and no mature hosted/team workflow yet.
+
+The current release target is a private alpha for real Rust repo tasks. Use it if you are comfortable running a Rust binary, reading diagnostics, and filing sharp bug reports.
+
+## Install From Source
+
+```bash
+git clone https://github.com/phonton-dev/phonton-cli.git
+cd phonton-cli
+cargo build --release -p phonton-cli
+```
+
+Run the binary:
+
+```bash
+./target/release/phonton
+```
+
+On Windows:
+
+```powershell
+.\target\release\phonton.exe
+```
+
+## Configure A Provider
+
+Phonton reads `~/.phonton/config.toml` and also checks provider-specific environment variables.
+
+Minimal config:
+
+```toml
+[provider]
+name = "gemini"
+model = "gemma-4-31b-it"
+
+[budget]
+max_tokens = 120000
+max_usd_cents = 200
+```
+
+Environment-variable setup examples:
+
+```bash
+export ANTHROPIC_API_KEY="..."
+export OPENAI_API_KEY="..."
+export GEMINI_API_KEY="..."
+export OPENROUTER_API_KEY="..."
+```
+
+Windows PowerShell:
+
+```powershell
+$env:GEMINI_API_KEY = "..."
+```
+
+Check the install:
+
+```bash
+phonton doctor
+phonton doctor --provider
+```
+
+## CLI Commands
+
+```text
+phonton                 Launch the interactive TUI
+phonton ask <question>  One-shot Q&A using the configured provider
+phonton doctor          Check config, store, trust, git, cargo, and Nexus
+phonton plan <goal>     Preview the task DAG without changing files
+phonton review          Show verified diff review payloads
+phonton config path     Print the resolved config file path
+phonton config show     Dump resolved config as TOML
+phonton version         Print version
+```
+
+Plan preview:
+
+```bash
+phonton plan --json "add input validation to config loading"
+```
+
+Review latest completed task:
+
+```bash
+phonton review latest
+phonton review approve latest
+phonton review reject latest
+```
+
+## How Phonton Handles Context
+
+<p align="center">
+  <img src="assets/readme/context-efficiency.png" alt="Diagram contrasting whole repo context with compact context packs and verified diffs">
+</p>
+
+Phonton is built around a simple rule: do not blindly dump the whole repo into the model.
+
+```mermaid
+flowchart TD
+    Repo["Local repo"] --> Index["Source index"]
+    Index --> Planner["Planner"]
+    Planner --> Pack["Task-specific context"]
+    Pack --> Worker["Worker"]
+    Worker --> Verify["Verify"]
+    Verify --> Review["Review"]
+    Review --> Store["Memory and event store"]
+    Store --> Planner
+```
+
+The intended result is lower context waste and better reviewability. The honest way to prove that is with benchmarks, so this repo includes a benchmark harness instead of hard-coded marketing numbers.
+
+## Benchmarks
+
+Run the plan benchmark harness:
+
+```powershell
+.\scripts\benchmark-plan.ps1
+```
+
+It runs repeatable planning tasks, captures estimated Phonton tokens versus the planner's naive baseline, and writes Markdown plus JSON reports to `benchmarks/results/`.
+
+Read the methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+Important: benchmark output is evidence, not a slogan. Do not claim "X percent savings" publicly until you can reproduce it on multiple real tasks and include the raw report.
 
 ## Architecture
 
-```
-phonton-cli ─────────────────────────────────────────────────
-    └─ phonton-orchestrator
-           ├─ phonton-planner ──── phonton-memory ─── phonton-store
-           ├─ phonton-worker  ──── phonton-providers
-           │       ├─ phonton-context
-           │       ├─ phonton-index (tree-sitter + fastembed + usearch)
-           │       ├─ phonton-diff  (git2)
-           │       └─ phonton-sandbox
-           └─ phonton-verify  (tree-sitter + cargo check/test)
-phonton-types  (used by all)
-phonton-desktop (Tauri — deferred)
-```
-
-## Prerequisites
-
-- **Rust Stable** (MSRV 1.78+)
-- **Cargo**
-- **libgit2** system dependency (needed for `phonton-diff`)
-- **tree-sitter CLI** (needed for `phonton-index` development)
-
-## Running the TUI
-
-```bash
-cd phonton-dev
-ANTHROPIC_API_KEY=sk-ant-... cargo run -p phonton-cli
+```mermaid
+flowchart TB
+    CLI["phonton-cli"] --> Planner["phonton-planner"]
+    CLI --> Orchestrator["phonton-orchestrator"]
+    Orchestrator --> Worker["phonton-worker"]
+    Orchestrator --> Verify["phonton-verify"]
+    Worker --> Providers["phonton-providers"]
+    Worker --> Context["phonton-context"]
+    Context --> Index["phonton-index"]
+    Verify --> Diff["phonton-diff"]
+    Verify --> Sandbox["phonton-sandbox"]
+    Planner --> Memory["phonton-memory"]
+    Memory --> Store["phonton-store"]
+    Types["phonton-types"] --> CLI
+    Types --> Orchestrator
+    Types --> Worker
 ```
 
-## Running Tests
+Repository layout:
 
-```bash
-cargo test --workspace                              # all unit tests
-cargo test --test smoke_test --features integration-tests  # integration
+- `phonton-cli` - terminal UI and user-facing command surface.
+- `phonton-planner` - goal decomposition and plan preview.
+- `phonton-orchestrator` - task state, dependencies, retries, and event flow.
+- `phonton-worker` - model-call loop, tool policy, and patch generation.
+- `phonton-verify` - syntax/type/test/decision checks before review.
+- `phonton-index` - local source indexing and semantic retrieval.
+- `phonton-context` - task-specific context compilation.
+- `phonton-diff` - diff application and rollback support.
+- `phonton-memory` / `phonton-store` - local persistence and decision memory.
+- `phonton-providers` - BYOK provider adapters.
+- `phonton-sandbox` - command execution policy.
+- `phonton-types` - shared domain contracts.
+
+## Release Checks
+
+Before cutting a release:
+
+```powershell
+.\scripts\release-check.ps1
 ```
 
-## Crate Completion Status
+The script runs formatting, clippy, tests, release build, doctor, and the plan benchmark harness.
 
-| Crate | Status | Key Gaps |
+Manual checks worth doing before a public release:
+
+- Fresh clone install on Windows, macOS, and Linux.
+- `phonton doctor --provider` with at least one hosted provider.
+- One real repo task from goal to reviewable verified diff.
+- Benchmark report committed or attached to the release notes.
+- No secrets printed in logs, screenshots, or benchmark output.
+
+## Comparison
+
+Phonton is not trying to win by pretending the incumbents are weak.
+
+| Tool | Strongest fit | Where Phonton is trying to be different |
 |---|---|---|
-| phonton-types | ✅ Done | — |
-| phonton-index | ✅ Done | Incremental re-index on file change (M2 checklist item) |
-| phonton-providers | ✅ Done | Anthropic, OpenAI, Gemini, Ollama all implemented with real HTTP calls |
-| phonton-verify | ✅ Done | 4-layer pipeline working. Integration tests cover syntax fail, type fail, test fail, and pass-through |
-| phonton-store | ✅ Done | Full async + sync API, warm-crate cache, memory records, task history |
-| phonton-memory | ✅ Done | Keyword-overlap query, async facade, wired into planner |
-| phonton-worker | ✅ Done | All 5 tools implemented (Read/Write/Run/Bash/Network). Memory write-back on pass + failure |
-| phonton-orchestrator | ✅ Done | DAG walk, retry/escalate, verify gate enforced, budget check |
-| phonton-planner | ✅ Done | Regex + LLM decomposition, memory consultation, DAG cycle detection |
-| phonton-context | ✅ Done | Sliding window, priority eviction, TiktokenCounter, provider-backed summarization, 9 tests |
-| phonton-cli | ✅ Done | Ratatui task board, goal/task/ask modes, savings line, spinner, tests. **Ask mode uses stub** |
-| phonton-diff | ✅ Done | git2 apply, stash-based rollback, `RollbackGuard` |
-| phonton-sandbox | ✅ Done | OS-level isolation (Job Objects, unshare, sandbox-exec), ExecutionGuard routing, async timeout |
-| phonton-desktop | ❌ Not started | Deferred (M10) |
+| Codex | Mature agent workflow, cloud/editor/CLI integration | Local-first ADE kernel, BYOK, explicit verification and review surfaces |
+| Claude Code | Excellent terminal-native coding agent | Less chat-first, more plan/verify/review oriented |
+| Cursor | Polished AI editor experience | Less editor polish, more auditable repo workflow |
+| Windsurf | Agentic IDE workflow | Narrower release scope, stronger local-first positioning |
+| Phonton CLI | Verified local ADE loop for serious repo tasks | Early product, smaller ecosystem, benchmark claims still being built |
 
-## Design Documents
+## Development
 
-For architecture context and foundational principles, see `phonton-brain/`:
-- `CLAUDE.md` — Hard rules for all contributions
-- `00-context/roadmap.md` — Milestone map and timeline
-- `01-architecture/` — Failure modes, structural patterns, and decisions
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --release -p phonton-cli
+```
 
-## Contributing
+Run from source:
 
-Before submitting PRs, be aware of the following principles:
-- **Verification Gate:** All changes must pass `cargo check --workspace` and the test suite. 
-- **No-Panic Rule:** Library crates must not panic. Use robust `Result` based error handling via `anyhow` or `thiserror` everywhere instead.
+```bash
+cargo run -p phonton-cli -- doctor
+cargo run -p phonton-cli -- plan "add input validation to config loading"
+```
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0
+- MIT License
+
+at your option.

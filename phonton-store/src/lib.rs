@@ -121,7 +121,13 @@ impl Store {
                  goal_text    = excluded.goal_text,
                  status_json  = excluded.status_json,
                  total_tokens = excluded.total_tokens",
-            params![id.to_string(), goal_text, status_json, now_secs() as i64, total_tokens as i64],
+            params![
+                id.to_string(),
+                goal_text,
+                status_json,
+                now_secs() as i64,
+                total_tokens as i64
+            ],
         )?;
         Ok(())
     }
@@ -172,10 +178,9 @@ impl Store {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let body_iter = if let Some(kind) = kind_filter {
-            stmt.query_map(
-                params![like, kind.as_str(), top_k as i64],
-                |r| r.get::<_, String>(0),
-            )?
+            stmt.query_map(params![like, kind.as_str(), top_k as i64], |r| {
+                r.get::<_, String>(0)
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
             stmt.query_map(params![like, top_k as i64], |r| r.get::<_, String>(0))?
@@ -323,11 +328,7 @@ impl Store {
 
     /// Overwrite the `status_json` column for one task. No-op if the id
     /// doesn't exist — callers must have upserted the task first.
-    pub async fn update_task_status(
-        &self,
-        id: TaskId,
-        status: serde_json::Value,
-    ) -> Result<()> {
+    pub async fn update_task_status(&self, id: TaskId, status: serde_json::Value) -> Result<()> {
         let status_json = serde_json::to_string(&status)?;
         self.conn.execute(
             "UPDATE tasks SET status_json = ?1 WHERE id = ?2",
@@ -349,8 +350,7 @@ impl Store {
         topic: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MemoryRecord>> {
-        let mut sql =
-            String::from("SELECT body_json FROM memory_records WHERE 1=1");
+        let mut sql = String::from("SELECT body_json FROM memory_records WHERE 1=1");
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(k) = kind {
             sql.push_str(" AND kind = ?");
@@ -364,8 +364,7 @@ impl Store {
         binds.push(Box::new(limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_ref: Vec<&dyn rusqlite::ToSql> =
-            binds.iter().map(|b| b.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
         let rows = stmt
             .query_map(params_ref.as_slice(), |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -411,20 +410,12 @@ pub struct TaskRecord {
 fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     let id_str: String = r.get(0)?;
     let uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let id = TaskId(uuid);
     let status_json: String = r.get(2)?;
     let status: serde_json::Value = serde_json::from_str(&status_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            2,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let created_at: i64 = r.get(3)?;
     let total_tokens: i64 = r.get(4)?;
@@ -474,7 +465,10 @@ fn memory_kind(r: &MemoryRecord) -> &'static str {
 fn memory_topic(r: &MemoryRecord) -> String {
     match r {
         MemoryRecord::Decision { title, body, .. } => format!("{title} {body}"),
-        MemoryRecord::Constraint { statement, rationale } => format!("{statement} {rationale}"),
+        MemoryRecord::Constraint {
+            statement,
+            rationale,
+        } => format!("{statement} {rationale}"),
         MemoryRecord::RejectedApproach { summary, reason } => format!("{summary} {reason}"),
         MemoryRecord::Convention { rule, scope } => {
             format!("{rule} {}", scope.as_deref().unwrap_or(""))
@@ -611,7 +605,8 @@ mod tests {
     async fn get_and_list_tasks() {
         let s = Store::in_memory().unwrap();
         let id = TaskId::new();
-        s.upsert_task(id, "find the bug", &TaskStatus::Queued, 42).unwrap();
+        s.upsert_task(id, "find the bug", &TaskStatus::Queued, 42)
+            .unwrap();
 
         let fetched = s.get_task(id).await.unwrap().expect("task exists");
         assert_eq!(fetched.goal_text, "find the bug");
@@ -713,8 +708,10 @@ mod tests {
     fn upsert_task_replaces_status() {
         let s = Store::in_memory().unwrap();
         let id = TaskId::new();
-        s.upsert_task(id, "goal one", &TaskStatus::Queued, 0).unwrap();
-        s.upsert_task(id, "goal one", &TaskStatus::Rejected, 100).unwrap();
+        s.upsert_task(id, "goal one", &TaskStatus::Queued, 0)
+            .unwrap();
+        s.upsert_task(id, "goal one", &TaskStatus::Rejected, 100)
+            .unwrap();
         // No assertion on read-back (no getter yet); the test passes if
         // the second insert doesn't error on the PK conflict.
     }

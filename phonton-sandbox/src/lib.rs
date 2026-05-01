@@ -298,12 +298,8 @@ impl Sandbox {
     pub async fn run_tool(&self, call: ToolCall) -> Result<Output> {
         match self.guard.evaluate(&call) {
             GuardDecision::Allow => self.execute(call).await,
-            GuardDecision::Approve { reason } => {
-                Err(anyhow!("Approval required: {}", reason))
-            }
-            GuardDecision::Block { reason } => {
-                Err(anyhow!("BLOCKED by sandbox: {}", reason))
-            }
+            GuardDecision::Approve { reason } => Err(anyhow!("Approval required: {}", reason)),
+            GuardDecision::Block { reason } => Err(anyhow!("BLOCKED by sandbox: {}", reason)),
         }
     }
 
@@ -347,8 +343,7 @@ impl Sandbox {
                 unsafe {
                     if let Ok(job) = CreateJobObjectW(None, None) {
                         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                        info.BasicLimitInformation.LimitFlags =
-                            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
                         let _ = SetInformationJobObject(
                             job,
@@ -457,7 +452,9 @@ fn apply_env_scrub(cmd: &mut Command) {
 /// [`acquire`]: CrateLock::acquire
 #[derive(Clone, Default)]
 pub struct CrateLock {
-    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>>,
+    inner: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    >,
 }
 
 /// RAII guard returned by [`CrateLock::acquire`].

@@ -28,7 +28,10 @@ fn hunk_added(path: &str, lines: Vec<&str>) -> DiffHunk {
         old_count: 0,
         new_start: 1,
         new_count: lines.len() as u32,
-        lines: lines.into_iter().map(|l| DiffLine::Added(l.into())).collect(),
+        lines: lines
+            .into_iter()
+            .map(|l| DiffLine::Added(l.into()))
+            .collect(),
     }
 }
 
@@ -62,10 +65,7 @@ edition = "2021"
 /// invoked. This is the cheapest possible fail — no subprocess spawned.
 #[tokio::test]
 async fn broken_syntax_fails_at_layer_1() {
-    let hunk = hunk_added(
-        "phonton-types/src/broken.rs",
-        vec!["fn broken( -> {"],
-    );
+    let hunk = hunk_added("phonton-types/src/broken.rs", vec!["fn broken( -> {"]);
 
     let dir = TempDir::new().expect("create temp dir");
     let result = phonton_verify::verify_diff(&[hunk], dir.path())
@@ -99,10 +99,7 @@ async fn broken_syntax_fails_at_layer_1() {
 #[tokio::test]
 async fn broken_types_fails_at_layer_2() {
     let dir = TempDir::new().expect("create temp dir");
-    let root = scaffold_cargo_project(
-        &dir,
-        "pub fn foo() -> NonExistentType { todo!() }\n",
-    );
+    let root = scaffold_cargo_project(&dir, "pub fn foo() -> NonExistentType { todo!() }\n");
 
     // The hunk must have a file_path that the verify pipeline can map to a
     // package. Since our crate is named `test_crate` (no `phonton-` prefix),
@@ -152,10 +149,7 @@ async fn broken_types_fails_at_layer_2() {
 #[tokio::test]
 async fn valid_code_passes_all_layers() {
     let dir = TempDir::new().expect("create temp dir");
-    let root = scaffold_cargo_project(
-        &dir,
-        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
-    );
+    let root = scaffold_cargo_project(&dir, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n");
 
     let hunk = hunk_added(
         "src/lib.rs",
@@ -195,10 +189,7 @@ async fn valid_code_passes_all_layers() {
 /// accidental subprocess invocations.
 #[tokio::test]
 async fn syntax_check_is_fast() {
-    let hunk = hunk_added(
-        "phonton-types/src/fast.rs",
-        vec!["fn ok() -> u32 { 42 }"],
-    );
+    let hunk = hunk_added("phonton-types/src/fast.rs", vec!["fn ok() -> u32 { 42 }"]);
 
     let start = Instant::now();
     let result = phonton_verify::verify_syntax(&[hunk]);

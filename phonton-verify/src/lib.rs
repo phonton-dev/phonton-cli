@@ -80,10 +80,7 @@ pub async fn verify_diff_with_memory(
 /// Layer 1: tree-sitter parse of each hunk's post-diff view.
 pub fn verify_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
     let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_rust::language())
-        .is_err()
-    {
+    if parser.set_language(&tree_sitter_rust::language()).is_err() {
         return Some(VerifyResult::Escalate {
             reason: "failed to load tree-sitter-rust grammar".into(),
         });
@@ -239,13 +236,7 @@ pub async fn verify_crate_check(
     for pkg in packages {
         let output = Command::new("cargo")
             .current_dir(working_dir)
-            .args([
-                "check",
-                "--package",
-                pkg,
-                "--message-format",
-                "json",
-            ])
+            .args(["check", "--package", pkg, "--message-format", "json"])
             .output()
             .await;
 
@@ -300,7 +291,10 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let msg = stderr.trim();
                 if !msg.is_empty() {
-                    errs.push(format!("cargo check --workspace failed: {}", last_lines(msg, 5)));
+                    errs.push(format!(
+                        "cargo check --workspace failed: {}",
+                        last_lines(msg, 5)
+                    ));
                 }
             }
             errs
@@ -325,10 +319,7 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
 /// A non-zero exit or timeout surfaces the last 20 lines of combined
 /// stdout+stderr as the failure message — enough to point at a failing
 /// assertion without flooding the UI.
-pub async fn verify_test(
-    packages: &[String],
-    working_dir: &Path,
-) -> Result<Option<VerifyResult>> {
+pub async fn verify_test(packages: &[String], working_dir: &Path) -> Result<Option<VerifyResult>> {
     // Skip for the same reason the cargo check layers do.
     if find_cargo_workspace(working_dir).is_none() {
         return Ok(None);
@@ -431,7 +422,10 @@ fn record_violations(rec: &MemoryRecord, added_text: &str) -> Vec<String> {
     if bans_unwrap {
         for needle in [".unwrap()", ".unwrap("] {
             if lower.contains(needle) {
-                hits.push(format!("added code contains `{}`", needle.trim_end_matches('(')));
+                hits.push(format!(
+                    "added code contains `{}`",
+                    needle.trim_end_matches('(')
+                ));
             }
         }
     }
@@ -452,11 +446,12 @@ fn record_violations(rec: &MemoryRecord, added_text: &str) -> Vec<String> {
     }
 
     // Rule 3: "no blocking in async".
-    if lc.contains("no blocking") || lc.contains("avoid blocking") || lc.contains("blocking call")
-    {
+    if lc.contains("no blocking") || lc.contains("avoid blocking") || lc.contains("blocking call") {
         for needle in ["std::thread::sleep", "std::fs::read", "std::fs::write"] {
             if lower.contains(needle) {
-                hits.push(format!("added code calls blocking `{needle}` (convention forbids)"));
+                hits.push(format!(
+                    "added code calls blocking `{needle}` (convention forbids)"
+                ));
             }
         }
     }
@@ -559,8 +554,10 @@ fn crate_name_for(path: &Path) -> Option<String> {
                 for line in text.lines() {
                     let line = line.trim();
                     if let Some(rest) = line.strip_prefix("name") {
-                        if let Some(val) = rest.trim_start_matches([' ', '=', '"', '\''].as_ref())
-                            .split('"').next()
+                        if let Some(val) = rest
+                            .trim_start_matches([' ', '=', '"', '\''].as_ref())
+                            .split('"')
+                            .next()
                         {
                             let name = val.trim_matches(['"', '\'', ' '].as_ref()).to_string();
                             if !name.is_empty() {
@@ -611,7 +608,9 @@ fn parse_cargo_errors(stdout: &str, label: &str) -> Vec<String> {
         if val.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
             continue;
         }
-        let Some(msg) = val.get("message") else { continue };
+        let Some(msg) = val.get("message") else {
+            continue;
+        };
         if msg.get("level").and_then(|l| l.as_str()) != Some("error") {
             continue;
         }
@@ -722,9 +721,7 @@ mod tests {
 
         let h = hunk(
             "phonton-types/src/foo.rs",
-            vec![DiffLine::Added(
-                "let v = some_call().unwrap();".into(),
-            )],
+            vec![DiffLine::Added("let v = some_call().unwrap();".into())],
         );
         let res = verify_decisions(&[h], &mem).await.unwrap();
         match res {
@@ -760,9 +757,7 @@ mod tests {
 
         let h = hunk(
             "phonton-types/src/foo.rs",
-            vec![DiffLine::Added(
-                "let v = some_call()?;".into(),
-            )],
+            vec![DiffLine::Added("let v = some_call()?;".into())],
         );
         let res = verify_decisions(&[h], &mem).await.unwrap();
         assert!(
@@ -833,7 +828,9 @@ mod tests {
         );
         // All three cargo layers must short-circuit to Ok(None) rather
         // than invoking cargo and surfacing "could not find Cargo.toml".
-        let crate_check = super::verify_crate_check(&["any".into()], dir).await.unwrap();
+        let crate_check = super::verify_crate_check(&["any".into()], dir)
+            .await
+            .unwrap();
         assert!(crate_check.is_none(), "crate_check must skip");
         let workspace_check = super::verify_workspace_check(dir).await.unwrap();
         assert!(workspace_check.is_none(), "workspace_check must skip");

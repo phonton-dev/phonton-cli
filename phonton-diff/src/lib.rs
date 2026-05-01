@@ -223,7 +223,9 @@ impl DiffApplier {
             let Some(rest) = name.strip_prefix(&prefix) else {
                 continue;
             };
-            let Ok(seq) = rest.parse::<u32>() else { continue };
+            let Ok(seq) = rest.parse::<u32>() else {
+                continue;
+            };
             let Some(oid) = r.target() else { continue };
             let commit = self.repo.find_commit(oid)?;
             let summary = commit.summary().unwrap_or("").to_string();
@@ -299,9 +301,7 @@ impl<'a> RollbackGuard<'a> {
         self.committed = true;
         if let Some(app) = self.applier.as_mut() {
             if app.stash_oid.take().is_some() {
-                app.repo
-                    .stash_drop(0)
-                    .context("stash_drop during commit")?;
+                app.repo.stash_drop(0).context("stash_drop during commit")?;
             }
         }
         Ok(())
@@ -355,6 +355,22 @@ fn build_unified_diff(by_file: &BTreeMap<PathBuf, Vec<&DiffHunk>>) -> String {
                         out.push('\n');
                     }
                 }
+            }
+        }
+    }
+    out
+}
+
+fn reconstruct_new_side(hunks: &[&DiffHunk]) -> String {
+    let mut out = String::new();
+    for h in hunks {
+        for line in &h.lines {
+            match line {
+                DiffLine::Context(s) | DiffLine::Added(s) => {
+                    out.push_str(s);
+                    out.push('\n');
+                }
+                DiffLine::Removed(_) => {}
             }
         }
     }
@@ -431,20 +447,4 @@ mod tests {
         let listed = applier.list_checkpoints(task).unwrap();
         assert!(listed.is_empty());
     }
-}
-
-fn reconstruct_new_side(hunks: &[&DiffHunk]) -> String {
-    let mut out = String::new();
-    for h in hunks {
-        for line in &h.lines {
-            match line {
-                DiffLine::Context(s) | DiffLine::Added(s) => {
-                    out.push_str(s);
-                    out.push('\n');
-                }
-                DiffLine::Removed(_) => {}
-            }
-        }
-    }
-    out
 }

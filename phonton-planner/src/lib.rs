@@ -304,8 +304,7 @@ fn specs_to_plan(specs: Vec<SubtaskSpec>) -> DecomposedPlan {
     let mut tests_planned = 0usize;
     let mut new_functions = 0usize;
     for (i, spec) in specs.into_iter().enumerate() {
-        let dependencies: Vec<SubtaskId> =
-            spec.depends_on.iter().map(|&j| ids[j]).collect();
+        let dependencies: Vec<SubtaskId> = spec.depends_on.iter().map(|&j| ids[j]).collect();
         let is_test = matches!(spec.model_tier, ModelTier::Cheap)
             && spec.description.to_ascii_lowercase().contains("test");
         if is_test {
@@ -408,10 +407,8 @@ pub async fn decompose_with_memory(
                 "planner skipped subtasks matching rejected approaches"
             );
             // Keep coverage honest: dropped implementations no longer count.
-            plan.coverage_summary.new_functions = plan
-                .coverage_summary
-                .new_functions
-                .saturating_sub(removed);
+            plan.coverage_summary.new_functions =
+                plan.coverage_summary.new_functions.saturating_sub(removed);
         }
     }
 
@@ -462,7 +459,10 @@ pub async fn decompose_with_memory_store(
 fn render_record_line(rec: &MemoryRecord) -> String {
     match rec {
         MemoryRecord::Decision { title, body, .. } => format!("decision: {title} — {body}"),
-        MemoryRecord::Constraint { statement, rationale } => {
+        MemoryRecord::Constraint {
+            statement,
+            rationale,
+        } => {
             format!("constraint: {statement} (because {rationale})")
         }
         MemoryRecord::RejectedApproach { summary, reason } => {
@@ -477,8 +477,7 @@ fn render_record_line(rec: &MemoryRecord) -> String {
 
 /// Collect distinct keyword queries to fan out against memory.
 fn memory_keywords(goal: &str) -> Vec<String> {
-    let ident = Regex::new(r"[A-Za-z_][A-Za-z0-9_]{4,}")
-        .expect("keyword regex is well-formed");
+    let ident = Regex::new(r"[A-Za-z_][A-Za-z0-9_]{4,}").expect("keyword regex is well-formed");
     let mut out: Vec<String> = Vec::new();
     for m in ident.find_iter(goal) {
         let w = m.as_str();
@@ -495,19 +494,32 @@ fn memory_keywords(goal: &str) -> Vec<String> {
 fn is_stopword(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
-        "a" | "an" | "the" | "and" | "with" | "for" | "into" | "that" | "this" |
-        "from" | "when" | "then" | "also" | "base" | "basic" | "skeletal" |
-        "initial" | "simple" | "project" | "everything" | "anything"
+        "a" | "an"
+            | "the"
+            | "and"
+            | "with"
+            | "for"
+            | "into"
+            | "that"
+            | "this"
+            | "from"
+            | "when"
+            | "then"
+            | "also"
+            | "base"
+            | "basic"
+            | "skeletal"
+            | "initial"
+            | "simple"
+            | "project"
+            | "everything"
+            | "anything"
     )
 }
 
 /// Run `query_memory` for every keyword and concatenate unique records
 /// (dedup on JSON-serialised form since `MemoryRecord` is not `Hash`).
-fn query_unique(
-    store: &Store,
-    keywords: &[String],
-    kind: MemoryKind,
-) -> Result<Vec<MemoryRecord>> {
+fn query_unique(store: &Store, keywords: &[String], kind: MemoryKind) -> Result<Vec<MemoryRecord>> {
     let mut out: Vec<MemoryRecord> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for k in keywords {
@@ -546,10 +558,7 @@ fn is_noise_word(s: &str) -> bool {
 
 /// Render the "Prior context" preamble from matched memory records. Empty
 /// when no records matched — caller should skip injection in that case.
-fn render_memory_preamble(
-    rejected: &[MemoryRecord],
-    decisions: &[MemoryRecord],
-) -> String {
+fn render_memory_preamble(rejected: &[MemoryRecord], decisions: &[MemoryRecord]) -> String {
     if rejected.is_empty() && decisions.is_empty() {
         return String::new();
     }
@@ -592,7 +601,11 @@ fn estimate_tokens(detections: &[Detection], goal: &Goal) -> u64 {
     let per_impl = 1_500u64;
     let per_test = 800u64;
     let impls = detections.len().max(1) as u64;
-    let tests = if goal.no_tests { 0 } else { detections.len() as u64 };
+    let tests = if goal.no_tests {
+        0
+    } else {
+        detections.len() as u64
+    };
     base + per_impl * impls + per_test * tests
 }
 
@@ -604,7 +617,11 @@ fn estimate_naive_tokens(detections: &[Detection], goal: &Goal) -> u64 {
     // rewrites.
     let per_turn = 35_000u64;
     let turns = detections.len().max(1) as u64;
-    let tests = if goal.no_tests { 0 } else { detections.len() as u64 };
+    let tests = if goal.no_tests {
+        0
+    } else {
+        detections.len() as u64
+    };
     (turns + tests) * per_turn
 }
 
@@ -658,7 +675,8 @@ pub fn detect_new_symbols(text: &str) -> Vec<Detection> {
 
     let mut out: Vec<Detection> = Vec::new();
     for caps in re.captures_iter(text) {
-        let kind = caps.name("kind")
+        let kind = caps
+            .name("kind")
             .map(|m| normalise_kind(m.as_str()))
             .unwrap_or_else(|| "feature".to_string());
 
@@ -711,9 +729,8 @@ mod tests {
 
     #[test]
     fn detects_function_and_struct() {
-        let dets = detect_new_symbols(
-            "Add a function parse_callsites and create struct ExecutionGuard.",
-        );
+        let dets =
+            detect_new_symbols("Add a function parse_callsites and create struct ExecutionGuard.");
         assert_eq!(dets.len(), 2);
         assert_eq!(dets[0].name, "parse_callsites");
         assert_eq!(dets[0].kind, "function");
@@ -778,13 +795,10 @@ mod tests {
                 task_id: None,
             })
             .unwrap();
-        let plan = decompose_with_memory(
-            &Goal::new("add a function parse_callsites"),
-            &store,
-            None,
-        )
-        .await
-        .unwrap();
+        let plan =
+            decompose_with_memory(&Goal::new("add a function parse_callsites"), &store, None)
+                .await
+                .unwrap();
         let first = &plan.subtasks[0];
         assert!(first.description.contains("Prior context from memory"));
         assert!(first.description.contains("parse_callsites"));
@@ -820,10 +834,9 @@ mod tests {
     async fn no_memory_records_leaves_plan_unchanged() {
         let store = Store::in_memory().unwrap();
         let base = decompose(&Goal::new("add a function foo"));
-        let with_mem =
-            decompose_with_memory(&Goal::new("add a function foo"), &store, None)
-                .await
-                .unwrap();
+        let with_mem = decompose_with_memory(&Goal::new("add a function foo"), &store, None)
+            .await
+            .unwrap();
         assert_eq!(base.subtasks.len(), with_mem.subtasks.len());
         // First description unchanged (no preamble).
         assert!(!with_mem.subtasks[0].description.contains("Prior context"));
@@ -884,7 +897,10 @@ mod tests {
 
     #[test]
     fn test_tier_steps_down_one_notch() {
-        assert!(matches!(test_tier(ModelTier::Frontier), ModelTier::Standard));
+        assert!(matches!(
+            test_tier(ModelTier::Frontier),
+            ModelTier::Standard
+        ));
         assert!(matches!(test_tier(ModelTier::Standard), ModelTier::Cheap));
         assert!(matches!(test_tier(ModelTier::Cheap), ModelTier::Local));
         assert!(matches!(test_tier(ModelTier::Local), ModelTier::Local));
@@ -941,7 +957,9 @@ mod tests {
             response: json.into(),
         });
 
-        let plan = decompose_with_llm("build a thing", provider, "").await.unwrap();
+        let plan = decompose_with_llm("build a thing", provider, "")
+            .await
+            .unwrap();
         assert_eq!(plan.subtasks.len(), 3);
 
         // Sanity on tiers.

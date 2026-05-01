@@ -173,15 +173,27 @@ pub async fn run(args: &[String]) -> Result<i32> {
     match request.action {
         ReviewAction::Show => {}
         ReviewAction::Approve => {
-            return finish_task(&store, task, TaskStatus::Done {
-                tokens_used: report.total_tokens,
-                wall_time_ms: 0,
-            }, "approve", request.options.json)
+            return finish_task(
+                &store,
+                task,
+                TaskStatus::Done {
+                    tokens_used: report.total_tokens,
+                    wall_time_ms: 0,
+                },
+                "approve",
+                request.options.json,
+            )
             .await;
         }
         ReviewAction::Reject => {
-            return finish_task(&store, task, TaskStatus::Rejected, "reject", request.options.json)
-                .await;
+            return finish_task(
+                &store,
+                task,
+                TaskStatus::Rejected,
+                "reject",
+                request.options.json,
+            )
+            .await;
         }
         ReviewAction::Rollback { seq } => {
             return rollback_task(&store, task, events, seq, request.options.json).await;
@@ -298,8 +310,10 @@ fn parse_task_id(raw: &str) -> Result<TaskId> {
 }
 
 fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
-    let mut context_by_subtask: std::collections::HashMap<String, (Vec<ContextAttribution>, usize)> =
-        std::collections::HashMap::new();
+    let mut context_by_subtask: std::collections::HashMap<
+        String,
+        (Vec<ContextAttribution>, usize),
+    > = std::collections::HashMap::new();
     for event in &events {
         if let OrchestratorEvent::ContextSelected {
             subtask_id,
@@ -307,10 +321,7 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
             total_token_count,
         } = &event.event
         {
-            context_by_subtask.insert(
-                subtask_id.to_string(),
-                (slices.clone(), *total_token_count),
-            );
+            context_by_subtask.insert(subtask_id.to_string(), (slices.clone(), *total_token_count));
         }
     }
 
@@ -383,7 +394,11 @@ fn print_text_report(report: &ReviewReport) {
             "   subtask: {}  provider: {}  model: {}",
             item.subtask_id,
             item.provider,
-            if item.model_name.is_empty() { "(unknown)" } else { &item.model_name }
+            if item.model_name.is_empty() {
+                "(unknown)"
+            } else {
+                &item.model_name
+            }
         );
         render_context(&item.context);
         render_hunks(&item.diff_hunks);

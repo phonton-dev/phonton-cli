@@ -50,7 +50,9 @@ impl MemoryStore {
     pub async fn record(&self, record: MemoryRecord) -> Result<()> {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let guard = store.lock().map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
             guard.append_memory(&record)?;
             Ok(())
         })
@@ -110,7 +112,9 @@ impl MemoryStore {
     async fn load_all(&self) -> Result<Vec<MemoryRecord>> {
         let store = Arc::clone(&self.store);
         let out = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRecord>> {
-            let guard = store.lock().map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
             let rows = guard.search_memory("", None, usize::MAX)?;
             Ok(rows)
         })
@@ -139,7 +143,10 @@ fn tokenize(text: &str) -> HashSet<String> {
 fn searchable_text(r: &MemoryRecord) -> String {
     match r {
         MemoryRecord::Decision { title, body, .. } => format!("{title} {body}"),
-        MemoryRecord::Constraint { statement, rationale } => format!("{statement} {rationale}"),
+        MemoryRecord::Constraint {
+            statement,
+            rationale,
+        } => format!("{statement} {rationale}"),
         MemoryRecord::RejectedApproach { summary, reason } => format!("{summary} {reason}"),
         MemoryRecord::Convention { rule, scope } => {
             format!("{rule} {}", scope.as_deref().unwrap_or(""))

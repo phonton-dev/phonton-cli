@@ -164,9 +164,9 @@ pub fn prompt_if_needed(workspace: &Path) -> Result<bool> {
     if answer == "y" || answer == "yes" {
         match record_trust(workspace) {
             Ok(()) => println!("Trust recorded — launching Phonton…\n"),
-            Err(e) => println!(
-                "Trust accepted (but persistence failed: {e}) — launching Phonton…\n"
-            ),
+            Err(e) => {
+                println!("Trust accepted (but persistence failed: {e}) — launching Phonton…\n")
+            }
         }
         Ok(true)
     } else {
