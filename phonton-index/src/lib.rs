@@ -486,7 +486,7 @@ pub async fn index_workspace_with_nexus_using_embedder(
     for chunk in all_slices.chunks(32) {
         let texts: Vec<&str> = chunk.iter().map(|s| s.signature.as_str()).collect();
         let vecs = embedder.embed(&texts)?;
-        for (slice, vec) in chunk.iter().cloned().zip(vecs.into_iter()) {
+        for (slice, vec) in chunk.iter().cloned().zip(vecs) {
             index.add(slice, vec)?;
         }
     }
@@ -530,7 +530,7 @@ pub async fn index_workspace_using_embedder(
     for chunk in all_slices.chunks(32) {
         let texts: Vec<&str> = chunk.iter().map(|s| s.signature.as_str()).collect();
         let vecs = embedder.embed(&texts)?;
-        for (slice, vec) in chunk.iter().cloned().zip(vecs.into_iter()) {
+        for (slice, vec) in chunk.iter().cloned().zip(vecs) {
             index.add(slice, vec)?;
         }
     }
@@ -649,7 +649,7 @@ pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
             for chunk in slices.chunks(32) {
                 let texts: Vec<&str> = chunk.iter().map(|s| s.signature.as_str()).collect();
                 if let Ok(vecs) = embedder.embed(&texts) {
-                    for (slice, vec) in chunk.iter().cloned().zip(vecs.into_iter()) {
+                    for (slice, vec) in chunk.iter().cloned().zip(vecs) {
                         let _ = index.add(slice, vec);
                     }
                 }
@@ -823,7 +823,7 @@ mod tests {
 
         let texts: Vec<&str> = slices.iter().map(|s| s.signature.as_str()).collect();
         let vecs = embedder.embed(&texts).expect("embed");
-        for (s, v) in slices.into_iter().zip(vecs.into_iter()) {
+        for (s, v) in slices.into_iter().zip(vecs) {
             index.add(s, v).unwrap();
         }
 

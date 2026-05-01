@@ -1059,12 +1059,10 @@ impl App {
                     self.settings.picker.rebuild_filter();
                     return Some(Intent::SaveSettings);
                 }
-                KeyCode::Up => {
-                    if self.settings.picker.selected > 0 {
-                        self.settings.picker.selected -= 1;
-                        if self.settings.picker.selected < self.settings.picker.scroll {
-                            self.settings.picker.scroll = self.settings.picker.selected;
-                        }
+                KeyCode::Up if self.settings.picker.selected > 0 => {
+                    self.settings.picker.selected -= 1;
+                    if self.settings.picker.selected < self.settings.picker.scroll {
+                        self.settings.picker.scroll = self.settings.picker.selected;
                     }
                 }
                 KeyCode::Down => {
