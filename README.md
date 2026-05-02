@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/readme/phonton-cli-logo.svg" width="92" alt="Phonton CLI logo">
+  <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
 <h1 align="center">Phonton CLI · v0.1.0</h1>
@@ -24,7 +24,7 @@ Phonton plans the work, routes it through local repo context, verifies changes b
 > Current status: pre-1.0 public-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
 
 <p align="center">
-  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI terminal UI home screen">
+  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI hero with terminal UI preview">
 </p>
 
 ## Why Phonton
