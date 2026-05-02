@@ -4,7 +4,22 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
-## 0.1.0 - Private Alpha
+## 0.2.0 - Public Alpha
+
+### Added
+
+- Persistent memory wiring for live CLI goal runs, worker decision records, and verify decision checks.
+- `phonton memory` commands for list, edit, delete, pin, and unpin.
+- Review payloads with token buckets, provider/model cost summaries, checkpoint lists, and persisted review decisions.
+- Provider doctor checks that validate both model discovery and a tiny completion call through the configured run adapter.
+
+### Fixed
+
+- Generic planning goals now preserve the original request instead of collapsing to lossy names like `feature input`.
+- Orchestrator tests now run against temporary workspaces instead of mutating tracked fixtures.
+- Release checks now fail if `cargo test --locked --workspace` leaves the workspace dirty.
+
+## 0.1.0 - Public Alpha
 
 Initial release target for the `phonton-dev/phonton-cli` repository.
 

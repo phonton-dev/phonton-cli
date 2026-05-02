@@ -16,3 +16,4 @@ petgraph       = "0.6"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

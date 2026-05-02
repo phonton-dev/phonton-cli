@@ -1,6 +1,6 @@
 [package]
 name = "phonton-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,6 +17,7 @@ phonton-types        = { path = "../phonton-types" }
 phonton-orchestrator = { path = "../phonton-orchestrator" }
 phonton-planner      = { path = "../phonton-planner" }
 phonton-store        = { path = "../phonton-store" }
+phonton-memory       = { path = "../phonton-memory" }
 phonton-verify       = { path = "../phonton-verify" }
 phonton-providers    = { path = "../phonton-providers" }
 phonton-sandbox      = { path = "../phonton-sandbox" }

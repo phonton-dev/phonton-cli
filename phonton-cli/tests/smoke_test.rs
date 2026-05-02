@@ -7,7 +7,7 @@ use phonton_planner::{decompose_with_memory, Goal};
 use phonton_store::Store;
 use phonton_types::{
     DiffHunk, DiffLine, OrchestratorMessage, ProviderKind, Subtask, SubtaskResult, SubtaskStatus,
-    VerifyLayer, VerifyResult,
+    TokenUsage, VerifyLayer, VerifyResult,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +45,7 @@ impl WorkerDispatcher for StubDispatcher {
             },
             provider: ProviderKind::Anthropic,
             model_name: "test-stub".into(),
+            token_usage: TokenUsage::estimated(120),
         })
     }
 }

@@ -40,7 +40,20 @@ pub struct PlanRequest {
 struct PlanReport {
     goal: String,
     memory_enabled: bool,
+    memory_influence_count: usize,
+    coverage_warnings: Vec<String>,
+    subtasks: Vec<PlanSubtaskReport>,
     plan: PlannerOutput,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanSubtaskReport {
+    id: String,
+    description: String,
+    tier: String,
+    dependencies: Vec<String>,
+    expected_touched_areas: Vec<String>,
+    memory_influenced: bool,
 }
 
 pub fn parse_request(args: &[String]) -> Result<PlanRequest> {
@@ -107,6 +120,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
     let report = PlanReport {
         goal: request.goal,
         memory_enabled: request.options.use_memory,
+        memory_influence_count: memory_influence_count(&plan),
+        coverage_warnings: coverage_warnings(&plan),
+        subtasks: subtask_reports(&plan),
         plan,
     };
 
@@ -138,6 +154,9 @@ fn print_text_report(report: &PlanReport) {
         "coverage: {} new functions, {} tests planned",
         report.plan.coverage_summary.new_functions, report.plan.coverage_summary.tests_planned
     );
+    for warning in &report.coverage_warnings {
+        println!("warning: {warning}");
+    }
     println!();
 
     let id_to_index: HashMap<SubtaskId, usize> = report
@@ -171,10 +190,75 @@ fn print_text_report(report: &PlanReport) {
         if subtask.description.contains("# Prior context") {
             println!("   memory: applied to this subtask");
         }
+        let areas = expected_touched_areas(&subtask.description);
+        if !areas.is_empty() {
+            println!("   expected areas: {}", areas.join(", "));
+        }
     }
 
     println!();
     println!("Preview only: no files were changed and no worker was dispatched.");
+}
+
+fn subtask_reports(plan: &PlannerOutput) -> Vec<PlanSubtaskReport> {
+    plan.subtasks
+        .iter()
+        .map(|subtask| PlanSubtaskReport {
+            id: subtask.id.to_string(),
+            description: first_line(&subtask.description).to_string(),
+            tier: format!("{:?}", subtask.model_tier),
+            dependencies: subtask
+                .dependencies
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            expected_touched_areas: expected_touched_areas(&subtask.description),
+            memory_influenced: subtask.description.contains("# Prior context"),
+        })
+        .collect()
+}
+
+fn memory_influence_count(plan: &PlannerOutput) -> usize {
+    plan.subtasks
+        .iter()
+        .filter(|s| s.description.contains("# Prior context"))
+        .count()
+}
+
+fn coverage_warnings(plan: &PlannerOutput) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if plan.coverage_summary.new_functions == 0 && plan.coverage_summary.tests_planned == 0 {
+        warnings.push(
+            "No concrete symbols detected; review the generated subtask before running.".into(),
+        );
+    }
+    if plan.coverage_summary.new_functions > 0 && plan.coverage_summary.tests_planned == 0 {
+        warnings.push(
+            "Tests are disabled or were not planned for detected implementation work.".into(),
+        );
+    }
+    warnings
+}
+
+fn expected_touched_areas(description: &str) -> Vec<String> {
+    let lower = description.to_ascii_lowercase();
+    let mut areas = Vec::new();
+    for (needle, area) in [
+        ("config", "configuration"),
+        ("memory", "memory store"),
+        ("review", "review surface"),
+        ("plan", "planner"),
+        ("test", "tests"),
+        ("cli", "cli"),
+        ("provider", "providers"),
+        ("verify", "verification"),
+        ("diff", "diff/checkpointing"),
+    ] {
+        if lower.contains(needle) && !areas.iter().any(|a| a == area) {
+            areas.push(area.to_string());
+        }
+    }
+    areas
 }
 
 fn first_line(text: &str) -> &str {

@@ -662,13 +662,9 @@ pub fn detect_new_symbols(text: &str) -> Vec<Detection> {
         r"(?ix)
         \b(?P<verb>add|create|implement|introduce|write|define|build|make)\b
         [^\.\n]{0,40}?
-        (?:
-            \b(?P<kind>function|fn|struct|enum|trait|method|module|type)\b
-            [\s:`'(]*
-            (?P<name>[A-Za-z_][A-Za-z0-9_]*)
-        |
-            \b(?P<generic_name>[A-Za-z_][A-Za-z0-9_]{2,})\b
-        )
+        \b(?P<kind>function|fn|struct|enum|trait|method|module|type)\b
+        [\s:`'(]*
+        (?P<name>[A-Za-z_][A-Za-z0-9_]*)
         ",
     )
     .expect("planner regex is well-formed");
@@ -680,17 +676,10 @@ pub fn detect_new_symbols(text: &str) -> Vec<Detection> {
             .map(|m| normalise_kind(m.as_str()))
             .unwrap_or_else(|| "feature".to_string());
 
-        let name = if let Some(n) = caps.name("name") {
-            n.as_str().to_string()
-        } else if let Some(n) = caps.name("generic_name") {
-            let n_str = n.as_str();
-            if is_stopword(n_str) {
-                continue;
-            }
-            n_str.to_string()
-        } else {
+        let Some(name_match) = caps.name("name") else {
             continue;
         };
+        let name = name_match.as_str().to_string();
 
         if name.is_empty() || is_kind_word(&name) {
             continue;
@@ -774,6 +763,21 @@ mod tests {
         assert_eq!(plan.subtasks.len(), 1);
         assert_eq!(plan.coverage_summary.new_functions, 0);
         assert_eq!(plan.coverage_summary.tests_planned, 0);
+    }
+
+    #[test]
+    fn generic_feature_goal_preserves_original_terms() {
+        let goal = "add input validation to config loading";
+        let dets = detect_new_symbols(goal);
+        assert!(
+            dets.is_empty(),
+            "generic detector should not invent a symbol: {dets:?}"
+        );
+
+        let plan = decompose(&Goal::new(goal));
+        assert_eq!(plan.subtasks.len(), 1);
+        assert_eq!(plan.subtasks[0].description, goal);
+        assert!(!plan.subtasks[0].description.contains("feature input"));
     }
 
     #[test]

@@ -36,6 +36,7 @@
 
 mod config;
 mod doctor;
+mod memory_cli;
 mod plan_preview;
 mod review;
 mod trust;
@@ -63,8 +64,9 @@ use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
     BudgetLimits, CoverageSummary, DiffHunk, DiffLine, EventRecord, GlobalState, MemoryRecord,
-    ModelTier, OrchestratorMessage, PlannerOutput, ProviderConfig as ApiProviderConfig, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus, VerifyLayer, VerifyResult,
+    ModelPricing, ModelTier, OrchestratorMessage, PlannerOutput,
+    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -2470,6 +2472,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::Thinking { .. } => (VIOLET, "thinking"),
         E::CheckpointCreated { .. } => (SUCCESS, "checkpoint"),
         E::RollbackPerformed { .. } => (WARN, "rollback"),
+        E::ReviewDecision { .. } => (ACCENT, "review"),
     }
 }
 
@@ -2770,6 +2773,7 @@ impl WorkerDispatcher for StubDispatcher {
             },
             provider: phonton_types::ProviderKind::Anthropic,
             model_name: String::new(),
+            token_usage: TokenUsage::estimated(120),
         })
     }
 }
@@ -2884,7 +2888,7 @@ async fn build_semantic_context(
 /// Load a provider for ask-mode (stateless Q&A) using the config file or
 /// env vars. Returns `None` when no key is available.
 fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
-    let api_key = config::resolve_api_key(&cfg.provider)?;
+    let api_key = provider_key_for_run(&cfg.provider)?;
     let model = cfg
         .provider
         .model
@@ -2897,6 +2901,20 @@ fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
         cfg.provider.base_url.clone(),
     )?;
     Some(Arc::from(provider_for(provider_cfg)))
+}
+
+fn provider_requires_key(name: &str) -> bool {
+    !matches!(name, "ollama" | "custom" | "openai-compatible")
+}
+
+fn provider_key_for_run(cfg: &config::ProviderConfig) -> Option<String> {
+    config::resolve_api_key(cfg).or_else(|| {
+        if provider_requires_key(&cfg.name) {
+            None
+        } else {
+            Some(String::new())
+        }
+    })
 }
 
 /// Build an [`ApiProviderConfig`] from the provider name, resolved key,
@@ -2992,14 +3010,18 @@ async fn test_provider(
     model: String,
     base_url: Option<String>,
 ) -> Result<String, String> {
-    if api_key.trim().is_empty() && name != "ollama" {
+    if api_key.trim().is_empty() && provider_requires_key(&name) {
         return Err("no API key — paste one in the API Key field or set the env var".into());
     }
     let cfg = make_api_provider_config(&name, api_key, model, base_url)
         .ok_or_else(|| format!("unknown provider `{name}`"))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
     let resp = provider
-        .call("You are a terse assistant.", "Reply with exactly: ok", &[])
+        .call(
+            "You are a terse assistant. Respond only with JSON.",
+            "Return exactly {\"ok\":true} as JSON.",
+            &[],
+        )
         .await
         .map_err(|e| format!("{e}"))?;
     Ok(resp.content)
@@ -3341,6 +3363,7 @@ fn print_help() {
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
+         memory            List, edit, delete, and pin persistent memory\n  \
          config path       Print the resolved config file path\n  \
          config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
          config show       Dump the resolved config as TOML\n  \
@@ -3365,7 +3388,14 @@ fn print_help() {
          phonton review [--json] [latest|<task-id>]\n  \
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
-         phonton review rollback [--json] [latest|<task-id>] <seq>\n"
+         phonton review rollback [--json] [latest|<task-id>] <seq>\n\
+         \n\
+         MEMORY:\n  \
+         phonton memory list [--json] [--kind <kind>] [--topic <text>] [--limit <n>]\n  \
+         phonton memory edit <id> <text>\n  \
+         phonton memory delete <id>\n  \
+         phonton memory pin <id>\n  \
+         phonton memory unpin <id>\n"
     );
 }
 
@@ -3473,6 +3503,13 @@ async fn handle_cli_args() -> Result<bool> {
             }
             Ok(true)
         }
+        "memory" => {
+            let code = memory_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
         "ask" => {
             let question = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();
             if question.trim().is_empty() {
@@ -3527,7 +3564,7 @@ async fn main() -> Result<()> {
     // the user already picked a model we leave it alone — they get to
     // override the auto-pick from Settings via Ctrl+D anyway.
     if cfg.provider.model.is_none() {
-        if let Some(api_key) = config::resolve_api_key(&cfg.provider) {
+        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
             let detect = tokio::time::timeout(
                 std::time::Duration::from_secs(8),
                 select_best_working_model(
@@ -3775,7 +3812,7 @@ async fn run_app<B: Backend>(
                                     model: None,
                                     base_url: None,
                                 };
-                                config::resolve_api_key(&stub).unwrap_or_default()
+                                provider_key_for_run(&stub).unwrap_or_default()
                             } else {
                                 app.settings.api_key.clone()
                             };
@@ -3813,7 +3850,7 @@ async fn run_app<B: Backend>(
                                     model: None,
                                     base_url: None,
                                 };
-                                config::resolve_api_key(&stub).unwrap_or_default()
+                                provider_key_for_run(&stub).unwrap_or_default()
                             } else {
                                 app.settings.api_key.clone()
                             };
@@ -3822,7 +3859,7 @@ async fn run_app<B: Backend>(
                             } else {
                                 Some(app.settings.base_url.clone())
                             };
-                            if key.trim().is_empty() && provider_name != "ollama" {
+                            if key.trim().is_empty() && provider_requires_key(&provider_name) {
                                 app.settings.message =
                                     Some("Detect failed: no API key in field or env var.".into());
                             } else {
@@ -3902,7 +3939,7 @@ async fn run_app<B: Backend>(
                                         model: None,
                                         base_url: None,
                                     };
-                                    config::resolve_api_key(&stub).unwrap_or_default()
+                                    provider_key_for_run(&stub).unwrap_or_default()
                                 } else {
                                     app.settings.api_key.clone()
                                 };
@@ -4058,6 +4095,7 @@ async fn spawn_goal(
     if let Ok(g) = store.lock() {
         let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
     }
+    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(store)).await;
 
     let plan_result = if direct_task {
         Ok(single_task_plan(text.clone()))
@@ -4094,7 +4132,7 @@ async fn spawn_goal(
     let semantic_context = build_semantic_context(working_dir).await;
 
     let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) =
-        config::resolve_api_key(&cfg.provider)
+        provider_key_for_run(&cfg.provider)
     {
         let provider_name = cfg.provider.name.clone();
         let base_url = cfg.provider.base_url.clone();
@@ -4119,7 +4157,9 @@ async fn spawn_goal(
 
         let guard = ExecutionGuard::new(working_dir.clone());
         let mut d =
-            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone());
+            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                .with_task_id(task_id)
+                .with_memory(memory_store.clone());
         if let Some(ctx) = semantic_context.clone() {
             d = d.with_semantic_context(ctx);
         }
@@ -4149,11 +4189,25 @@ async fn spawn_goal(
         max_tokens: cfg.budget.max_tokens,
         max_usd_micros: cfg.budget.max_usd_micros(),
     };
-    let budget_guard = BudgetGuard::new(limits);
+    let mut budget_guard = BudgetGuard::new(limits);
+    if cfg.provider.name == "ollama" {
+        if let Some(model) = cfg.provider.model.as_deref() {
+            budget_guard = budget_guard.with_price(
+                ProviderKind::Ollama,
+                model,
+                ModelPricing {
+                    input_usd_micros_per_mtok: 0,
+                    output_usd_micros_per_mtok: 0,
+                },
+            );
+        }
+    }
 
     let mut orch = Orchestrator::new(dispatcher)
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
+        .with_working_dir(working_dir.clone())
+        .with_memory(memory_store)
         .with_event_sink(task_id, text.clone(), event_tx)
         .with_control_channel(ctrl_rx);
     if let Some(da) = diff_applier {
@@ -4245,6 +4299,33 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn local_providers_can_run_without_api_keys() {
+        let ollama = config::ProviderConfig {
+            name: "ollama".into(),
+            api_key: None,
+            model: Some("llama3.2:3b".into()),
+            base_url: None,
+        };
+        assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
+
+        let custom = config::ProviderConfig {
+            name: "openai-compatible".into(),
+            api_key: None,
+            model: Some("local-model".into()),
+            base_url: Some("http://localhost:1234/v1".into()),
+        };
+        assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn hosted_providers_still_require_api_keys() {
+        assert!(provider_requires_key("openai"));
+        assert!(provider_requires_key("anthropic"));
+        assert!(!provider_requires_key("ollama"));
+        assert!(!provider_requires_key("openai-compatible"));
     }
 
     #[test]

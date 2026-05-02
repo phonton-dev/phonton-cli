@@ -9,9 +9,13 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
+use phonton_providers::provider_for;
 use serde::Serialize;
 
-use crate::{config, default_model_for, default_store_path, trust};
+use crate::{
+    config, default_model_for, default_store_path, make_api_provider_config, provider_requires_key,
+    trust,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,7 +86,7 @@ pub fn parse_options(args: &[String]) -> Result<DoctorOptions> {
             "--provider" | "--network" => opts.check_provider = true,
             "-h" | "--help" => {
                 return Err(anyhow::anyhow!(
-                    "usage: phonton doctor [--json] [--provider]\n\n  --json      Emit machine-readable JSON\n  --provider  Also probe the configured provider/models endpoint"
+                    "usage: phonton doctor [--json] [--provider]\n\n  --json      Emit machine-readable JSON\n  --provider  Also probe the configured provider models endpoint and completion adapter"
                 ));
             }
             other => return Err(anyhow::anyhow!("unknown doctor option `{other}`")),
@@ -234,8 +238,7 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
     }
 
     let key = config::resolve_api_key(&cfg.provider);
-    let needs_key = !matches!(provider, "ollama");
-    if needs_key && key.is_none() {
+    if provider_requires_key(provider) && key.is_none() {
         push(
             checks,
             "provider.key",
@@ -280,22 +283,31 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
         .model
         .clone()
         .unwrap_or_else(|| default_model_for(provider));
-    let model_severity = if cfg.provider.model.is_some() {
+    let custom_missing_model =
+        matches!(provider, "custom" | "openai-compatible") && cfg.provider.model.is_none();
+    let model_severity = if custom_missing_model {
+        Severity::Fail
+    } else if cfg.provider.model.is_some() {
         Severity::Ok
     } else {
         Severity::Warn
     };
+    let model_for_probe = model.clone();
     push(
         checks,
         "provider.model",
         model_severity,
-        if cfg.provider.model.is_some() {
+        if custom_missing_model {
+            "Custom provider needs a model"
+        } else if cfg.provider.model.is_some() {
             "Model is configured"
         } else {
             "Model is using CLI default"
         },
         model,
-        if cfg.provider.model.is_some() {
+        if custom_missing_model {
+            Some("Set provider.model in ~/.phonton/config.toml.".into())
+        } else if cfg.provider.model.is_some() {
             None
         } else {
             Some(
@@ -305,8 +317,19 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
         },
     );
 
+    if custom_missing_model {
+        return;
+    }
+
     if opts.check_provider {
-        check_provider_endpoint(checks, provider, &cfg.provider, key.as_deref()).await;
+        check_provider_endpoint(
+            checks,
+            provider,
+            &cfg.provider,
+            key.as_deref(),
+            &model_for_probe,
+        )
+        .await;
     } else {
         push(
             checks,
@@ -314,7 +337,10 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
             Severity::Warn,
             "Provider network probe skipped",
             "local-only doctor run",
-            Some("Run `phonton doctor --provider` to validate the key and models endpoint.".into()),
+            Some(
+                "Run `phonton doctor --provider` to validate model discovery and a tiny completion call."
+                    .into(),
+            ),
         );
     }
 }
@@ -324,26 +350,33 @@ async fn check_provider_endpoint(
     provider: &str,
     cfg: &config::ProviderConfig,
     key: Option<&str>,
+    model: &str,
 ) {
-    if provider == "ollama" {
-        let key = "";
-        probe_models(checks, provider, key, cfg.base_url.as_deref()).await;
-        return;
-    }
-
-    let Some(key) = key else {
-        push(
-            checks,
-            "provider.probe",
-            Severity::Fail,
-            "Provider network probe cannot run",
-            "missing API key",
-            Some(provider_key_hint(provider)),
-        );
-        return;
+    let effective_key = match key {
+        Some(key) => key,
+        None if !provider_requires_key(provider) => "",
+        None => {
+            push(
+                checks,
+                "provider.probe",
+                Severity::Fail,
+                "Provider network probe cannot run",
+                "missing API key",
+                Some(provider_key_hint(provider)),
+            );
+            return;
+        }
     };
 
-    probe_models(checks, provider, key, cfg.base_url.as_deref()).await;
+    probe_models(checks, provider, effective_key, cfg.base_url.as_deref()).await;
+    probe_completion(
+        checks,
+        provider,
+        effective_key,
+        model,
+        cfg.base_url.as_deref(),
+    )
+    .await;
 }
 
 async fn probe_models(
@@ -397,6 +430,88 @@ async fn probe_models(
             Some(
                 "Check network access or try again with a more reliable provider endpoint.".into(),
             ),
+        ),
+    }
+}
+
+async fn probe_completion(
+    checks: &mut Vec<DoctorCheck>,
+    provider: &str,
+    key: &str,
+    model: &str,
+    base_url: Option<&str>,
+) {
+    let Some(cfg) = make_api_provider_config(
+        provider,
+        key.to_string(),
+        model.to_string(),
+        base_url.map(str::to_string),
+    ) else {
+        push(
+            checks,
+            "provider.completion",
+            Severity::Fail,
+            "Provider completion call cannot be configured",
+            format!("{provider} with model {model}"),
+            Some("Check provider.name, provider.model, and provider.base_url.".into()),
+        );
+        return;
+    };
+
+    let provider_impl = provider_for(cfg);
+    let probe = tokio::time::timeout(
+        Duration::from_secs(60),
+        provider_impl.call(
+            "You are a terse assistant. Respond only with JSON.",
+            "Return exactly {\"ok\":true} as JSON.",
+            &[],
+        ),
+    )
+    .await;
+
+    match probe {
+        Ok(Ok(resp)) if !resp.content.trim().is_empty() => push(
+            checks,
+            "provider.completion",
+            Severity::Ok,
+            "Provider completion adapter works",
+            format!(
+                "{} via {} (input {}, output {}, cached {}, cache_create {})",
+                resp.model_name,
+                resp.provider,
+                resp.input_tokens,
+                resp.output_tokens,
+                resp.cached_tokens,
+                resp.cache_creation_tokens
+            ),
+            None,
+        ),
+        Ok(Ok(resp)) => push(
+            checks,
+            "provider.completion",
+            Severity::Fail,
+            "Provider completion returned empty content",
+            format!("{} via {}", resp.model_name, resp.provider),
+            Some("Check the configured model name and provider account access.".into()),
+        ),
+        Ok(Err(e)) => push(
+            checks,
+            "provider.completion",
+            Severity::Fail,
+            "Provider completion call failed",
+            e.to_string(),
+            Some(
+                "Check model name, API key, account quota, and chat/completions compatibility."
+                    .into(),
+            ),
+        ),
+        Err(_) => push(
+            checks,
+            "provider.completion",
+            Severity::Fail,
+            "Provider completion call timed out",
+            "no response within 60 seconds",
+            Some("Check network access or try a faster model/provider endpoint.".into()),
         ),
     }
 }
@@ -611,7 +726,7 @@ fn print_text_report(report: &DoctorReport, opts: DoctorOptions) {
         );
     } else if report.warn_count() > 0 {
         println!(
-            "Result: usable with {} warning(s). Tighten these before public alpha.",
+            "Result: usable with {} warning(s). Tighten these before a trusted release run.",
             report.warn_count()
         );
     } else {

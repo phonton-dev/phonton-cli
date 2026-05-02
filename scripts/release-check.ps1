@@ -27,7 +27,14 @@ try {
         Invoke-Checked cargo @("clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings")
     }
 
+    $beforeTestStatus = @(git status --short -- .)
     Invoke-Checked cargo @("test", "--locked", "--workspace")
+    $afterTestStatus = @(git status --short -- .)
+    $beforeJoined = $beforeTestStatus -join "`n"
+    $afterJoined = $afterTestStatus -join "`n"
+    if ($afterJoined -ne $beforeJoined) {
+        throw "cargo test changed workspace status:`nBefore:`n$beforeJoined`nAfter:`n$afterJoined"
+    }
     Invoke-Checked cargo @("build", "--locked", "--release", "-p", "phonton-cli")
     Invoke-Checked ".\target\release\phonton.exe" @("doctor")
 

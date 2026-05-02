@@ -15,8 +15,8 @@ pub mod providers;
 pub use events::{EventRecord, OrchestratorEvent, TOKEN_MILESTONE_INTERVAL};
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
-    BudgetDecision, BudgetLimits, LLMResponse, ModelMetricsSnapshot, ModelPricing, ProviderConfig,
-    ProviderError, ProviderKind,
+    BudgetDecision, BudgetLimits, CostSummary, LLMResponse, ModelMetricsSnapshot, ModelPricing,
+    ProviderConfig, ProviderError, ProviderKind, TokenUsage,
 };
 
 // ---------------------------------------------------------------------------
@@ -486,6 +486,8 @@ pub struct SubtaskResult {
     /// Model name as reported by the provider (e.g. `claude-haiku-4-5-20251001`).
     /// Empty string when unknown (e.g. stub dispatcher).
     pub model_name: String,
+    /// Provider-reported token usage split by input/output/cache buckets.
+    pub token_usage: TokenUsage,
 }
 
 // ---------------------------------------------------------------------------

@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS memory_records (
     body_json   TEXT NOT NULL,        -- full MemoryRecord serialised
     topic       TEXT NOT NULL,        -- denormalised for FTS-lite LIKE matching
     task_id     TEXT,                 -- nullable; only set for Decisions tied to a task
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    pinned      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memory_kind  ON memory_records(kind);
 CREATE INDEX IF NOT EXISTS idx_memory_topic ON memory_records(topic);
@@ -82,6 +83,7 @@ impl Store {
             .with_context(|| format!("opening sqlite db at {}", path.display()))?;
         conn.execute_batch(MIGRATIONS)
             .context("applying phonton-store migrations")?;
+        ensure_memory_columns(&conn)?;
         Ok(Self { conn, path })
     }
 
@@ -90,6 +92,7 @@ impl Store {
         let conn = Connection::open_in_memory().context("opening in-memory sqlite")?;
         conn.execute_batch(MIGRATIONS)
             .context("applying phonton-store migrations")?;
+        ensure_memory_columns(&conn)?;
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
@@ -149,6 +152,82 @@ impl Store {
             params![kind, body, topic, task_id, now_secs() as i64],
         )?;
         Ok(())
+    }
+
+    /// List editable memory entries with their database ids and pin state.
+    pub fn list_memory(
+        &self,
+        kind: Option<&str>,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let mut sql = String::from(
+            "SELECT id, kind, body_json, topic, task_id, created_at, pinned
+             FROM memory_records WHERE 1=1",
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(k) = kind {
+            sql.push_str(" AND kind = ?");
+            binds.push(Box::new(k.to_string()));
+        }
+        if let Some(t) = topic {
+            sql.push_str(" AND LOWER(topic) LIKE ?");
+            binds.push(Box::new(format!("%{}%", t.to_lowercase())));
+        }
+        sql.push_str(" ORDER BY pinned DESC, created_at DESC, id DESC LIMIT ?");
+        binds.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_ref.as_slice(), row_to_memory_entry)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Replace the body of an existing memory record.
+    pub fn update_memory(&self, id: i64, record: &MemoryRecord) -> Result<bool> {
+        let kind = memory_kind(record);
+        let topic = memory_topic(record);
+        let task_id = memory_task_id(record).map(|t| t.to_string());
+        let body = serde_json::to_string(record)?;
+        let changed = self.conn.execute(
+            "UPDATE memory_records
+             SET kind = ?1, body_json = ?2, topic = ?3, task_id = ?4
+             WHERE id = ?5",
+            params![kind, body, topic, task_id, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Delete one memory record by id.
+    pub fn delete_memory(&self, id: i64) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM memory_records WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    /// Set or clear a memory record's pinned state.
+    pub fn set_memory_pinned(&self, id: i64, pinned: bool) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE memory_records SET pinned = ?1 WHERE id = ?2",
+            params![if pinned { 1 } else { 0 }, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Fetch one memory entry by id.
+    pub fn get_memory(&self, id: i64) -> Result<Option<MemoryEntry>> {
+        self.conn
+            .query_row(
+                "SELECT id, kind, body_json, topic, task_id, created_at, pinned
+                 FROM memory_records WHERE id = ?1",
+                params![id],
+                row_to_memory_entry,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Free-form memory query, ranked by recency. `kind_filter` narrows
@@ -342,6 +421,16 @@ impl Store {
         self.append_memory(record)
     }
 
+    /// Async counterpart to [`Store::list_memory`].
+    pub async fn list_memory_entries(
+        &self,
+        kind: Option<&str>,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.list_memory(kind, topic, limit)
+    }
+
     /// Filter memory by `kind` and/or `topic` substring. `None` on either
     /// side removes that predicate. Ordered by recency.
     pub async fn query_memory(
@@ -407,6 +496,18 @@ pub struct TaskRecord {
     pub total_tokens: u64,
 }
 
+/// Editable memory row returned by memory management commands.
+#[derive(Debug, Clone)]
+pub struct MemoryEntry {
+    pub id: i64,
+    pub kind: String,
+    pub record: MemoryRecord,
+    pub topic: String,
+    pub task_id: Option<TaskId>,
+    pub created_at: u64,
+    pub pinned: bool,
+}
+
 fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     let id_str: String = r.get(0)?;
     let uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
@@ -425,6 +526,33 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         status,
         created_at: created_at as u64,
         total_tokens: total_tokens as u64,
+    })
+}
+
+fn row_to_memory_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    let task_id_str: Option<String> = r.get(4)?;
+    let task_id = task_id_str
+        .as_deref()
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+        })?
+        .map(TaskId);
+    let body_json: String = r.get(2)?;
+    let record = serde_json::from_str(&body_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at: i64 = r.get(5)?;
+    let pinned: i64 = r.get(6)?;
+    Ok(MemoryEntry {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        record,
+        topic: r.get(3)?,
+        task_id,
+        created_at: created_at as u64,
+        pinned: pinned != 0,
     })
 }
 
@@ -490,6 +618,23 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn ensure_memory_columns(conn: &Connection) -> Result<()> {
+    let has_pinned = {
+        let mut stmt = conn.prepare("PRAGMA table_info(memory_records)")?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        cols.iter().any(|c| c == "pinned")
+    };
+    if !has_pinned {
+        conn.execute(
+            "ALTER TABLE memory_records ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -534,6 +679,46 @@ mod tests {
         // Decision should not show up under the RejectedApproach filter.
         let none_rejected = s.query_rejected_approaches("mpsc", 5).unwrap();
         assert!(none_rejected.is_empty());
+    }
+
+    #[test]
+    fn memory_entries_can_be_edited_pinned_and_deleted() {
+        let s = Store::in_memory().unwrap();
+        s.append_memory(&MemoryRecord::Convention {
+            rule: "prefer small modules".into(),
+            scope: Some("planner".into()),
+        })
+        .unwrap();
+
+        let entries = s
+            .list_memory(Some("Convention"), Some("planner"), 10)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let id = entries[0].id;
+        assert!(!entries[0].pinned);
+
+        assert!(s.set_memory_pinned(id, true).unwrap());
+        assert!(s
+            .update_memory(
+                id,
+                &MemoryRecord::Convention {
+                    rule: "prefer focused modules".into(),
+                    scope: Some("planner".into()),
+                }
+            )
+            .unwrap());
+
+        let updated = s.get_memory(id).unwrap().unwrap();
+        assert!(updated.pinned);
+        match updated.record {
+            MemoryRecord::Convention { rule, .. } => {
+                assert_eq!(rule, "prefer focused modules");
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+
+        assert!(s.delete_memory(id).unwrap());
+        assert!(s.get_memory(id).unwrap().is_none());
     }
 
     #[test]

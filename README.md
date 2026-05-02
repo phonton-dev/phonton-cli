@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.1.0</h1>
+<h1 align="center">Phonton CLI · v0.2.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.1.0-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.2.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -55,7 +55,8 @@ That gives Phonton a different shape from an IDE assistant or a terminal chatbot
 - `phonton doctor` setup diagnostics for config, provider key, store, trust, git, cargo, and Nexus config.
 - `phonton plan` preview for task DAGs before edits happen.
 - `phonton review` surfaces for verified diff review payloads, approvals, rejections, and rollback.
-- BYOK provider support through the provider layer, including Anthropic, OpenAI, OpenRouter, Gemini, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints.
+- `phonton memory` commands for inspecting, editing, deleting, pinning, and unpinning local decision memory.
+- BYOK provider adapters for Anthropic, OpenAI, OpenRouter, Gemini, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints. `phonton doctor --provider` verifies your configured provider by checking model discovery and a tiny completion call through the same adapter used for runs.
 - Local store, memory, planner, worker, diff, sandbox, verification, and orchestration crates.
 - Semantic indexing behind the CLI stack for repo-aware workflows.
 
@@ -63,7 +64,7 @@ That gives Phonton a different shape from an IDE assistant or a terminal chatbot
 
 Phonton is not yet as polished as Codex, Claude Code, Cursor, or Windsurf. It has fewer integrations, less onboarding polish, narrower public documentation, and no mature hosted/team workflow yet.
 
-The current release target is a public alpha for real Rust repo tasks. Use it if you are comfortable running a Rust binary, reading diagnostics, and filing sharp bug reports.
+The current release target is a public alpha for real Rust repo tasks. Phonton can ask configured models to write app-sized changes, but quality is only claimed after plan review, sandboxed edits, verification, and human review. Use it if you are comfortable running a Rust binary, reading diagnostics, and filing sharp bug reports.
 
 ## Install
 
@@ -97,7 +98,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.1.0 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.2.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -113,7 +114,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.1.0 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.2.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -178,6 +179,8 @@ phonton doctor
 phonton doctor --provider
 ```
 
+`phonton doctor --provider` proves the configured key/model/base URL can make a real completion call. It does not claim every listed provider works for every account, model name, quota state, or proxy configuration.
+
 ## CLI Commands
 
 ```text
@@ -186,6 +189,7 @@ phonton ask <question>  One-shot Q&A using the configured provider
 phonton doctor          Check config, store, trust, git, cargo, and Nexus
 phonton plan <goal>     Preview the task DAG without changing files
 phonton review          Show verified diff review payloads
+phonton memory list     Inspect local decision memory
 phonton config path     Print the resolved config file path
 phonton config show     Dump resolved config as TOML
 phonton version         Print version
@@ -203,6 +207,15 @@ Review latest completed task:
 phonton review latest
 phonton review approve latest
 phonton review reject latest
+```
+
+Memory management:
+
+```bash
+phonton memory list --json
+phonton memory edit <id> "updated rationale"
+phonton memory pin <id>
+phonton memory delete <id>
 ```
 
 ## How Phonton Handles Context
@@ -289,7 +302,7 @@ The script runs formatting, clippy, tests, release build, doctor, and the plan b
 Manual checks worth doing before a public release:
 
 - Fresh clone install on Windows, macOS, and Linux.
-- `phonton doctor --provider` with at least one hosted provider.
+- `phonton doctor --provider` with at least one hosted provider, confirming both model discovery and a completion call.
 - One real repo task from goal to reviewable verified diff.
 - Benchmark report committed or attached to the release notes.
 - No secrets printed in logs, screenshots, or benchmark output.

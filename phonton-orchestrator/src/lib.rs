@@ -25,10 +25,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use petgraph::graph::{DiGraph, NodeIndex};
 use phonton_types::{
-    classify_task, effective_tier, BudgetDecision, BudgetLimits, Checkpoint, DiffHunk, EventRecord,
-    GlobalState, ModelPricing, ModelTier, OrchestratorEvent, OrchestratorMessage, PlannerOutput,
-    ProviderKind, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus,
-    VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
+    classify_task, effective_tier, BudgetDecision, BudgetLimits, Checkpoint, CostSummary, DiffHunk,
+    EventRecord, GlobalState, ModelPricing, ModelTier, OrchestratorEvent, OrchestratorMessage,
+    PlannerOutput, ProviderKind, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
+    TaskStatus, TokenUsage, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
 };
 use std::collections::HashSet;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -129,6 +129,27 @@ impl BudgetGuard {
         self.decision()
     }
 
+    /// Estimate cost for a usage bucket without mutating running totals.
+    pub fn estimate(&self, provider: ProviderKind, model: &str, usage: TokenUsage) -> CostSummary {
+        let Some(p) = self.pricing.get(&(provider, model.to_string())) else {
+            return CostSummary {
+                pricing_known: false,
+                ..CostSummary::default()
+            };
+        };
+        let input_usd_micros =
+            ((usage.input_tokens as u128 * p.input_usd_micros_per_mtok as u128) / 1_000_000) as u64;
+        let output_usd_micros = ((usage.output_tokens as u128
+            * p.output_usd_micros_per_mtok as u128)
+            / 1_000_000) as u64;
+        CostSummary {
+            pricing_known: true,
+            input_usd_micros,
+            output_usd_micros,
+            total_usd_micros: input_usd_micros.saturating_add(output_usd_micros),
+        }
+    }
+
     /// Decision for the current running totals without charging anything.
     pub fn decision(&self) -> BudgetDecision {
         if let Some(ceiling) = self.limits.max_tokens {
@@ -207,6 +228,7 @@ struct SubtaskRuntime {
     escalations: u8,
     prior_errors: Vec<String>,
     tokens_used: u64,
+    token_usage: TokenUsage,
     diff_hunks: Vec<DiffHunk>,
     /// Provider that served the most recent successful LLM call. Used by
     /// `BudgetGuard` to look up per-model pricing.
@@ -228,6 +250,7 @@ impl SubtaskRuntime {
             escalations: 0,
             prior_errors: Vec::new(),
             tokens_used: 0,
+            token_usage: TokenUsage::default(),
             diff_hunks: Vec::new(),
             provider: ProviderKind::Anthropic,
             model_name: String::new(),
@@ -352,6 +375,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
     pub fn with_memory(mut self, memory: phonton_memory::MemoryStore) -> Self {
         self.memory = Some(memory);
         self
+    }
+
+    fn cost_summary(&self, provider: ProviderKind, model: &str, usage: TokenUsage) -> CostSummary {
+        let Some(guard) = &self.budget_guard else {
+            return CostSummary::default();
+        };
+        guard
+            .lock()
+            .map(|g| g.estimate(provider, model, usage))
+            .unwrap_or_default()
     }
 
     /// Attach a `phonton_diff::DiffApplier` so the orchestrator can take
@@ -656,11 +689,23 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         let already = g.tokens_used();
                         let delta = tokens_used.saturating_sub(already);
                         if delta > 0 {
-                            let (charge_provider, charge_model) = runtimes
+                            let (charge_provider, charge_model, usage) = runtimes
                                 .get(&id)
-                                .map(|r| (r.provider, r.model_name.clone()))
-                                .unwrap_or((ProviderKind::Anthropic, String::new()));
-                            let _ = g.charge(charge_provider, &charge_model, delta, 0);
+                                .map(|r| (r.provider, r.model_name.clone(), r.token_usage))
+                                .unwrap_or((
+                                    ProviderKind::Anthropic,
+                                    String::new(),
+                                    TokenUsage::estimated(delta),
+                                ));
+                            let input = if usage.budget_tokens() > 0 {
+                                usage
+                                    .input_tokens
+                                    .saturating_add(usage.cache_creation_tokens)
+                            } else {
+                                delta
+                            };
+                            let output = usage.output_tokens;
+                            let _ = g.charge(charge_provider, &charge_model, input, output);
                         }
                         if let BudgetDecision::Pause {
                             limit,
@@ -952,6 +997,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 _ => 0,
             };
             rt.tokens_used = rt.tokens_used.saturating_add(worker_tokens);
+            rt.token_usage = sr.token_usage;
             rt.diff_hunks = sr.diff_hunks.clone();
             rt.provider = sr.provider;
             rt.model_name = sr.model_name.clone();
@@ -1021,6 +1067,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         description: rt.subtask.description.clone(),
                         tier: rt.subtask.model_tier,
                         tokens_used: rt.tokens_used,
+                        token_usage: rt.token_usage,
+                        cost: self.cost_summary(rt.provider, &rt.model_name, rt.token_usage),
                         diff_hunks: rt.diff_hunks.clone(),
                         verify_result: VerifyResult::Pass { layer },
                         provider: rt.provider,
@@ -1362,6 +1410,7 @@ mod tests {
     use phonton_types::{
         CoverageSummary, DiffHunk, DiffLine, Subtask, SubtaskId, SubtaskStatus, VerifyLayer,
     };
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -1398,7 +1447,10 @@ mod tests {
                 old_count: 0,
                 new_start: 1,
                 new_count: 1,
-                lines: vec![DiffLine::Added("fn ok() -> u32 { 42 }".into())],
+                lines: vec![DiffLine::Added(format!(
+                    "fn ok_{}() -> u32 {{ 42 }}",
+                    subtask.id.to_string().replace('-', "_")
+                ))],
             }];
             Ok(SubtaskResult {
                 id: subtask.id,
@@ -1413,6 +1465,11 @@ mod tests {
                 },
                 provider: ProviderKind::Anthropic,
                 model_name: "test-model".into(),
+                token_usage: TokenUsage {
+                    input_tokens: 60,
+                    output_tokens: 40,
+                    ..TokenUsage::default()
+                },
             })
         }
     }
@@ -1439,6 +1496,28 @@ mod tests {
         tx
     }
 
+    fn temp_workspace() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        fs::create_dir_all(tmp.path().join("phonton-types/src")).expect("fixture dirs");
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"phonton-types\"]\n",
+        )
+        .expect("workspace manifest");
+        fs::write(
+            tmp.path().join("phonton-types/Cargo.toml"),
+            "[package]\nname = \"phonton-types\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .expect("crate manifest");
+        fs::write(
+            tmp.path().join("phonton-types/src/lib.rs"),
+            "pub mod stub;\n",
+        )
+        .expect("lib");
+        fs::write(tmp.path().join("phonton-types/src/stub.rs"), "").expect("stub");
+        tmp
+    }
+
     #[tokio::test]
     async fn runs_linear_chain_in_order() {
         let a = subtask("first", vec![]);
@@ -1451,7 +1530,8 @@ mod tests {
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(Arc::clone(&dispatcher));
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = orch.run_task(plan, empty_state()).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
         let calls = dispatcher.calls.lock().unwrap();
@@ -1473,7 +1553,8 @@ mod tests {
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(Arc::clone(&dispatcher));
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = orch.run_task(plan, empty_state()).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
         assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
@@ -1516,6 +1597,10 @@ mod tests {
                     },
                     provider: ProviderKind::Anthropic,
                     model_name: "test-broken".into(),
+                    token_usage: TokenUsage {
+                        input_tokens: 10,
+                        ..TokenUsage::default()
+                    },
                 })
             }
         }
@@ -1530,7 +1615,8 @@ mod tests {
         let dispatcher = Arc::new(BrokenDispatcher {
             calls: Mutex::new(Vec::new()),
         });
-        let orch = Orchestrator::new(Arc::clone(&dispatcher));
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = orch.run_task(plan, empty_state()).await.unwrap();
         assert!(matches!(status, TaskStatus::Failed { .. }));
         let calls = dispatcher.calls.lock().unwrap();
@@ -1570,7 +1656,10 @@ mod tests {
                     old_count: 0,
                     new_start: 1,
                     new_count: 1,
-                    lines: vec![DiffLine::Added("fn ok() -> u32 { 42 }".into())],
+                    lines: vec![DiffLine::Added(format!(
+                        "fn ok_{}() -> u32 {{ 42 }}",
+                        subtask.id.to_string().replace('-', "_")
+                    ))],
                 }];
                 Ok(SubtaskResult {
                     id: subtask.id,
@@ -1585,6 +1674,10 @@ mod tests {
                     },
                     provider: ProviderKind::Anthropic,
                     model_name: "test-barrier".into(),
+                    token_usage: TokenUsage {
+                        input_tokens: 10,
+                        ..TokenUsage::default()
+                    },
                 })
             }
         }
@@ -1601,7 +1694,8 @@ mod tests {
             barrier: Arc::new(tokio::sync::Barrier::new(2)),
             calls: Mutex::new(Vec::new()),
         });
-        let orch = Orchestrator::new(Arc::clone(&dispatcher));
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = timeout(Duration::from_secs(600), orch.run_task(plan, empty_state()))
             .await
             .expect("sequential dispatch would deadlock the barrier")
@@ -1627,7 +1721,10 @@ mod tests {
             max_tokens: Some(50),
             max_usd_micros: None,
         });
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_budget_guard(guard);
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_budget_guard(guard);
         let status = orch.run_task(plan, empty_state()).await.unwrap();
         match status {
             TaskStatus::Paused { limit, .. } => {
@@ -1655,7 +1752,8 @@ mod tests {
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(Arc::clone(&dispatcher));
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let _ = orch.run_task(plan, empty_state()).await.unwrap();
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -1710,7 +1808,8 @@ mod tests {
             coverage_summary: CoverageSummary::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(Arc::clone(&dispatcher));
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let r = orch.run_task(plan, empty_state()).await;
         assert!(r.is_err());
     }

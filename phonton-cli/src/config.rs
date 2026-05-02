@@ -48,8 +48,9 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct ProviderConfig {
-    /// Provider name: `"anthropic"`, `"openai"`, `"openrouter"`, `"gemini"`,
-    /// or `"ollama"`. Defaults to `"anthropic"` when a key is present.
+    /// Provider name, e.g. `"anthropic"`, `"openai"`, `"gemini"`,
+    /// `"ollama"`, or `"openai-compatible"`.
+    /// Defaults to `"anthropic"` when no config exists.
     #[serde(default = "default_provider_name")]
     pub name: String,
 
@@ -195,6 +196,7 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "groq",
     "together",
     "ollama",
+    "openai-compatible",
     "custom",
 ];
 

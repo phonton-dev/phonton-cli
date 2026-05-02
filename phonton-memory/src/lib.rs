@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use phonton_store::Store;
+use phonton_store::{MemoryEntry, Store};
 use phonton_types::MemoryRecord;
 
 /// Async facade over a shared [`Store`] used for memory reads and writes.
@@ -105,11 +105,82 @@ impl MemoryStore {
             .collect())
     }
 
+    /// List memory records with editable ids and pin state.
+    pub async fn list(
+        &self,
+        kind: Option<String>,
+        topic: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let store = Arc::clone(&self.store);
+        let out = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            guard.list_memory(kind.as_deref(), topic.as_deref(), limit)
+        })
+        .await
+        .context("spawn_blocking join")??;
+        Ok(out)
+    }
+
+    /// Fetch one memory entry by id.
+    pub async fn get(&self, id: i64) -> Result<Option<MemoryEntry>> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            guard.get_memory(id)
+        })
+        .await
+        .context("spawn_blocking join")?
+    }
+
+    /// Replace one memory record while preserving its id and pin state.
+    pub async fn update(&self, id: i64, record: MemoryRecord) -> Result<bool> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            guard.update_memory(id, &record)
+        })
+        .await
+        .context("spawn_blocking join")?
+    }
+
+    /// Delete one memory record.
+    pub async fn delete(&self, id: i64) -> Result<bool> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            guard.delete_memory(id)
+        })
+        .await
+        .context("spawn_blocking join")?
+    }
+
+    /// Pin or unpin a memory record.
+    pub async fn set_pinned(&self, id: i64, pinned: bool) -> Result<bool> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let guard = store
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+            guard.set_memory_pinned(id, pinned)
+        })
+        .await
+        .context("spawn_blocking join")?
+    }
+
     /// Pull every record out of the store. The phonton-store public API
     /// only exposes topic-filtered lookups; we use the widest possible
     /// substring (`""`, which `LIKE '%%'` matches for every row) and let
     /// `usize::MAX` stand in for "no limit".
-    async fn load_all(&self) -> Result<Vec<MemoryRecord>> {
+    pub async fn load_all(&self) -> Result<Vec<MemoryRecord>> {
         let store = Arc::clone(&self.store);
         let out = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRecord>> {
             let guard = store
@@ -272,5 +343,47 @@ mod tests {
         assert_eq!(constraints.len(), 1);
         let none = ms.by_kind("Convention").await.unwrap();
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_list_edit_pin_delete() {
+        let ms = mem_store();
+        ms.record(MemoryRecord::Convention {
+            rule: "prefer small modules".into(),
+            scope: Some("planner".into()),
+        })
+        .await
+        .unwrap();
+
+        let entries = ms
+            .list(Some("Convention".into()), Some("planner".into()), 10)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let id = entries[0].id;
+
+        assert!(ms.set_pinned(id, true).await.unwrap());
+        assert!(ms
+            .update(
+                id,
+                MemoryRecord::Convention {
+                    rule: "prefer focused modules".into(),
+                    scope: Some("planner".into()),
+                },
+            )
+            .await
+            .unwrap());
+
+        let updated = ms.get(id).await.unwrap().unwrap();
+        assert!(updated.pinned);
+        match updated.record {
+            MemoryRecord::Convention { rule, .. } => {
+                assert_eq!(rule, "prefer focused modules");
+            }
+            other => panic!("unexpected record: {other:?}"),
+        }
+
+        assert!(ms.delete(id).await.unwrap());
+        assert!(ms.get(id).await.unwrap().is_none());
     }
 }

@@ -42,15 +42,30 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
             ModelTier::Standard => "gpt-4o".into(),
             ModelTier::Frontier => "gpt-5.2-preview".into(),
         },
+        "openrouter" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "openai/gpt-4o-mini".into(),
+            ModelTier::Standard => "openai/gpt-4o".into(),
+            ModelTier::Frontier => "anthropic/claude-sonnet-4.5".into(),
+        },
         "gemini" => match tier {
             ModelTier::Local | ModelTier::Cheap => "gemini-2.0-flash".into(),
             ModelTier::Standard => "gemini-2.5-flash".into(),
             ModelTier::Frontier => "gemini-2.5-pro".into(),
         },
+        "agentrouter" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5".into(),
+            ModelTier::Standard => "claude-sonnet-4-5".into(),
+            ModelTier::Frontier => "claude-sonnet-4-5".into(),
+        },
         "deepseek" => match tier {
             ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
             ModelTier::Standard => "deepseek-chat".into(),
             ModelTier::Frontier => "deepseek-reasoner".into(),
+        },
+        "xai" | "grok" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "grok-2-mini".into(),
+            ModelTier::Standard => "grok-2".into(),
+            ModelTier::Frontier => "grok-2".into(),
         },
         "groq" => match tier {
             ModelTier::Local | ModelTier::Cheap => "llama-3.3-70b-versatile".into(),
@@ -1280,6 +1295,34 @@ impl GeminiProvider {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()).into())
     }
+
+    async fn raw_generate_with_retry(
+        &self,
+        model: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let mut delay = std::time::Duration::from_millis(400);
+        for attempt in 0..3 {
+            let resp = self.raw_generate(model, body).await?;
+            if !is_transient_http_status(resp.status()) || attempt == 2 {
+                return Ok(resp);
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+        }
+        unreachable!("retry loop always returns")
+    }
+}
+
+fn is_transient_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 #[async_trait]
@@ -1361,7 +1404,7 @@ impl Provider for GeminiProvider {
             }
         });
 
-        let mut http_resp = self.raw_generate(&model, &body).await?;
+        let mut http_resp = self.raw_generate_with_retry(&model, &body).await?;
 
         // Free-tier keys frequently reject the configured model with 404.
         // Auto-discover an accessible model and retry once before failing
@@ -1374,7 +1417,7 @@ impl Provider for GeminiProvider {
                         if let Ok(mut m) = self.model.write() {
                             *m = picked.clone();
                         }
-                        http_resp = self.raw_generate(&picked, &body).await?;
+                        http_resp = self.raw_generate_with_retry(&picked, &body).await?;
                     }
                 }
             }
@@ -1574,6 +1617,15 @@ mod tests {
     }
 
     #[test]
+    fn transient_http_statuses_are_retryable() {
+        assert!(is_transient_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_http_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_transient_http_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_transient_http_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_http_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
     fn metrics_first_sample_sets_ewma_directly() {
         let m = ModelMetrics::new();
         let k = ModelKey::new(ProviderKind::Anthropic, "claude-haiku-4-5");
@@ -1636,6 +1688,27 @@ mod tests {
             model: "openai/gpt-5.2".into(),
         });
         assert_eq!(p.kind(), ProviderKind::OpenRouter);
+    }
+
+    #[test]
+    fn tier_defaults_cover_public_provider_names() {
+        for provider in [
+            "anthropic",
+            "openai",
+            "openrouter",
+            "gemini",
+            "agentrouter",
+            "deepseek",
+            "xai",
+            "grok",
+            "groq",
+            "together",
+            "ollama",
+        ] {
+            for tier in [ModelTier::Cheap, ModelTier::Standard, ModelTier::Frontier] {
+                assert_ne!(model_for_tier(provider, tier), "unknown", "{provider:?}");
+            }
+        }
     }
 
     /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`

@@ -4,11 +4,14 @@
 //! In particular, `SubtaskReviewReady` is emitted only after verification
 //! passes, so this command never presents an unverified worker diff as ready.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::Result;
 use phonton_diff::DiffApplier;
 use phonton_store::TaskRecord;
 use phonton_types::{
-    ContextAttribution, DiffHunk, DiffLine, EventRecord, OrchestratorEvent, TaskId, TaskStatus,
+    ContextAttribution, CostSummary, DiffHunk, DiffLine, EventRecord, OrchestratorEvent, TaskId,
+    TaskStatus, TokenUsage,
 };
 use serde::Serialize;
 
@@ -40,6 +43,7 @@ struct ReviewReport {
     goal: String,
     status: serde_json::Value,
     total_tokens: u64,
+    checkpoints: Vec<CheckpointItem>,
     review_items: Vec<ReviewItem>,
 }
 
@@ -49,12 +53,21 @@ struct ReviewItem {
     description: String,
     tier: String,
     tokens_used: u64,
+    token_usage: TokenUsage,
+    cost: CostSummary,
     provider: String,
     model_name: String,
     verify: String,
     context: Vec<ContextAttribution>,
     context_token_count: usize,
     diff_hunks: Vec<DiffHunk>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CheckpointItem {
+    seq: u32,
+    subtask_id: String,
+    commit_oid: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -230,6 +243,16 @@ async fn finish_task(
     json: bool,
 ) -> Result<i32> {
     store.upsert_task(task.id, &task.goal_text, &status, task.total_tokens)?;
+    append_review_decision(
+        store,
+        task.id,
+        action,
+        match action {
+            "approve" => "Task marked Done.",
+            "reject" => "Task marked Rejected.",
+            _ => "Task updated.",
+        },
+    )?;
     let status_json = serde_json::to_value(&status)?;
     let report = ActionReport {
         task_id: task.id.to_string(),
@@ -278,11 +301,24 @@ async fn rollback_task(
         estimated_savings_tokens: 0,
     };
     store.upsert_task(task.id, &task.goal_text, &status, task.total_tokens)?;
+    let detail = format!(
+        "Rolled worktree back to checkpoint #{seq} ({commit_oid}). Review remaining work and rerun planning for a revised path."
+    );
+    store.append_event(&EventRecord {
+        task_id: task.id,
+        timestamp_ms: now_ms(),
+        event: OrchestratorEvent::RollbackPerformed {
+            task_id: task.id,
+            to_seq: seq,
+            requeued_subtasks: 0,
+        },
+    })?;
+    append_review_decision(store, task.id, "rollback", &detail)?;
     let report = ActionReport {
         task_id: task.id.to_string(),
         action: "rollback".into(),
         status: serde_json::to_value(&status)?,
-        detail: format!("Rolled worktree back to checkpoint #{seq} ({commit_oid})."),
+        detail,
     };
     print_action_report(&report, json)?;
     Ok(0)
@@ -302,6 +338,30 @@ fn checkpoint_oid(events: &[EventRecord], seq: u32) -> Option<String> {
         }
         None
     })
+}
+
+fn append_review_decision(
+    store: &phonton_store::Store,
+    task_id: TaskId,
+    decision: &str,
+    detail: &str,
+) -> Result<()> {
+    store.append_event(&EventRecord {
+        task_id,
+        timestamp_ms: now_ms(),
+        event: OrchestratorEvent::ReviewDecision {
+            task_id,
+            decision: decision.to_string(),
+            detail: detail.to_string(),
+        },
+    })
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn parse_task_id(raw: &str) -> Result<TaskId> {
@@ -325,34 +385,51 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
         }
     }
 
+    let mut checkpoints = Vec::new();
     let mut review_items = Vec::new();
     for event in events {
-        if let OrchestratorEvent::SubtaskReviewReady {
-            subtask_id,
-            description,
-            tier,
-            tokens_used,
-            diff_hunks,
-            verify_result,
-            provider,
-            model_name,
-        } = event.event
-        {
-            let (context, context_token_count) = context_by_subtask
-                .remove(&subtask_id.to_string())
-                .unwrap_or_default();
-            review_items.push(ReviewItem {
+        match event.event {
+            OrchestratorEvent::CheckpointCreated {
+                subtask_id,
+                seq,
+                commit_oid,
+                ..
+            } => checkpoints.push(CheckpointItem {
+                seq,
                 subtask_id: subtask_id.to_string(),
+                commit_oid,
+            }),
+            OrchestratorEvent::SubtaskReviewReady {
+                subtask_id,
                 description,
-                tier: tier.to_string(),
+                tier,
                 tokens_used,
-                provider: provider.to_string(),
-                model_name,
-                verify: format!("{verify_result:?}"),
-                context,
-                context_token_count,
+                token_usage,
+                cost,
                 diff_hunks,
-            });
+                verify_result,
+                provider,
+                model_name,
+            } => {
+                let (context, context_token_count) = context_by_subtask
+                    .remove(&subtask_id.to_string())
+                    .unwrap_or_default();
+                review_items.push(ReviewItem {
+                    subtask_id: subtask_id.to_string(),
+                    description,
+                    tier: tier.to_string(),
+                    tokens_used,
+                    token_usage,
+                    cost,
+                    provider: provider.to_string(),
+                    model_name,
+                    verify: format!("{verify_result:?}"),
+                    context,
+                    context_token_count,
+                    diff_hunks,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -361,6 +438,7 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
         goal: task.goal_text,
         status: task.status,
         total_tokens: task.total_tokens,
+        checkpoints,
         review_items,
     }
 }
@@ -371,6 +449,7 @@ fn print_text_report(report: &ReviewReport) {
     println!("goal:   {}", report.goal);
     println!("tokens: {}", report.total_tokens);
     println!("status: {}", compact_json(&report.status));
+    println!("checkpoints: {}", report.checkpoints.len());
     println!();
 
     if report.review_items.is_empty() {
@@ -390,19 +469,47 @@ fn print_text_report(report: &ReviewReport) {
             item.context.len(),
             item.context_token_count
         );
+        let price = if item.cost.pricing_known {
+            format!("{} micros", item.cost.total_usd_micros)
+        } else {
+            "unknown pricing".into()
+        };
         println!(
-            "   subtask: {}  provider: {}  model: {}",
+            "   subtask: {}  provider: {}  model: {}  cost: {}",
             item.subtask_id,
             item.provider,
             if item.model_name.is_empty() {
                 "(unknown)"
             } else {
                 &item.model_name
+            },
+            price
+        );
+        println!(
+            "   usage: input={} output={} cached={} cache_creation={}{}",
+            item.token_usage.input_tokens,
+            item.token_usage.output_tokens,
+            item.token_usage.cached_tokens,
+            item.token_usage.cache_creation_tokens,
+            if item.token_usage.estimated {
+                " estimated"
+            } else {
+                ""
             }
         );
         render_context(&item.context);
         render_hunks(&item.diff_hunks);
         println!();
+    }
+
+    if !report.checkpoints.is_empty() {
+        println!("Checkpoints:");
+        for checkpoint in &report.checkpoints {
+            println!(
+                "  #{} {} {}",
+                checkpoint.seq, checkpoint.subtask_id, checkpoint.commit_oid
+            );
+        }
     }
 }
 
@@ -464,7 +571,8 @@ fn print_action_report(report: &ActionReport, json: bool) -> Result<()> {
 mod tests {
     use super::*;
     use phonton_types::{
-        DiffHunk, ModelTier, ProviderKind, SliceOrigin, SubtaskId, VerifyLayer, VerifyResult,
+        CostSummary, DiffHunk, ModelTier, ProviderKind, SliceOrigin, SubtaskId, TokenUsage,
+        VerifyLayer, VerifyResult,
     };
 
     #[test]
@@ -548,6 +656,17 @@ mod tests {
                     description: "Implement function `foo`".into(),
                     tier: ModelTier::Standard,
                     tokens_used: 120,
+                    token_usage: TokenUsage {
+                        input_tokens: 80,
+                        output_tokens: 40,
+                        ..TokenUsage::default()
+                    },
+                    cost: CostSummary {
+                        pricing_known: true,
+                        input_usd_micros: 80,
+                        output_usd_micros: 40,
+                        total_usd_micros: 120,
+                    },
                     diff_hunks: vec![DiffHunk {
                         file_path: "src/lib.rs".into(),
                         old_start: 1,
@@ -571,5 +690,7 @@ mod tests {
         assert_eq!(report.review_items[0].diff_hunks.len(), 1);
         assert_eq!(report.review_items[0].context_token_count, 11);
         assert_eq!(report.review_items[0].context[0].symbol_name, "foo");
+        assert_eq!(report.review_items[0].token_usage.input_tokens, 80);
+        assert_eq!(report.review_items[0].cost.total_usd_micros, 120);
     }
 }

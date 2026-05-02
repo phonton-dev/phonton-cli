@@ -12,7 +12,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContextAttribution, DiffHunk, ModelTier, ProviderKind, SubtaskId, TaskId, VerifyResult,
+    ContextAttribution, CostSummary, DiffHunk, ModelTier, ProviderKind, SubtaskId, TaskId,
+    TokenUsage, VerifyResult,
 };
 
 /// Token threshold between successive [`OrchestratorEvent::TokenMilestone`]
@@ -62,6 +63,10 @@ pub enum OrchestratorEvent {
         description: String,
         tier: ModelTier,
         tokens_used: u64,
+        #[serde(default)]
+        token_usage: TokenUsage,
+        #[serde(default)]
+        cost: CostSummary,
         diff_hunks: Vec<DiffHunk>,
         verify_result: VerifyResult,
         provider: ProviderKind,
@@ -127,6 +132,12 @@ pub enum OrchestratorEvent {
         to_seq: u32,
         requeued_subtasks: usize,
     },
+    /// Human review action persisted as an immutable audit event.
+    ReviewDecision {
+        task_id: TaskId,
+        decision: String,
+        detail: String,
+    },
 }
 
 /// An [`OrchestratorEvent`] paired with the wall-clock instant it was
@@ -160,6 +171,7 @@ impl EventRecord {
             OrchestratorEvent::Thinking { .. } => "thinking",
             OrchestratorEvent::CheckpointCreated { .. } => "checkpoint",
             OrchestratorEvent::RollbackPerformed { .. } => "rollback",
+            OrchestratorEvent::ReviewDecision { .. } => "review-decision",
         }
     }
 
@@ -276,6 +288,11 @@ impl EventRecord {
                 ..
             } => {
                 format!("rollback to checkpoint #{to_seq} — {requeued_subtasks} subtasks requeued")
+            }
+            OrchestratorEvent::ReviewDecision {
+                decision, detail, ..
+            } => {
+                format!("review {decision}: {detail}")
             }
         }
     }

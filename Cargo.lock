@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2283,6 +2283,7 @@ dependencies = [
  "git2",
  "phonton-diff",
  "phonton-index",
+ "phonton-memory",
  "phonton-orchestrator",
  "phonton-planner",
  "phonton-providers",
@@ -2312,10 +2313,6 @@ dependencies = [
  "tokio",
  "tracing",
 ]
-
-[[package]]
-name = "phonton-desktop"
-version = "0.1.0"
 
 [[package]]
 name = "phonton-diff"
@@ -2370,6 +2367,7 @@ dependencies = [
  "phonton-memory",
  "phonton-types",
  "phonton-verify",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -34,7 +34,7 @@ use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
     CodeSlice, ContextFrame, DiffHunk, DiffLine, MemoryRecord, ModelTier, SliceOrigin, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, VerifyLayer, VerifyResult,
+    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer, VerifyResult,
 };
 use regex::Regex;
 use tracing::{debug, warn};
@@ -251,6 +251,7 @@ impl Worker {
 
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
+        let mut token_usage = TokenUsage::default();
         let mut last_provider = phonton_types::ProviderKind::Anthropic;
         let mut last_model_name = String::new();
 
@@ -282,6 +283,7 @@ impl Worker {
                 .await?;
             last_provider = response.provider;
             last_model_name = response.model_name.clone();
+            token_usage.add_response(&response);
             total_tokens = total_tokens
                 .saturating_add(response.input_tokens)
                 .saturating_add(response.output_tokens);
@@ -324,6 +326,7 @@ impl Worker {
                             },
                             provider: last_provider,
                             model_name: last_model_name,
+                            token_usage,
                         });
                     }
                     continue;
@@ -373,6 +376,7 @@ impl Worker {
                         verify_result: VerifyResult::Pass { layer },
                         provider: last_provider,
                         model_name: last_model_name,
+                        token_usage,
                     });
                 }
                 VerifyResult::Fail {
@@ -393,7 +397,7 @@ impl Worker {
                         subtask.id,
                         model_tier,
                         VerifyResult::Escalate { reason },
-                        total_tokens,
+                        token_usage,
                         attempt,
                         last_provider,
                         last_model_name,
@@ -430,7 +434,7 @@ impl Worker {
             subtask.id,
             model_tier,
             VerifyResult::Escalate { reason },
-            total_tokens,
+            token_usage,
             MAX_ATTEMPTS,
             last_provider,
             last_model_name,
@@ -685,7 +689,7 @@ fn failed_result(
     id: SubtaskId,
     model_tier: ModelTier,
     verify_result: VerifyResult,
-    _tokens_used: u64,
+    token_usage: TokenUsage,
     attempt: u8,
     provider: phonton_types::ProviderKind,
     model_name: String,
@@ -703,6 +707,7 @@ fn failed_result(
         verify_result,
         provider,
         model_name,
+        token_usage,
     }
 }
 

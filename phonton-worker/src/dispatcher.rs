@@ -23,7 +23,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use phonton_orchestrator::WorkerDispatcher;
 use phonton_sandbox::{ExecutionGuard, Sandbox};
-use phonton_types::{CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskResult};
+use phonton_types::{CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskResult, TaskId};
 
 use crate::Worker;
 
@@ -45,6 +45,7 @@ pub struct RealDispatcher {
     sandbox: Arc<Sandbox>,
     /// Optional memory store â€” wired through to the worker when present.
     memory: Option<phonton_memory::MemoryStore>,
+    task_id: Option<TaskId>,
     /// Shared context manager for all workers in this dispatch session.
     context: Arc<tokio::sync::Mutex<phonton_context::ContextManager>>,
     /// Optional semantic index used to retrieve per-subtask context.
@@ -81,6 +82,7 @@ impl RealDispatcher {
             guard,
             sandbox,
             memory: None,
+            task_id: None,
             context: Arc::new(tokio::sync::Mutex::new(context)),
             semantic: None,
         }
@@ -90,6 +92,12 @@ impl RealDispatcher {
     /// rejected-approach records that the planner reads on the next goal.
     pub fn with_memory(mut self, memory: phonton_memory::MemoryStore) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach the current task id to worker memory records.
+    pub fn with_task_id(mut self, task_id: TaskId) -> Self {
+        self.task_id = Some(task_id);
         self
     }
 
@@ -138,6 +146,10 @@ impl WorkerDispatcher for RealDispatcher {
 
         if let Some(memory) = self.memory.clone() {
             worker = worker.with_memory_store(memory);
+        }
+
+        if let Some(task_id) = self.task_id {
+            worker = worker.with_task_id(task_id);
         }
 
         // The worker's `execute` method runs the full LLM â†’ verify â†’ retry

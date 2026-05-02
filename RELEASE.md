@@ -11,7 +11,7 @@ Use this before tagging a Phonton CLI release.
 - [ ] `cargo test --locked --workspace` passes.
 - [ ] `cargo build --locked --release -p phonton-cli` passes.
 - [ ] `phonton doctor` runs from the release binary.
-- [ ] `phonton doctor --provider` is tested with at least one hosted provider.
+- [ ] `phonton doctor --provider` proves model discovery and a tiny completion call with at least one hosted provider.
 - [ ] `scripts/benchmark-plan.ps1 -ReleaseBinary` passes.
 - [ ] Benchmark report is attached to the release notes if making efficiency claims.
 - [ ] No benchmark output, screenshots, logs, or docs contain secrets.
