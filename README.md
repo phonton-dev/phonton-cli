@@ -275,3 +275,7 @@ Licensed under either of:
 - MIT License
 
 at your option.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=phonton-dev/phonton-cli&type=date&legend=top-left)](https://www.star-history.com/?repos=phonton-dev%2Fphonton-cli&type=date&legend=top-left)
