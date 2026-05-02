@@ -24,7 +24,7 @@ Phonton plans the work, routes it through local repo context, verifies changes b
 > Current status: pre-1.0 public-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
 
 <p align="center">
-  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI task board showing plan, verify, and review columns">
+  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI terminal UI home screen">
 </p>
 
 ## Why Phonton

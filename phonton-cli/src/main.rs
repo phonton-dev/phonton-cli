@@ -97,6 +97,9 @@ const GRAD_A: (u8, u8, u8) = (99, 179, 237); // cyan
 const GRAD_B: (u8, u8, u8) = (159, 122, 234); // violet
 const GRAD_C: (u8, u8, u8) = (237, 100, 166); // pink
 
+const UI_TICK_MS: u64 = 80;
+const LOGO_SHIMMER_SPEED: f32 = 0.004;
+const LOGO_ROW_PHASE: f32 = 0.035;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
@@ -164,6 +167,43 @@ fn gradient_line(text: &str, phase: f32, bold: bool) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len().max(1) as f32;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
+    let wave = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+
+    for (i, ch) in chars.into_iter().enumerate() {
+        if ch == ' ' {
+            spans.push(Span::raw(" "));
+            continue;
+        }
+
+        let x = i as f32 / n;
+        let base = grad3((x + phase * 0.35).fract());
+        let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
+        let style = if distance < 0.045 {
+            Style::default()
+                .fg(ACCENT_HI)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if matches!(ch, '╔' | '╗' | '╚' | '╝' | '═' | '║') {
+            Style::default().fg(grad(base_rgb(base), GRAD_C, 0.18))
+        } else {
+            Style::default().fg(base).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+
+    Line::from(spans)
+}
+
+fn base_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => GRAD_B,
+    }
 }
 
 /// Render text as a "pill" — small inline badge with a colored bg.
@@ -1525,16 +1565,14 @@ fn render_help(frame: &mut Frame, area: Rect) {
 }
 
 fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
-    // Slowly drifting phase so the logo gradient gently shimmers.
-    let phase = (app.spinner_frame as f32) * 0.012;
+    // Slowly drifting phase so the logo gets a deliberate scanline shimmer
+    // without turning the whole splash into a fast flashing surface.
+    let phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
     if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
         let lines: Vec<Line> = LOGO
             .iter()
             .enumerate()
-            .map(|(row_idx, row)| {
-                // Per-row phase shift gives the gradient a soft diagonal feel.
-                gradient_line(row, phase + (row_idx as f32) * 0.04, true)
-            })
+            .map(|(row_idx, row)| logo_line(row, phase, row_idx))
             .collect();
         let p = Paragraph::new(lines)
             .alignment(Alignment::Center)
@@ -1542,19 +1580,7 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(p, area);
     } else {
         // Compact one-line header — gradient "phonton" + dim subtitle.
-        let mut spans: Vec<Span<'static>> = vec![Span::styled(
-            "✦ ",
-            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-        )];
-        let title_chars: Vec<char> = "phonton".chars().collect();
-        let n = title_chars.len() as f32;
-        for (i, ch) in title_chars.into_iter().enumerate() {
-            let t = (i as f32) / (n - 1.0).max(1.0);
-            spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
-            ));
-        }
+        let mut spans = gradient_line("✦ phonton", phase * 0.5, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
             "agentic dev environment",
@@ -3559,6 +3585,7 @@ async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -3592,9 +3619,10 @@ async fn main() -> Result<()> {
 
 fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
     std::thread::spawn(move || loop {
-        // Poll for events at ~30Hz. Lower than the 100ms default to make
-        // the UI feel snappier/less "laggy" while still being kind to CPU.
-        if event::poll(Duration::from_millis(33)).unwrap_or(false) {
+        // Poll on a modest cadence. This keeps input responsive while
+        // preventing the splash animation and terminal cursor from feeling
+        // like they are flashing on every frame.
+        if event::poll(Duration::from_millis(UI_TICK_MS)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
                 // IMPORTANT: Filter for 'Press' events only. Windows and some
                 // modern terminal emulators send 'Release' events too. If we
