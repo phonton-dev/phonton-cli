@@ -14,14 +14,14 @@
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
   <img alt="release" src="https://img.shields.io/badge/release-v0.1.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
-  <img alt="status" src="https://img.shields.io/badge/status-private_alpha-f97316">
+  <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
 
 ---
 
 Phonton plans the work, routes it through local repo context, verifies changes before handoff, and keeps the result reviewable. The goal is not to be the loudest coding agent. The goal is to make AI-assisted development feel less reckless.
 
-> Current status: pre-1.0 private-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
+> Current status: pre-1.0 public-alpha quality. The core loop is real, the CLI runs, and the Rust workspace is tested. Public launch claims should stay tied to reproducible benchmarks.
 
 <p align="center">
   <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI task board showing plan, verify, and review columns">
@@ -63,9 +63,51 @@ That gives Phonton a different shape from an IDE assistant or a terminal chatbot
 
 Phonton is not yet as polished as Codex, Claude Code, Cursor, or Windsurf. It has fewer integrations, less onboarding polish, narrower public documentation, and no mature hosted/team workflow yet.
 
-The current release target is a private alpha for real Rust repo tasks. Use it if you are comfortable running a Rust binary, reading diagnostics, and filing sharp bug reports.
+The current release target is a public alpha for real Rust repo tasks. Use it if you are comfortable running a Rust binary, reading diagnostics, and filing sharp bug reports.
 
-## Install From Source
+## Install
+
+Phonton currently installs from GitHub source with Cargo. Rust is required.
+
+macOS/Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.ps1)))
+```
+
+Direct Cargo install:
+
+```bash
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.1.0 phonton-cli --locked --force
+```
+
+Check the install:
+
+```bash
+phonton version
+phonton doctor
+```
+
+## Release Channels
+
+Phonton uses GitHub branches and releases as install channels:
+
+| Channel | Install | Use when |
+|---|---|---|
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.1.0 phonton-cli --locked --force` | You want the best validated public alpha |
+| Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
+| Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
+| Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
+
+For the channel policy and automation, read [docs/RELEASE_CHANNELS.md](docs/RELEASE_CHANNELS.md).
+
+## Build From Source
 
 ```bash
 git clone https://github.com/phonton-dev/phonton-cli.git

@@ -1,0 +1,102 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach assets to, for example v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: phonton-x86_64-unknown-linux-gnu.tar.gz
+            binary: phonton
+            archive: tar
+          - os: macos-latest
+            asset: phonton-aarch64-apple-darwin.tar.gz
+            binary: phonton
+            archive: tar
+          - os: windows-latest
+            asset: phonton-x86_64-pc-windows-msvc.zip
+            binary: phonton.exe
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI
+        run: cargo build --locked --release -p phonton-cli
+
+      - name: Package Unix
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          mkdir -p dist/package
+          cp "target/release/${{ matrix.binary }}" dist/package/phonton
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/package/
+          tar -C dist/package -czf "dist/${{ matrix.asset }}" .
+
+      - name: Package Windows
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" "dist/package/phonton.exe"
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.asset }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  publish:
+    name: Attach assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Phonton CLI $TAG" --notes "Automated Phonton CLI release assets."
+          gh release upload "$TAG" dist/* --clobber

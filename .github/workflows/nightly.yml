@@ -1,0 +1,136 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync nightly branch
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+      date: ${{ steps.sha.outputs.date }}
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Push nightly branch
+        run: git push origin HEAD:nightly --force-with-lease
+
+      - name: Capture version info
+        id: sha
+        shell: bash
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build nightly ${{ matrix.asset }}
+    needs: sync
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: phonton-nightly-x86_64-unknown-linux-gnu.tar.gz
+            binary: phonton
+            archive: tar
+          - os: macos-latest
+            asset: phonton-nightly-aarch64-apple-darwin.tar.gz
+            binary: phonton
+            archive: tar
+          - os: windows-latest
+            asset: phonton-nightly-x86_64-pc-windows-msvc.zip
+            binary: phonton.exe
+            archive: zip
+
+    steps:
+      - name: Checkout nightly
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI
+        run: cargo build --locked --release -p phonton-cli
+
+      - name: Package Unix
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          mkdir -p dist/package
+          cp "target/release/${{ matrix.binary }}" dist/package/phonton
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/package/
+          tar -C dist/package -czf "dist/${{ matrix.asset }}" .
+
+      - name: Package Windows
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" "dist/package/phonton.exe"
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE dist/package/
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.asset }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  publish:
+    name: Publish nightly prerelease
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout nightly
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish moving nightly tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          SHORT_SHA: ${{ needs.sync.outputs.short_sha }}
+          DATE: ${{ needs.sync.outputs.date }}
+        shell: bash
+        run: |
+          git tag -f nightly "$SHA"
+          git push origin refs/tags/nightly --force
+          gh release delete nightly --yes --cleanup-tag >/dev/null 2>&1 || true
+          git tag -f nightly "$SHA"
+          git push origin refs/tags/nightly --force
+          cat > nightly-notes.md <<EOF
+          Nightly snapshot from \`dev\`.
+
+          - Date: ${DATE}
+          - Commit: ${SHA}
+          - Install from source: \`cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force\`
+
+          This channel is not fully validated and may contain regressions.
+          EOF
+          gh release create nightly dist/* --title "Phonton CLI nightly ${DATE}.${SHORT_SHA}" --notes-file nightly-notes.md --prerelease
