@@ -67,7 +67,20 @@ The current release target is a public alpha for real Rust repo tasks. Use it if
 
 ## Install
 
-Phonton currently installs from GitHub source with Cargo. Rust is required.
+The easiest install path is npm. This downloads a prebuilt GitHub Release binary when the package installs.
+
+```bash
+npm install -g phonton-cli
+phonton
+```
+
+Run without installing:
+
+```bash
+npx phonton-cli
+```
+
+Cargo still works if you prefer building from source. Rust is required for the Cargo path.
 
 macOS/Linux:
 
