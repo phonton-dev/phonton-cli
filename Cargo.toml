@@ -13,7 +13,6 @@ members = [
     "phonton-sandbox",
     "phonton-store",
     "phonton-cli",
-    "phonton-desktop",
 ]
 resolver = "2"
 

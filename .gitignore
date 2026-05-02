@@ -2,3 +2,21 @@
 /benchmarks/results/
 /npm/vendor/
 /npm/*.tgz
+/dist/
+
+# Local secrets and machine state
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite
+*.sqlite-journal
+
+# Keep private monorepo material out of the public CLI subtree.
+phonton-brain/
+phonton-desktop/
+phonton-website/
+PROMPTS.md
+MARKETING.md
+STATUS.md
+CLAUDE.md
