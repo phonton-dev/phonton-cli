@@ -6,7 +6,7 @@ This is the Rust/GitHub equivalent of package-manager channels:
 
 | Channel | Source | Install | Intended use |
 |---|---|---|---|
-| Stable | `v*` tags and GitHub Releases | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.1.0 phonton-cli --locked --force` | Best available public alpha |
+| Stable | `v*` tags and GitHub Releases | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.2.1 phonton-cli --locked --force` | Best available public alpha |
 | Dev | `dev` branch | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | Next-release integration |
 | Nightly | `nightly` branch and moving `nightly` prerelease | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | Daily snapshots; expect regressions |
 | Main | `main` branch | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | Current stable branch tip |

@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::cursor::SetCursorStyle;
+use crossterm::cursor::{Hide, SetCursorStyle};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -99,21 +99,23 @@ const GRAD_A: (u8, u8, u8) = (99, 179, 237); // cyan
 const GRAD_B: (u8, u8, u8) = (159, 122, 234); // violet
 const GRAD_C: (u8, u8, u8) = (237, 100, 166); // pink
 
-const UI_TICK_MS: u64 = 80;
-const LOGO_SHIMMER_SPEED: f32 = 0.004;
-const LOGO_ROW_PHASE: f32 = 0.035;
+const UI_TICK_MS: u64 = 140;
+const LOGO_SHIMMER_SPEED: f32 = 0.006;
+const LOGO_ROW_PHASE: f32 = 0.018;
+const LOGO_SWEEP_WIDTH: f32 = 0.13;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
-    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
-    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
-    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
-    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
-    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
+    "████   █  █   ████   █   █  █████  ████   █   █",
+    "█   █  █  █  █    █  ██  █    █   █    █  ██  █",
+    "█   █  █  █  █    █  █ █ █    █   █    █  █ █ █",
+    "████   ████  █    █  █  ██    █   █    █  █  ██",
+    "█      █  █  █    █  █   █    █   █    █  █   █",
+    "█      █  █  █    █  █   █    █   █    █  █   █",
+    "█      █  █   ████   █   █    █    ████   █   █",
 ];
 
-const LOGO_WIDTH_THRESHOLD: u16 = 100;
+const LOGO_WIDTH_THRESHOLD: u16 = 72;
 
 // ---------------------------------------------------------------------------
 // Visual helpers — gradient + pill primitives
@@ -128,6 +130,14 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 /// Linearly interpolate between two RGB colors.
 fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
     Color::Rgb(
+        lerp_u8(a.0, b.0, t),
+        lerp_u8(a.1, b.1, t),
+        lerp_u8(a.2, b.2, t),
+    )
+}
+
+fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    (
         lerp_u8(a.0, b.0, t),
         lerp_u8(a.1, b.1, t),
         lerp_u8(a.2, b.2, t),
@@ -184,17 +194,18 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let base = grad3((x + phase * 0.35).fract());
+        let base_t = (x * 0.82 + row_idx as f32 * 0.018 + phase * 0.12).fract();
+        let base = base_rgb(grad3(base_t));
         let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
-        let style = if distance < 0.045 {
-            Style::default()
-                .fg(ACCENT_HI)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else if matches!(ch, '╔' | '╗' | '╚' | '╝' | '═' | '║') {
-            Style::default().fg(grad(base_rgb(base), GRAD_C, 0.18))
+        let sweep = (1.0 - distance / LOGO_SWEEP_WIDTH).clamp(0.0, 1.0);
+        let color = if sweep > 0.0 {
+            let eased = sweep * sweep * (3.0 - 2.0 * sweep);
+            let rgb = blend_rgb(base, (228, 249, 255), eased * 0.62);
+            Color::Rgb(rgb.0, rgb.1, rgb.2)
         } else {
-            Style::default().fg(base).add_modifier(Modifier::BOLD)
+            Color::Rgb(base.0, base.1, base.2)
         };
+        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
         spans.push(Span::styled(ch.to_string(), style));
     }
 
@@ -2600,18 +2611,26 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let total_chars = char_count(buf);
     let cursor_clamped = cursor.min(total_chars);
     let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
-    let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
+    let show_caret = !matches!(
+        app.mode,
+        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+    );
+    let mut input_spans = vec![Span::styled(
+        prompt_prefix,
+        Style::default()
+            .fg(border_color)
+            .add_modifier(Modifier::BOLD),
+    )];
+    input_spans.extend(input_value_spans(
+        buf,
+        cursor_clamped,
+        scroll,
+        input_width,
+        show_caret,
+        border_color,
+    ));
 
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled(
-            prompt_prefix,
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(visible, Style::default().fg(Color::White)),
-    ]))
-    .style(Style::default().bg(BG_DEEP));
+    let prompt = Paragraph::new(Line::from(input_spans)).style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
 
     let badge = Paragraph::new(Line::from(Span::styled(mode_label, mode_style)))
@@ -2619,19 +2638,48 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
 
-    // Draw a native terminal cursor instead of a manual in-buffer caret.
-    // Native cursors are handled efficiently by the terminal emulator and
-    // don't flicker on every frame draw.
-    if !matches!(
-        app.mode,
-        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
-    ) {
-        let cx = row[0].x + prompt_prefix_w + (cursor_clamped - scroll) as u16;
-        let cy = row[0].y;
-        if cx < row[0].x + row[0].width {
-            frame.set_cursor_position((cx, cy));
+    // The caret is rendered inside the buffer instead of using the terminal's
+    // native blinking cursor. That keeps the input calm while the splash and
+    // worker spinners redraw.
+}
+
+fn input_value_spans(
+    buf: &str,
+    cursor: usize,
+    scroll: usize,
+    width: usize,
+    show_caret: bool,
+    caret_color: Color,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let chars: Vec<char> = buf.chars().skip(scroll).take(width).collect();
+    let caret_col = cursor.saturating_sub(scroll).min(width.saturating_sub(1));
+    let last_col = if show_caret {
+        chars.len().max(caret_col + 1)
+    } else {
+        chars.len()
+    }
+    .min(width);
+
+    let text_style = Style::default().fg(Color::White);
+    let caret_style = Style::default()
+        .fg(BG_DEEP)
+        .bg(caret_color)
+        .add_modifier(Modifier::BOLD);
+
+    let mut spans = Vec::with_capacity(last_col);
+    for col in 0..last_col {
+        let ch = chars.get(col).copied().unwrap_or(' ');
+        if show_caret && col == caret_col {
+            spans.push(Span::styled(ch.to_string(), caret_style));
+        } else {
+            spans.push(Span::styled(ch.to_string(), text_style));
         }
     }
+    spans
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -3622,7 +3670,7 @@ async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    execute!(stdout, SetCursorStyle::SteadyBar)?;
+    execute!(stdout, SetCursorStyle::SteadyBar, Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -4453,6 +4501,34 @@ mod tests {
     fn savings_line_handles_missing_state() {
         let line = render_savings_line(None);
         assert!(line.contains("baseline"));
+    }
+
+    #[test]
+    fn logo_art_avoids_box_drawing_edges() {
+        let art = LOGO.join("\n");
+        for ch in ['╔', '╗', '╚', '╝', '═', '║'] {
+            assert!(
+                !art.contains(ch),
+                "logo should avoid glyphs that render as noisy outlines"
+            );
+        }
+    }
+
+    #[test]
+    fn input_value_spans_draws_steady_end_caret() {
+        let spans = input_value_spans("abc", 3, 0, 8, true, ACCENT);
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "abc ");
+        assert_eq!(spans[3].style.bg, Some(ACCENT));
+    }
+
+    #[test]
+    fn input_value_spans_highlights_character_under_caret() {
+        let spans = input_value_spans("abcd", 1, 0, 8, true, ACCENT);
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "abcd");
+        assert_eq!(spans[1].style.bg, Some(ACCENT));
+        assert_eq!(spans[0].style.bg, None);
     }
 
     #[test]

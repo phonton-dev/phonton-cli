@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.2.1 - Public Alpha Patch
+
+### Fixed
+
+- Replaced the startup logo art with cleaner solid-block lettering that avoids noisy box-drawing outlines.
+- Smoothed the splash gradient animation with a slower redraw cadence and a softer highlight sweep.
+- Replaced the native blinking input cursor with a steady in-buffer caret so the bottom input bar no longer flashes during splash animation.
+
 ## 0.2.0 - Public Alpha
 
 ### Added
