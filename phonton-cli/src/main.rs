@@ -51,7 +51,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -107,18 +106,19 @@ const GRAD_D: (u8, u8, u8) = (69, 144, 255); // electric blue
 const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
 const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
-const UI_TICK_MS: u64 = 80;
-const LOGO_SHIMMER_SPEED: f32 = 0.018;
-const LOGO_ROW_PHASE: f32 = 0.085;
+const UI_TICK_MS: u64 = 50;
+const LOGO_SHIMMER_SPEED: f32 = 0.008;
+const LOGO_ROW_PHASE: f32 = 0.055;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "█████░  █   █░  ████░  █   █░ █████░  ████░  █   █░",
-    "█   █░  █   █░ █    █░ ██  █░   █  ░ █    █░ ██  █░",
-    "█████░  █████░ █    █░ █ █ █░   █  ░ █    █░ █ █ █░",
-    "█    ░  █   █░ █    █░ █  ██░   █  ░ █    █░ █  ██░",
-    "█    ░  █   █░  ████░  █   █░   █  ░  ████░  █   █░",
-    " ░░░░    ░   ░   ░░░░    ░   ░    ░     ░░░░    ░   ░",
+    "████╗  ██╗  ██╗  ████╗  ███╗  ██╗ █████╗  ████╗  ███╗  ██╗",
+    "██╔██╗ ██║  ██║ ██╔═██╗ ████╗ ██║ ╚═██╔╝ ██╔═██╗ ████╗ ██║",
+    "████╔╝ ███████║ ██║ ██║ ██╔██╗██║   ██║  ██║ ██║ ██╔██╗██║",
+    "██╔═╝  ██╔══██║ ██║ ██║ ██║╚████║   ██║  ██║ ██║ ██║╚████║",
+    "██║    ██║  ██║ ╚████╔╝ ██║ ╚███║   ██║  ╚████╔╝ ██║ ╚███║",
+    "╚═╝░   ╚═╝  ╚═╝  ╚═══╝░ ╚═╝  ╚══╝   ╚═╝   ╚═══╝░ ╚═╝  ╚══╝",
+    "  ░░     ░░  ░░    ░░░    ░░   ░░    ░░     ░░░    ░░   ░░",
 ];
 
 const LOGO_WIDTH_THRESHOLD: u16 = 72;
@@ -143,6 +143,16 @@ fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
     )
 }
 
+#[inline]
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn grad_smooth(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
+    grad(a, b, smoothstep(t))
+}
+
 /// Three-stop gradient (a → b → c) sampled at t ∈ [0, 1].
 fn grad3(t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);
@@ -157,12 +167,14 @@ fn grad3(t: f32) -> Color {
 /// mock, then travels through electric blue and cyan before looping.
 fn logo_grad(t: f32) -> Color {
     let t = t - t.floor();
-    if t < 0.33 {
-        grad(GRAD_B, GRAD_C, t / 0.33)
-    } else if t < 0.66 {
-        grad(GRAD_C, GRAD_D, (t - 0.33) / 0.33)
+    if t < 0.28 {
+        grad_smooth(GRAD_B, GRAD_C, t / 0.28)
+    } else if t < 0.56 {
+        grad_smooth(GRAD_C, GRAD_D, (t - 0.28) / 0.28)
+    } else if t < 0.82 {
+        grad_smooth(GRAD_D, GRAD_A, (t - 0.56) / 0.26)
     } else {
-        grad(GRAD_D, GRAD_A, (t - 0.66) / 0.34)
+        grad_smooth(GRAD_A, GRAD_B, (t - 0.82) / 0.18)
     }
 }
 
@@ -211,10 +223,10 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
             let lift = (0.18 - shadow_t).max(0.0) / 0.18;
             Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
         } else {
-            let base = logo_grad((x * 0.82 + phase * 0.74 + row_idx as f32 * 0.04).fract());
+            let base = logo_grad((x * 0.72 + phase * 0.48 + row_idx as f32 * 0.03).fract());
             let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
-            let glint = if distance < 0.075 {
-                (1.0 - distance / 0.075) * 0.55
+            let glint = if distance < 0.12 {
+                smoothstep(1.0 - distance / 0.12) * 0.34
             } else {
                 0.0
             };
@@ -223,7 +235,7 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
                 + row_idx as f32 * 0.65)
                 .sin()
                 + 1.0)
-                * 0.07;
+                * 0.045;
             Style::default()
                 .fg(grad(
                     base_rgb(base),
@@ -2868,23 +2880,48 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let prompt_prefix = format!(" {icon} ");
     let prompt_prefix_w = prompt_prefix.chars().count() as u16;
 
-    // Horizontal scroll so the caret is always visible inside the input slot.
+    // Horizontal scroll so the drawn caret is always visible inside the input slot.
     let input_width = row[0].width.saturating_sub(prompt_prefix_w) as usize;
+    let show_drawn_caret = input_width > 0
+        && !matches!(
+            app.mode,
+            Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+        );
+    let visible_width = input_width.saturating_sub(usize::from(show_drawn_caret));
     let total_chars = char_count(buf);
     let cursor_clamped = cursor.min(total_chars);
-    let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
-    let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
+    let scroll = if show_drawn_caret {
+        cursor_clamped.saturating_sub(visible_width)
+    } else {
+        cursor_clamped.saturating_sub(input_width.saturating_sub(1))
+    };
+    let visible_chars: Vec<char> = buf.chars().skip(scroll).take(visible_width).collect();
+    let caret_offset = cursor_clamped
+        .saturating_sub(scroll)
+        .min(visible_chars.len());
+    let before_caret: String = visible_chars.iter().take(caret_offset).collect();
+    let after_caret: String = visible_chars.iter().skip(caret_offset).collect();
 
-    let prompt = Paragraph::new(Line::from(vec![
+    let mut prompt_spans = vec![
         Span::styled(
             prompt_prefix,
             Style::default()
                 .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(visible, Style::default().fg(Color::White)),
-    ]))
-    .style(Style::default().bg(BG_DEEP));
+        Span::styled(before_caret, Style::default().fg(Color::White)),
+    ];
+    if show_drawn_caret {
+        prompt_spans.push(Span::styled(
+            "▌",
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    prompt_spans.push(Span::styled(after_caret, Style::default().fg(Color::White)));
+
+    let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
 
     let badge = Paragraph::new(Line::from(Span::styled(mode_label, mode_style)))
@@ -2892,19 +2929,9 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
 
-    // Draw a native terminal cursor instead of a manual in-buffer caret.
-    // Native cursors are handled efficiently by the terminal emulator and
-    // don't flicker on every frame draw.
-    if !matches!(
-        app.mode,
-        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
-    ) {
-        let cx = row[0].x + prompt_prefix_w + (cursor_clamped - scroll) as u16;
-        let cy = row[0].y;
-        if cx < row[0].x + row[0].width {
-            frame.set_cursor_position((cx, cy));
-        }
-    }
+    // The native terminal cursor is hidden while Phonton runs. A drawn caret
+    // avoids terminal-controlled blinking and keeps the input bar visually
+    // stable during the animated splash.
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -4037,8 +4064,7 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    execute!(stdout, SetCursorStyle::SteadyBar)?;
+    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -4064,7 +4090,6 @@ async fn main() -> Result<()> {
         terminal.backend_mut(),
         LeaveAlternateScreen,
         crossterm::cursor::Show,
-        SetCursorStyle::DefaultUserShape,
     )?;
     terminal.show_cursor()?;
     result
@@ -4073,8 +4098,8 @@ async fn main() -> Result<()> {
 fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
     std::thread::spawn(move || loop {
         // Poll on a modest cadence. This keeps input responsive while
-        // preventing the splash animation and terminal cursor from feeling
-        // like they are flashing on every frame.
+        // preventing the splash animation from feeling like it is flashing
+        // on every frame.
         if event::poll(Duration::from_millis(UI_TICK_MS)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
                 // IMPORTANT: Filter for 'Press' events only. Windows and some
@@ -5419,6 +5444,20 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn input_bar_renders_steady_drawn_caret() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.goal_input = "ship 0.3.1".to_string();
+        app.goal_cursor = char_count(&app.goal_input);
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("ship 0.3.1▌"));
+    }
+
+    #[test]
     fn splash_logo_is_compact_and_shadowed() {
         let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
@@ -5426,6 +5465,10 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(
             LOGO.iter().any(|row| row.contains('░')),
             "logo should carry its own pixel shadow layer"
+        );
+        assert!(
+            LOGO.iter().any(|row| row.contains("╚═╝")),
+            "logo should use the ANSI-shadow terminal mark"
         );
     }
 
@@ -5438,7 +5481,8 @@ fn extract_id(line: &str) -> Option<String> {
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("█████"));
-        assert!(dump.contains("░░░░"));
+        assert!(dump.contains("╚═╝░"));
+        assert!(dump.contains("░░"));
     }
 
     #[test]

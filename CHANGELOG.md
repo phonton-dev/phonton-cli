@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.3.1 - TUI Polish Patch
+
+### Changed
+
+- Replaced the native blinking terminal cursor in the input bar with a drawn, steady caret.
+- Refined the splash ASCII logo to a tighter ANSI-shadow style closer to the current product mockups.
+- Smoothed the animated logo gradient with slower ticks, eased color interpolation, and a softer glint.
+
 ## 0.3.0 - Extension Runtime Alpha
 
 ### Added
