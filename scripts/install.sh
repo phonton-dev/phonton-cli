@@ -46,7 +46,7 @@ fi
 
 case "$channel" in
   stable)
-    ref_args="--tag v0.2.1"
+    ref_args="--tag v0.1.0"
     ;;
   dev)
     ref_args="--branch dev"

@@ -57,6 +57,7 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
             ModelTier::Standard => "claude-sonnet-4-5".into(),
             ModelTier::Frontier => "claude-sonnet-4-5".into(),
         },
+        "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "deepseek" => match tier {
             ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
             ModelTier::Standard => "deepseek-chat".into(),
@@ -113,6 +114,12 @@ pub async fn discover_models(
             // Validate the key with a tiny probe then return the static
             // list of models it routes to.
             discover_agentrouter(&http, api_key).await
+        }
+        "cloudflare" => {
+            // Workers AI's OpenAI-compatible endpoint is the contract we use.
+            // Keep discovery deterministic; doctor's completion probe proves
+            // account/model access without depending on a catalogue endpoint.
+            Ok(cloudflare_static_models())
         }
         "deepseek" => {
             discover_openai_bearer(&http, api_key, "https://api.deepseek.com/v1/models").await
@@ -278,6 +285,29 @@ fn agentrouter_static_models() -> Vec<String> {
         "llama-3.3-70b".into(),
         "llama-3.1-8b".into(),
     ]
+}
+
+fn cloudflare_static_models() -> Vec<String> {
+    vec![
+        "@cf/moonshotai/kimi-k2.6".into(),
+        "@cf/openai/gpt-oss-120b".into(),
+        "@cf/meta/llama-3.1-8b-instruct".into(),
+    ]
+}
+
+fn cloudflare_workers_ai_base_url(base_url_or_account: Option<&str>) -> Option<String> {
+    let raw = base_url_or_account
+        .map(str::to_string)
+        .or_else(|| std::env::var("CLOUDFLARE_ACCOUNT_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Some(raw)
+    } else {
+        Some(format!(
+            "https://api.cloudflare.com/client/v4/accounts/{raw}/ai/v1"
+        ))
+    }
 }
 
 async fn discover_together(http: &Client, api_key: &str) -> Result<Vec<String>> {
@@ -477,6 +507,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "llama",
         ],
         "agentrouter" => &["claude-sonnet", "gpt-4o", "claude-haiku"],
+        "cloudflare" => &["@cf/moonshotai/kimi-k2.6", "kimi-k2.6", "gpt-oss", "llama"],
         _ => &[],
     };
     for needle in preferences {
@@ -552,6 +583,17 @@ pub async fn select_best_working_model(
                 base_url: base_url.unwrap_or("http://localhost:11434").into(),
                 model: cand.clone(),
             },
+            "cloudflare" => {
+                let Some(url) = cloudflare_workers_ai_base_url(base_url) else {
+                    continue;
+                };
+                ProviderConfig::OpenAiCompatible {
+                    name: "cloudflare".into(),
+                    api_key: api_key.into(),
+                    model: cand.clone(),
+                    base_url: url,
+                }
+            }
             "deepseek" | "xai" | "grok" | "groq" | "together" | "custom" | "openai-compatible" => {
                 let url = match name {
                     "deepseek" => "https://api.deepseek.com/v1".to_string(),
@@ -695,15 +737,23 @@ pub fn provider_for(config: ProviderConfig) -> Box<dyn Provider> {
             Box::new(OpenAiCompatibleProvider::agentrouter(api_key, model))
         }
         ProviderConfig::OpenAiCompatible {
-            name: _,
+            name,
             api_key,
             model,
             base_url,
-        } => Box::new(OpenAiCompatibleProvider::custom(
-            api_key,
-            model,
-            &format!("{}/chat/completions", base_url.trim_end_matches('/')),
-        )),
+        } => {
+            let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            if name == "cloudflare" {
+                Box::new(OpenAiCompatibleProvider::new(
+                    api_key,
+                    model,
+                    &endpoint,
+                    ProviderKind::Cloudflare,
+                ))
+            } else {
+                Box::new(OpenAiCompatibleProvider::custom(api_key, model, &endpoint))
+            }
+        }
     }
 }
 
@@ -1698,6 +1748,7 @@ mod tests {
             "openrouter",
             "gemini",
             "agentrouter",
+            "cloudflare",
             "deepseek",
             "xai",
             "grok",

@@ -29,14 +29,17 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use phonton_context::{ContextManager, TiktokenCounter};
+use phonton_mcp::{McpCallResult, McpRuntime, McpTool};
 use phonton_providers::Provider;
 use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
-    CodeSlice, ContextFrame, DiffHunk, DiffLine, MemoryRecord, ModelTier, SliceOrigin, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer, VerifyResult,
+    CodeSlice, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord, ModelTier, Permission,
+    SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer,
+    VerifyResult,
 };
 use regex::Regex;
+use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 /// Re-exports of the guard / tool-call types. Canonical definitions now
@@ -49,6 +52,12 @@ pub mod dispatcher;
 
 /// Maximum verification attempts before escalating model tier.
 pub const MAX_ATTEMPTS: u8 = 3;
+
+/// Maximum MCP tool calls a worker may make for one subtask.
+pub const MAX_MCP_CALLS_PER_SUBTASK: usize = 3;
+
+/// Maximum MCP result characters fed back into the model.
+pub const MCP_RESULT_MAX_CHARS: usize = 4_000;
 
 /// Default token limit for the context window.
 pub const DEFAULT_WINDOW_LIMIT: usize = 120_000;
@@ -77,6 +86,8 @@ pub struct Worker {
     msg_tx: Option<tokio::sync::mpsc::Sender<phonton_types::messages::OrchestratorMessage>>,
     /// Context window manager.
     context: Arc<tokio::sync::Mutex<ContextManager>>,
+    /// Optional MCP runtime used for attributed tool calls.
+    mcp: Option<Arc<McpRuntime>>,
 }
 
 /// Bundle of the embedder + prebuilt index used to surface relevant
@@ -118,6 +129,7 @@ impl Worker {
             semantic: None,
             msg_tx: None,
             context: Arc::new(tokio::sync::Mutex::new(context)),
+            mcp: None,
         }
     }
 
@@ -161,6 +173,14 @@ impl Worker {
         context: Arc<tokio::sync::Mutex<ContextManager>>,
     ) -> Self {
         self.context = context;
+        self
+    }
+
+    /// Attach the shared MCP runtime. Workers may request MCP calls only by
+    /// emitting the explicit `MCP_TOOL_CALL` marker; the runtime handles
+    /// permission checks, approval policy, execution, and audit events.
+    pub fn with_mcp_runtime(mut self, runtime: Arc<McpRuntime>) -> Self {
+        self.mcp = Some(runtime);
         self
     }
 
@@ -254,10 +274,18 @@ impl Worker {
         let mut token_usage = TokenUsage::default();
         let mut last_provider = phonton_types::ProviderKind::Anthropic;
         let mut last_model_name = String::new();
+        let mut mcp_results: Vec<McpResultContext> = Vec::new();
+        let mut mcp_calls = 0usize;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            let user_prompt =
-                render_user_prompt(&subtask, &context_slices, &relevant_slices, &last_errors);
+            let user_prompt = render_user_prompt(
+                &subtask,
+                &context_slices,
+                &relevant_slices,
+                &last_errors,
+                self.mcp.as_deref(),
+                &mcp_results,
+            );
 
             if let Some(tx) = &self.msg_tx {
                 let _ = tx.try_send(
@@ -295,6 +323,72 @@ impl Worker {
                         tokens_so_far: total_tokens,
                     },
                 );
+            }
+
+            match parse_mcp_tool_request(&response.content) {
+                Ok(Some(request)) => {
+                    let Some(runtime) = &self.mcp else {
+                        last_errors = vec![
+                            "MCP_TOOL_CALL was requested, but no MCP runtime is available for this run. \
+                             Produce the unified diff directly or omit MCP usage."
+                                .into(),
+                        ];
+                        continue;
+                    };
+                    if mcp_calls >= MAX_MCP_CALLS_PER_SUBTASK {
+                        last_errors = vec![format!(
+                            "MCP tool-call budget exhausted for this subtask ({MAX_MCP_CALLS_PER_SUBTASK} calls). \
+                             Produce the unified diff using the gathered context."
+                        )];
+                        continue;
+                    }
+                    mcp_calls += 1;
+                    let server_id = request.server_id.clone();
+                    let tool_name = request.tool_name.clone();
+                    let result = if is_mcp_tool_list_request(&tool_name) {
+                        runtime
+                            .list_tools(&server_id)
+                            .await
+                            .map(|tools| (true, render_mcp_tools(&tools)))
+                    } else {
+                        runtime
+                            .call_tool(&server_id, &tool_name, request.arguments)
+                            .await
+                            .map(|result| (!result.is_error, render_mcp_result(&result)))
+                    };
+                    match result {
+                        Ok((success, rendered)) => {
+                            mcp_results.push(McpResultContext {
+                                server_id,
+                                tool_name,
+                                success,
+                                content: truncate_chars(&rendered, MCP_RESULT_MAX_CHARS),
+                            });
+                            last_errors.clear();
+                        }
+                        Err(e) => {
+                            mcp_results.push(McpResultContext {
+                                server_id,
+                                tool_name,
+                                success: false,
+                                content: truncate_chars(e.to_string(), MCP_RESULT_MAX_CHARS),
+                            });
+                            last_errors = vec![format!(
+                                "The requested MCP tool call failed or was denied: {e}. \
+                                 Do not repeat the same request unless you can change it meaningfully."
+                            )];
+                        }
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    last_errors = vec![format!(
+                        "Your MCP_TOOL_CALL request was malformed: {e}. \
+                         Use exactly: MCP_TOOL_CALL {{\"server\":\"<server-id>\",\"tool\":\"<tool-name>\",\"arguments\":{{...}}}}"
+                    )];
+                    continue;
+                }
             }
 
             let hunks = match parse_unified_diff(&response.content) {
@@ -592,9 +686,10 @@ fn truncate_with_notice(text: String, limit: usize) -> String {
     truncated
 }
 
-fn truncate_chars(text: String, limit: usize) -> String {
+fn truncate_chars(text: impl AsRef<str>, limit: usize) -> String {
+    let text = text.as_ref();
     if text.chars().count() <= limit {
-        return text;
+        return text.to_string();
     }
     text.chars().take(limit).collect()
 }
@@ -732,7 +827,8 @@ fn next_tier(t: ModelTier) -> ModelTier {
 /// review and verification expect parseable unified diffs.
 fn base_system_prompt() -> String {
     "You are a Phonton worker. You produce code changes as unified diffs ONLY.\n\
-     Your output must be a single, parseable unified diff. NO PROSE. NO COMMENTARY. NO EXPLANATION.\n\n\
+     Your output must be a single, parseable unified diff. NO PROSE. NO COMMENTARY. NO EXPLANATION.\n\
+     The only exception is when the user prompt explicitly lists MCP servers: then you may output exactly one MCP_TOOL_CALL JSON marker instead of a diff, and nothing else. After MCP results are provided, return to unified-diff output.\n\n\
      EXAMPLE OF CREATING A NEW FILE `main.c`:\n\
      --- /dev/null\n\
      +++ b/main.c\n\
@@ -744,7 +840,8 @@ fn base_system_prompt() -> String {
      3. Do NOT explain what you are doing. Output the diff and nothing else.\n\
      4. Do NOT include unchanged code in the diff unless it is for context (max 3 lines).\n\
      5. If you have nothing to change, output an empty response.\n\
-     6. ANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n"
+     6. If requesting MCP, output exactly `MCP_TOOL_CALL {\"server\":\"<server-id>\",\"tool\":\"<tool-name>\",\"arguments\":{...}}`.\n\
+     7. ANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n"
         .to_string()
 }
 
@@ -753,6 +850,8 @@ fn render_user_prompt(
     slices: &[CodeSlice],
     relevant: &[CodeSlice],
     prior_errors: &[String],
+    mcp: Option<&McpRuntime>,
+    mcp_results: &[McpResultContext],
 ) -> String {
     let mut out = String::new();
     if !relevant.is_empty() {
@@ -787,10 +886,237 @@ fn render_user_prompt(
         }
     }
 
+    if let Some(mcp) = mcp {
+        let mut servers = mcp.servers();
+        servers.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        if !servers.is_empty() {
+            out.push_str("\n# MCP servers\n");
+            out.push_str(
+                "You may request one MCP operation instead of a diff when external context is necessary. \
+                 Output exactly one line in this form and no prose:\n",
+            );
+            out.push_str(
+                "MCP_TOOL_CALL {\"server\":\"<server-id>\",\"tool\":\"tools/list\",\"arguments\":{}}\n",
+            );
+            out.push_str(
+                "After tools are listed, request one concrete tool with the same marker. \
+                 Approval-required or blocked operations may be denied.\n",
+            );
+            out.push_str("Available servers:\n");
+            for server in servers {
+                let permissions = render_permissions(&server.permissions);
+                out.push_str(&format!(
+                    "- {} ({}) trust={} permissions={}\n",
+                    server.id, server.name, server.trust, permissions
+                ));
+            }
+        }
+    }
+
+    if !mcp_results.is_empty() {
+        out.push_str("\n# MCP results\n");
+        for result in mcp_results {
+            let status = if result.success { "success" } else { "failed" };
+            out.push_str(&format!(
+                "- {}/{}: {status}\n",
+                result.server_id, result.tool_name
+            ));
+            out.push_str("<mcp-result>\n");
+            out.push_str(&result.content);
+            if !result.content.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("</mcp-result>\n");
+        }
+    }
+
     out.push_str("\n# CRITICAL\n");
     out.push_str("Output the UNIFIED DIFF for the above subtask. START with `--- a/` or `--- /dev/null`. NO PREAMBLE. NO PROSE.\n");
 
     out
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct McpToolRequest {
+    server_id: ExtensionId,
+    tool_name: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct McpResultContext {
+    server_id: ExtensionId,
+    tool_name: String,
+    success: bool,
+    content: String,
+}
+
+fn parse_mcp_tool_request(content: &str) -> Result<Option<McpToolRequest>> {
+    let body = unfence_diff(content);
+    let trimmed = body.trim();
+    if trimmed.is_empty() || trimmed.starts_with("--- ") || trimmed.starts_with("diff --git") {
+        return Ok(None);
+    }
+
+    let value = if let Some(rest) = trimmed.strip_prefix("MCP_TOOL_CALL") {
+        let json_text = extract_json_object(rest)
+            .ok_or_else(|| anyhow!("missing JSON object after MCP_TOOL_CALL marker"))?;
+        serde_json::from_str::<Value>(json_text)
+            .map_err(|e| anyhow!("invalid MCP_TOOL_CALL JSON: {e}"))?
+    } else if trimmed.starts_with('{') {
+        let json_text =
+            extract_json_object(trimmed).ok_or_else(|| anyhow!("missing JSON object"))?;
+        let value = serde_json::from_str::<Value>(json_text)
+            .map_err(|e| anyhow!("invalid MCP tool-call JSON: {e}"))?;
+        match value.get("mcp_tool_call") {
+            Some(inner) => inner.clone(),
+            None if value.get("server").is_some() || value.get("server_id").is_some() => value,
+            None => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+
+    parse_mcp_tool_request_value(value).map(Some)
+}
+
+fn parse_mcp_tool_request_value(value: Value) -> Result<McpToolRequest> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow!("MCP tool call must be a JSON object"))?;
+    let server_id = obj
+        .get("server")
+        .or_else(|| obj.get("server_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("missing non-empty `server`"))?;
+    let tool_name = obj
+        .get("tool")
+        .or_else(|| obj.get("tool_name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("missing non-empty `tool`"))?;
+    let arguments = obj
+        .get("arguments")
+        .or_else(|| obj.get("args"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        return Err(anyhow!("`arguments` must be a JSON object"));
+    }
+    Ok(McpToolRequest {
+        server_id: ExtensionId::new(server_id.trim()),
+        tool_name: tool_name.trim().to_string(),
+        arguments,
+    })
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&text[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_mcp_tool_list_request(tool_name: &str) -> bool {
+    matches!(tool_name, "tools/list" | "__list_tools" | "list_tools")
+}
+
+fn render_mcp_tools(tools: &[McpTool]) -> String {
+    if tools.is_empty() {
+        return "No tools returned by server.".into();
+    }
+    let mut out = String::new();
+    for tool in tools {
+        out.push_str(&format!("- {}", tool.name));
+        if let Some(title) = tool.title.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&format!(" ({title})"));
+        }
+        if let Some(description) = tool.description.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(": ");
+            out.push_str(description.trim());
+        }
+        if !tool.input_schema.is_null() {
+            out.push_str("\n  input_schema: ");
+            out.push_str(&compact_json(&tool.input_schema));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn render_mcp_result(result: &McpCallResult) -> String {
+    let mut out = String::new();
+    if result.is_error {
+        out.push_str("[tool reported error]\n");
+    }
+    for block in &result.content {
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        } else if let Some(text) = block.as_str() {
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(&compact_json(block));
+            out.push('\n');
+        }
+    }
+    if let Some(structured) = &result.structured_content {
+        out.push_str("structured_content: ");
+        out.push_str(&compact_json(structured));
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        "Tool returned no content.".into()
+    } else {
+        out
+    }
+}
+
+fn render_permissions(permissions: &[Permission]) -> String {
+    if permissions.is_empty() {
+        return "none".into();
+    }
+    permissions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable-json>".into())
 }
 
 /// Minimal unified-diff parser. Sufficient for the model output the worker
@@ -1087,6 +1413,76 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].file_path, PathBuf::from("src/lib.rs"));
         assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn parses_mcp_tool_call_marker() {
+        let request = parse_mcp_tool_request(
+            r#"MCP_TOOL_CALL {"server":"github","tool":"search_issues","arguments":{"q":"bug"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.server_id, ExtensionId::new("github"));
+        assert_eq!(request.tool_name, "search_issues");
+        assert_eq!(request.arguments["q"], "bug");
+    }
+
+    #[test]
+    fn parses_json_mcp_tool_call_object() {
+        let request = parse_mcp_tool_request(
+            r#"{"mcp_tool_call":{"server_id":"docs","tool_name":"tools/list"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.server_id, ExtensionId::new("docs"));
+        assert_eq!(request.tool_name, "tools/list");
+        assert_eq!(request.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn malformed_mcp_tool_call_reports_error() {
+        let err = parse_mcp_tool_request(
+            r#"MCP_TOOL_CALL {"server":"docs","tool":"read","arguments":["not","object"]}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("arguments"));
+    }
+
+    #[test]
+    fn render_user_prompt_lists_mcp_servers_and_results() {
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Read docs before editing".into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let server = phonton_types::McpServerDefinition {
+            id: ExtensionId::new("docs"),
+            name: "Docs".into(),
+            source: phonton_types::ExtensionSource::Workspace,
+            transport: phonton_types::McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["server.js".into()],
+            },
+            trust: phonton_types::TrustLevel::ReadOnlyTool,
+            permissions: vec![Permission::FsReadWorkspace],
+            applies_to: phonton_types::AppliesTo::default(),
+            env: Vec::new(),
+            enabled: true,
+        };
+        let runtime = McpRuntime::new(vec![server], guard());
+        let results = vec![McpResultContext {
+            server_id: ExtensionId::new("docs"),
+            tool_name: "tools/list".into(),
+            success: true,
+            content: "- read_file".into(),
+        }];
+        let prompt = render_user_prompt(&subtask, &[], &[], &[], Some(&runtime), &results);
+        assert!(prompt.contains("# MCP servers"));
+        assert!(prompt.contains("docs (Docs)"));
+        assert!(prompt.contains("# MCP results"));
+        assert!(prompt.contains("read_file"));
     }
 
     #[test]

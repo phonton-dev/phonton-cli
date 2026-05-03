@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.2.1</h1>
+<h1 align="center">Phonton CLI · v0.3.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.2.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.3.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -56,7 +56,9 @@ That gives Phonton a different shape from an IDE assistant or a terminal chatbot
 - `phonton plan` preview for task DAGs before edits happen.
 - `phonton review` surfaces for verified diff review payloads, approvals, rejections, and rollback.
 - `phonton memory` commands for inspecting, editing, deleting, pinning, and unpinning local decision memory.
-- BYOK provider adapters for Anthropic, OpenAI, OpenRouter, Gemini, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints. `phonton doctor --provider` verifies your configured provider by checking model discovery and a tiny completion call through the same adapter used for runs.
+- `phonton extensions` commands for inspecting resolved skills, steering, MCP servers, profiles, conflicts, and diagnostics.
+- `phonton mcp` commands for listing configured servers and lazily approving tool discovery or tool calls.
+- BYOK provider adapters for Anthropic, OpenAI, OpenRouter, Gemini, Cloudflare Workers AI, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints. `phonton doctor --provider` verifies your configured provider by checking model discovery and a tiny completion call through the same adapter used for runs.
 - Local store, memory, planner, worker, diff, sandbox, verification, and orchestration crates.
 - Semantic indexing behind the CLI stack for repo-aware workflows.
 
@@ -98,7 +100,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.2.1 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.3.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -114,7 +116,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.2.1 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.3.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -164,13 +166,23 @@ export ANTHROPIC_API_KEY="..."
 export OPENAI_API_KEY="..."
 export GEMINI_API_KEY="..."
 export OPENROUTER_API_KEY="..."
+export CLOUDFLARE_API_TOKEN="..."
+export CLOUDFLARE_ACCOUNT_ID="..."
 ```
 
 Windows PowerShell:
 
 ```powershell
 $env:GEMINI_API_KEY = "..."
+$env:CLOUDFLARE_API_TOKEN = "..."
+$env:CLOUDFLARE_ACCOUNT_ID = "..."
 ```
+
+Cloudflare Workers AI uses the OpenAI-compatible endpoint. Set
+`name = "cloudflare"` and the default model is `@cf/moonshotai/kimi-k2.6`.
+Set `provider.account_id` or `CLOUDFLARE_ACCOUNT_ID` for the Workers AI account.
+`provider.base_url` remains available for a full
+`https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1` base URL override.
 
 Check the install:
 
@@ -190,6 +202,8 @@ phonton doctor          Check config, store, trust, git, cargo, and Nexus
 phonton plan <goal>     Preview the task DAG without changing files
 phonton review          Show verified diff review payloads
 phonton memory list     Inspect local decision memory
+phonton extensions list Inspect skills, steering, MCP servers, and profiles
+phonton mcp list        Show configured MCP servers without starting them
 phonton config path     Print the resolved config file path
 phonton config show     Dump resolved config as TOML
 phonton version         Print version
@@ -216,6 +230,17 @@ phonton memory list --json
 phonton memory edit <id> "updated rationale"
 phonton memory pin <id>
 phonton memory delete <id>
+```
+
+Extension visibility:
+
+```bash
+phonton extensions list --json
+phonton extensions doctor --json
+phonton extensions skills --json
+phonton extensions steering --json
+phonton extensions mcp --json
+phonton mcp list --json
 ```
 
 ## How Phonton Handles Context

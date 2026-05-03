@@ -12,8 +12,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContextAttribution, CostSummary, DiffHunk, ModelTier, ProviderKind, SubtaskId, TaskId,
-    TokenUsage, VerifyResult,
+    ContextAttribution, CostSummary, DiffHunk, ExtensionId, ExtensionKind, ExtensionSource,
+    ModelTier, Permission, ProviderKind, SteeringSeverity, SubtaskId, TaskId, TokenUsage,
+    VerifyResult,
 };
 
 /// Token threshold between successive [`OrchestratorEvent::TokenMilestone`]
@@ -78,6 +79,67 @@ pub enum OrchestratorEvent {
         subtask_id: SubtaskId,
         slices: Vec<ContextAttribution>,
         total_token_count: usize,
+    },
+    /// An extension manifest was loaded by the resolver.
+    ExtensionLoaded {
+        extension_id: ExtensionId,
+        kind: ExtensionKind,
+        source: ExtensionSource,
+        enabled: bool,
+    },
+    /// An extension manifest was skipped or rejected.
+    ExtensionSkipped {
+        extension_id: Option<ExtensionId>,
+        kind: Option<ExtensionKind>,
+        source: ExtensionSource,
+        reason: String,
+    },
+    /// Two extension records conflicted during resolution.
+    ExtensionConflict {
+        extension_id: ExtensionId,
+        lower_source: ExtensionSource,
+        higher_source: ExtensionSource,
+        detail: String,
+    },
+    /// A steering rule influenced planning, worker context, or verification.
+    SteeringApplied {
+        rule_id: ExtensionId,
+        severity: SteeringSeverity,
+        target: String,
+    },
+    /// A skill was injected into planner or worker context.
+    SkillApplied {
+        skill_id: ExtensionId,
+        version: String,
+        target: String,
+    },
+    /// An MCP server is configured and visible to the run.
+    McpServerAvailable {
+        server_id: ExtensionId,
+        permissions: Vec<Permission>,
+    },
+    /// A worker or planner requested an MCP tool call.
+    McpToolRequested {
+        server_id: ExtensionId,
+        tool_name: String,
+        permissions: Vec<Permission>,
+    },
+    /// A requested MCP tool call was approved.
+    McpToolApproved {
+        server_id: ExtensionId,
+        tool_name: String,
+    },
+    /// A requested MCP tool call was denied by trust or guard policy.
+    McpToolDenied {
+        server_id: ExtensionId,
+        tool_name: String,
+        reason: String,
+    },
+    /// An MCP tool call completed.
+    McpToolCompleted {
+        server_id: ExtensionId,
+        tool_name: String,
+        success: bool,
     },
     /// A subtask hit terminal failure (retry + escalation budget exhausted).
     SubtaskFailed {
@@ -161,6 +223,16 @@ impl EventRecord {
             OrchestratorEvent::TaskCompleted { .. } => "task-done",
             OrchestratorEvent::SubtaskDispatched { .. } => "dispatch",
             OrchestratorEvent::ContextSelected { .. } => "context",
+            OrchestratorEvent::ExtensionLoaded { .. } => "extension-loaded",
+            OrchestratorEvent::ExtensionSkipped { .. } => "extension-skipped",
+            OrchestratorEvent::ExtensionConflict { .. } => "extension-conflict",
+            OrchestratorEvent::SteeringApplied { .. } => "steering",
+            OrchestratorEvent::SkillApplied { .. } => "skill",
+            OrchestratorEvent::McpServerAvailable { .. } => "mcp-server",
+            OrchestratorEvent::McpToolRequested { .. } => "mcp-request",
+            OrchestratorEvent::McpToolApproved { .. } => "mcp-approved",
+            OrchestratorEvent::McpToolDenied { .. } => "mcp-denied",
+            OrchestratorEvent::McpToolCompleted { .. } => "mcp-completed",
             OrchestratorEvent::SubtaskCompleted { .. } => "subtask-done",
             OrchestratorEvent::SubtaskReviewReady { .. } => "review-ready",
             OrchestratorEvent::SubtaskFailed { .. } => "subtask-failed",
@@ -219,6 +291,99 @@ impl EventRecord {
                     slices.len(),
                     total_token_count
                 )
+            }
+            OrchestratorEvent::ExtensionLoaded {
+                extension_id,
+                kind,
+                source,
+                enabled,
+            } => {
+                format!(
+                    "extension loaded {extension_id} kind={kind} source={source} enabled={enabled}"
+                )
+            }
+            OrchestratorEvent::ExtensionSkipped {
+                extension_id,
+                kind,
+                source,
+                reason,
+            } => {
+                let id = extension_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "(unknown)".into());
+                let kind = kind
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "(unknown)".into());
+                format!("extension skipped {id} kind={kind} source={source}: {reason}")
+            }
+            OrchestratorEvent::ExtensionConflict {
+                extension_id,
+                lower_source,
+                higher_source,
+                detail,
+            } => {
+                format!(
+                    "extension conflict {extension_id}: {lower_source} overridden by {higher_source}: {detail}"
+                )
+            }
+            OrchestratorEvent::SteeringApplied {
+                rule_id,
+                severity,
+                target,
+            } => {
+                format!("steering applied {rule_id} severity={severity} target={target}")
+            }
+            OrchestratorEvent::SkillApplied {
+                skill_id,
+                version,
+                target,
+            } => {
+                format!("skill applied {skill_id}@{version} target={target}")
+            }
+            OrchestratorEvent::McpServerAvailable {
+                server_id,
+                permissions,
+            } => {
+                let permissions = permissions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("mcp server available {server_id} permissions=[{permissions}]")
+            }
+            OrchestratorEvent::McpToolRequested {
+                server_id,
+                tool_name,
+                permissions,
+            } => {
+                let permissions = permissions
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("mcp tool requested {server_id}.{tool_name} permissions=[{permissions}]")
+            }
+            OrchestratorEvent::McpToolApproved {
+                server_id,
+                tool_name,
+            } => {
+                format!("mcp tool approved {server_id}.{tool_name}")
+            }
+            OrchestratorEvent::McpToolDenied {
+                server_id,
+                tool_name,
+                reason,
+            } => {
+                format!("mcp tool denied {server_id}.{tool_name}: {reason}")
+            }
+            OrchestratorEvent::McpToolCompleted {
+                server_id,
+                tool_name,
+                success,
+            } => {
+                format!("mcp tool completed {server_id}.{tool_name} success={success}")
             }
             OrchestratorEvent::SubtaskReviewReady {
                 subtask_id,

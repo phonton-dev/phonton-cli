@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use phonton_mcp::McpRuntime;
 use phonton_orchestrator::WorkerDispatcher;
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_types::{CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskResult, TaskId};
@@ -50,6 +51,8 @@ pub struct RealDispatcher {
     context: Arc<tokio::sync::Mutex<phonton_context::ContextManager>>,
     /// Optional semantic index used to retrieve per-subtask context.
     semantic: Option<Arc<crate::SemanticContext>>,
+    /// Optional MCP runtime shared by all workers for this goal.
+    mcp: Option<Arc<McpRuntime>>,
 }
 
 impl RealDispatcher {
@@ -85,6 +88,7 @@ impl RealDispatcher {
             task_id: None,
             context: Arc::new(tokio::sync::Mutex::new(context)),
             semantic: None,
+            mcp: None,
         }
     }
 
@@ -105,6 +109,13 @@ impl RealDispatcher {
     /// the top relevant slices and passes those slices into the worker.
     pub fn with_semantic_context(mut self, semantic: Arc<crate::SemanticContext>) -> Self {
         self.semantic = Some(semantic);
+        self
+    }
+
+    /// Attach the shared MCP runtime. Servers remain lazy; workers must
+    /// request one MCP operation explicitly before anything starts.
+    pub fn with_mcp_runtime(mut self, runtime: Arc<McpRuntime>) -> Self {
+        self.mcp = Some(runtime);
         self
     }
 }
@@ -146,6 +157,10 @@ impl WorkerDispatcher for RealDispatcher {
 
         if let Some(memory) = self.memory.clone() {
             worker = worker.with_memory_store(memory);
+        }
+
+        if let Some(runtime) = &self.mcp {
+            worker = worker.with_mcp_runtime(Arc::clone(runtime));
         }
 
         if let Some(task_id) = self.task_id {

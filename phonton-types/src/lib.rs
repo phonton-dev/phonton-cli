@@ -9,10 +9,16 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod events;
+pub mod extensions;
 pub mod messages;
 pub mod providers;
 
 pub use events::{EventRecord, OrchestratorEvent, TOKEN_MILESTONE_INTERVAL};
+pub use extensions::{
+    AppliesTo, ExtensionAction, ExtensionConflict, ExtensionId, ExtensionInfluence, ExtensionKind,
+    ExtensionManifest, ExtensionScope, ExtensionSource, McpServerDefinition, McpTransport,
+    Permission, ProfileDefinition, SkillDefinition, SteeringRule, SteeringSeverity, TrustLevel,
+};
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
     BudgetDecision, BudgetLimits, CostSummary, LLMResponse, ModelMetricsSnapshot, ModelPricing,

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to attach assets to, for example v0.2.1"
+        description: "Release tag to attach assets to, for example v0.1.0"
         required: true
 
 permissions:
@@ -101,5 +101,10 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         shell: bash
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Phonton CLI $TAG" --notes "Automated Phonton CLI release assets."
+          NOTES_FILE="release-notes/${TAG}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Phonton CLI $TAG" --notes-file "$NOTES_FILE"
+          else
+            gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Phonton CLI $TAG" --notes "Automated Phonton CLI release assets."
+          fi
           gh release upload "$TAG" dist/* --clobber

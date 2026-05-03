@@ -9,12 +9,14 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
+use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions};
 use phonton_providers::provider_for;
+use phonton_types::{ExtensionKind, Permission};
 use serde::Serialize;
 
 use crate::{
-    config, default_model_for, default_store_path, make_api_provider_config, provider_requires_key,
-    trust,
+    cloudflare_base_url, config, default_model_for, default_store_path, make_api_provider_config,
+    provider_requires_key, trust,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -124,6 +126,7 @@ pub async fn build_report(workspace: &Path, opts: DoctorOptions) -> DoctorReport
     );
     check_cargo_manifest(workspace, &mut checks);
     check_nexus(workspace, &mut checks);
+    check_extensions(workspace, &mut checks);
 
     DoctorReport {
         workspace: workspace_display,
@@ -278,6 +281,26 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
         );
     }
 
+    if provider == "cloudflare"
+        && cloudflare_base_url(
+            cfg.provider.account_id.clone(),
+            cfg.provider.base_url.clone(),
+        )
+        .is_none()
+    {
+        push(
+            checks,
+            "provider.cloudflare_account",
+            Severity::Fail,
+            "Cloudflare account ID is missing",
+            "no provider.account_id, provider.base_url, or CLOUDFLARE_ACCOUNT_ID value",
+            Some(
+                "Set CLOUDFLARE_ACCOUNT_ID, provider.account_id, or provider.base_url to the full Workers AI base URL."
+                    .into(),
+            ),
+        );
+    }
+
     let model = cfg
         .provider
         .model
@@ -368,12 +391,18 @@ async fn check_provider_endpoint(
         }
     };
 
-    probe_models(checks, provider, effective_key, cfg.base_url.as_deref()).await;
+    let probe_base = if provider == "cloudflare" {
+        cloudflare_base_url(cfg.account_id.clone(), cfg.base_url.clone())
+    } else {
+        cfg.base_url.clone()
+    };
+    probe_models(checks, provider, effective_key, probe_base.as_deref()).await;
     probe_completion(
         checks,
         provider,
         effective_key,
         model,
+        cfg.account_id.as_deref(),
         cfg.base_url.as_deref(),
     )
     .await;
@@ -439,12 +468,14 @@ async fn probe_completion(
     provider: &str,
     key: &str,
     model: &str,
+    account_id: Option<&str>,
     base_url: Option<&str>,
 ) {
     let Some(cfg) = make_api_provider_config(
         provider,
         key.to_string(),
         model.to_string(),
+        account_id.map(str::to_string),
         base_url.map(str::to_string),
     ) else {
         push(
@@ -694,6 +725,125 @@ fn check_nexus(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
+fn check_extensions(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
+    let set = load_extensions(&ExtensionLoadOptions::for_workspace(workspace));
+    let error_count = set
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Error)
+        .count();
+    let warn_count = set
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Warn)
+        .count();
+
+    if error_count > 0 {
+        let first = set
+            .diagnostics
+            .iter()
+            .find(|d| d.severity == DiagnosticSeverity::Error)
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "extension config has errors".into());
+        push(
+            checks,
+            "extensions.load",
+            Severity::Fail,
+            "Extension config has errors",
+            format!("{error_count} error(s), {warn_count} warning(s): {first}"),
+            Some("Fix ~/.phonton or <workspace>/.phonton extension config.".into()),
+        );
+    } else if warn_count > 0 {
+        push(
+            checks,
+            "extensions.load",
+            Severity::Warn,
+            "Extension config has warnings",
+            format!("{warn_count} warning(s)"),
+            Some("Review extension diagnostics before a release run.".into()),
+        );
+    } else {
+        push(
+            checks,
+            "extensions.load",
+            Severity::Ok,
+            "Extension config loads",
+            format!("{} manifest(s)", set.manifests.len()),
+            None,
+        );
+    }
+
+    let disabled_mcp = set
+        .manifests
+        .iter()
+        .filter(|m| m.kind == ExtensionKind::McpServer && !m.enabled)
+        .count();
+    let active_mcp = set.mcp_servers.len();
+    let approval_gated: Vec<String> = set
+        .mcp_servers
+        .iter()
+        .filter(|server| {
+            server
+                .permissions
+                .iter()
+                .any(|permission| !matches!(permission, Permission::FsReadWorkspace))
+        })
+        .map(|server| {
+            format!(
+                "{} ({})",
+                server.id,
+                render_permissions(&server.permissions)
+            )
+        })
+        .collect();
+
+    if active_mcp == 0 && disabled_mcp == 0 {
+        push(
+            checks,
+            "mcp.config",
+            Severity::Ok,
+            "No MCP servers configured",
+            "nothing will be started",
+            None,
+        );
+    } else if !approval_gated.is_empty() {
+        push(
+            checks,
+            "mcp.config",
+            Severity::Warn,
+            "MCP servers require approval",
+            format!(
+                "{} active, {} disabled; approval-gated: {}",
+                active_mcp,
+                disabled_mcp,
+                approval_gated.join(", ")
+            ),
+            Some("Use `phonton mcp list`; tool operations require explicit approval.".into()),
+        );
+    } else {
+        push(
+            checks,
+            "mcp.config",
+            Severity::Ok,
+            "MCP config is conservative",
+            format!("{active_mcp} active, {disabled_mcp} disabled"),
+            None,
+        );
+    }
+}
+
+fn render_permissions(permissions: &[Permission]) -> String {
+    if permissions.is_empty() {
+        "none".into()
+    } else {
+        permissions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
 fn print_text_report(report: &DoctorReport, opts: DoctorOptions) {
     println!("Phonton doctor");
     println!("workspace: {}", report.workspace);
@@ -766,6 +916,9 @@ fn provider_key_hint(provider: &str) -> String {
         }
         "gemini" => "Set GEMINI_API_KEY, GOOGLE_API_KEY, or provider.api_key.".into(),
         "agentrouter" => "Set AGENTROUTER_API_KEY or provider.api_key.".into(),
+        "cloudflare" => {
+            "Set CLOUDFLARE_API_TOKEN plus CLOUDFLARE_ACCOUNT_ID, or provider.api_key plus provider.base_url.".into()
+        }
         "deepseek" => "Set DEEPSEEK_API_KEY or provider.api_key.".into(),
         "xai" | "grok" => "Set XAI_API_KEY, GROK_API_KEY, or provider.api_key.".into(),
         "groq" => "Set GROQ_API_KEY or provider.api_key.".into(),

@@ -12,6 +12,8 @@ Use this before tagging a Phonton CLI release.
 - [ ] `cargo build --locked --release -p phonton-cli` passes.
 - [ ] `phonton doctor` runs from the release binary.
 - [ ] `phonton doctor --provider` proves model discovery and a tiny completion call with at least one hosted provider.
+- [ ] `phonton extensions list --json`, `phonton extensions doctor --json`, and `phonton mcp list --json` run from the release binary.
+- [ ] `npm run test:npm-wrapper` reports the same version as `package.json`.
 - [ ] `scripts/benchmark-plan.ps1 -ReleaseBinary` passes.
 - [ ] Benchmark report is attached to the release notes if making efficiency claims.
 - [ ] No benchmark output, screenshots, logs, or docs contain secrets.
@@ -22,6 +24,9 @@ Use this before tagging a Phonton CLI release.
 .\target\release\phonton.exe version
 .\target\release\phonton.exe doctor
 .\target\release\phonton.exe plan --json "add input validation to config loading"
+.\target\release\phonton.exe extensions doctor --json
+.\target\release\phonton.exe mcp list --json
+npm run test:npm-wrapper
 .\scripts\benchmark-plan.ps1 -ReleaseBinary
 ```
 

@@ -4,13 +4,30 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
-## 0.2.1 - Public Alpha Patch
+## 0.3.0 - Extension Runtime Alpha
+
+### Added
+
+- Extension loader for user and workspace manifests, including skills, steering, MCP servers, and profiles.
+- Worker prompt preamble injection for active text-based extensions.
+- `phonton extensions` inventory and doctor commands, plus `phonton skills list` and `phonton steering list` aliases.
+- MCP runtime with lazy stdio/HTTP server startup, tool discovery, tool calls, trust checks, approval policies, and event reporting.
+- `phonton mcp list`, `phonton mcp tools`, and `phonton mcp call` commands.
+- TUI approval modal for MCP operations, including approve, deny, keyboard navigation, and denial on quit.
+- Worker-facing `MCP_TOOL_CALL` flow with capped MCP results and an end-to-end approval plus verified-diff test.
+- Compact TUI splash logo and smoother gradient treatment.
+- Cloudflare Workers AI provider alias for the OpenAI-compatible endpoint, defaulting to `@cf/moonshotai/kimi-k2.6`, plus an explicit Settings/config account ID field.
 
 ### Fixed
 
-- Replaced the startup logo art with cleaner solid-block lettering that avoids noisy box-drawing outlines.
-- Smoothed the splash gradient animation with a slower redraw cadence and a softer highlight sweep.
-- Replaced the native blinking input cursor with a steady in-buffer caret so the bottom input bar no longer flashes during splash animation.
+- Release clippy blockers in the extension trust inference, MCP client enum layout, and worker MCP error rendering.
+- npm wrapper testing now runs the freshly built binary instead of a stale ignored vendored binary when checking local release readiness.
+
+### Known Limitations
+
+- Extension installation is not a package marketplace yet; 0.3.0 focuses on local manifest loading, visibility, diagnostics, and MCP execution.
+- MCP server coverage depends on user/workspace configuration and trust policy.
+- Benchmark reports remain planner estimates unless explicitly labeled otherwise.
 
 ## 0.2.0 - Public Alpha
 
@@ -37,7 +54,7 @@ Initial release target for the `phonton-dev/phonton-cli` repository.
 - `phonton doctor` diagnostics for config, provider keys, store, trust, git, cargo, and Nexus config.
 - `phonton plan` preview for task DAGs.
 - `phonton review` commands for review payloads, approval, rejection, and rollback.
-- BYOK provider layer for Anthropic, OpenAI, OpenRouter, Gemini, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom endpoints.
+- BYOK provider layer for Anthropic, OpenAI, OpenRouter, Gemini, Cloudflare Workers AI, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom endpoints.
 - Local store, memory, planner, worker, diff, sandbox, verification, context, index, and orchestration crates.
 - README visuals and release-oriented documentation.
 - Plan benchmark harness with Markdown and JSON output.

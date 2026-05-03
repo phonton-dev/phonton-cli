@@ -12,6 +12,8 @@ members = [
     "phonton-providers",
     "phonton-sandbox",
     "phonton-store",
+    "phonton-extensions",
+    "phonton-mcp",
     "phonton-cli",
 ]
 resolver = "2"

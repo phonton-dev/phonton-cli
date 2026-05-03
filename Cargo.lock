@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2282,7 +2282,9 @@ dependencies = [
  "dirs 5.0.1",
  "git2",
  "phonton-diff",
+ "phonton-extensions",
  "phonton-index",
+ "phonton-mcp",
  "phonton-memory",
  "phonton-orchestrator",
  "phonton-planner",
@@ -2325,6 +2327,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "phonton-extensions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "phonton-types",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "phonton-index"
 version = "0.1.0"
 dependencies = [
@@ -2342,6 +2356,20 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "usearch",
+]
+
+[[package]]
+name = "phonton-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "phonton-sandbox",
+ "phonton-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2459,6 +2487,7 @@ dependencies = [
  "async-trait",
  "phonton-context",
  "phonton-index",
+ "phonton-mcp",
  "phonton-memory",
  "phonton-orchestrator",
  "phonton-providers",
@@ -2468,6 +2497,7 @@ dependencies = [
  "phonton-verify",
  "regex",
  "reqwest",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

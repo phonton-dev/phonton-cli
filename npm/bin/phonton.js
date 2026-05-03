@@ -5,11 +5,19 @@ const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
 const binaryName = process.platform === "win32" ? "phonton.exe" : "phonton";
-const binaryPath = path.join(__dirname, "..", "vendor", binaryName);
+const configuredBinary = process.env.PHONTON_BINARY || process.env.PHONTON_CLI_BINARY;
+const binaryPath = configuredBinary
+  ? path.resolve(configuredBinary)
+  : path.join(__dirname, "..", "vendor", binaryName);
 
 function ensureBinary() {
   if (fs.existsSync(binaryPath)) {
     return;
+  }
+
+  if (configuredBinary) {
+    console.error(`Configured Phonton binary does not exist: ${binaryPath}`);
+    process.exit(1);
   }
 
   const installScript = path.join(__dirname, "..", "install.js");

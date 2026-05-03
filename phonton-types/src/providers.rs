@@ -31,6 +31,8 @@ pub enum ProviderKind {
     Ollama,
     /// AgentRouter unified gateway (`agentrouter.org`).
     AgentRouter,
+    /// Cloudflare Workers AI OpenAI-compatible endpoint.
+    Cloudflare,
     /// Generic OpenAI-compatible endpoint (DeepSeek, xAI, Groq, vLLM, …).
     OpenAiCompatible,
 }
@@ -44,6 +46,7 @@ impl fmt::Display for ProviderKind {
             ProviderKind::Gemini => "gemini",
             ProviderKind::Ollama => "ollama",
             ProviderKind::AgentRouter => "agentrouter",
+            ProviderKind::Cloudflare => "cloudflare",
             ProviderKind::OpenAiCompatible => "openai-compatible",
         };
         f.write_str(s)
@@ -143,6 +146,9 @@ impl ProviderConfig {
             ProviderConfig::Gemini { .. } => ProviderKind::Gemini,
             ProviderConfig::Ollama { .. } => ProviderKind::Ollama,
             ProviderConfig::AgentRouter { .. } => ProviderKind::AgentRouter,
+            ProviderConfig::OpenAiCompatible { name, .. } if name == "cloudflare" => {
+                ProviderKind::Cloudflare
+            }
             ProviderConfig::OpenAiCompatible { .. } => ProviderKind::OpenAiCompatible,
         }
     }

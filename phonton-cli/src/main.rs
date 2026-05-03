@@ -36,6 +36,8 @@
 
 mod config;
 mod doctor;
+mod extensions_cli;
+mod mcp_cli;
 mod memory_cli;
 mod plan_preview;
 mod review;
@@ -43,18 +45,21 @@ mod trust;
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use crossterm::cursor::{Hide, SetCursorStyle};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use phonton_diff::DiffApplier;
+use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions, ExtensionSet};
+use phonton_mcp::{McpApprovalDecision, McpApprovalRequest, McpApprover};
 use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
 use phonton_planner::{decompose_with_memory, Goal};
 use phonton_providers::{
@@ -63,10 +68,10 @@ use phonton_providers::{
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
-    BudgetLimits, CoverageSummary, DiffHunk, DiffLine, EventRecord, GlobalState, MemoryRecord,
-    ModelPricing, ModelTier, OrchestratorMessage, PlannerOutput,
-    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    BudgetLimits, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId, GlobalState,
+    MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent, OrchestratorMessage, Permission,
+    PlannerOutput, ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId,
+    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -74,13 +79,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 // ---------------------------------------------------------------------------
 // Visual identity
 // ---------------------------------------------------------------------------
 
-// Curated palette — cool slate base with cyan→violet gradient accents.
+// Curated palette - cool slate base with cyan/violet/magenta accents.
 const ACCENT: Color = Color::Rgb(99, 179, 237); // cyan-300
 const ACCENT_HI: Color = Color::Rgb(160, 215, 250); // cyan-200 highlight
 const SUCCESS: Color = Color::Rgb(72, 199, 142);
@@ -98,24 +103,26 @@ const PINK: Color = Color::Rgb(237, 100, 166);
 const GRAD_A: (u8, u8, u8) = (99, 179, 237); // cyan
 const GRAD_B: (u8, u8, u8) = (159, 122, 234); // violet
 const GRAD_C: (u8, u8, u8) = (237, 100, 166); // pink
+const GRAD_D: (u8, u8, u8) = (69, 144, 255); // electric blue
+const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
+const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
-const UI_TICK_MS: u64 = 140;
-const LOGO_SHIMMER_SPEED: f32 = 0.006;
-const LOGO_ROW_PHASE: f32 = 0.018;
-const LOGO_SWEEP_WIDTH: f32 = 0.13;
+const UI_TICK_MS: u64 = 80;
+const LOGO_SHIMMER_SPEED: f32 = 0.018;
+const LOGO_ROW_PHASE: f32 = 0.085;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "████   █  █   ████   █   █  █████  ████   █   █",
-    "█   █  █  █  █    █  ██  █    █   █    █  ██  █",
-    "█   █  █  █  █    █  █ █ █    █   █    █  █ █ █",
-    "████   ████  █    █  █  ██    █   █    █  █  ██",
-    "█      █  █  █    █  █   █    █   █    █  █   █",
-    "█      █  █  █    █  █   █    █   █    █  █   █",
-    "█      █  █   ████   █   █    █    ████   █   █",
+    "█████░  █   █░  ████░  █   █░ █████░  ████░  █   █░",
+    "█   █░  █   █░ █    █░ ██  █░   █  ░ █    █░ ██  █░",
+    "█████░  █████░ █    █░ █ █ █░   █  ░ █    █░ █ █ █░",
+    "█    ░  █   █░ █    █░ █  ██░   █  ░ █    █░ █  ██░",
+    "█    ░  █   █░  ████░  █   █░   █  ░  ████░  █   █░",
+    " ░░░░    ░   ░   ░░░░    ░   ░    ░     ░░░░    ░   ░",
 ];
 
 const LOGO_WIDTH_THRESHOLD: u16 = 72;
+static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Visual helpers — gradient + pill primitives
@@ -136,14 +143,6 @@ fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
     )
 }
 
-fn blend_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
-    (
-        lerp_u8(a.0, b.0, t),
-        lerp_u8(a.1, b.1, t),
-        lerp_u8(a.2, b.2, t),
-    )
-}
-
 /// Three-stop gradient (a → b → c) sampled at t ∈ [0, 1].
 fn grad3(t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);
@@ -151,6 +150,19 @@ fn grad3(t: f32) -> Color {
         grad(GRAD_A, GRAD_B, t * 2.0)
     } else {
         grad(GRAD_B, GRAD_C, (t - 0.5) * 2.0)
+    }
+}
+
+/// Four-stop animated logo palette. Starts in violet/pink like the splash
+/// mock, then travels through electric blue and cyan before looping.
+fn logo_grad(t: f32) -> Color {
+    let t = t - t.floor();
+    if t < 0.33 {
+        grad(GRAD_B, GRAD_C, t / 0.33)
+    } else if t < 0.66 {
+        grad(GRAD_C, GRAD_D, (t - 0.33) / 0.33)
+    } else {
+        grad(GRAD_D, GRAD_A, (t - 0.66) / 0.34)
     }
 }
 
@@ -194,18 +206,32 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let base_t = (x * 0.82 + row_idx as f32 * 0.018 + phase * 0.12).fract();
-        let base = base_rgb(grad3(base_t));
-        let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
-        let sweep = (1.0 - distance / LOGO_SWEEP_WIDTH).clamp(0.0, 1.0);
-        let color = if sweep > 0.0 {
-            let eased = sweep * sweep * (3.0 - 2.0 * sweep);
-            let rgb = blend_rgb(base, (228, 249, 255), eased * 0.62);
-            Color::Rgb(rgb.0, rgb.1, rgb.2)
+        let style = if matches!(ch, '░' | '▒' | '▓') {
+            let shadow_t = ((x + phase * 0.45 + row_idx as f32 * 0.025).fract() - 0.5).abs();
+            let lift = (0.18 - shadow_t).max(0.0) / 0.18;
+            Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
         } else {
-            Color::Rgb(base.0, base.1, base.2)
+            let base = logo_grad((x * 0.82 + phase * 0.74 + row_idx as f32 * 0.04).fract());
+            let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
+            let glint = if distance < 0.075 {
+                (1.0 - distance / 0.075) * 0.55
+            } else {
+                0.0
+            };
+            let breathing = ((phase * std::f32::consts::TAU
+                + x * std::f32::consts::TAU * 1.4
+                + row_idx as f32 * 0.65)
+                .sin()
+                + 1.0)
+                * 0.07;
+            Style::default()
+                .fg(grad(
+                    base_rgb(base),
+                    LOGO_GLOW,
+                    (glint + breathing).clamp(0.0, 0.62),
+                ))
+                .add_modifier(Modifier::BOLD)
         };
-        let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
         spans.push(Span::styled(ch.to_string(), style));
     }
 
@@ -295,6 +321,7 @@ pub enum SettingsField {
     Provider,
     Model,
     ApiKey,
+    AccountId,
     BaseUrl,
     MaxTokens,
     MaxUsdCents,
@@ -339,6 +366,7 @@ pub struct SettingsState {
     pub provider: String,
     pub model: String,
     pub api_key: String,
+    pub account_id: String,
     pub base_url: String,
     pub max_tokens: String,
     pub max_usd_cents: String,
@@ -358,6 +386,7 @@ impl SettingsState {
             provider: cfg.provider.name.clone(),
             model: cfg.provider.model.clone().unwrap_or_default(),
             api_key: cfg.provider.api_key.clone().unwrap_or_default(),
+            account_id: cfg.provider.account_id.clone().unwrap_or_default(),
             base_url: cfg.provider.base_url.clone().unwrap_or_default(),
             max_tokens: cfg
                 .budget
@@ -393,6 +422,36 @@ pub struct GoalEntry {
     /// Index into `state.checkpoints` the user is hovering over in the
     /// checkpoint picker. `None` when the picker has no focus.
     pub checkpoint_cursor: Option<usize>,
+}
+
+/// Render-safe view of one MCP approval request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMcpApproval {
+    /// Unique request id owned by the TUI approval bridge.
+    pub id: u64,
+    /// Goal index that triggered this request.
+    pub goal_index: usize,
+    /// MCP server id.
+    pub server_id: ExtensionId,
+    /// Tool name, or `server/start` when the server process itself needs consent.
+    pub tool_name: String,
+    /// Permissions declared by the server.
+    pub permissions: Vec<Permission>,
+    /// Human-readable approval reason from the guard/runtime.
+    pub reason: String,
+}
+
+impl PendingMcpApproval {
+    fn from_request(id: u64, goal_index: usize, request: McpApprovalRequest) -> Self {
+        Self {
+            id,
+            goal_index,
+            server_id: request.server_id,
+            tool_name: request.tool_name,
+            permissions: request.permissions,
+            reason: request.reason,
+        }
+    }
 }
 
 impl GoalEntry {
@@ -468,6 +527,10 @@ pub struct App {
     pub nexus_status: NexusStatus,
     /// Path of the SQLite store backing this session.
     pub store_path: Option<std::path::PathBuf>,
+    /// MCP approval requests awaiting an explicit user decision.
+    pub pending_mcp_approvals: Vec<PendingMcpApproval>,
+    /// Cursor into `pending_mcp_approvals` when more than one request is queued.
+    pub mcp_approval_selected: usize,
 }
 
 impl App {
@@ -497,6 +560,8 @@ impl App {
             history_records: Vec::new(),
             nexus_status: NexusStatus::default(),
             store_path: None,
+            pending_mcp_approvals: Vec::new(),
+            mcp_approval_selected: 0,
         }
     }
 
@@ -615,6 +680,7 @@ impl Default for App {
                 name: "anthropic".to_string(),
                 api_key: None,
                 model: None,
+                account_id: None,
                 base_url: None,
             },
             budget: crate::config::BudgetConfig {
@@ -659,12 +725,46 @@ impl App {
         }
     }
 
+    /// Add an MCP approval prompt and focus the newest request.
+    pub fn push_mcp_approval(&mut self, prompt: PendingMcpApproval) {
+        self.pending_mcp_approvals.push(prompt);
+        self.mcp_approval_selected = self.pending_mcp_approvals.len().saturating_sub(1);
+    }
+
+    fn active_mcp_approval(&self) -> Option<&PendingMcpApproval> {
+        self.pending_mcp_approvals.get(
+            self.mcp_approval_selected
+                .min(self.pending_mcp_approvals.len().saturating_sub(1)),
+        )
+    }
+
+    fn resolve_selected_mcp_approval(&mut self, approved: bool) -> Option<Intent> {
+        if self.pending_mcp_approvals.is_empty() {
+            return None;
+        }
+        let idx = self
+            .mcp_approval_selected
+            .min(self.pending_mcp_approvals.len().saturating_sub(1));
+        let prompt = self.pending_mcp_approvals.remove(idx);
+        self.mcp_approval_selected = self
+            .mcp_approval_selected
+            .min(self.pending_mcp_approvals.len().saturating_sub(1));
+        Some(Intent::ResolveMcpApproval {
+            approval_id: prompt.id,
+            approved,
+        })
+    }
+
     /// Translate a key event into a state transition. Pure function so the
     /// key-handling logic is unit-testable without a terminal.
     ///
     /// Returns `Some(Intent)` when the caller should act on the outside
     /// world (queue a new goal, issue an ask, exit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if !self.pending_mcp_approvals.is_empty() {
+            return self.handle_mcp_approval_key(key);
+        }
+
         // Global shortcuts first, regardless of mode.
         if matches!(key.code, KeyCode::Esc) {
             if self.help_open {
@@ -806,6 +906,33 @@ impl App {
             Mode::Settings => self.handle_settings_key(key),
             Mode::Memory | Mode::History => None,
             Mode::CommandPalette => self.handle_palette_key(key),
+        }
+    }
+
+    fn handle_mcp_approval_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return Some(Intent::Quit);
+        }
+
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.resolve_selected_mcp_approval(true)
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.resolve_selected_mcp_approval(false)
+            }
+            KeyCode::Up => {
+                self.mcp_approval_selected = self.mcp_approval_selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                if self.mcp_approval_selected + 1 < self.pending_mcp_approvals.len() {
+                    self.mcp_approval_selected += 1;
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1199,7 +1326,8 @@ impl App {
                 self.settings.active_field = match self.settings.active_field {
                     SettingsField::Provider => SettingsField::Model,
                     SettingsField::Model => SettingsField::ApiKey,
-                    SettingsField::ApiKey => SettingsField::BaseUrl,
+                    SettingsField::ApiKey => SettingsField::AccountId,
+                    SettingsField::AccountId => SettingsField::BaseUrl,
                     SettingsField::BaseUrl => SettingsField::MaxTokens,
                     SettingsField::MaxTokens => SettingsField::MaxUsdCents,
                     SettingsField::MaxUsdCents => SettingsField::Provider,
@@ -1211,7 +1339,8 @@ impl App {
                     SettingsField::Provider => SettingsField::MaxUsdCents,
                     SettingsField::Model => SettingsField::Provider,
                     SettingsField::ApiKey => SettingsField::Model,
-                    SettingsField::BaseUrl => SettingsField::ApiKey,
+                    SettingsField::AccountId => SettingsField::ApiKey,
+                    SettingsField::BaseUrl => SettingsField::AccountId,
                     SettingsField::MaxTokens => SettingsField::BaseUrl,
                     SettingsField::MaxUsdCents => SettingsField::MaxTokens,
                 };
@@ -1221,7 +1350,8 @@ impl App {
                 self.settings.active_field = match self.settings.active_field {
                     SettingsField::Provider => SettingsField::Model,
                     SettingsField::Model => SettingsField::ApiKey,
-                    SettingsField::ApiKey => SettingsField::BaseUrl,
+                    SettingsField::ApiKey => SettingsField::AccountId,
+                    SettingsField::AccountId => SettingsField::BaseUrl,
                     SettingsField::BaseUrl => SettingsField::MaxTokens,
                     SettingsField::MaxTokens => SettingsField::MaxUsdCents,
                     SettingsField::MaxUsdCents => SettingsField::Provider,
@@ -1239,6 +1369,9 @@ impl App {
                     }
                     SettingsField::ApiKey => {
                         self.settings.api_key.pop();
+                    }
+                    SettingsField::AccountId => {
+                        self.settings.account_id.pop();
                     }
                     SettingsField::BaseUrl => {
                         self.settings.base_url.pop();
@@ -1264,6 +1397,9 @@ impl App {
                     }
                     SettingsField::ApiKey => {
                         self.settings.api_key.push(c);
+                    }
+                    SettingsField::AccountId => {
+                        self.settings.account_id.push(c);
                     }
                     SettingsField::BaseUrl => {
                         self.settings.base_url.push(c);
@@ -1303,6 +1439,8 @@ pub enum Intent {
     /// User triggered a rollback to a specific checkpoint seq for the
     /// currently selected goal.
     Rollback { goal_index: usize, to_seq: u32 },
+    /// User approved or denied a pending MCP approval prompt.
+    ResolveMcpApproval { approval_id: u64, approved: bool },
     /// Save settings.
     SaveSettings,
     /// Test the configured provider/model/api-key by issuing one tiny
@@ -1495,6 +1633,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.help_open {
         render_help(frame, area);
     }
+    if !app.pending_mcp_approvals.is_empty() {
+        render_mcp_approval(frame, area, app);
+    }
 }
 
 /// Centred modal listing every keybinding in one place. Toggled by `?`,
@@ -1577,23 +1718,123 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(p, inner);
 }
 
+/// Focused modal for approval-gated MCP operations.
+fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(prompt) = app.active_mcp_approval() else {
+        return;
+    };
+
+    let popup_w = if area.width > 50 {
+        area.width.saturating_sub(4).min(86)
+    } else {
+        area.width.saturating_sub(2).max(1)
+    };
+    let popup_h = if area.height > 16 {
+        14
+    } else {
+        area.height.saturating_sub(2).max(1)
+    };
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let count = app.pending_mcp_approvals.len();
+    let title = if count > 1 {
+        format!(" MCP Approval {}/{} ", app.mcp_approval_selected + 1, count)
+    } else {
+        " MCP Approval ".into()
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled(" Enter/Y approve ", Style::default().fg(SUCCESS)),
+            Span::styled("  N/Esc deny ", Style::default().fg(DANGER)),
+            Span::styled("  Up/Down select ", Style::default().fg(MUTED)),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(WARN))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(block.clone(), popup_area);
+
+    let inner = block.inner(popup_area);
+    let permissions = permissions_label(&prompt.permissions);
+    let reason_width = inner.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  server  ", Style::default().fg(MUTED)),
+            Span::styled(
+                prompt.server_id.to_string(),
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  tool    ", Style::default().fg(MUTED)),
+            Span::styled(
+                prompt.tool_name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  perms   ", Style::default().fg(MUTED)),
+            Span::styled(permissions, Style::default().fg(WARN)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Reason",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for line in wrap_text(&prompt.reason, reason_width).into_iter().take(4) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(line, Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Approving lets this one MCP operation run. Denying returns the failure to the worker.",
+        Style::default().fg(MUTED),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().bg(BG_DEEP)),
+        inner,
+    );
+}
+
 fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
     // Slowly drifting phase so the logo gets a deliberate scanline shimmer
     // without turning the whole splash into a fast flashing surface.
     let phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
     if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
-        let lines: Vec<Line> = LOGO
-            .iter()
-            .enumerate()
-            .map(|(row_idx, row)| logo_line(row, phase, row_idx))
-            .collect();
+        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 1);
+        lines.push(Line::raw(""));
+        lines.extend(
+            LOGO.iter()
+                .enumerate()
+                .map(|(row_idx, row)| logo_line(row, phase, row_idx)),
+        );
         let p = Paragraph::new(lines)
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
         frame.render_widget(p, area);
     } else {
-        // Compact one-line header — gradient "phonton" + dim subtitle.
-        let mut spans = gradient_line("✦ phonton", phase * 0.5, true).spans;
+        // Compact one-line header - gradient "phonton" + dim subtitle.
+        let mut spans = gradient_line("✦ phonton", phase * 0.8, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
             "agentic dev environment",
@@ -2426,6 +2667,17 @@ fn nexus_label(status: &NexusStatus) -> String {
     }
 }
 
+fn permissions_label(permissions: &[Permission]) -> String {
+    if permissions.is_empty() {
+        return "none".into();
+    }
+    permissions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Soft-wrap `s` into width-`w` chunks. Splits on whitespace where it
 /// can; otherwise hard-breaks mid-token so a 400-char URL or JSON blob
 /// still appears in full.
@@ -2473,6 +2725,16 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::TaskFailed { .. } => (DANGER, "task-failed"),
         E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
         E::ContextSelected { .. } => (VIOLET, "context"),
+        E::ExtensionLoaded { .. } => (ACCENT, "ext-loaded"),
+        E::ExtensionSkipped { .. } => (WARN, "ext-skipped"),
+        E::ExtensionConflict { .. } => (WARN, "ext-conflict"),
+        E::SteeringApplied { .. } => (VIOLET, "steering"),
+        E::SkillApplied { .. } => (VIOLET, "skill"),
+        E::McpServerAvailable { .. } => (ACCENT, "mcp-server"),
+        E::McpToolRequested { .. } => (WARN, "mcp-request"),
+        E::McpToolApproved { .. } => (SUCCESS, "mcp-approve"),
+        E::McpToolDenied { .. } => (DANGER, "mcp-denied"),
+        E::McpToolCompleted { .. } => (SUCCESS, "mcp-done"),
         E::SubtaskCompleted { .. } => (SUCCESS, "subtask-done"),
         E::SubtaskReviewReady { .. } => (SUCCESS, "review-ready"),
         E::SubtaskFailed { .. } => (DANGER, "subtask-fail"),
@@ -2611,26 +2873,18 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let total_chars = char_count(buf);
     let cursor_clamped = cursor.min(total_chars);
     let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
-    let show_caret = !matches!(
-        app.mode,
-        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
-    );
-    let mut input_spans = vec![Span::styled(
-        prompt_prefix,
-        Style::default()
-            .fg(border_color)
-            .add_modifier(Modifier::BOLD),
-    )];
-    input_spans.extend(input_value_spans(
-        buf,
-        cursor_clamped,
-        scroll,
-        input_width,
-        show_caret,
-        border_color,
-    ));
+    let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
 
-    let prompt = Paragraph::new(Line::from(input_spans)).style(Style::default().bg(BG_DEEP));
+    let prompt = Paragraph::new(Line::from(vec![
+        Span::styled(
+            prompt_prefix,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(visible, Style::default().fg(Color::White)),
+    ]))
+    .style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
 
     let badge = Paragraph::new(Line::from(Span::styled(mode_label, mode_style)))
@@ -2638,48 +2892,19 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
 
-    // The caret is rendered inside the buffer instead of using the terminal's
-    // native blinking cursor. That keeps the input calm while the splash and
-    // worker spinners redraw.
-}
-
-fn input_value_spans(
-    buf: &str,
-    cursor: usize,
-    scroll: usize,
-    width: usize,
-    show_caret: bool,
-    caret_color: Color,
-) -> Vec<Span<'static>> {
-    if width == 0 {
-        return Vec::new();
-    }
-
-    let chars: Vec<char> = buf.chars().skip(scroll).take(width).collect();
-    let caret_col = cursor.saturating_sub(scroll).min(width.saturating_sub(1));
-    let last_col = if show_caret {
-        chars.len().max(caret_col + 1)
-    } else {
-        chars.len()
-    }
-    .min(width);
-
-    let text_style = Style::default().fg(Color::White);
-    let caret_style = Style::default()
-        .fg(BG_DEEP)
-        .bg(caret_color)
-        .add_modifier(Modifier::BOLD);
-
-    let mut spans = Vec::with_capacity(last_col);
-    for col in 0..last_col {
-        let ch = chars.get(col).copied().unwrap_or(' ');
-        if show_caret && col == caret_col {
-            spans.push(Span::styled(ch.to_string(), caret_style));
-        } else {
-            spans.push(Span::styled(ch.to_string(), text_style));
+    // Draw a native terminal cursor instead of a manual in-buffer caret.
+    // Native cursors are handled efficiently by the terminal emulator and
+    // don't flicker on every frame draw.
+    if !matches!(
+        app.mode,
+        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+    ) {
+        let cx = row[0].x + prompt_prefix_w + (cursor_clamped - scroll) as u16;
+        let cy = row[0].y;
+        if cx < row[0].x + row[0].width {
+            frame.set_cursor_position((cx, cy));
         }
     }
-    spans
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -2836,6 +3061,10 @@ enum LoopEvent {
     Key(KeyEvent),
     StateUpdate(usize, GlobalState),
     AskAnswer(String),
+    McpApprovalRequested {
+        prompt: PendingMcpApproval,
+        reply_tx: oneshot::Sender<McpApprovalDecision>,
+    },
     /// One-shot result of a Settings-panel "Test connection" round-trip.
     /// Carries the formatted ✓/✗ message that lands in
     /// `SettingsState::message`.
@@ -2860,6 +3089,43 @@ struct GoalControl {
 
 /// Shared registry mapping goal index → control handle.
 type ControlRegistry = Arc<std::sync::Mutex<HashMap<usize, GoalControl>>>;
+
+/// Approval bridge from the MCP runtime into the TUI event loop.
+#[derive(Clone)]
+struct TuiMcpApprover {
+    goal_index: usize,
+    tx: mpsc::Sender<LoopEvent>,
+}
+
+impl TuiMcpApprover {
+    fn new(goal_index: usize, tx: mpsc::Sender<LoopEvent>) -> Self {
+        Self { goal_index, tx }
+    }
+}
+
+#[async_trait]
+impl McpApprover for TuiMcpApprover {
+    async fn approve(&self, request: McpApprovalRequest) -> McpApprovalDecision {
+        let id = NEXT_MCP_APPROVAL_ID.fetch_add(1, Ordering::Relaxed);
+        let prompt = PendingMcpApproval::from_request(id, self.goal_index, request);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(LoopEvent::McpApprovalRequested { prompt, reply_tx })
+            .await
+            .is_err()
+        {
+            return McpApprovalDecision::Denied;
+        }
+        reply_rx.await.unwrap_or(McpApprovalDecision::Denied)
+    }
+}
+
+fn deny_pending_mcp_approvals(approvals: &mut HashMap<u64, oneshot::Sender<McpApprovalDecision>>) {
+    for (_, reply_tx) in approvals.drain() {
+        let _ = reply_tx.send(McpApprovalDecision::Denied);
+    }
+}
 
 const SEMANTIC_INDEX_TIMEOUT_SECS: u64 = 120;
 
@@ -2946,6 +3212,7 @@ fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
         &cfg.provider.name,
         api_key,
         model,
+        cfg.provider.account_id.clone(),
         cfg.provider.base_url.clone(),
     )?;
     Some(Arc::from(provider_for(provider_cfg)))
@@ -2953,6 +3220,36 @@ fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
 
 fn provider_requires_key(name: &str) -> bool {
     !matches!(name, "ollama" | "custom" | "openai-compatible")
+}
+
+fn cloudflare_base_url(
+    account_id: Option<String>,
+    base_url_or_account: Option<String>,
+) -> Option<String> {
+    let raw = account_id
+        .or(base_url_or_account)
+        .or_else(|| std::env::var("CLOUDFLARE_ACCOUNT_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Some(raw)
+    } else {
+        Some(format!(
+            "https://api.cloudflare.com/client/v4/accounts/{raw}/ai/v1"
+        ))
+    }
+}
+
+fn provider_probe_base_url(
+    provider: &str,
+    account_id: Option<String>,
+    base_url: Option<String>,
+) -> Option<String> {
+    if provider == "cloudflare" {
+        cloudflare_base_url(account_id, base_url)
+    } else {
+        base_url
+    }
 }
 
 fn provider_key_for_run(cfg: &config::ProviderConfig) -> Option<String> {
@@ -2976,6 +3273,7 @@ fn make_api_provider_config(
     name: &str,
     api_key: String,
     model: String,
+    account_id: Option<String>,
     base_url: Option<String>,
 ) -> Option<ApiProviderConfig> {
     // Empty-string base URLs come from the Settings panel when the user
@@ -3003,6 +3301,14 @@ fn make_api_provider_config(
         },
         "gemini" => Some(ApiProviderConfig::Gemini { api_key, model }),
         "agentrouter" => Some(ApiProviderConfig::AgentRouter { api_key, model }),
+        "cloudflare" => cloudflare_base_url(account_id, base_url).map(|url| {
+            ApiProviderConfig::OpenAiCompatible {
+                name: "cloudflare".into(),
+                api_key,
+                model,
+                base_url: url,
+            }
+        }),
         "ollama" => Some(ApiProviderConfig::Ollama {
             base_url: base_url.unwrap_or_else(|| "http://localhost:11434".into()),
             model,
@@ -3056,12 +3362,13 @@ async fn test_provider(
     name: String,
     api_key: String,
     model: String,
+    account_id: Option<String>,
     base_url: Option<String>,
 ) -> Result<String, String> {
     if api_key.trim().is_empty() && provider_requires_key(&name) {
         return Err("no API key — paste one in the API Key field or set the env var".into());
     }
-    let cfg = make_api_provider_config(&name, api_key, model, base_url)
+    let cfg = make_api_provider_config(&name, api_key, model, account_id, base_url)
         .ok_or_else(|| format!("unknown provider `{name}`"))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
     let resp = provider
@@ -3092,7 +3399,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_DEEP));
 
     let popup_w = 72u16;
-    let popup_h = 24u16;
+    let popup_h = 27u16;
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
         y: area.y + (area.height.saturating_sub(popup_h)) / 2,
@@ -3113,6 +3420,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(3), // Provider
             Constraint::Length(3), // Model
             Constraint::Length(3), // API Key
+            Constraint::Length(3), // Account ID
             Constraint::Length(3), // Base URL
             Constraint::Length(3), // Max Tokens
             Constraint::Length(3), // Max USD Cents
@@ -3177,13 +3485,21 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     );
     frame.render_widget(key_p, chunks[2]);
 
+    let account_p = Paragraph::new(app.settings.account_id.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Account ID (Cloudflare) ")
+            .border_style(field_style(SettingsField::AccountId)),
+    );
+    frame.render_widget(account_p, chunks[3]);
+
     let url_p = Paragraph::new(app.settings.base_url.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Base URL (self-hosted / proxy) ")
+            .title(" Base URL override ")
             .border_style(field_style(SettingsField::BaseUrl)),
     );
-    frame.render_widget(url_p, chunks[3]);
+    frame.render_widget(url_p, chunks[4]);
 
     let tokens_p = Paragraph::new(app.settings.max_tokens.as_str()).block(
         Block::default()
@@ -3191,7 +3507,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Max Tokens / Session ")
             .border_style(field_style(SettingsField::MaxTokens)),
     );
-    frame.render_widget(tokens_p, chunks[4]);
+    frame.render_widget(tokens_p, chunks[5]);
 
     let cents_p = Paragraph::new(app.settings.max_usd_cents.as_str()).block(
         Block::default()
@@ -3199,7 +3515,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Max Cents / Session ")
             .border_style(field_style(SettingsField::MaxUsdCents)),
     );
-    frame.render_widget(cents_p, chunks[5]);
+    frame.render_widget(cents_p, chunks[6]);
 
     if let Some(msg) = &app.settings.message {
         let colour = if msg.starts_with('✗') {
@@ -3211,7 +3527,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().fg(colour))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true });
-        frame.render_widget(msg_p, chunks[6]);
+        frame.render_widget(msg_p, chunks[7]);
     }
 
     let instructions = Paragraph::new(Line::from(vec![
@@ -3227,7 +3543,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" close"),
     ]))
     .alignment(Alignment::Center);
-    frame.render_widget(instructions, chunks[7]);
+    frame.render_widget(instructions, chunks[8]);
 
     // --- Model picker overlay ---
     if app.settings.picker_open {
@@ -3387,6 +3703,7 @@ fn default_model_for(provider: &str) -> String {
         // `phonton-providers::GeminiProvider`).
         "gemini" => "gemini-flash-latest".into(),
         "agentrouter" => "claude-sonnet-4-5".into(),
+        "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "ollama" => "llama3.2:3b".into(),
         "deepseek" => "deepseek-chat".into(),
         "xai" | "grok" => "grok-2-mini".into(),
@@ -3409,6 +3726,10 @@ fn print_help() {
          (none)            Launch the interactive TUI (default)\n  \
          ask <question>    One-shot Q&A using the configured provider\n  \
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
+         extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
+         skills            Inspect loaded skills\n  \
+         steering          Inspect loaded steering rules\n  \
+         mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
@@ -3437,6 +3758,17 @@ fn print_help() {
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
          phonton review rollback [--json] [latest|<task-id>] <seq>\n\
+         \n\
+         MCP:\n  \
+         phonton mcp list [--json]\n  \
+         phonton mcp tools <server-id> [--json] [--yes]\n  \
+         phonton mcp call <server-id> <tool-name> [json-args] [--json] [--yes]\n\
+         \n\
+         EXTENSIONS:\n  \
+         phonton extensions list [--json]\n  \
+         phonton extensions doctor [--json]\n  \
+         phonton skills list [--json]\n  \
+         phonton steering list [--json]\n\
          \n\
          MEMORY:\n  \
          phonton memory list [--json] [--kind <kind>] [--topic <text>] [--limit <n>]\n  \
@@ -3532,6 +3864,42 @@ async fn handle_cli_args() -> Result<bool> {
             let working_dir =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let code = doctor::run(&working_dir, &args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "extensions" => {
+            let working_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let code = extensions_cli::run(&working_dir, &args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "skills" => {
+            let working_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let code = extensions_cli::run_skills(&working_dir, &args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "steering" => {
+            let working_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let code = extensions_cli::run_steering(&working_dir, &args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "mcp" => {
+            let working_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let code = mcp_cli::run(&working_dir, &args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -3670,7 +4038,7 @@ async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
-    execute!(stdout, SetCursorStyle::SteadyBar, Hide)?;
+    execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -3742,6 +4110,7 @@ async fn run_app<B: Backend>(
     // this the Ask side panel would keep using the original credentials
     // until the user restarted the CLI.
     let mut ask_provider = ask_provider;
+    let mut approval_replies: HashMap<u64, oneshot::Sender<McpApprovalDecision>> = HashMap::new();
     loop {
         terminal.draw(|f| render(f, app))?;
         let Some(evt) = rx.recv().await else { break };
@@ -3755,7 +4124,10 @@ async fn run_app<B: Backend>(
             LoopEvent::Key(k) => {
                 if let Some(intent) = app.handle_key(k) {
                     match intent {
-                        Intent::Quit => break,
+                        Intent::Quit => {
+                            deny_pending_mcp_approvals(&mut approval_replies);
+                            break;
+                        }
                         Intent::QueueGoal(text) | Intent::QueueTask(text) => {
                             let direct_task = app.mode == Mode::Task;
                             // `handle_key` inserts the goal at index 0.
@@ -3777,6 +4149,11 @@ async fn run_app<B: Backend>(
                                 None
                             } else {
                                 Some(app.settings.api_key.clone())
+                            };
+                            cfg.provider.account_id = if app.settings.account_id.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.account_id.clone())
                             };
                             cfg.provider.base_url = if app.settings.base_url.is_empty() {
                                 None
@@ -3804,6 +4181,19 @@ async fn run_app<B: Backend>(
                                         .control_tx
                                         .try_send(OrchestratorMessage::RollbackRequest { to_seq });
                                 }
+                            }
+                        }
+                        Intent::ResolveMcpApproval {
+                            approval_id,
+                            approved,
+                        } => {
+                            if let Some(reply_tx) = approval_replies.remove(&approval_id) {
+                                let decision = if approved {
+                                    McpApprovalDecision::Approved
+                                } else {
+                                    McpApprovalDecision::Denied
+                                };
+                                let _ = reply_tx.send(decision);
                             }
                         }
                         Intent::SaveSettings => {
@@ -3858,6 +4248,11 @@ async fn run_app<B: Backend>(
                                     name: provider_name.clone(),
                                     api_key: None,
                                     model: None,
+                                    account_id: if app.settings.account_id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(app.settings.account_id.clone())
+                                    },
                                     base_url: None,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
@@ -3869,12 +4264,23 @@ async fn run_app<B: Backend>(
                             } else {
                                 Some(app.settings.base_url.clone())
                             };
+                            let account_id = if app.settings.account_id.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.account_id.clone())
+                            };
                             app.settings.message =
                                 Some(format!("Testing {provider_name} with model {model}…"));
                             let tx2 = tx.clone();
                             tokio::spawn(async move {
-                                let result =
-                                    test_provider(provider_name.clone(), key, model, base).await;
+                                let result = test_provider(
+                                    provider_name.clone(),
+                                    key,
+                                    model,
+                                    account_id,
+                                    base,
+                                )
+                                .await;
                                 // Re-use the AskAnswer channel as a generic
                                 // "string back to settings" — main loop
                                 // routes it onto settings.message when in
@@ -3896,6 +4302,11 @@ async fn run_app<B: Backend>(
                                     name: provider_name.clone(),
                                     api_key: None,
                                     model: None,
+                                    account_id: if app.settings.account_id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(app.settings.account_id.clone())
+                                    },
                                     base_url: None,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
@@ -3907,6 +4318,13 @@ async fn run_app<B: Backend>(
                             } else {
                                 Some(app.settings.base_url.clone())
                             };
+                            let account_id = if app.settings.account_id.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.account_id.clone())
+                            };
+                            let probe_base =
+                                provider_probe_base_url(&provider_name, account_id, base);
                             if key.trim().is_empty() && provider_requires_key(&provider_name) {
                                 app.settings.message =
                                     Some("Detect failed: no API key in field or env var.".into());
@@ -3918,9 +4336,12 @@ async fn run_app<B: Backend>(
                                     // List the catalogue first — needed
                                     // for the summary regardless of
                                     // probe outcome.
-                                    let list_res =
-                                        discover_models(&provider_name, &key, base.as_deref())
-                                            .await;
+                                    let list_res = discover_models(
+                                        &provider_name,
+                                        &key,
+                                        probe_base.as_deref(),
+                                    )
+                                    .await;
                                     let payload = match list_res {
                                         Ok(models) if models.is_empty() => Err(format!(
                                             "✗ {provider_name}: key valid but no models accessible."
@@ -3934,7 +4355,7 @@ async fn run_app<B: Backend>(
                                             let probed = select_best_working_model(
                                                 &provider_name,
                                                 &key,
-                                                base.as_deref(),
+                                                probe_base.as_deref(),
                                                 3,
                                             )
                                             .await
@@ -3985,6 +4406,11 @@ async fn run_app<B: Backend>(
                                         name: provider_name.clone(),
                                         api_key: None,
                                         model: None,
+                                        account_id: if app.settings.account_id.is_empty() {
+                                            None
+                                        } else {
+                                            Some(app.settings.account_id.clone())
+                                        },
                                         base_url: None,
                                     };
                                     provider_key_for_run(&stub).unwrap_or_default()
@@ -3996,12 +4422,22 @@ async fn run_app<B: Backend>(
                                 } else {
                                     Some(app.settings.base_url.clone())
                                 };
+                                let account_id = if app.settings.account_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(app.settings.account_id.clone())
+                                };
+                                let probe_base =
+                                    provider_probe_base_url(&provider_name, account_id, base);
                                 let tx2 = tx.clone();
                                 tokio::spawn(async move {
-                                    let res =
-                                        discover_models(&provider_name, &key, base.as_deref())
-                                            .await
-                                            .map_err(|e| e.to_string());
+                                    let res = discover_models(
+                                        &provider_name,
+                                        &key,
+                                        probe_base.as_deref(),
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string());
                                     let _ = tx2.send(LoopEvent::ModelsLoaded(res)).await;
                                 });
                             }
@@ -4067,6 +4503,10 @@ async fn run_app<B: Backend>(
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
             }
+            LoopEvent::McpApprovalRequested { prompt, reply_tx } => {
+                approval_replies.insert(prompt.id, reply_tx);
+                app.push_mcp_approval(prompt);
+            }
             LoopEvent::TestResult(msg) => {
                 app.settings.model_ok = Some(msg.starts_with('✓'));
                 app.settings.message = Some(msg);
@@ -4105,6 +4545,7 @@ async fn run_app<B: Backend>(
             }
         }
         if app.should_quit {
+            deny_pending_mcp_approvals(&mut approval_replies);
             break;
         }
     }
@@ -4156,7 +4597,7 @@ async fn spawn_goal(
         drop(store_guard);
         result
     };
-    let plan = match plan_result {
+    let mut plan = match plan_result {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -4176,45 +4617,70 @@ async fn spawn_goal(
     let mut event_rx_ui = event_tx.subscribe();
     let mut event_rx_store = event_tx.subscribe();
 
+    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(working_dir));
+    apply_extension_context_to_plan(&mut plan, &extension_set);
+    publish_extension_events(task_id, &extension_set, &event_tx);
+
     let naive = plan.naive_baseline_tokens;
     let semantic_context = build_semantic_context(working_dir).await;
-
-    let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) =
-        provider_key_for_run(&cfg.provider)
-    {
-        let provider_name = cfg.provider.name.clone();
-        let base_url = cfg.provider.base_url.clone();
-        // CRITICAL: when the user (or auto-detect) picked a specific model,
-        // honour it for *every* tier. The previous behaviour was to call
-        // `model_for_tier(provider, tier)` and silently override the chosen
-        // model with the hard-coded tier default — so a Gemini key that
-        // only has access to `gemma-4-31b-it` would 404 the moment goal
-        // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
-        // model and worked; goals didn't, and the gap was invisible.
-        let configured_model = cfg.provider.model.clone();
-
-        let factory = move |tier: phonton_types::ModelTier| {
-            let model = configured_model
-                .clone()
-                .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
-            let provider_cfg =
-                make_api_provider_config(&provider_name, api_key.clone(), model, base_url.clone())
-                    .expect("unknown provider config");
-            provider_for(provider_cfg)
-        };
-
-        let guard = ExecutionGuard::new(working_dir.clone());
-        let mut d =
-            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
-                .with_task_id(task_id)
-                .with_memory(memory_store.clone());
-        if let Some(ctx) = semantic_context.clone() {
-            d = d.with_semantic_context(ctx);
-        }
-        Arc::new(d)
+    let mcp_runtime = if extension_set.mcp_servers.is_empty() {
+        None
     } else {
-        Arc::new(StubDispatcher::new(sandbox.clone()))
+        let approver = Arc::new(TuiMcpApprover::new(goal_index, tx.clone()));
+        Some(Arc::new(
+            phonton_mcp::McpRuntime::new(
+                extension_set.mcp_servers.clone(),
+                ExecutionGuard::new(working_dir.clone()),
+            )
+            .with_approver(approver)
+            .with_event_sink(task_id, event_tx.clone()),
+        ))
     };
+
+    let dispatcher: Arc<dyn WorkerDispatcher> =
+        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
+            let provider_name = cfg.provider.name.clone();
+            let account_id = cfg.provider.account_id.clone();
+            let base_url = cfg.provider.base_url.clone();
+            // CRITICAL: when the user (or auto-detect) picked a specific model,
+            // honour it for *every* tier. The previous behaviour was to call
+            // `model_for_tier(provider, tier)` and silently override the chosen
+            // model with the hard-coded tier default — so a Gemini key that
+            // only has access to `gemma-4-31b-it` would 404 the moment goal
+            // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
+            // model and worked; goals didn't, and the gap was invisible.
+            let configured_model = cfg.provider.model.clone();
+
+            let factory = move |tier: phonton_types::ModelTier| {
+                let model = configured_model
+                    .clone()
+                    .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
+                let provider_cfg = make_api_provider_config(
+                    &provider_name,
+                    api_key.clone(),
+                    model,
+                    account_id.clone(),
+                    base_url.clone(),
+                )
+                .expect("unknown provider config");
+                provider_for(provider_cfg)
+            };
+
+            let guard = ExecutionGuard::new(working_dir.clone());
+            let mut d =
+                phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                    .with_task_id(task_id)
+                    .with_memory(memory_store.clone());
+            if let Some(ctx) = semantic_context.clone() {
+                d = d.with_semantic_context(ctx);
+            }
+            if let Some(runtime) = mcp_runtime.clone() {
+                d = d.with_mcp_runtime(runtime);
+            }
+            Arc::new(d)
+        } else {
+            Arc::new(StubDispatcher::new(sandbox.clone()))
+        };
 
     // Wire phonton-diff so the orchestrator takes a checkpoint commit
     // after every subtask passes verify.
@@ -4238,14 +4704,23 @@ async fn spawn_goal(
         max_usd_micros: cfg.budget.max_usd_micros(),
     };
     let mut budget_guard = BudgetGuard::new(limits);
-    if cfg.provider.name == "ollama" {
-        if let Some(model) = cfg.provider.model.as_deref() {
+    if let Some(model) = cfg.provider.model.as_deref() {
+        if cfg.provider.name == "ollama" {
             budget_guard = budget_guard.with_price(
                 ProviderKind::Ollama,
                 model,
                 ModelPricing {
                     input_usd_micros_per_mtok: 0,
                     output_usd_micros_per_mtok: 0,
+                },
+            );
+        } else if cfg.provider.name == "cloudflare" && model == "@cf/moonshotai/kimi-k2.6" {
+            budget_guard = budget_guard.with_price(
+                ProviderKind::Cloudflare,
+                model,
+                ModelPricing {
+                    input_usd_micros_per_mtok: 950_000,
+                    output_usd_micros_per_mtok: 4_000_000,
                 },
             );
         }
@@ -4333,6 +4808,128 @@ async fn spawn_goal(
     });
 }
 
+fn apply_extension_context_to_plan(plan: &mut PlannerOutput, extension_set: &ExtensionSet) {
+    let preamble = extension_set.render_prompt_preamble();
+    if preamble.is_empty() {
+        return;
+    }
+
+    for subtask in &mut plan.subtasks {
+        subtask.description = format!("{preamble}\n\n{}", subtask.description);
+    }
+}
+
+fn publish_extension_events(
+    task_id: TaskId,
+    extension_set: &ExtensionSet,
+    event_tx: &broadcast::Sender<EventRecord>,
+) {
+    for manifest in &extension_set.manifests {
+        send_event(
+            task_id,
+            event_tx,
+            OrchestratorEvent::ExtensionLoaded {
+                extension_id: manifest.id.clone(),
+                kind: manifest.kind,
+                source: manifest.source,
+                enabled: manifest.enabled,
+            },
+        );
+    }
+
+    for conflict in &extension_set.conflicts {
+        send_event(
+            task_id,
+            event_tx,
+            OrchestratorEvent::ExtensionConflict {
+                extension_id: conflict.id.clone(),
+                lower_source: conflict.lower_source,
+                higher_source: conflict.higher_source,
+                detail: conflict.detail.clone(),
+            },
+        );
+    }
+
+    for diagnostic in &extension_set.diagnostics {
+        let severity = match diagnostic.severity {
+            DiagnosticSeverity::Warn => "warn",
+            DiagnosticSeverity::Error => "error",
+        };
+        let reason = match &diagnostic.path {
+            Some(path) => format!("{severity}: {} ({})", diagnostic.message, path.display()),
+            None => format!("{severity}: {}", diagnostic.message),
+        };
+        send_event(
+            task_id,
+            event_tx,
+            OrchestratorEvent::ExtensionSkipped {
+                extension_id: None,
+                kind: None,
+                source: diagnostic.source,
+                reason,
+            },
+        );
+    }
+
+    for rule in &extension_set.steering {
+        send_event(
+            task_id,
+            event_tx,
+            OrchestratorEvent::SteeringApplied {
+                rule_id: rule.id.clone(),
+                severity: rule.severity,
+                target: "worker-context".into(),
+            },
+        );
+    }
+
+    for skill in &extension_set.skills {
+        if skill.content.trim().is_empty() {
+            continue;
+        }
+        send_event(
+            task_id,
+            event_tx,
+            OrchestratorEvent::SkillApplied {
+                skill_id: skill.definition.id.clone(),
+                version: skill.definition.version.clone(),
+                target: "worker-context".into(),
+            },
+        );
+    }
+
+    for server in &extension_set.mcp_servers {
+        send_event(
+            task_id,
+            event_tx,
+            OrchestratorEvent::McpServerAvailable {
+                server_id: server.id.clone(),
+                permissions: server.permissions.clone(),
+            },
+        );
+    }
+}
+
+fn send_event(
+    task_id: TaskId,
+    event_tx: &broadcast::Sender<EventRecord>,
+    event: OrchestratorEvent,
+) {
+    let record = EventRecord {
+        task_id,
+        timestamp_ms: current_timestamp_ms(),
+        event,
+    };
+    let _ = event_tx.send(record);
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4340,7 +4937,12 @@ async fn spawn_goal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phonton_types::{
+        AppliesTo, ExtensionSource, LLMResponse, McpServerDefinition, McpTransport, TrustLevel,
+    };
     use ratatui::backend::TestBackend;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -4348,6 +4950,136 @@ mod tests {
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
+    fn approval_prompt(id: u64) -> PendingMcpApproval {
+        PendingMcpApproval {
+            id,
+            goal_index: 0,
+            server_id: ExtensionId::new("docs"),
+            tool_name: "read_file".into(),
+            permissions: vec![Permission::FsReadWorkspace],
+            reason: "read docs from the current workspace".into(),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct McpE2eProvider {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl Provider for McpE2eProvider {
+        async fn call(
+            &self,
+            _system: &str,
+            user: &str,
+            _slice_origins: &[phonton_types::SliceOrigin],
+        ) -> Result<LLMResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let content = if call == 0 {
+                r#"MCP_TOOL_CALL {"server":"fixture","tool":"read_context","arguments":{"path":"README.md"}}"#
+                    .to_string()
+            } else {
+                if !user.contains("fixture-value-from-mcp") {
+                    return Err(anyhow::anyhow!(
+                        "worker prompt did not include MCP tool result: {user}"
+                    ));
+                }
+                "\
+--- /dev/null
++++ b/src/mcp_fixture.rs
+@@ -0,0 +1,3 @@
++pub fn mcp_fixture() -> &'static str {
++    \"fixture-value-from-mcp\"
++}
+"
+                .to_string()
+            };
+
+            Ok(LLMResponse {
+                content,
+                input_tokens: 10,
+                output_tokens: 8,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                provider: ProviderKind::OpenAiCompatible,
+                model_name: "fake-mcp-e2e".into(),
+            })
+        }
+
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAiCompatible
+        }
+
+        fn model(&self) -> String {
+            "fake-mcp-e2e".into()
+        }
+
+        fn clone_box(&self) -> Box<dyn Provider> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn compile_fake_mcp_server(dir: &Path) -> Result<PathBuf> {
+        let src = dir.join("fake_mcp_server.rs");
+        let exe = dir.join(if cfg!(windows) {
+            "fake_mcp_server.exe"
+        } else {
+            "fake_mcp_server"
+        });
+        std::fs::write(&src, FAKE_MCP_SERVER_SOURCE)?;
+
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+        let output = Command::new(rustc).arg(&src).arg("-o").arg(&exe).output()?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "failed to compile fake MCP server\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(exe)
+    }
+
+    const FAKE_MCP_SERVER_SOURCE: &str = r#"
+use std::io::{self, BufRead, Write};
+
+fn main() {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => break,
+        };
+        if line.contains("\"method\":\"notifications/initialized\"") {
+            continue;
+        }
+        let id = extract_id(&line).unwrap_or_else(|| "null".to_string());
+        let result = if line.contains("\"method\":\"initialize\"") {
+            "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fixture\",\"version\":\"0.0.1\"}}"
+        } else if line.contains("\"method\":\"tools/list\"") {
+            "{\"tools\":[{\"name\":\"read_context\",\"title\":\"Read Context\",\"description\":\"returns fixture context\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}]}"
+        } else if line.contains("\"method\":\"tools/call\"") {
+            "{\"content\":[{\"type\":\"text\",\"text\":\"fixture-value-from-mcp\"}],\"isError\":false}"
+        } else {
+            "{\"content\":[{\"type\":\"text\",\"text\":\"unknown method\"}],\"isError\":true}"
+        };
+        writeln!(stdout, "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}", id, result).unwrap();
+        stdout.flush().unwrap();
+    }
+}
+
+fn extract_id(line: &str) -> Option<String> {
+    let marker = "\"id\":";
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let id: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if id.is_empty() { None } else { Some(id) }
+}
+"#;
 
     #[test]
     fn local_providers_can_run_without_api_keys() {
@@ -4355,6 +5087,7 @@ mod tests {
             name: "ollama".into(),
             api_key: None,
             model: Some("llama3.2:3b".into()),
+            account_id: None,
             base_url: None,
         };
         assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
@@ -4363,6 +5096,7 @@ mod tests {
             name: "openai-compatible".into(),
             api_key: None,
             model: Some("local-model".into()),
+            account_id: None,
             base_url: Some("http://localhost:1234/v1".into()),
         };
         assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
@@ -4372,8 +5106,32 @@ mod tests {
     fn hosted_providers_still_require_api_keys() {
         assert!(provider_requires_key("openai"));
         assert!(provider_requires_key("anthropic"));
+        assert!(provider_requires_key("cloudflare"));
         assert!(!provider_requires_key("ollama"));
         assert!(!provider_requires_key("openai-compatible"));
+    }
+
+    #[test]
+    fn cloudflare_account_id_builds_workers_ai_base_url() {
+        let cfg = make_api_provider_config(
+            "cloudflare",
+            "cf-token".into(),
+            "@cf/moonshotai/kimi-k2.6".into(),
+            Some("abc123".into()),
+            None,
+        )
+        .expect("cloudflare config should build from account id");
+
+        match cfg {
+            ApiProviderConfig::OpenAiCompatible { name, base_url, .. } => {
+                assert_eq!(name, "cloudflare");
+                assert_eq!(
+                    base_url,
+                    "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1"
+                );
+            }
+            other => panic!("unexpected provider config: {other:?}"),
+        }
     }
 
     #[test]
@@ -4420,6 +5178,155 @@ mod tests {
         let r = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(r.is_none());
         assert_eq!(app.goals.len(), 0);
+    }
+
+    #[test]
+    fn mcp_approval_enter_approves_and_removes_prompt() {
+        let mut app = App::default();
+        app.push_mcp_approval(approval_prompt(42));
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            intent,
+            Some(Intent::ResolveMcpApproval {
+                approval_id: 42,
+                approved: true
+            })
+        );
+        assert!(app.pending_mcp_approvals.is_empty());
+    }
+
+    #[test]
+    fn mcp_approval_esc_denies_without_quitting() {
+        let mut app = App::default();
+        app.push_mcp_approval(approval_prompt(7));
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            intent,
+            Some(Intent::ResolveMcpApproval {
+                approval_id: 7,
+                approved: false
+            })
+        );
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn mcp_approval_arrows_select_between_prompts() {
+        let mut app = App::default();
+        app.push_mcp_approval(approval_prompt(1));
+        app.push_mcp_approval(approval_prompt(2));
+        assert_eq!(app.mcp_approval_selected, 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let intent = app.handle_key(key('n'));
+        assert_eq!(
+            intent,
+            Some(Intent::ResolveMcpApproval {
+                approval_id: 1,
+                approved: false
+            })
+        );
+        assert_eq!(app.pending_mcp_approvals.len(), 1);
+        assert_eq!(app.pending_mcp_approvals[0].id, 2);
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_e2e_uses_tui_approval_and_verified_diff() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let server_exe = compile_fake_mcp_server(temp.path())?;
+
+        let (approval_tx, mut approval_rx) = mpsc::channel::<LoopEvent>(8);
+        let approval_driver = tokio::spawn(async move {
+            let mut app = App::default();
+            let mut approved = Vec::new();
+            while let Some(event) = approval_rx.recv().await {
+                let LoopEvent::McpApprovalRequested { prompt, reply_tx } = event else {
+                    continue;
+                };
+                let prompt_id = prompt.id;
+                app.push_mcp_approval(prompt);
+                let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                match intent {
+                    Some(Intent::ResolveMcpApproval {
+                        approval_id,
+                        approved: true,
+                    }) => {
+                        assert_eq!(approval_id, prompt_id);
+                        approved.push(approval_id);
+                        let _ = reply_tx.send(McpApprovalDecision::Approved);
+                    }
+                    other => panic!("expected MCP approval intent, got {other:?}"),
+                }
+            }
+            approved
+        });
+
+        let server = McpServerDefinition {
+            id: ExtensionId::new("fixture"),
+            name: "Fixture MCP".into(),
+            source: ExtensionSource::Workspace,
+            transport: McpTransport::Stdio {
+                command: server_exe.display().to_string(),
+                args: Vec::new(),
+            },
+            trust: TrustLevel::ReadOnlyTool,
+            permissions: vec![Permission::FsReadOutsideWorkspace],
+            applies_to: AppliesTo::default(),
+            env: Vec::new(),
+            enabled: true,
+        };
+        let runtime = Arc::new(
+            phonton_mcp::McpRuntime::new(
+                vec![server],
+                ExecutionGuard::new(temp.path().to_path_buf()),
+            )
+            .with_approver(Arc::new(TuiMcpApprover::new(0, approval_tx.clone()))),
+        );
+        drop(approval_tx);
+
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Use MCP fixture context and add a Rust helper".into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let provider = McpE2eProvider::default();
+        let provider_calls = Arc::clone(&provider.calls);
+        let worker = phonton_worker::Worker::new(
+            Box::new(provider),
+            ExecutionGuard::new(temp.path().to_path_buf()),
+        )
+        .with_mcp_runtime(Arc::clone(&runtime));
+
+        let result = worker.execute(subtask, Vec::new()).await?;
+        drop(worker);
+        drop(runtime);
+        let approvals = tokio::time::timeout(Duration::from_secs(5), approval_driver).await??;
+
+        assert!(
+            matches!(result.status, SubtaskStatus::Done { .. }),
+            "worker should finish after MCP result, got {:?}",
+            result.status
+        );
+        assert!(
+            matches!(result.verify_result, VerifyResult::Pass { .. }),
+            "final diff must be verified, got {:?}",
+            result.verify_result
+        );
+        assert_eq!(result.diff_hunks.len(), 1);
+        assert_eq!(
+            result.diff_hunks[0].file_path,
+            PathBuf::from("src/mcp_fixture.rs")
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            approvals.len() >= 2,
+            "expected tool and server/start approvals, got {approvals:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -4504,39 +5411,49 @@ mod tests {
     }
 
     #[test]
-    fn logo_art_avoids_box_drawing_edges() {
-        let art = LOGO.join("\n");
-        for ch in ['╔', '╗', '╚', '╝', '═', '║'] {
-            assert!(
-                !art.contains(ch),
-                "logo should avoid glyphs that render as noisy outlines"
-            );
-        }
-    }
-
-    #[test]
-    fn input_value_spans_draws_steady_end_caret() {
-        let spans = input_value_spans("abc", 3, 0, 8, true, ACCENT);
-        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(rendered, "abc ");
-        assert_eq!(spans[3].style.bg, Some(ACCENT));
-    }
-
-    #[test]
-    fn input_value_spans_highlights_character_under_caret() {
-        let spans = input_value_spans("abcd", 1, 0, 8, true, ACCENT);
-        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(rendered, "abcd");
-        assert_eq!(spans[1].style.bg, Some(ACCENT));
-        assert_eq!(spans[0].style.bg, None);
-    }
-
-    #[test]
     fn renders_without_panicking_on_empty_state() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::default();
         terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn splash_logo_is_compact_and_shadowed() {
+        let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
+        assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
+        assert!(max_width < 64, "logo should stay compact for the splash");
+        assert!(
+            LOGO.iter().any(|row| row.contains('░')),
+            "logo should carry its own pixel shadow layer"
+        );
+    }
+
+    #[test]
+    fn renders_new_logo_on_wide_splash() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("█████"));
+        assert!(dump.contains("░░░░"));
+    }
+
+    #[test]
+    fn renders_mcp_approval_overlay() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.push_mcp_approval(approval_prompt(9));
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("MCP Approval"));
+        assert!(dump.contains("read_file"));
+        assert!(dump.contains("Enter/Y approve"));
     }
 
     #[test]

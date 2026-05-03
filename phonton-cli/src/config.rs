@@ -6,11 +6,13 @@
 //! # Example config
 //! ```toml
 //! [provider]
-//! # Which provider to use: "anthropic" | "openai" | "openrouter" | "gemini"
+//! # Which provider to use: "anthropic" | "openai" | "openrouter" | "gemini" | "cloudflare"
 //! name = "anthropic"
 //! api_key = "sk-ant-..."
 //! # Optional model override. Defaults are picked per provider.
 //! model = "claude-sonnet-4-5-20251022"
+//! # Cloudflare-only: Workers AI account ID.
+//! account_id = "..."
 //!
 //! [budget]
 //! max_tokens = 500000
@@ -49,7 +51,7 @@ pub struct Config {
 #[allow(dead_code)]
 pub struct ProviderConfig {
     /// Provider name, e.g. `"anthropic"`, `"openai"`, `"gemini"`,
-    /// `"ollama"`, or `"openai-compatible"`.
+    /// `"cloudflare"`, `"ollama"`, or `"openai-compatible"`.
     /// Defaults to `"anthropic"` when no config exists.
     #[serde(default = "default_provider_name")]
     pub name: String,
@@ -61,7 +63,14 @@ pub struct ProviderConfig {
     /// Model override. When absent, each provider picks its own default.
     pub model: Option<String>,
 
+    /// Account identifier for providers that require one. Used by
+    /// Cloudflare Workers AI; falls back to `CLOUDFLARE_ACCOUNT_ID`.
+    pub account_id: Option<String>,
+
     /// Base URL override for self-hosted / proxy endpoints (OpenAI-compat).
+    /// For `cloudflare`, this may be the full
+    /// `https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1` base URL.
+    /// A bare account ID is still accepted here for backward compatibility.
     pub base_url: Option<String>,
 }
 
@@ -71,6 +80,7 @@ impl Default for ProviderConfig {
             name: default_provider_name(),
             api_key: None,
             model: None,
+            account_id: None,
             base_url: None,
         }
     }
@@ -165,6 +175,11 @@ pub fn resolve_api_key(cfg: &ProviderConfig) -> Option<String> {
         "openrouter" => &["OPENROUTER_API_KEY"],
         "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "agentrouter" => &["AGENTROUTER_API_KEY", "ANTHROPIC_API_KEY"],
+        "cloudflare" => &[
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_WORKERS_AI_API_TOKEN",
+            "CLOUDFLARE_API_KEY",
+        ],
         "deepseek" => &["DEEPSEEK_API_KEY"],
         "xai" | "grok" => &["XAI_API_KEY", "GROK_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
@@ -190,6 +205,7 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "openai",
     "openrouter",
     "gemini",
+    "cloudflare",
     "agentrouter",
     "deepseek",
     "xai",
@@ -215,6 +231,7 @@ mod tests {
 name = "openai"
 api_key = "sk-test"
 model = "gpt-4o"
+account_id = "acct-test"
 
 [budget]
 max_tokens = 100000
@@ -224,6 +241,7 @@ max_usd_cents = 50
         assert_eq!(cfg.provider.name, "openai");
         assert_eq!(cfg.provider.api_key.as_deref(), Some("sk-test"));
         assert_eq!(cfg.provider.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(cfg.provider.account_id.as_deref(), Some("acct-test"));
         assert_eq!(cfg.budget.max_tokens, Some(100_000));
         assert_eq!(cfg.budget.max_usd_micros(), Some(500_000));
     }
@@ -248,6 +266,7 @@ max_usd_cents = 50
             name: "anthropic".into(),
             api_key: None,
             model: None,
+            account_id: None,
             base_url: None,
         };
         // No env var set in test — should return None.
@@ -261,6 +280,7 @@ max_usd_cents = 50
             name: "anthropic".into(),
             api_key: Some("from-config".into()),
             model: None,
+            account_id: None,
             base_url: None,
         };
         assert_eq!(resolve_api_key(&cfg).as_deref(), Some("from-config"));

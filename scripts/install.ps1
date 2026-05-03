@@ -16,7 +16,7 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 
 $refArgs = switch ($Channel) {
-    "stable" { @("--tag", "v0.2.1") }
+    "stable" { @("--tag", "v0.1.0") }
     "dev" { @("--branch", "dev") }
     "nightly" { @("--branch", "nightly") }
     "main" { @("--branch", "main") }
