@@ -106,22 +106,22 @@ const GRAD_D: (u8, u8, u8) = (69, 144, 255); // electric blue
 const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
 const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
-const UI_TICK_MS: u64 = 50;
-const LOGO_SHIMMER_SPEED: f32 = 0.008;
-const LOGO_ROW_PHASE: f32 = 0.055;
+const UI_TICK_MS: u64 = 80;
+const LOGO_SHIMMER_SPEED: f32 = 0.026;
+const LOGO_ROW_PHASE: f32 = 0.11;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "████╗  ██╗  ██╗  ████╗  ███╗  ██╗ █████╗  ████╗  ███╗  ██╗",
-    "██╔██╗ ██║  ██║ ██╔═██╗ ████╗ ██║ ╚═██╔╝ ██╔═██╗ ████╗ ██║",
-    "████╔╝ ███████║ ██║ ██║ ██╔██╗██║   ██║  ██║ ██║ ██╔██╗██║",
-    "██╔═╝  ██╔══██║ ██║ ██║ ██║╚████║   ██║  ██║ ██║ ██║╚████║",
-    "██║    ██║  ██║ ╚████╔╝ ██║ ╚███║   ██║  ╚████╔╝ ██║ ╚███║",
-    "╚═╝░   ╚═╝  ╚═╝  ╚═══╝░ ╚═╝  ╚══╝   ╚═╝   ╚═══╝░ ╚═╝  ╚══╝",
-    "  ░░     ░░  ░░    ░░░    ░░   ░░    ░░     ░░░    ░░   ░░",
+    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
+    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
+    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
+    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
+    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
 ];
 
-const LOGO_WIDTH_THRESHOLD: u16 = 72;
+const LOGO_WIDTH_THRESHOLD: u16 = 70;
 static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
@@ -143,16 +143,6 @@ fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
     )
 }
 
-#[inline]
-fn smoothstep(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn grad_smooth(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
-    grad(a, b, smoothstep(t))
-}
-
 /// Three-stop gradient (a → b → c) sampled at t ∈ [0, 1].
 fn grad3(t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);
@@ -163,19 +153,14 @@ fn grad3(t: f32) -> Color {
     }
 }
 
-/// Four-stop animated logo palette. Starts in violet/pink like the splash
-/// mock, then travels through electric blue and cyan before looping.
+/// Four-stop animated logo palette: violet → pink → electric blue → cyan,
+/// looping back to violet so the cycle is seamless.
 fn logo_grad(t: f32) -> Color {
     let t = t - t.floor();
-    if t < 0.28 {
-        grad_smooth(GRAD_B, GRAD_C, t / 0.28)
-    } else if t < 0.56 {
-        grad_smooth(GRAD_C, GRAD_D, (t - 0.28) / 0.28)
-    } else if t < 0.82 {
-        grad_smooth(GRAD_D, GRAD_A, (t - 0.56) / 0.26)
-    } else {
-        grad_smooth(GRAD_A, GRAD_B, (t - 0.82) / 0.18)
-    }
+    let stops = [GRAD_B, GRAD_C, GRAD_D, GRAD_A, GRAD_B];
+    let seg = t * 4.0;
+    let i = (seg as usize).min(3);
+    grad(stops[i], stops[i + 1], seg - i as f32)
 }
 
 /// Build a horizontally-gradient-colored line from `text`. `phase` shifts the
@@ -209,7 +194,10 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let wave = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+    // Two highlight waves traveling at different speeds give a richer shimmer
+    // than a single pass, like light playing across a curved surface.
+    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
 
     for (i, ch) in chars.into_iter().enumerate() {
         if ch == ' ' {
@@ -218,31 +206,66 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let style = if matches!(ch, '░' | '▒' | '▓') {
-            let shadow_t = ((x + phase * 0.45 + row_idx as f32 * 0.025).fract() - 0.5).abs();
-            let lift = (0.18 - shadow_t).max(0.0) / 0.18;
-            Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
-        } else {
-            let base = logo_grad((x * 0.72 + phase * 0.48 + row_idx as f32 * 0.03).fract());
-            let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
-            let glint = if distance < 0.12 {
-                smoothstep(1.0 - distance / 0.12) * 0.34
-            } else {
-                0.0
-            };
-            let breathing = ((phase * std::f32::consts::TAU
-                + x * std::f32::consts::TAU * 1.4
-                + row_idx as f32 * 0.65)
-                .sin()
-                + 1.0)
-                * 0.045;
-            Style::default()
-                .fg(grad(
-                    base_rgb(base),
-                    LOGO_GLOW,
-                    (glint + breathing).clamp(0.0, 0.62),
-                ))
-                .add_modifier(Modifier::BOLD)
+        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
+        let base_color = base_rgb(base);
+        let dist = |w: f32| -> f32 {
+            let raw = (x - w).abs();
+            raw.min(1.0 - raw)
+        };
+        let d_a = dist(wave_a);
+        let d_b = dist(wave_b);
+
+        let style = match ch {
+            '░' | '▒' | '▓' => {
+                let body = match ch {
+                    '▓' => 0.55,
+                    '▒' => 0.32,
+                    _ => 0.16,
+                };
+                let glow = if d_a < 0.14 {
+                    (1.0 - d_a / 0.14) * 0.45
+                } else {
+                    0.0
+                };
+                let color = grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9));
+                Style::default().fg(color)
+            }
+            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
+                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
+                let lift = if d_a < 0.07 {
+                    (1.0 - d_a / 0.07) * 0.35
+                } else {
+                    0.0
+                };
+                Style::default()
+                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
+                    .add_modifier(Modifier::BOLD)
+            }
+            _ => {
+                let glint_a = if d_a < 0.08 {
+                    (1.0 - d_a / 0.08) * 0.65
+                } else {
+                    0.0
+                };
+                let glint_b = if d_b < 0.05 {
+                    (1.0 - d_b / 0.05) * 0.45
+                } else {
+                    0.0
+                };
+                let breathing = ((phase * std::f32::consts::TAU
+                    + x * std::f32::consts::TAU * 1.4
+                    + row_idx as f32 * 0.65)
+                    .sin()
+                    + 1.0)
+                    * 0.08;
+                Style::default()
+                    .fg(grad(
+                        base_color,
+                        LOGO_GLOW,
+                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
+                    ))
+                    .add_modifier(Modifier::BOLD)
+            }
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
@@ -5467,8 +5490,8 @@ fn extract_id(line: &str) -> Option<String> {
             "logo should carry its own pixel shadow layer"
         );
         assert!(
-            LOGO.iter().any(|row| row.contains("╚═╝")),
-            "logo should use the ANSI-shadow terminal mark"
+            LOGO.iter().any(|row| row.contains("██████╗")),
+            "logo should use the ANSI Shadow terminal mark"
         );
     }
 
@@ -5481,8 +5504,8 @@ fn extract_id(line: &str) -> Option<String> {
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("█████"));
-        assert!(dump.contains("╚═╝░"));
-        assert!(dump.contains("░░"));
+        assert!(dump.contains("██████╗"));
+        assert!(dump.contains("░▒▓"));
     }
 
     #[test]
