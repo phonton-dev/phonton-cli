@@ -17,7 +17,7 @@
 //! 7. Publishes a fresh [`GlobalState`] snapshot on every transition via a
 //!    `tokio::sync::watch::Sender<GlobalState>` the caller owns.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,12 +25,13 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use petgraph::graph::{DiGraph, NodeIndex};
 use phonton_types::{
-    classify_task, effective_tier, BudgetDecision, BudgetLimits, Checkpoint, CostSummary, DiffHunk,
-    EventRecord, GlobalState, ModelPricing, ModelTier, OrchestratorEvent, OrchestratorMessage,
-    PlannerOutput, ProviderKind, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
-    TaskStatus, TokenUsage, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
+    classify_task, effective_tier, BudgetDecision, BudgetLimits, ChangedFileSummary, Checkpoint,
+    CostSummary, DiffHunk, DiffLine, DiffStats, EventRecord, GeneratedArtifact, GlobalState,
+    GoalContract, HandoffPacket, InfluenceSummary, ModelPricing, ModelTier, OrchestratorEvent,
+    OrchestratorMessage, PlannerOutput, ProviderKind, ReviewAction, RollbackPoint, Subtask,
+    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer,
+    VerifyReport, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
 };
-use std::collections::HashSet;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
@@ -236,6 +237,8 @@ struct SubtaskRuntime {
     /// Model name from the most recent LLM call. Empty until the first
     /// worker result is received.
     model_name: String,
+    /// Most recent verification verdict for this subtask.
+    verify_result: Option<VerifyResult>,
     /// True if the worker is actively waiting for an LLM response.
     is_thinking: bool,
 }
@@ -254,6 +257,7 @@ impl SubtaskRuntime {
             diff_hunks: Vec::new(),
             provider: ProviderKind::Anthropic,
             model_name: String::new(),
+            verify_result: None,
             is_thinking: false,
         }
     }
@@ -470,9 +474,13 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             &task_status,
             &runtimes,
             tokens_used,
-            self.tokens_budget,
-            self.estimated_naive_tokens,
-            &checkpoints,
+            BroadcastExtras {
+                tokens_budget: self.tokens_budget,
+                estimated_naive_tokens: self.estimated_naive_tokens,
+                checkpoints: &checkpoints,
+                goal_contract: plan.goal_contract.as_ref(),
+                handoff_packet: None,
+            },
         );
 
         // 3. Main scheduler loop. Each iteration either dispatches newly
@@ -494,9 +502,13 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 &task_status,
                 &runtimes,
                 tokens_used,
-                self.tokens_budget,
-                self.estimated_naive_tokens,
-                &checkpoints,
+                BroadcastExtras {
+                    tokens_budget: self.tokens_budget,
+                    estimated_naive_tokens: self.estimated_naive_tokens,
+                    checkpoints: &checkpoints,
+                    goal_contract: plan.goal_contract.as_ref(),
+                    handoff_packet: None,
+                },
             );
 
             // Race a worker completion against an inbound control
@@ -762,14 +774,20 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 estimated_savings_tokens: self.estimated_naive_tokens.saturating_sub(tokens_used),
             }
         };
+        let handoff =
+            self.build_handoff_packet(&plan, &runtimes, &terminal, tokens_used, &checkpoints);
         broadcast(
             &state_tx,
             &terminal,
             &runtimes,
             tokens_used,
-            self.tokens_budget,
-            self.estimated_naive_tokens,
-            &checkpoints,
+            BroadcastExtras {
+                tokens_budget: self.tokens_budget,
+                estimated_naive_tokens: self.estimated_naive_tokens,
+                checkpoints: &checkpoints,
+                goal_contract: plan.goal_contract.as_ref(),
+                handoff_packet: Some(&handoff),
+            },
         );
         Ok(terminal)
     }
@@ -865,6 +883,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 rt.prior_errors.clear();
                 rt.tokens_used = 0;
                 rt.diff_hunks.clear();
+                rt.verify_result = None;
                 requeued += 1;
             }
         }
@@ -1050,6 +1069,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 .ok_or_else(|| anyhow!("unknown subtask id {id}"))?;
             match verdict {
                 VerifyResult::Pass { layer } => {
+                    rt.verify_result = Some(VerifyResult::Pass { layer });
                     events.push(OrchestratorEvent::VerifyPass {
                         subtask_id: id,
                         layer,
@@ -1079,6 +1099,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 }
                 VerifyResult::Fail { errors, layer, .. } => {
                     let attempt_for_event = rt.attempts_at_tier.saturating_add(1);
+                    rt.verify_result = Some(VerifyResult::Fail {
+                        layer,
+                        errors: errors.clone(),
+                        attempt: attempt_for_event,
+                    });
                     events.push(OrchestratorEvent::VerifyFail {
                         subtask_id: id,
                         layer,
@@ -1121,6 +1146,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     }
                 }
                 VerifyResult::Escalate { reason } => {
+                    rt.verify_result = Some(VerifyResult::Escalate {
+                        reason: reason.clone(),
+                    });
                     rt.prior_errors.push(reason.clone());
                     let from_tier = rt.subtask.model_tier;
                     if !escalate(rt) {
@@ -1160,6 +1188,267 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             self.spawn_worker(runtimes, id, joinset, worker_msg_tx);
         }
         Ok(())
+    }
+
+    fn build_handoff_packet(
+        &self,
+        plan: &PlannerOutput,
+        runtimes: &HashMap<SubtaskId, SubtaskRuntime>,
+        terminal: &TaskStatus,
+        tokens_used: u64,
+        checkpoints: &[Checkpoint],
+    ) -> HandoffPacket {
+        #[derive(Default)]
+        struct FileAgg {
+            added: u32,
+            removed: u32,
+            descriptions: BTreeSet<String>,
+            generated: bool,
+        }
+
+        let mut files: BTreeMap<std::path::PathBuf, FileAgg> = BTreeMap::new();
+        let mut usage = TokenUsage::default();
+        let mut verified = Vec::new();
+        let mut findings = Vec::new();
+        let mut reached_test_layer = false;
+
+        for rt in runtimes.values() {
+            usage.input_tokens = usage
+                .input_tokens
+                .saturating_add(rt.token_usage.input_tokens);
+            usage.output_tokens = usage
+                .output_tokens
+                .saturating_add(rt.token_usage.output_tokens);
+            usage.cached_tokens = usage
+                .cached_tokens
+                .saturating_add(rt.token_usage.cached_tokens);
+            usage.cache_creation_tokens = usage
+                .cache_creation_tokens
+                .saturating_add(rt.token_usage.cache_creation_tokens);
+            usage.estimated |= rt.token_usage.estimated;
+
+            let clean_desc = compact_description(&rt.subtask.description);
+            match &rt.verify_result {
+                Some(VerifyResult::Pass { layer }) => {
+                    reached_test_layer |= *layer == VerifyLayer::Test;
+                    verified.push(format!("{clean_desc} passed {}", verify_layer_name(*layer)));
+                }
+                Some(VerifyResult::Fail { errors, layer, .. }) => {
+                    let detail = if errors.is_empty() {
+                        "unknown verification error".into()
+                    } else {
+                        errors.join("; ")
+                    };
+                    findings.push(format!(
+                        "{clean_desc} failed {}: {detail}",
+                        verify_layer_name(*layer)
+                    ));
+                }
+                Some(VerifyResult::Escalate { reason }) => {
+                    findings.push(format!("{clean_desc} escalated: {reason}"));
+                }
+                None if rt.is_failed() => {
+                    findings.push(format!(
+                        "{clean_desc} failed: {}",
+                        failure_reason(&rt.status)
+                    ));
+                }
+                None => {}
+            }
+
+            for hunk in &rt.diff_hunks {
+                let entry = files.entry(hunk.file_path.clone()).or_default();
+                entry.generated |= hunk.old_count == 0;
+                entry.descriptions.insert(clean_desc.clone());
+                for line in &hunk.lines {
+                    match line {
+                        DiffLine::Added(_) => {
+                            entry.added = entry.added.saturating_add(1);
+                        }
+                        DiffLine::Removed(_) => {
+                            entry.removed = entry.removed.saturating_add(1);
+                        }
+                        DiffLine::Context(_) => {}
+                    }
+                }
+            }
+        }
+
+        if usage.budget_tokens() == 0 && tokens_used > 0 {
+            usage = TokenUsage::estimated(tokens_used);
+        }
+
+        verified.sort();
+        findings.sort();
+
+        let changed_files: Vec<ChangedFileSummary> = files
+            .iter()
+            .map(|(path, agg)| {
+                let mut descriptions: Vec<String> = agg.descriptions.iter().cloned().collect();
+                descriptions.sort();
+                let first = descriptions
+                    .first()
+                    .map(|s| short_text(s, 72))
+                    .unwrap_or_else(|| "verified diff".into());
+                let suffix = if descriptions.len() > 1 {
+                    format!(" (+{} more subtasks)", descriptions.len() - 1)
+                } else {
+                    String::new()
+                };
+                ChangedFileSummary {
+                    path: path.clone(),
+                    added_lines: agg.added,
+                    removed_lines: agg.removed,
+                    summary: format!("{first}{suffix}"),
+                }
+            })
+            .collect();
+
+        let generated_artifacts: Vec<GeneratedArtifact> = files
+            .iter()
+            .filter(|(_, agg)| agg.generated)
+            .map(|(path, _)| GeneratedArtifact {
+                path: path.clone(),
+                description: "New file produced by this run".into(),
+            })
+            .collect();
+
+        let diff_stats = DiffStats {
+            files_changed: changed_files.len() as u32,
+            added_lines: changed_files.iter().map(|f| f.added_lines).sum(),
+            removed_lines: changed_files.iter().map(|f| f.removed_lines).sum(),
+        };
+
+        let run_commands = plan
+            .goal_contract
+            .as_ref()
+            .map(|c| c.run_plan.clone())
+            .unwrap_or_default();
+
+        let mut known_gaps = Vec::new();
+        if changed_files.is_empty() {
+            known_gaps.push("No changed files were recorded for this run.".into());
+        }
+        if run_commands.is_empty() {
+            known_gaps.push("No run command was inferred yet.".into());
+        }
+        if !reached_test_layer {
+            known_gaps.push("No explicit test layer was recorded by this run.".into());
+        }
+        if checkpoints.is_empty() && !changed_files.is_empty() {
+            known_gaps.push("No git rollback checkpoint was recorded.".into());
+        }
+        if let Some(contract) = &plan.goal_contract {
+            for question in &contract.clarification_questions {
+                known_gaps.push(format!("Unanswered clarification: {question}"));
+            }
+        }
+        if !findings.is_empty() {
+            known_gaps.push("Review verification findings before applying the result.".into());
+        }
+
+        let rollback_points = checkpoints
+            .iter()
+            .map(|c| RollbackPoint {
+                seq: c.seq,
+                label: c.message.clone(),
+            })
+            .collect();
+
+        let mut review_actions = vec![
+            ReviewAction {
+                label: "Review files".into(),
+                description: "Inspect the changed files listed in this handoff.".into(),
+            },
+            ReviewAction {
+                label: "Open Flight Log".into(),
+                description: "Press Shift+L to inspect the execution events.".into(),
+            },
+        ];
+        if !checkpoints.is_empty() {
+            review_actions.push(ReviewAction {
+                label: "Rollback".into(),
+                description: "Select a checkpoint with Ctrl+Up/Ctrl+Down and press r.".into(),
+            });
+        }
+
+        let done_count = runtimes.values().filter(|rt| rt.is_done()).count();
+        let goal = if self.goal_text.trim().is_empty() {
+            plan.goal_contract
+                .as_ref()
+                .map(|c| c.goal.clone())
+                .unwrap_or_else(|| "task".into())
+        } else {
+            self.goal_text.clone()
+        };
+        let headline = match terminal {
+            TaskStatus::Reviewing { .. } | TaskStatus::Done { .. } => format!(
+                "Review ready: {} file(s), {} verified subtask(s)",
+                diff_stats.files_changed, done_count
+            ),
+            TaskStatus::Paused {
+                limit,
+                observed,
+                ceiling,
+            } => format!("Paused on {limit}: {observed}/{ceiling}"),
+            TaskStatus::Failed { reason, .. } => {
+                format!("Task failed before review: {}", short_text(reason, 96))
+            }
+            _ => "Task state updated".into(),
+        };
+
+        HandoffPacket {
+            task_id: self.task_id,
+            goal,
+            headline,
+            changed_files,
+            generated_artifacts,
+            diff_stats,
+            verification: VerifyReport {
+                passed: verified,
+                findings,
+                skipped: if reached_test_layer {
+                    Vec::new()
+                } else {
+                    vec!["No explicit test layer was recorded.".into()]
+                },
+            },
+            run_commands,
+            known_gaps,
+            review_actions,
+            rollback_points,
+            token_usage: usage,
+            influence: InfluenceSummary::default(),
+        }
+    }
+}
+
+fn compact_description(description: &str) -> String {
+    description
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(description)
+        .trim()
+        .to_string()
+}
+
+fn short_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn verify_layer_name(layer: VerifyLayer) -> &'static str {
+    match layer {
+        VerifyLayer::Syntax => "syntax",
+        VerifyLayer::DecisionCheck => "decision check",
+        VerifyLayer::CrateCheck => "crate check",
+        VerifyLayer::WorkspaceCheck => "workspace check",
+        VerifyLayer::Test => "test",
     }
 }
 
@@ -1347,14 +1636,20 @@ fn build_graph(
 // State broadcast
 // ---------------------------------------------------------------------------
 
+struct BroadcastExtras<'a> {
+    tokens_budget: Option<u64>,
+    estimated_naive_tokens: u64,
+    checkpoints: &'a [Checkpoint],
+    goal_contract: Option<&'a GoalContract>,
+    handoff_packet: Option<&'a HandoffPacket>,
+}
+
 fn broadcast(
     tx: &watch::Sender<GlobalState>,
     task_status: &TaskStatus,
     runtimes: &HashMap<SubtaskId, SubtaskRuntime>,
     tokens_used: u64,
-    tokens_budget: Option<u64>,
-    estimated_naive_tokens: u64,
-    checkpoints: &[Checkpoint],
+    extras: BroadcastExtras<'_>,
 ) {
     let active_workers = runtimes
         .values()
@@ -1373,11 +1668,13 @@ fn broadcast(
     // recorded as the latest value, so a late-subscribing UI sees it.
     let _ = tx.send(GlobalState {
         task_status: task_status.clone(),
+        goal_contract: extras.goal_contract.cloned(),
+        handoff_packet: extras.handoff_packet.cloned(),
         active_workers,
         tokens_used,
-        tokens_budget,
-        estimated_naive_tokens,
-        checkpoints: checkpoints.to_vec(),
+        tokens_budget: extras.tokens_budget,
+        estimated_naive_tokens: extras.estimated_naive_tokens,
+        checkpoints: extras.checkpoints.to_vec(),
     });
 }
 
@@ -1480,6 +1777,7 @@ mod tests {
             description: desc.into(),
             model_tier: ModelTier::Cheap,
             dependencies: deps,
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         }
     }
@@ -1487,6 +1785,8 @@ mod tests {
     fn empty_state() -> watch::Sender<GlobalState> {
         let (tx, _rx) = watch::channel(GlobalState {
             task_status: TaskStatus::Queued,
+            goal_contract: None,
+            handoff_packet: None,
             active_workers: Vec::new(),
             tokens_used: 0,
             tokens_budget: None,
@@ -1528,6 +1828,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -1543,6 +1844,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_state_contains_handoff_packet() {
+        let a = subtask("create stub helper", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+        };
+        let (state_tx, state_rx) = watch::channel(GlobalState {
+            task_status: TaskStatus::Queued,
+            goal_contract: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+        });
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+
+        let status = orch.run_task(plan, state_tx).await.unwrap();
+        assert!(matches!(status, TaskStatus::Reviewing { .. }));
+
+        let state = state_rx.borrow().clone();
+        let handoff = state
+            .handoff_packet
+            .expect("final GlobalState should contain a handoff packet");
+        assert_eq!(handoff.diff_stats.files_changed, 1);
+        assert!(handoff
+            .changed_files
+            .iter()
+            .any(|f| f.path.as_path() == std::path::Path::new("phonton-types/src/stub.rs")));
+        assert!(handoff
+            .verification
+            .passed
+            .iter()
+            .any(|line| line.contains("passed")));
+    }
+
+    #[tokio::test]
     async fn independent_subtasks_both_dispatch() {
         let a = subtask("one", vec![]);
         let b = subtask("two", vec![]);
@@ -1551,6 +1895,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -1611,6 +1956,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         let dispatcher = Arc::new(BrokenDispatcher {
             calls: Mutex::new(Vec::new()),
@@ -1689,6 +2035,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         let dispatcher = Arc::new(BarrierDispatcher {
             barrier: Arc::new(tokio::sync::Barrier::new(2)),
@@ -1713,6 +2060,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         // TrivialDispatcher reports 100 tokens per call; ceiling at 50
         // must trip after the first completion.
@@ -1743,6 +2091,7 @@ mod tests {
             description: "Write integration tests for FooBar".into(),
             model_tier: ModelTier::Frontier,
             dependencies: vec![],
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let plan = PlannerOutput {
@@ -1750,6 +2099,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -1792,6 +2142,7 @@ mod tests {
             description: "a".into(),
             model_tier: ModelTier::Cheap,
             dependencies: vec![id_b],
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let b = Subtask {
@@ -1799,6 +2150,7 @@ mod tests {
             description: "b".into(),
             model_tier: ModelTier::Cheap,
             dependencies: vec![id_a],
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let plan = PlannerOutput {
@@ -1806,6 +2158,7 @@ mod tests {
             estimated_total_tokens: 0,
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();

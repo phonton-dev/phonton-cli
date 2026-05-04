@@ -19,8 +19,8 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use phonton_types::{
-    LLMResponse, ModelMetricsSnapshot, ModelTier, ProviderConfig, ProviderError, ProviderKind,
-    SliceOrigin,
+    LLMResponse, ModelMetricsSnapshot, ModelTier, PromptAttachment, ProviderConfig, ProviderError,
+    ProviderKind, SliceOrigin,
 };
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
@@ -678,6 +678,82 @@ fn annotate_http_error(provider: &str, status: StatusCode, body: &str) -> anyhow
     anyhow!("{provider} HTTP {}{hint}: {preview}", status.as_u16())
 }
 
+fn native_image_attachments(attachments: &[PromptAttachment]) -> Vec<&PromptAttachment> {
+    attachments
+        .iter()
+        .filter(|a| a.has_image_payload())
+        .filter(|a| {
+            matches!(
+                a.mime_type.as_deref(),
+                Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+            )
+        })
+        .collect()
+}
+
+fn anthropic_user_content(user: &str, attachments: &[PromptAttachment]) -> Value {
+    let images = native_image_attachments(attachments);
+    if images.is_empty() {
+        return json!(user);
+    }
+
+    let mut content = vec![json!({ "type": "text", "text": user })];
+    for image in images {
+        if let (Some(media_type), Some(data)) =
+            (image.mime_type.as_deref(), image.data_base64.as_deref())
+        {
+            content.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data
+                }
+            }));
+        }
+    }
+    Value::Array(content)
+}
+
+fn openai_user_content(user: &str, attachments: &[PromptAttachment]) -> Value {
+    let images = native_image_attachments(attachments);
+    if images.is_empty() {
+        return json!(user);
+    }
+
+    let mut content = vec![json!({ "type": "text", "text": user })];
+    for image in images {
+        if let (Some(media_type), Some(data)) =
+            (image.mime_type.as_deref(), image.data_base64.as_deref())
+        {
+            content.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{media_type};base64,{data}")
+                }
+            }));
+        }
+    }
+    Value::Array(content)
+}
+
+fn gemini_user_parts(user: &str, attachments: &[PromptAttachment]) -> Vec<Value> {
+    let mut parts = vec![json!({ "text": user })];
+    for image in native_image_attachments(attachments) {
+        if let (Some(mime_type), Some(data)) =
+            (image.mime_type.as_deref(), image.data_base64.as_deref())
+        {
+            parts.push(json!({
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": data
+                }
+            }));
+        }
+    }
+    parts
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -703,6 +779,22 @@ pub trait Provider: Send + Sync {
         user: &str,
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse>;
+
+    /// Issue one completion call with optional user-mentioned attachments.
+    ///
+    /// Text attachment contents should already be represented in `user`.
+    /// Vision-capable adaptors may send image payloads as provider-native
+    /// parts; text-only adaptors fall back to [`Provider::call`].
+    async fn call_with_attachments(
+        &self,
+        system: &str,
+        user: &str,
+        slice_origins: &[SliceOrigin],
+        attachments: &[PromptAttachment],
+    ) -> Result<LLMResponse> {
+        let _ = attachments;
+        self.call(system, user, slice_origins).await
+    }
 
     /// Which back-end this adaptor targets.
     fn kind(&self) -> ProviderKind;
@@ -959,8 +1051,22 @@ impl Provider for MeteredProvider {
         user: &str,
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse> {
+        self.call_with_attachments(system, user, slice_origins, &[])
+            .await
+    }
+
+    async fn call_with_attachments(
+        &self,
+        system: &str,
+        user: &str,
+        slice_origins: &[SliceOrigin],
+        attachments: &[PromptAttachment],
+    ) -> Result<LLMResponse> {
         let started = Instant::now();
-        let resp = self.inner.call(system, user, slice_origins).await?;
+        let resp = self
+            .inner
+            .call_with_attachments(system, user, slice_origins, attachments)
+            .await?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         self.metrics
             .record_call(&self.key, elapsed_ms, resp.output_tokens);
@@ -1017,6 +1123,17 @@ impl Provider for AnthropicProvider {
         user: &str,
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse> {
+        self.call_with_attachments(system, user, slice_origins, &[])
+            .await
+    }
+
+    async fn call_with_attachments(
+        &self,
+        system: &str,
+        user: &str,
+        slice_origins: &[SliceOrigin],
+        attachments: &[PromptAttachment],
+    ) -> Result<LLMResponse> {
         let system = build_system_prompt(system, slice_origins);
         // Only attach a cache breakpoint once the system prompt is long
         // enough that the write cost amortises over future reads. Short
@@ -1038,7 +1155,7 @@ impl Provider for AnthropicProvider {
             "model": self.model,
             "max_tokens": 8192,
             "system": [system_block],
-            "messages": [{ "role": "user", "content": user }],
+            "messages": [{ "role": "user", "content": anthropic_user_content(user, attachments) }],
         });
 
         let http_resp = self
@@ -1191,6 +1308,17 @@ impl Provider for OpenAiCompatibleProvider {
         user: &str,
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse> {
+        self.call_with_attachments(system, user, slice_origins, &[])
+            .await
+    }
+
+    async fn call_with_attachments(
+        &self,
+        system: &str,
+        user: &str,
+        slice_origins: &[SliceOrigin],
+        attachments: &[PromptAttachment],
+    ) -> Result<LLMResponse> {
         let system = build_system_prompt(system, slice_origins);
         // OpenAI's *current* spec uses `max_completion_tokens` and o1/o3/o4
         // *reject* `max_tokens` outright. Every other OpenAI-compat provider
@@ -1204,12 +1332,17 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             "max_tokens"
         };
+        let user_content = if matches!(self.kind, ProviderKind::OpenAI | ProviderKind::OpenRouter) {
+            openai_user_content(user, attachments)
+        } else {
+            json!(user)
+        };
         let body = json!({
             "model": self.model,
             token_key: 4096,
             "messages": [
                 { "role": "system", "content": system },
-                { "role": "user", "content": user },
+                { "role": "user", "content": user_content },
             ],
         });
 
@@ -1383,6 +1516,17 @@ impl Provider for GeminiProvider {
         user: &str,
         slice_origins: &[SliceOrigin],
     ) -> Result<LLMResponse> {
+        self.call_with_attachments(system, user, slice_origins, &[])
+            .await
+    }
+
+    async fn call_with_attachments(
+        &self,
+        system: &str,
+        user: &str,
+        slice_origins: &[SliceOrigin],
+        attachments: &[PromptAttachment],
+    ) -> Result<LLMResponse> {
         let system_full = build_system_prompt(system, slice_origins);
         let model = self.current_model();
         let is_gemma = model.contains("gemma");
@@ -1440,7 +1584,7 @@ impl Provider for GeminiProvider {
         } else {
             contents.push(json!({
                 "role": "user",
-                "parts": [{ "text": user }],
+                "parts": gemini_user_parts(user, attachments),
             }));
         }
 

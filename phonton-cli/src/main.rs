@@ -43,14 +43,17 @@ mod plan_preview;
 mod review;
 mod trust;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -67,10 +70,12 @@ use phonton_providers::{
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
-    BudgetLimits, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId, GlobalState,
-    MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent, OrchestratorMessage, Permission,
-    PlannerOutput, ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId,
-    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    BudgetLimits, ContextManifest, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId,
+    GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
+    OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
+    PromptAttachment, PromptAttachmentKind, ProviderConfig as ApiProviderConfig, ProviderKind,
+    Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer,
+    VerifyResult,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -107,21 +112,20 @@ const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
 const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
 const UI_TICK_MS: u64 = 80;
-const LOGO_SHIMMER_SPEED: f32 = 0.026;
-const LOGO_ROW_PHASE: f32 = 0.11;
+const LOGO_SHIMMER_SPEED: f32 = 0.018;
+const LOGO_ROW_PHASE: f32 = 0.085;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
-    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
-    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
-    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
-    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
-    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
-    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
+    "█████░  █   █░  ████░  █   █░ █████░  ████░  █   █░",
+    "█   █░  █   █░ █    █░ ██  █░   █  ░ █    █░ ██  █░",
+    "█████░  █████░ █    █░ █ █ █░   █  ░ █    █░ █ █ █░",
+    "█    ░  █   █░ █    █░ █  ██░   █  ░ █    █░ █  ██░",
+    "█    ░  █   █░  ████░  █   █░   █  ░  ████░  █   █░",
+    " ░░░░    ░   ░   ░░░░    ░   ░    ░     ░░░░    ░   ░",
 ];
 
-const LOGO_WIDTH_THRESHOLD: u16 = 70;
+const LOGO_WIDTH_THRESHOLD: u16 = 72;
 static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
@@ -153,14 +157,17 @@ fn grad3(t: f32) -> Color {
     }
 }
 
-/// Four-stop animated logo palette: violet → pink → electric blue → cyan,
-/// looping back to violet so the cycle is seamless.
+/// Four-stop animated logo palette. Starts in violet/pink like the splash
+/// mock, then travels through electric blue and cyan before looping.
 fn logo_grad(t: f32) -> Color {
     let t = t - t.floor();
-    let stops = [GRAD_B, GRAD_C, GRAD_D, GRAD_A, GRAD_B];
-    let seg = t * 4.0;
-    let i = (seg as usize).min(3);
-    grad(stops[i], stops[i + 1], seg - i as f32)
+    if t < 0.33 {
+        grad(GRAD_B, GRAD_C, t / 0.33)
+    } else if t < 0.66 {
+        grad(GRAD_C, GRAD_D, (t - 0.33) / 0.33)
+    } else {
+        grad(GRAD_D, GRAD_A, (t - 0.66) / 0.34)
+    }
 }
 
 /// Build a horizontally-gradient-colored line from `text`. `phase` shifts the
@@ -194,10 +201,7 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    // Two highlight waves traveling at different speeds give a richer shimmer
-    // than a single pass, like light playing across a curved surface.
-    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
-    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
+    let wave = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
 
     for (i, ch) in chars.into_iter().enumerate() {
         if ch == ' ' {
@@ -206,66 +210,31 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
-        let base_color = base_rgb(base);
-        let dist = |w: f32| -> f32 {
-            let raw = (x - w).abs();
-            raw.min(1.0 - raw)
-        };
-        let d_a = dist(wave_a);
-        let d_b = dist(wave_b);
-
-        let style = match ch {
-            '░' | '▒' | '▓' => {
-                let body = match ch {
-                    '▓' => 0.55,
-                    '▒' => 0.32,
-                    _ => 0.16,
-                };
-                let glow = if d_a < 0.14 {
-                    (1.0 - d_a / 0.14) * 0.45
-                } else {
-                    0.0
-                };
-                let color = grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9));
-                Style::default().fg(color)
-            }
-            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
-                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
-                let lift = if d_a < 0.07 {
-                    (1.0 - d_a / 0.07) * 0.35
-                } else {
-                    0.0
-                };
-                Style::default()
-                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
-                    .add_modifier(Modifier::BOLD)
-            }
-            _ => {
-                let glint_a = if d_a < 0.08 {
-                    (1.0 - d_a / 0.08) * 0.65
-                } else {
-                    0.0
-                };
-                let glint_b = if d_b < 0.05 {
-                    (1.0 - d_b / 0.05) * 0.45
-                } else {
-                    0.0
-                };
-                let breathing = ((phase * std::f32::consts::TAU
-                    + x * std::f32::consts::TAU * 1.4
-                    + row_idx as f32 * 0.65)
-                    .sin()
-                    + 1.0)
-                    * 0.08;
-                Style::default()
-                    .fg(grad(
-                        base_color,
-                        LOGO_GLOW,
-                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
-                    ))
-                    .add_modifier(Modifier::BOLD)
-            }
+        let style = if matches!(ch, '░' | '▒' | '▓') {
+            let shadow_t = ((x + phase * 0.45 + row_idx as f32 * 0.025).fract() - 0.5).abs();
+            let lift = (0.18 - shadow_t).max(0.0) / 0.18;
+            Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
+        } else {
+            let base = logo_grad((x * 0.82 + phase * 0.74 + row_idx as f32 * 0.04).fract());
+            let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
+            let glint = if distance < 0.075 {
+                (1.0 - distance / 0.075) * 0.55
+            } else {
+                0.0
+            };
+            let breathing = ((phase * std::f32::consts::TAU
+                + x * std::f32::consts::TAU * 1.4
+                + row_idx as f32 * 0.65)
+                .sin()
+                + 1.0)
+                * 0.07;
+            Style::default()
+                .fg(grad(
+                    base_rgb(base),
+                    LOGO_GLOW,
+                    (glint + breathing).clamp(0.0, 0.62),
+                ))
+                .add_modifier(Modifier::BOLD)
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
@@ -2366,7 +2335,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
             "goal: ",
@@ -2404,6 +2373,10 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             app.best_savings_pct,
             app.new_best_ticks,
         ));
+
+        if let Some(handoff) = &state.handoff_packet {
+            append_handoff_lines(&mut lines, handoff);
+        }
 
         // Checkpoint picker — one line per landed subtask, newest last.
         // Marked with a "↶ N" tag for "Rollback to step N" — the actual
@@ -2449,6 +2422,128 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
     frame.render_widget(p, area);
+}
+
+fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket) {
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Result",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(handoff.headline.clone(), Style::default().fg(Color::White)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  files ", Style::default().fg(MUTED)),
+        Span::styled(
+            handoff.diff_stats.files_changed.to_string(),
+            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  +", Style::default().fg(MUTED)),
+        Span::styled(
+            handoff.diff_stats.added_lines.to_string(),
+            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  -", Style::default().fg(MUTED)),
+        Span::styled(
+            handoff.diff_stats.removed_lines.to_string(),
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if !handoff.changed_files.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Changed files",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for file in handoff.changed_files.iter().take(6) {
+            lines.push(Line::from(vec![
+                Span::styled("  - ", Style::default().fg(ACCENT_HI)),
+                Span::styled(
+                    short(&file.path.display().to_string(), 44),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  +", Style::default().fg(MUTED)),
+                Span::styled(file.added_lines.to_string(), Style::default().fg(SUCCESS)),
+                Span::styled(" -", Style::default().fg(MUTED)),
+                Span::styled(file.removed_lines.to_string(), Style::default().fg(DANGER)),
+                Span::styled("  ", Style::default()),
+                Span::styled(short(&file.summary, 62), Style::default().fg(MUTED)),
+            ]));
+        }
+        if handoff.changed_files.len() > 6 {
+            lines.push(Line::from(Span::styled(
+                format!("  +{} more file(s)", handoff.changed_files.len() - 6),
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    if !handoff.verification.passed.is_empty() || !handoff.verification.findings.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Verification",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for passed in handoff.verification.passed.iter().take(4) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  pass ",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(short(passed, 86), Style::default().fg(MUTED)),
+            ]));
+        }
+        for finding in handoff.verification.findings.iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  warn ",
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(short(finding, 86), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Run",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    if handoff.run_commands.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No run command inferred yet.",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for command in handoff.run_commands.iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  $ ",
+                    Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(command.command.join(" "), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    if !handoff.known_gaps.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Known gaps",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        )));
+        for gap in handoff.known_gaps.iter().take(4) {
+            lines.push(Line::from(vec![
+                Span::styled("  - ", Style::default().fg(WARN)),
+                Span::styled(short(gap, 90), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
 }
 
 /// Render the Flight Log — raw [`EventRecord`] stream for the currently
@@ -2631,6 +2726,19 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         for row in app.history_records.iter().take(20) {
             let status = task_status_label(&row.status);
+            let outcome = row
+                .outcome_ledger
+                .as_ref()
+                .and_then(|ledger| ledger.handoff.as_ref())
+                .map(|handoff| {
+                    format!(
+                        "{} files +{} -{}  ",
+                        handoff.diff_stats.files_changed,
+                        handoff.diff_stats.added_lines,
+                        handoff.diff_stats.removed_lines
+                    )
+                })
+                .unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{status:<9} "),
@@ -2640,6 +2748,7 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
                     format!("{} tok  ", row.total_tokens),
                     Style::default().fg(MUTED),
                 ),
+                Span::styled(outcome, Style::default().fg(SUCCESS)),
                 Span::raw(short(&row.goal_text, 90)),
             ]));
         }
@@ -2903,48 +3012,23 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let prompt_prefix = format!(" {icon} ");
     let prompt_prefix_w = prompt_prefix.chars().count() as u16;
 
-    // Horizontal scroll so the drawn caret is always visible inside the input slot.
+    // Horizontal scroll so the caret is always visible inside the input slot.
     let input_width = row[0].width.saturating_sub(prompt_prefix_w) as usize;
-    let show_drawn_caret = input_width > 0
-        && !matches!(
-            app.mode,
-            Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
-        );
-    let visible_width = input_width.saturating_sub(usize::from(show_drawn_caret));
     let total_chars = char_count(buf);
     let cursor_clamped = cursor.min(total_chars);
-    let scroll = if show_drawn_caret {
-        cursor_clamped.saturating_sub(visible_width)
-    } else {
-        cursor_clamped.saturating_sub(input_width.saturating_sub(1))
-    };
-    let visible_chars: Vec<char> = buf.chars().skip(scroll).take(visible_width).collect();
-    let caret_offset = cursor_clamped
-        .saturating_sub(scroll)
-        .min(visible_chars.len());
-    let before_caret: String = visible_chars.iter().take(caret_offset).collect();
-    let after_caret: String = visible_chars.iter().skip(caret_offset).collect();
+    let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
+    let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
 
-    let mut prompt_spans = vec![
+    let prompt = Paragraph::new(Line::from(vec![
         Span::styled(
             prompt_prefix,
             Style::default()
                 .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(before_caret, Style::default().fg(Color::White)),
-    ];
-    if show_drawn_caret {
-        prompt_spans.push(Span::styled(
-            "▌",
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    prompt_spans.push(Span::styled(after_caret, Style::default().fg(Color::White)));
-
-    let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
+        Span::styled(visible, Style::default().fg(Color::White)),
+    ]))
+    .style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
 
     let badge = Paragraph::new(Line::from(Span::styled(mode_label, mode_style)))
@@ -2952,9 +3036,19 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
 
-    // The native terminal cursor is hidden while Phonton runs. A drawn caret
-    // avoids terminal-controlled blinking and keeps the input bar visually
-    // stable during the animated splash.
+    // Draw a native terminal cursor instead of a manual in-buffer caret.
+    // Native cursors are handled efficiently by the terminal emulator and
+    // don't flicker on every frame draw.
+    if !matches!(
+        app.mode,
+        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+    ) {
+        let cx = row[0].x + prompt_prefix_w + (cursor_clamped - scroll) as u16;
+        let cy = row[0].y;
+        if cx < row[0].x + row[0].width {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -3109,7 +3203,7 @@ impl WorkerDispatcher for StubDispatcher {
 /// state update the driver received on one of the watch channels.
 enum LoopEvent {
     Key(KeyEvent),
-    StateUpdate(usize, GlobalState),
+    StateUpdate(usize, Box<GlobalState>),
     AskAnswer(String),
     McpApprovalRequested {
         prompt: PendingMcpApproval,
@@ -4087,7 +4181,8 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -4113,6 +4208,7 @@ async fn main() -> Result<()> {
         terminal.backend_mut(),
         LeaveAlternateScreen,
         crossterm::cursor::Show,
+        SetCursorStyle::DefaultUserShape,
     )?;
     terminal.show_cursor()?;
     result
@@ -4121,8 +4217,8 @@ async fn main() -> Result<()> {
 fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
     std::thread::spawn(move || loop {
         // Poll on a modest cadence. This keeps input responsive while
-        // preventing the splash animation from feeling like it is flashing
-        // on every frame.
+        // preventing the splash animation and terminal cursor from feeling
+        // like they are flashing on every frame.
         if event::poll(Duration::from_millis(UI_TICK_MS)).unwrap_or(false) {
             if let Ok(Event::Key(k)) = event::read() {
                 // IMPORTANT: Filter for 'Press' events only. Windows and some
@@ -4545,7 +4641,7 @@ async fn run_app<B: Backend>(
                     }
                 }
             }
-            LoopEvent::StateUpdate(idx, state) => app.apply_state(idx, state),
+            LoopEvent::StateUpdate(idx, state) => app.apply_state(idx, *state),
             LoopEvent::FlightEvent(idx, ev) => app.apply_event(idx, ev),
             LoopEvent::AskAnswer(a) => {
                 app.ask_pending = false;
@@ -4600,12 +4696,19 @@ async fn run_app<B: Backend>(
     Ok(())
 }
 
-fn single_task_plan(description: String) -> PlannerOutput {
+const MAX_TEXT_ATTACHMENT_BYTES: u64 = 64 * 1024;
+const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
+fn single_task_plan(description: String, attachments: Vec<PromptAttachment>) -> PlannerOutput {
+    let goal_contract = Goal::new(description.clone())
+        .with_attachments(attachments.clone())
+        .contract();
     let subtask = Subtask {
         id: SubtaskId::new(),
         description,
         model_tier: ModelTier::Standard,
         dependencies: Vec::new(),
+        attachments,
         status: SubtaskStatus::Queued,
     };
 
@@ -4614,7 +4717,240 @@ fn single_task_plan(description: String) -> PlannerOutput {
         estimated_total_tokens: 1_200,
         naive_baseline_tokens: 4_000,
         coverage_summary: CoverageSummary::default(),
+        goal_contract: Some(goal_contract),
     }
+}
+
+fn prepare_goal_attachments(text: &str, working_dir: &Path) -> Vec<PromptAttachment> {
+    let workspace_root = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut attachments = Vec::new();
+
+    for raw in extract_file_mentions(text) {
+        if let Some(attachment) = load_prompt_attachment(&raw, working_dir, &workspace_root) {
+            let key = workspace_root.join(&attachment.path);
+            if seen.insert(key) {
+                attachments.push(attachment);
+            }
+        }
+    }
+
+    attachments
+}
+
+fn extract_file_mentions(text: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    let mut iter = text.char_indices().peekable();
+
+    while let Some((_, ch)) = iter.next() {
+        if ch != '@' {
+            continue;
+        }
+
+        let Some(&(next_idx, next_ch)) = iter.peek() else {
+            continue;
+        };
+
+        let raw = if next_ch == '"' || next_ch == '\'' {
+            let quote = next_ch;
+            iter.next();
+            let start = next_idx + quote.len_utf8();
+            let mut end = start;
+            for (idx, c) in iter.by_ref() {
+                if c == quote {
+                    end = idx;
+                    break;
+                }
+                end = idx + c.len_utf8();
+            }
+            text[start..end].trim().to_string()
+        } else if next_ch == '[' {
+            iter.next();
+            let start = next_idx + next_ch.len_utf8();
+            let mut end = start;
+            for (idx, c) in iter.by_ref() {
+                if c == ']' {
+                    end = idx;
+                    break;
+                }
+                end = idx + c.len_utf8();
+            }
+            text[start..end].trim().to_string()
+        } else {
+            let start = next_idx;
+            let mut end = text.len();
+            while let Some(&(idx, c)) = iter.peek() {
+                if c.is_whitespace() || matches!(c, ',' | ';' | ')' | '(' | '<' | '>' | '`') {
+                    end = idx;
+                    break;
+                }
+                iter.next();
+            }
+            text[start..end]
+                .trim_matches(|c: char| matches!(c, '.' | ':' | '!' | '?' | ']' | '}'))
+                .trim()
+                .to_string()
+        };
+
+        if !raw.is_empty() {
+            mentions.push(raw);
+        }
+    }
+
+    mentions
+}
+
+fn load_prompt_attachment(
+    raw: &str,
+    working_dir: &Path,
+    workspace_root: &Path,
+) -> Option<PromptAttachment> {
+    let candidate = PathBuf::from(raw);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        working_dir.join(candidate)
+    };
+    let canonical = resolved.canonicalize().ok()?;
+    if !canonical.starts_with(workspace_root) {
+        return None;
+    }
+
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    let path = canonical
+        .strip_prefix(workspace_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| canonical.clone());
+    let size_bytes = metadata.len();
+    let mime_type = mime_for_path(&canonical).map(str::to_string);
+
+    if is_image_path(&canonical) {
+        let (data_base64, truncated, note) = if size_bytes <= MAX_IMAGE_ATTACHMENT_BYTES {
+            let bytes = std::fs::read(&canonical).ok()?;
+            (Some(general_purpose::STANDARD.encode(bytes)), false, None)
+        } else {
+            (
+                None,
+                true,
+                Some(format!(
+                    "image payload omitted because it is larger than {} bytes",
+                    MAX_IMAGE_ATTACHMENT_BYTES
+                )),
+            )
+        };
+        return Some(PromptAttachment {
+            path,
+            kind: PromptAttachmentKind::Image,
+            mime_type,
+            size_bytes,
+            text: None,
+            data_base64,
+            truncated,
+            note,
+        });
+    }
+
+    use std::io::Read;
+    let mut file = std::fs::File::open(&canonical).ok()?;
+    let mut bytes = Vec::with_capacity(size_bytes.min(MAX_TEXT_ATTACHMENT_BYTES) as usize);
+    file.by_ref()
+        .take(MAX_TEXT_ATTACHMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let truncated = bytes.len() as u64 > MAX_TEXT_ATTACHMENT_BYTES;
+    if truncated {
+        bytes.truncate(MAX_TEXT_ATTACHMENT_BYTES as usize);
+    }
+    if bytes.contains(&0) {
+        return Some(PromptAttachment {
+            path,
+            kind: PromptAttachmentKind::Unsupported,
+            mime_type,
+            size_bytes,
+            text: None,
+            data_base64: None,
+            truncated: false,
+            note: Some("binary file was mentioned but not attached as text".into()),
+        });
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let note = truncated.then(|| {
+        format!(
+            "file content truncated to the first {} bytes",
+            MAX_TEXT_ATTACHMENT_BYTES
+        )
+    });
+
+    Some(PromptAttachment {
+        path,
+        kind: PromptAttachmentKind::Text,
+        mime_type,
+        size_bytes,
+        text: Some(text),
+        data_base64: None,
+        truncated,
+        note,
+    })
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn mime_for_path(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("svg") => Some("image/svg+xml"),
+        Some("rs") => Some("text/x-rust"),
+        Some("ts") => Some("text/typescript"),
+        Some("tsx") => Some("text/tsx"),
+        Some("js") => Some("text/javascript"),
+        Some("jsx") => Some("text/jsx"),
+        Some("py") => Some("text/x-python"),
+        Some("md") | Some("mdx") => Some("text/markdown"),
+        Some("json") => Some("application/json"),
+        Some("toml") => Some("application/toml"),
+        Some("yaml") | Some("yml") => Some("application/yaml"),
+        Some("txt") | Some("log") => Some("text/plain"),
+        Some("html") => Some("text/html"),
+        Some("css") => Some("text/css"),
+        _ => None,
+    }
+}
+
+fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<OutcomeLedger> {
+    let handoff = state.handoff_packet.clone()?;
+    Some(OutcomeLedger {
+        task_id,
+        goal_contract: state.goal_contract.clone(),
+        context_manifest: ContextManifest::default(),
+        permission_ledger: PermissionLedger::default(),
+        verify_report: handoff.verification.clone(),
+        handoff: Some(handoff),
+    })
 }
 
 async fn spawn_goal(
@@ -4629,19 +4965,21 @@ async fn spawn_goal(
     cfg: &config::Config,
     working_dir: &std::path::PathBuf,
 ) {
+    let attachments = prepare_goal_attachments(&text, working_dir);
     if let Ok(g) = store.lock() {
         let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
     }
     let memory_store = phonton_memory::MemoryStore::new(Arc::clone(store)).await;
 
     let plan_result = if direct_task {
-        Ok(single_task_plan(text.clone()))
+        Ok(single_task_plan(text.clone(), attachments.clone()))
     } else {
         let store_guard = match store.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        let result = decompose_with_memory(&Goal::new(text.clone()), &store_guard, None).await;
+        let goal = Goal::new(text.clone()).with_attachments(attachments.clone());
+        let result = decompose_with_memory(&goal, &store_guard, None).await;
         drop(store_guard);
         result
     };
@@ -4652,6 +4990,8 @@ async fn spawn_goal(
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
+        goal_contract: plan.goal_contract.clone(),
+        handoff_packet: None,
         active_workers: Vec::new(),
         tokens_used: 0,
         tokens_budget: None,
@@ -4799,9 +5139,12 @@ async fn spawn_goal(
                     &s.task_status,
                     s.tokens_used,
                 );
+                if let Some(ledger) = outcome_ledger_from_state(task_id, &s) {
+                    let _ = g.upsert_outcome_ledger(&ledger);
+                }
             }
             if tx_updates
-                .send(LoopEvent::StateUpdate(goal_index, s))
+                .send(LoopEvent::StateUpdate(goal_index, Box::new(s)))
                 .await
                 .is_err()
             {
@@ -5229,6 +5572,53 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn goal_mentions_attach_text_and_images() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("src");
+        std::fs::create_dir(&src)?;
+        std::fs::write(src.join("lib.rs"), "pub fn old() {}\n")?;
+        std::fs::write(temp.path().join("screen.png"), [0x89, b'P', b'N', b'G'])?;
+
+        let attachments =
+            prepare_goal_attachments("fix @src/lib.rs based on @screen.png", temp.path());
+
+        assert_eq!(attachments.len(), 2);
+        let text = attachments
+            .iter()
+            .find(|a| a.path.as_path() == Path::new("src/lib.rs"))
+            .expect("text attachment");
+        assert_eq!(text.kind, PromptAttachmentKind::Text);
+        assert!(text.text.as_deref().unwrap_or("").contains("old"));
+
+        let image = attachments
+            .iter()
+            .find(|a| a.path.as_path() == Path::new("screen.png"))
+            .expect("image attachment");
+        assert_eq!(image.kind, PromptAttachmentKind::Image);
+        assert_eq!(image.mime_type.as_deref(), Some("image/png"));
+        assert!(image.data_base64.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn quoted_goal_mentions_support_spaces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("notes file.md"), "# Notes\n")?;
+
+        let attachments =
+            prepare_goal_attachments("use @\"notes file.md\" while editing", temp.path());
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].path, PathBuf::from("notes file.md"));
+        assert!(attachments[0]
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("Notes"));
+        Ok(())
+    }
+
+    #[test]
     fn mcp_approval_enter_approves_and_removes_prompt() {
         let mut app = App::default();
         app.push_mcp_approval(approval_prompt(42));
@@ -5339,6 +5729,7 @@ fn extract_id(line: &str) -> Option<String> {
             description: "Use MCP fixture context and add a Rust helper".into(),
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let provider = McpE2eProvider::default();
@@ -5440,6 +5831,8 @@ fn extract_id(line: &str) -> Option<String> {
     fn savings_line_shows_percent_when_baseline_known() {
         let s = GlobalState {
             task_status: TaskStatus::Queued,
+            goal_contract: None,
+            handoff_packet: None,
             active_workers: Vec::new(),
             tokens_used: 200,
             tokens_budget: None,
@@ -5467,20 +5860,6 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn input_bar_renders_steady_drawn_caret() {
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::default();
-        app.goal_input = "ship 0.3.1".to_string();
-        app.goal_cursor = char_count(&app.goal_input);
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("ship 0.3.1▌"));
-    }
-
-    #[test]
     fn splash_logo_is_compact_and_shadowed() {
         let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
@@ -5488,10 +5867,6 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(
             LOGO.iter().any(|row| row.contains('░')),
             "logo should carry its own pixel shadow layer"
-        );
-        assert!(
-            LOGO.iter().any(|row| row.contains("██████╗")),
-            "logo should use the ANSI Shadow terminal mark"
         );
     }
 
@@ -5504,8 +5879,7 @@ fn extract_id(line: &str) -> Option<String> {
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("█████"));
-        assert!(dump.contains("██████╗"));
-        assert!(dump.contains("░▒▓"));
+        assert!(dump.contains("░░░░"));
     }
 
     #[test]
@@ -5564,6 +5938,65 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn renders_handoff_packet_on_review_ready() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_state(
+            0,
+            GlobalState {
+                task_status: TaskStatus::Reviewing {
+                    tokens_used: 240,
+                    estimated_savings_tokens: 760,
+                },
+                goal_contract: None,
+                handoff_packet: Some(HandoffPacket {
+                    task_id: TaskId::new(),
+                    goal: "make chess".into(),
+                    headline: "Review ready: 1 file(s), 1 verified subtask(s)".into(),
+                    changed_files: vec![phonton_types::ChangedFileSummary {
+                        path: PathBuf::from("chess.py"),
+                        added_lines: 42,
+                        removed_lines: 0,
+                        summary: "created chess scaffold".into(),
+                    }],
+                    generated_artifacts: Vec::new(),
+                    diff_stats: phonton_types::DiffStats {
+                        files_changed: 1,
+                        added_lines: 42,
+                        removed_lines: 0,
+                    },
+                    verification: phonton_types::VerifyReport {
+                        passed: vec!["created chess scaffold passed syntax".into()],
+                        findings: Vec::new(),
+                        skipped: vec!["No explicit test layer was recorded.".into()],
+                    },
+                    run_commands: Vec::new(),
+                    known_gaps: vec!["No run command was inferred yet.".into()],
+                    review_actions: Vec::new(),
+                    rollback_points: Vec::new(),
+                    token_usage: TokenUsage::estimated(240),
+                    influence: phonton_types::InfluenceSummary::default(),
+                }),
+                active_workers: Vec::new(),
+                tokens_used: 240,
+                tokens_budget: None,
+                estimated_naive_tokens: 1000,
+                checkpoints: Vec::new(),
+            },
+        );
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("Result"));
+        assert!(dump.contains("Changed files"));
+        assert!(dump.contains("chess.py"));
+        assert!(dump.contains("Known gaps"));
+    }
+
+    #[test]
     fn renders_with_active_goal_and_savings() {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -5577,6 +6010,8 @@ fn extract_id(line: &str) -> Option<String> {
                     completed: 1,
                     total: 2,
                 },
+                goal_contract: None,
+                handoff_packet: None,
                 active_workers: Vec::new(),
                 tokens_used: 150,
                 tokens_budget: None,

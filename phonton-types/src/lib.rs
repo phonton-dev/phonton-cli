@@ -445,6 +445,100 @@ pub enum ContextFrame {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt attachments
+// ---------------------------------------------------------------------------
+
+/// Attachment kind parsed from a goal prompt mention such as `@README.md` or
+/// `@screenshots/failure.png`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptAttachmentKind {
+    /// UTF-8-ish text content that can be inlined into the prompt.
+    Text,
+    /// Raster/vector image content. Providers with vision support may receive
+    /// the base64 payload; text-only providers receive metadata only.
+    Image,
+    /// Mention was recognized but could not be safely attached.
+    Unsupported,
+}
+
+/// A user-mentioned file carried alongside a goal or subtask.
+///
+/// Attachments are local-first: paths are resolved by the CLI and constrained
+/// to the workspace before they enter planner/worker context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptAttachment {
+    /// Path as displayed to the model/user, usually relative to the workspace.
+    pub path: PathBuf,
+    /// Attachment category.
+    pub kind: PromptAttachmentKind,
+    /// Best-effort MIME type inferred by the CLI.
+    pub mime_type: Option<String>,
+    /// File size in bytes when known.
+    pub size_bytes: u64,
+    /// UTF-8 text payload for text attachments.
+    pub text: Option<String>,
+    /// Base64 payload for image attachments small enough to carry.
+    pub data_base64: Option<String>,
+    /// True when text or image bytes were truncated or omitted due to size.
+    pub truncated: bool,
+    /// User-visible note for skipped, truncated, or metadata-only attachments.
+    pub note: Option<String>,
+}
+
+impl PromptAttachment {
+    /// True when this attachment can be sent as image input to a vision-capable
+    /// provider.
+    pub fn has_image_payload(&self) -> bool {
+        self.kind == PromptAttachmentKind::Image
+            && self.mime_type.is_some()
+            && self.data_base64.is_some()
+    }
+}
+
+/// Render prompt attachments as deterministic text context.
+///
+/// Text files are inlined. Images are described by path/MIME/size and may also
+/// be sent as provider-native image parts by `phonton-providers`.
+pub fn render_prompt_attachments(attachments: &[PromptAttachment]) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("# Mentioned files\n");
+    for attachment in attachments {
+        let kind = match attachment.kind {
+            PromptAttachmentKind::Text => "text",
+            PromptAttachmentKind::Image => "image",
+            PromptAttachmentKind::Unsupported => "unsupported",
+        };
+        let mime = attachment.mime_type.as_deref().unwrap_or("unknown");
+        out.push_str(&format!(
+            "## {} ({kind}, {mime}, {} bytes)\n",
+            attachment.path.display(),
+            attachment.size_bytes
+        ));
+        if let Some(note) = &attachment.note {
+            out.push_str("note: ");
+            out.push_str(note);
+            out.push('\n');
+        }
+        if let Some(text) = &attachment.text {
+            out.push_str("<file-content>\n");
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("</file-content>\n");
+        } else if attachment.kind == PromptAttachmentKind::Image {
+            out.push_str(
+                "image attachment: use the provider-native image payload when available; otherwise treat this as image metadata only.\n",
+            );
+        }
+        out.push('\n');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
 
@@ -463,6 +557,9 @@ pub struct Subtask {
     pub model_tier: ModelTier,
     /// IDs of subtasks that must reach `Done` before this one is `Ready`.
     pub dependencies: Vec<SubtaskId>,
+    /// User-mentioned files/images inherited from the top-level goal.
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
     /// Current lifecycle state.
     pub status: SubtaskStatus,
 }
@@ -665,6 +762,9 @@ pub struct PlannerOutput {
     /// Honest-signal coverage summary surfaced to the UI alongside the plan.
     /// See `01-architecture/failure-modes.md` Risk 2.
     pub coverage_summary: CoverageSummary,
+    /// v0.4.0 first-slice definition of done for this goal.
+    #[serde(default)]
+    pub goal_contract: Option<GoalContract>,
 }
 
 /// Pre-execution coverage signal: how many new symbols the plan creates,
@@ -689,4 +789,243 @@ impl CoverageSummary {
             self.new_functions, self.tests_planned
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Accountability spine (v0.4.0 first slice)
+// ---------------------------------------------------------------------------
+
+/// Expected artifact described by a [`GoalContract`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedArtifact {
+    /// Human-readable artifact description.
+    pub description: String,
+    /// Optional path where the artifact is expected.
+    pub path: Option<PathBuf>,
+}
+
+/// A command Phonton believes the user can run to inspect or verify a result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCommand {
+    /// Display label, e.g. `"Run chess demo"`.
+    pub label: String,
+    /// Command tokens in execution order.
+    pub command: Vec<String>,
+    /// Optional working directory for the command.
+    pub cwd: Option<PathBuf>,
+}
+
+/// A planned verification step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyStepSpec {
+    /// Human-readable check name.
+    pub name: String,
+    /// Verification layer this step maps to when known.
+    pub layer: Option<VerifyLayer>,
+    /// Optional concrete command.
+    pub command: Option<RunCommand>,
+}
+
+/// Minimum bar Phonton should satisfy before claiming a task is review-ready.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualityFloor {
+    /// Task-class-specific minimum expectations.
+    pub criteria: Vec<String>,
+}
+
+/// Visible definition of done for a top-level goal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalContract {
+    /// Original user goal.
+    pub goal: String,
+    /// Inferred task class.
+    pub task_class: TaskClass,
+    /// Confidence as 0-100 to avoid float drift across serialized records.
+    pub confidence_percent: u8,
+    /// Concrete acceptance criteria.
+    pub acceptance_criteria: Vec<String>,
+    /// Expected files, commands, docs, or generated artifacts.
+    pub expected_artifacts: Vec<ExpectedArtifact>,
+    /// Paths the planner expects to touch.
+    pub likely_files: Vec<PathBuf>,
+    /// Planned verification.
+    pub verify_plan: Vec<VerifyStepSpec>,
+    /// Expected run commands.
+    pub run_plan: Vec<RunCommand>,
+    /// Minimum bar for the task class.
+    pub quality_floor: QualityFloor,
+    /// Questions that should be asked before execution if confidence is low.
+    pub clarification_questions: Vec<String>,
+    /// Assumptions Phonton is making if it proceeds.
+    pub assumptions: Vec<String>,
+}
+
+/// Summary of a context source that influenced a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSource {
+    /// Source kind, e.g. `"index"`, `"memory"`, `"skill"`, `"mcp"`.
+    pub kind: String,
+    /// Stable id or path for the source.
+    pub id: String,
+    /// Review-safe summary.
+    pub summary: String,
+    /// Tokens attributed to this source when known.
+    pub token_count: Option<u64>,
+}
+
+/// Manifest of what influenced the model during a task.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextManifest {
+    /// Review-safe source list.
+    pub sources: Vec<ContextSource>,
+}
+
+/// Record of one privileged action request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRecord {
+    /// Action category, e.g. `"shell"`, `"mcp"`, `"network"`.
+    pub action: String,
+    /// Scope requested by the action.
+    pub scope: String,
+    /// Whether it was approved.
+    pub approved: bool,
+    /// Human-readable approval source or denial reason.
+    pub decision: String,
+}
+
+/// Ledger of privileged actions involved in a task.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionLedger {
+    /// Ordered permission records.
+    pub records: Vec<PermissionRecord>,
+}
+
+/// Summary of verification work performed for a task.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyReport {
+    /// Verification steps that passed.
+    pub passed: Vec<String>,
+    /// Verification failures or warnings.
+    pub findings: Vec<String>,
+    /// Checks skipped and why.
+    pub skipped: Vec<String>,
+}
+
+/// Per-file summary for a handoff packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFileSummary {
+    /// Changed file path.
+    pub path: PathBuf,
+    /// Added lines when known.
+    pub added_lines: u32,
+    /// Removed lines when known.
+    pub removed_lines: u32,
+    /// Short explanation.
+    pub summary: String,
+}
+
+/// Diff statistics for the full task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffStats {
+    /// Files touched.
+    pub files_changed: u32,
+    /// Added lines.
+    pub added_lines: u32,
+    /// Removed lines.
+    pub removed_lines: u32,
+}
+
+/// Artifact generated by the task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedArtifact {
+    /// Artifact path.
+    pub path: PathBuf,
+    /// Artifact description.
+    pub description: String,
+}
+
+/// User-facing review action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAction {
+    /// Short command/action label.
+    pub label: String,
+    /// Details shown in review UI.
+    pub description: String,
+}
+
+/// Rollback checkpoint surfaced in a handoff packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackPoint {
+    /// Checkpoint sequence number.
+    pub seq: u32,
+    /// Human-readable checkpoint label.
+    pub label: String,
+}
+
+/// Summary of influences that shaped the result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InfluenceSummary {
+    /// Memory records used.
+    pub memories: Vec<String>,
+    /// Index slices used.
+    pub index_slices: Vec<String>,
+    /// Skills or steering rules used.
+    pub skills: Vec<String>,
+    /// Extensions or MCP servers/tools used.
+    pub extensions: Vec<String>,
+}
+
+/// User-facing receipt for a completed or failed task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffPacket {
+    /// Task id.
+    pub task_id: TaskId,
+    /// Original goal.
+    pub goal: String,
+    /// One-line result.
+    pub headline: String,
+    /// Files changed.
+    pub changed_files: Vec<ChangedFileSummary>,
+    /// Generated artifacts.
+    pub generated_artifacts: Vec<GeneratedArtifact>,
+    /// Diff stats.
+    pub diff_stats: DiffStats,
+    /// Verification report.
+    pub verification: VerifyReport,
+    /// Commands users can run.
+    pub run_commands: Vec<RunCommand>,
+    /// Known limitations or incomplete parts.
+    pub known_gaps: Vec<String>,
+    /// Review actions.
+    pub review_actions: Vec<ReviewAction>,
+    /// Rollback points.
+    pub rollback_points: Vec<RollbackPoint>,
+    /// Token usage for the task.
+    pub token_usage: TokenUsage,
+    /// Influence summary.
+    pub influence: InfluenceSummary,
+}
+
+/// Durable evidence record for one task run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeLedger {
+    /// Task id.
+    pub task_id: TaskId,
+    /// Goal contract when available.
+    pub goal_contract: Option<GoalContract>,
+    /// Context manifest.
+    pub context_manifest: ContextManifest,
+    /// Permission ledger.
+    pub permission_ledger: PermissionLedger,
+    /// Verification report.
+    pub verify_report: VerifyReport,
+    /// Handoff packet when available.
+    pub handoff: Option<HandoffPacket>,
+}
+
+/// Structured memory writes proposed after a task completes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUpdate {
+    /// Records that should be written if accepted.
+    pub records: Vec<MemoryRecord>,
 }

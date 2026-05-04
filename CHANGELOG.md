@@ -4,13 +4,28 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
-## 0.3.1 - TUI Polish Patch
+## 0.4.0 - Accountability Handoff Alpha
+
+### Added
+
+- Prompt file mentions in the TUI goal bar. Users can reference workspace files with `@path`, `@"path with spaces.md"`, or `@[path with spaces.md]`.
+- Bounded text attachment context and image attachment metadata/payload plumbing for compatible providers.
+- First-slice v0.4 accountability types: `GoalContract`, `HandoffPacket`, `OutcomeLedger`, context manifests, permission ledgers, verification reports, and handoff summaries.
+- Planner-generated goal contracts that capture acceptance criteria, assumptions, likely files, and attachment influence.
+- Review-ready TUI handoff receipts with result headline, changed files, verification, run commands, known gaps, token usage, and rollback context.
+- Durable `outcome_ledgers` store table so completed task evidence survives the TUI session.
+- History and review surfaces now consume persisted handoff data when available.
 
 ### Changed
 
-- Replaced the native blinking terminal cursor in the input bar with a drawn, steady caret.
-- Refined the splash ASCII logo to a tighter ANSI-shadow style closer to the current product mockups.
-- Smoothed the animated logo gradient with slower ticks, eased color interpolation, and a softer glint.
+- Orchestrator final state now includes a deterministic handoff packet derived from verified subtasks, diff hunks, checkpoints, and token usage.
+- Store task history joins outcome ledgers so review/history commands can show evidence beyond raw status JSON.
+
+### Known Limitations
+
+- `ContextManifest` and `PermissionLedger` are persisted as minimal/default records in this slice; deeper source attribution and approval replay are planned next.
+- Image payloads are only sent natively to providers with compatible request formats. Other providers receive deterministic image metadata.
+- Run-command inference is conservative and may be absent until task-class quality gates mature.
 
 ## 0.3.0 - Extension Runtime Alpha
 

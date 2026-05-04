@@ -307,7 +307,7 @@ impl Worker {
 
             let response = self
                 .provider
-                .call(&system_prompt, &full_prompt, &origins)
+                .call_with_attachments(&system_prompt, &full_prompt, &origins, &subtask.attachments)
                 .await?;
             last_provider = response.provider;
             last_model_name = response.model_name.clone();
@@ -854,6 +854,11 @@ fn render_user_prompt(
     mcp_results: &[McpResultContext],
 ) -> String {
     let mut out = String::new();
+    let attachment_context = phonton_types::render_prompt_attachments(&subtask.attachments);
+    if !attachment_context.is_empty() {
+        out.push_str(&attachment_context);
+        out.push('\n');
+    }
     if !relevant.is_empty() {
         out.push_str("# Relevant code\n");
         for s in relevant {
@@ -1455,6 +1460,7 @@ mod tests {
             description: "Read docs before editing".into(),
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let server = phonton_types::McpServerDefinition {
@@ -1492,6 +1498,7 @@ mod tests {
             description: "Introduce a trait MemoryWriter for async appends".into(),
             model_tier: ModelTier::Standard,
             dependencies: Vec::new(),
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let d = detect_decisions(&st, None);
@@ -1512,6 +1519,7 @@ mod tests {
             description: "Add a function parse_callsites".into(),
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         assert!(detect_decisions(&st, None).is_empty());
@@ -1528,6 +1536,7 @@ mod tests {
             description: "create struct ExecutionGuard for tool gating".into(),
             model_tier: ModelTier::Standard,
             dependencies: Vec::new(),
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let decisions = detect_decisions(&st, None);

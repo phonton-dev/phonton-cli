@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use phonton_types::{EventRecord, MemoryRecord, TaskId, TaskStatus};
+use phonton_types::{EventRecord, MemoryRecord, OutcomeLedger, TaskId, TaskStatus};
 use rusqlite::{params, Connection, OptionalExtension};
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,13 @@ CREATE TABLE IF NOT EXISTS orchestrator_events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_task_ts
     ON orchestrator_events(task_id, timestamp_ms);
+
+CREATE TABLE IF NOT EXISTS outcome_ledgers (
+    task_id       TEXT PRIMARY KEY,
+    body_json     TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS warm_crates (
     crate_name        TEXT PRIMARY KEY,
@@ -319,6 +326,39 @@ impl Store {
     }
 
     // -----------------------------------------------------------------
+    // Outcome ledgers — durable v0.4 task evidence
+    // -----------------------------------------------------------------
+
+    /// Insert or replace the durable outcome ledger for one task.
+    pub fn upsert_outcome_ledger(&self, ledger: &OutcomeLedger) -> Result<()> {
+        let body = serde_json::to_string(ledger)?;
+        let now = now_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO outcome_ledgers (task_id, body_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET
+                 body_json  = excluded.body_json,
+                 updated_at = excluded.updated_at",
+            params![ledger.task_id.to_string(), body, now, now],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch the durable outcome ledger for one task, if one has been written.
+    pub fn get_outcome_ledger(&self, task_id: TaskId) -> Result<Option<OutcomeLedger>> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body_json FROM outcome_ledgers WHERE task_id = ?1",
+                params![task_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        body.map(|s| serde_json::from_str::<OutcomeLedger>(&s).map_err(Into::into))
+            .transpose()
+    }
+
+    // -----------------------------------------------------------------
     // Warm-crate cache (Risk 1 mitigation)
     // -----------------------------------------------------------------
 
@@ -384,8 +424,10 @@ impl Store {
     pub async fn get_task(&self, id: TaskId) -> Result<Option<TaskRecord>> {
         self.conn
             .query_row(
-                "SELECT id, goal_text, status_json, created_at, total_tokens
-                 FROM tasks WHERE id = ?1",
+                "SELECT t.id, t.goal_text, t.status_json, t.created_at, t.total_tokens, o.body_json
+                 FROM tasks t
+                 LEFT JOIN outcome_ledgers o ON o.task_id = t.id
+                 WHERE t.id = ?1",
                 params![id.to_string()],
                 row_to_task,
             )
@@ -396,8 +438,10 @@ impl Store {
     /// Most recent `limit` tasks, newest first.
     pub async fn list_tasks(&self, limit: usize) -> Result<Vec<TaskRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, goal_text, status_json, created_at, total_tokens
-             FROM tasks ORDER BY created_at DESC LIMIT ?1",
+            "SELECT t.id, t.goal_text, t.status_json, t.created_at, t.total_tokens, o.body_json
+             FROM tasks t
+             LEFT JOIN outcome_ledgers o ON o.task_id = t.id
+             ORDER BY t.created_at DESC LIMIT ?1",
         )?;
         let rows = stmt
             .query_map(params![limit as i64], row_to_task)?
@@ -494,6 +538,7 @@ pub struct TaskRecord {
     pub status: serde_json::Value,
     pub created_at: u64,
     pub total_tokens: u64,
+    pub outcome_ledger: Option<OutcomeLedger>,
 }
 
 /// Editable memory row returned by memory management commands.
@@ -520,12 +565,21 @@ fn row_to_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     })?;
     let created_at: i64 = r.get(3)?;
     let total_tokens: i64 = r.get(4)?;
+    let outcome_json: Option<String> = r.get(5)?;
+    let outcome_ledger = outcome_json
+        .as_deref()
+        .map(serde_json::from_str::<OutcomeLedger>)
+        .transpose()
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     Ok(TaskRecord {
         id,
         goal_text: r.get(1)?,
         status,
         created_at: created_at as u64,
         total_tokens: total_tokens as u64,
+        outcome_ledger,
     })
 }
 
@@ -803,6 +857,38 @@ mod tests {
         let list = s.list_tasks(10).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, id);
+        assert!(list[0].outcome_ledger.is_none());
+    }
+
+    #[tokio::test]
+    async fn outcome_ledger_round_trip_and_joins_task_history() {
+        let s = Store::in_memory().unwrap();
+        let id = TaskId::new();
+        s.upsert_task(id, "ship handoff", &TaskStatus::Queued, 42)
+            .unwrap();
+
+        let ledger = OutcomeLedger {
+            task_id: id,
+            goal_contract: None,
+            context_manifest: phonton_types::ContextManifest::default(),
+            permission_ledger: phonton_types::PermissionLedger::default(),
+            verify_report: phonton_types::VerifyReport {
+                passed: vec!["syntax".into()],
+                findings: Vec::new(),
+                skipped: Vec::new(),
+            },
+            handoff: None,
+        };
+        s.upsert_outcome_ledger(&ledger).unwrap();
+
+        let fetched = s.get_outcome_ledger(id).unwrap().expect("ledger exists");
+        assert_eq!(fetched.verify_report.passed, vec!["syntax"]);
+
+        let task = s.get_task(id).await.unwrap().expect("task exists");
+        assert_eq!(
+            task.outcome_ledger.as_ref().unwrap().verify_report.passed,
+            vec!["syntax"]
+        );
     }
 
     #[tokio::test]

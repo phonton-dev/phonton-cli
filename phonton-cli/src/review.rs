@@ -10,8 +10,8 @@ use anyhow::Result;
 use phonton_diff::DiffApplier;
 use phonton_store::TaskRecord;
 use phonton_types::{
-    ContextAttribution, CostSummary, DiffHunk, DiffLine, EventRecord, OrchestratorEvent, TaskId,
-    TaskStatus, TokenUsage,
+    ContextAttribution, CostSummary, DiffHunk, DiffLine, EventRecord, HandoffPacket,
+    OrchestratorEvent, TaskId, TaskStatus, TokenUsage,
 };
 use serde::Serialize;
 
@@ -43,6 +43,7 @@ struct ReviewReport {
     goal: String,
     status: serde_json::Value,
     total_tokens: u64,
+    handoff: Option<HandoffPacket>,
     checkpoints: Vec<CheckpointItem>,
     review_items: Vec<ReviewItem>,
 }
@@ -438,6 +439,7 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
         goal: task.goal_text,
         status: task.status,
         total_tokens: task.total_tokens,
+        handoff: task.outcome_ledger.and_then(|ledger| ledger.handoff),
         checkpoints,
         review_items,
     }
@@ -450,6 +452,21 @@ fn print_text_report(report: &ReviewReport) {
     println!("tokens: {}", report.total_tokens);
     println!("status: {}", compact_json(&report.status));
     println!("checkpoints: {}", report.checkpoints.len());
+    if let Some(handoff) = &report.handoff {
+        println!(
+            "result: {} files, +{} -{}",
+            handoff.diff_stats.files_changed,
+            handoff.diff_stats.added_lines,
+            handoff.diff_stats.removed_lines
+        );
+        println!("summary: {}", handoff.headline);
+        if !handoff.known_gaps.is_empty() {
+            println!("known gaps:");
+            for gap in handoff.known_gaps.iter().take(5) {
+                println!("  - {gap}");
+            }
+        }
+    }
     println!();
 
     if report.review_items.is_empty() {
@@ -632,6 +649,7 @@ mod tests {
             status: serde_json::json!({"Reviewing": {"tokens_used": 120}}),
             created_at: 1,
             total_tokens: 120,
+            outcome_ledger: None,
         };
         let events = vec![
             EventRecord {

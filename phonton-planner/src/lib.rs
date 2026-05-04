@@ -22,7 +22,8 @@ use phonton_memory::MemoryStore;
 use phonton_providers::Provider;
 use phonton_store::{MemoryKind, Store};
 use phonton_types::{
-    CoverageSummary, MemoryRecord, ModelTier, PlannerOutput, Subtask, SubtaskId, SubtaskStatus,
+    CoverageSummary, ExpectedArtifact, GoalContract, MemoryRecord, ModelTier, PlannerOutput,
+    PromptAttachment, QualityFloor, RunCommand, Subtask, SubtaskId, SubtaskStatus, VerifyStepSpec,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -46,6 +47,8 @@ pub struct Goal {
     /// If `true`, suppress automatic test-subtask generation. Mirrors the
     /// `--no-tests` user flag.
     pub no_tests: bool,
+    /// User-mentioned files/images attached to this goal.
+    pub attachments: Vec<PromptAttachment>,
 }
 
 impl Goal {
@@ -55,6 +58,76 @@ impl Goal {
             description: description.into(),
             default_tier: ModelTier::Standard,
             no_tests: false,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Attach user-mentioned files/images to this goal.
+    pub fn with_attachments(mut self, attachments: Vec<PromptAttachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    /// Render the goal and attachment context for planner prompts.
+    pub fn prompt_text(&self) -> String {
+        let attachment_context = phonton_types::render_prompt_attachments(&self.attachments);
+        if attachment_context.is_empty() {
+            self.description.clone()
+        } else {
+            format!("{}\n\n{}", self.description, attachment_context)
+        }
+    }
+
+    /// Build a conservative first-pass contract for the goal.
+    pub fn contract(&self) -> GoalContract {
+        let task_class = phonton_types::classify_task(&self.description);
+        let mut assumptions = Vec::new();
+        if !self.attachments.is_empty() {
+            assumptions.push(format!(
+                "{} mentioned file/image attachment(s) should influence the plan.",
+                self.attachments.len()
+            ));
+        }
+        GoalContract {
+            goal: self.description.clone(),
+            task_class,
+            confidence_percent: if self.description.split_whitespace().count() <= 3 {
+                60
+            } else {
+                75
+            },
+            acceptance_criteria: vec![
+                "Produce a focused, reviewable diff for the requested change.".into(),
+                "Respect mentioned file/image attachments when planning and editing.".into(),
+                "Do not claim correctness beyond checks that actually ran.".into(),
+            ],
+            expected_artifacts: self
+                .attachments
+                .iter()
+                .map(|a| ExpectedArtifact {
+                    description: format!("Use mentioned attachment {}", a.path.display()),
+                    path: Some(a.path.clone()),
+                })
+                .collect(),
+            likely_files: self.attachments.iter().map(|a| a.path.clone()).collect(),
+            verify_plan: vec![VerifyStepSpec {
+                name: "Run configured Phonton verification layers".into(),
+                layer: None,
+                command: None,
+            }],
+            run_plan: Vec::<RunCommand>::new(),
+            quality_floor: QualityFloor {
+                criteria: vec![
+                    "Diff is parseable and reviewable.".into(),
+                    "Verification outcome is surfaced honestly.".into(),
+                ],
+            },
+            clarification_questions: if self.description.split_whitespace().count() <= 2 {
+                vec!["What exact behavior or artifact should Phonton produce?".into()]
+            } else {
+                Vec::new()
+            },
+            assumptions,
         }
     }
 }
@@ -93,6 +166,7 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
             description: goal.description.clone(),
             model_tier: goal.default_tier,
             dependencies: Vec::new(),
+            attachments: goal.attachments.clone(),
             status: SubtaskStatus::Queued,
         });
     } else {
@@ -104,6 +178,7 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
                 description: format!("Implement {} `{}`", d.kind, d.name),
                 model_tier: goal.default_tier,
                 dependencies: Vec::new(),
+                attachments: goal.attachments.clone(),
                 status: SubtaskStatus::Queued,
             });
 
@@ -114,6 +189,7 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
                     description: format!("Write integration tests for {}", d.name),
                     model_tier: test_tier(goal.default_tier),
                     dependencies: vec![impl_id],
+                    attachments: goal.attachments.clone(),
                     status: SubtaskStatus::Queued,
                 });
             }
@@ -128,6 +204,7 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
             new_functions,
             tests_planned,
         },
+        goal_contract: Some(goal.contract()),
     }
 }
 
@@ -317,6 +394,7 @@ fn specs_to_plan(specs: Vec<SubtaskSpec>) -> DecomposedPlan {
             description: spec.description,
             model_tier: spec.model_tier,
             dependencies,
+            attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         });
     }
@@ -372,12 +450,16 @@ pub async fn decompose_with_memory(
     // there's no need to double-guard here.
     if let Some(p) = provider {
         let memory_context = render_memory_preamble(&rejected, &decisions);
-        let llm_plan = decompose_with_llm(&goal.description, p, &memory_context).await?;
+        let mut llm_plan = decompose_with_llm(&goal.prompt_text(), p, &memory_context).await?;
+        for subtask in &mut llm_plan.subtasks {
+            subtask.attachments = goal.attachments.clone();
+        }
         return Ok(PlannerOutput {
             subtasks: llm_plan.subtasks,
             estimated_total_tokens: llm_plan.estimated_total_tokens,
             naive_baseline_tokens: llm_plan.naive_baseline_tokens,
             coverage_summary: llm_plan.coverage_summary,
+            goal_contract: Some(goal.contract()),
         });
     }
 

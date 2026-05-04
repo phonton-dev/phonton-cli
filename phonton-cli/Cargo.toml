@@ -1,6 +1,6 @@
 [package]
 name = "phonton-cli"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -30,6 +30,7 @@ anyhow               = { workspace = true }
 tokio                = { workspace = true }
 tracing              = { workspace = true }
 async-trait          = "0.1"
+base64               = "0.22"
 ratatui              = "0.28"
 crossterm            = "0.28"
 serde                = { workspace = true }

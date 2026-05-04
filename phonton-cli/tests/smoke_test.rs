@@ -95,6 +95,8 @@ async fn smoke_test_full_pipeline() -> Result<()> {
     use tokio::sync::watch;
     let (state_tx, state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
+        goal_contract: None,
+        handoff_packet: None,
         active_workers: vec![],
         tokens_used: 0,
         tokens_budget: None,

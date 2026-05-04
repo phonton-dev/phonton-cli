@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Checkpoint, CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskStatus,
+    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier, Subtask,
+    SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +136,12 @@ pub enum WorkerMessage {
 pub struct GlobalState {
     /// High-level lifecycle state of the task.
     pub task_status: TaskStatus,
+    /// v0.4.0 definition of done when available.
+    #[serde(default)]
+    pub goal_contract: Option<GoalContract>,
+    /// v0.4.0 review receipt when available.
+    #[serde(default)]
+    pub handoff_packet: Option<HandoffPacket>,
     /// One entry per worker currently executing a subtask.
     pub active_workers: Vec<WorkerState>,
     /// Total tokens consumed across all subtasks so far.
