@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.4.1</h1>
+<h1 align="center">Phonton CLI · v0.4.2</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.4.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.4.2-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -41,7 +41,7 @@ flowchart LR
     F --> B
 ```
 
-That gives Phonton a different shape from an IDE assistant or a terminal chatbot:
+That gives Phonton a different shape from an IDE assistant or a chat-first terminal assistant:
 
 - **Review first:** plans and diffs are first-class surfaces, not buried in a conversation.
 - **Verification first:** generated work is expected to pass checks before it is treated as ready.
@@ -52,6 +52,7 @@ That gives Phonton a different shape from an IDE assistant or a terminal chatbot
 ## What Works Today
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
+- Saved workspace sessions: use `phonton -r` or `phonton --resume` to reopen the last saved TUI conversation for the current repo.
 - `phonton doctor` setup diagnostics for config, provider key, store, trust, git, cargo, and Nexus config.
 - `phonton plan` preview for task DAGs before edits happen.
 - `phonton review` surfaces for verified diff review payloads, approvals, rejections, and rollback.
@@ -102,7 +103,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.4.1 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.4.2 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -118,7 +119,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.4.1 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.4.2 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -199,6 +200,7 @@ phonton doctor --provider
 
 ```text
 phonton                 Launch the interactive TUI
+phonton -r              Resume the saved TUI session for this workspace
 phonton ask <question>  One-shot Q&A using the configured provider
 phonton doctor          Check config, store, trust, git, cargo, and Nexus
 phonton plan <goal>     Preview the task DAG without changing files
@@ -239,9 +241,8 @@ Extension visibility:
 ```bash
 phonton extensions list --json
 phonton extensions doctor --json
-phonton extensions skills --json
-phonton extensions steering --json
-phonton extensions mcp --json
+phonton skills list --json
+phonton steering list --json
 phonton mcp list --json
 ```
 
@@ -343,7 +344,7 @@ Phonton is not trying to win by pretending the incumbents are weak.
 | Codex | Mature agent workflow, cloud/editor/CLI integration | Local-first ADE kernel, BYOK, explicit verification and review surfaces |
 | Claude Code | Excellent terminal-native coding agent | Less chat-first, more plan/verify/review oriented |
 | Cursor | Polished AI editor experience | Less editor polish, more auditable repo workflow |
-| Windsurf | Agentic IDE workflow | Narrower release scope, stronger local-first positioning |
+| Windsurf | Agentic IDE workflow | Narrower release scope, explicit local-first positioning |
 | Phonton CLI | Verified local ADE loop for serious repo tasks | Early product, smaller ecosystem, benchmark claims still being built |
 
 ## Development

@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use phonton_types::{EventRecord, MemoryRecord, OutcomeLedger, TaskId, TaskStatus};
+use phonton_types::{
+    EventRecord, MemoryRecord, OutcomeLedger, SessionSnapshot, TaskId, TaskStatus,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 // ---------------------------------------------------------------------------
@@ -62,6 +64,12 @@ CREATE TABLE IF NOT EXISTS warm_crates (
     last_checked_at   INTEGER NOT NULL,  -- unix seconds
     last_files_hash   TEXT NOT NULL      -- caller-supplied hash of crate sources
 );
+
+CREATE TABLE IF NOT EXISTS session_snapshots (
+    workspace     TEXT PRIMARY KEY,
+    body_json     TEXT NOT NULL,
+    saved_at      INTEGER NOT NULL
+);
 ";
 
 /// How long a `warm_crates` row stays valid. See
@@ -109,6 +117,38 @@ impl Store {
     /// Filesystem path the store was opened with (or `:memory:`).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    // -----------------------------------------------------------------
+    // Session snapshots
+    // -----------------------------------------------------------------
+
+    /// Insert or replace the saved interactive session for one workspace.
+    pub fn save_session_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
+        let body = serde_json::to_string(snapshot)?;
+        self.conn.execute(
+            "INSERT INTO session_snapshots (workspace, body_json, saved_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace) DO UPDATE SET
+                 body_json = excluded.body_json,
+                 saved_at  = excluded.saved_at",
+            params![snapshot.workspace.as_str(), body, snapshot.saved_at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Load the saved interactive session for `workspace`, if one exists.
+    pub fn load_session_snapshot(&self, workspace: &str) -> Result<Option<SessionSnapshot>> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body_json FROM session_snapshots WHERE workspace = ?1",
+                params![workspace],
+                |r| r.get(0),
+            )
+            .optional()?;
+        body.map(|s| serde_json::from_str::<SessionSnapshot>(&s).map_err(Into::into))
+            .transpose()
     }
 
     // -----------------------------------------------------------------
@@ -696,7 +736,7 @@ fn ensure_memory_columns(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phonton_types::MemoryRecord;
+    use phonton_types::{MemoryRecord, SessionGoalSnapshot, SessionSnapshot, SessionTotals};
 
     #[test]
     fn open_creates_schema() {
@@ -819,6 +859,50 @@ mod tests {
 
         let for_t2 = s.list_events(t2, 100).unwrap();
         assert_eq!(for_t2.len(), 1);
+    }
+
+    #[test]
+    fn session_snapshot_round_trips_by_workspace() {
+        let s = Store::in_memory().unwrap();
+        let task_id = TaskId::new();
+        let snapshot = SessionSnapshot {
+            workspace: "C:\\work\\phonton".into(),
+            saved_at: 1_777_777,
+            selected_goal: 0,
+            goal_input: "finish docs".into(),
+            ask_input: "what changed?".into(),
+            ask_answer: Some("the CLI now resumes sessions".into()),
+            best_savings_pct: Some(71),
+            goals: vec![SessionGoalSnapshot {
+                description: "add resume support".into(),
+                status: TaskStatus::Reviewing {
+                    tokens_used: 320,
+                    estimated_savings_tokens: 680,
+                },
+                state: None,
+                task_id,
+                flight_log: Vec::new(),
+            }],
+            totals: SessionTotals {
+                goals: 1,
+                completed: 0,
+                failed: 0,
+                reviewing: 1,
+                tokens_used: 320,
+                naive_baseline_tokens: 1_000,
+                estimated_tokens_saved: 680,
+                best_savings_pct: Some(71),
+            },
+        };
+
+        s.save_session_snapshot(&snapshot).unwrap();
+
+        let loaded = s
+            .load_session_snapshot("C:\\work\\phonton")
+            .unwrap()
+            .expect("snapshot exists");
+        assert_eq!(loaded, snapshot);
+        assert!(s.load_session_snapshot("C:\\other").unwrap().is_none());
     }
 
     #[test]

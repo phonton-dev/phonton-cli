@@ -132,7 +132,7 @@ pub enum WorkerMessage {
 ///
 /// The TUI, desktop UI, and any external observer consume this instead of
 /// subscribing to the mpsc message stream directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalState {
     /// High-level lifecycle state of the task.
     pub task_status: TaskStatus,
@@ -159,7 +159,7 @@ pub struct GlobalState {
 }
 
 /// Live snapshot of a single worker, included in [`GlobalState`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerState {
     /// Subtask this worker is currently executing.
     pub subtask_id: SubtaskId,

@@ -11,12 +11,17 @@ Use this before tagging a Phonton CLI release.
 - [ ] `cargo test --locked --workspace` passes.
 - [ ] `cargo build --locked --release -p phonton-cli` passes.
 - [ ] `phonton doctor` runs from the release binary.
-- [ ] `phonton doctor --provider` proves model discovery and a tiny completion call with at least one hosted provider.
 - [ ] `phonton extensions list --json`, `phonton extensions doctor --json`, and `phonton mcp list --json` run from the release binary.
 - [ ] `npm run test:npm-wrapper` reports the same version as `package.json`.
-- [ ] `scripts/benchmark-plan.ps1 -ReleaseBinary` passes.
-- [ ] Benchmark report is attached to the release notes if making efficiency claims.
 - [ ] No benchmark output, screenshots, logs, or docs contain secrets.
+- [ ] GitHub release is created from a `vX.Y.Z` tag on `main`.
+- [ ] npm publish is run by `.github/workflows/publish-npm.yml` using Trusted Publishing.
+
+## Conditional
+
+- [ ] `phonton doctor --provider` proves model discovery and a tiny completion call when the release notes claim provider/runtime validation.
+- [ ] `scripts/benchmark-plan.ps1 -ReleaseBinary` passes when the release includes benchmark or efficiency claims.
+- [ ] Benchmark report is attached to the release notes when making efficiency claims.
 
 ## Recommended Manual Smoke Test
 
@@ -27,7 +32,6 @@ Use this before tagging a Phonton CLI release.
 .\target\release\phonton.exe extensions doctor --json
 .\target\release\phonton.exe mcp list --json
 npm run test:npm-wrapper
-.\scripts\benchmark-plan.ps1 -ReleaseBinary
 ```
 
 ## Release Notes Policy

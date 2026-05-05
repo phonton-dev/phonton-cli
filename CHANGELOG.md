@@ -4,6 +4,16 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.2 - Session Resume
+
+### Added
+
+- `phonton -r` / `phonton --resume` now restores the latest saved interactive TUI session for the current workspace.
+- Confirmed quit flow for the TUI: `Ctrl+C` or top-level `Esc` opens an exit confirmation instead of ending immediately.
+- Session exit receipts now print saved-session totals, including actual tokens used, estimated naive baseline tokens, estimated saved tokens, and best observed savings percentage.
+- Durable per-workspace session snapshots in the local store so visible goals, ask state, Flight Log data, and token totals survive CLI restarts.
+- Restored the normal ANSI Shadow Phonton splash logo and added a muted TUI version label.
+
 ## 0.4.1 - Trust Surface Patch
 
 ### Fixed
