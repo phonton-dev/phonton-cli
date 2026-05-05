@@ -185,10 +185,10 @@ impl Embedder {
     /// Load `all-MiniLM-L6-v2`. On first call this downloads and caches
     /// the ONNX weights under the platform's fastembed cache dir.
     pub fn new() -> Result<Self> {
-        let model = fastembed::TextEmbedding::try_new(fastembed::InitOptions::new(
-            fastembed::EmbeddingModel::AllMiniLML6V2,
-        ))
-        .context("loading all-MiniLM-L6-v2")?;
+        let options = fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+            .with_show_download_progress(false);
+        let model =
+            fastembed::TextEmbedding::try_new(options).context("loading all-MiniLM-L6-v2")?;
         Ok(Self { model })
     }
 

@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.3 - Terminal-Safe TUI
+
+### Fixed
+
+- Disabled fastembed/Hugging Face model download progress output while the Ratatui TUI is active, preventing `model.onnx` progress bars from corrupting the input area.
+- Switched the TUI splash wordmark and spinner to ASCII-safe glyphs so Windows terminal font fallback does not smear the startup screen.
+- Routed semantic-index setup failures through tracing instead of writing directly to stderr during an active TUI session.
+
 ## 0.4.2 - Session Resume
 
 ### Added
