@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.1 - Trust Surface Patch
+
+### Fixed
+
+- `phonton plan --json` now exposes `goal_contract` at the top level of the plan preview report, so release smoke tests and external tooling can validate the advertised v0.4 accountability surface directly.
+- npm wrapper release testing now runs a real `phonton plan --json --no-memory` smoke check and fails if the GoalContract surface is missing or malformed.
+
 ## 0.4.0 - Accountability Handoff Alpha
 
 ### Added
