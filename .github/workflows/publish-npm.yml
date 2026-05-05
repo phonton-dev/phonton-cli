@@ -62,4 +62,15 @@ jobs:
         env:
           VERSION: ${{ steps.package.outputs.version }}
         shell: bash
-        run: npm view "phonton-cli@${VERSION}" version
+        run: |
+          for attempt in {1..12}; do
+            published="$(npm view "phonton-cli@${VERSION}" version 2>/dev/null || true)"
+            if [ "$published" = "$VERSION" ]; then
+              echo "$published"
+              exit 0
+            fi
+            echo "Waiting for phonton-cli@${VERSION} to propagate to npm (${attempt}/12)."
+            sleep 5
+          done
+
+          npm view "phonton-cli@${VERSION}" version
