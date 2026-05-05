@@ -30,10 +30,10 @@ use crate::Worker;
 
 /// Production dispatcher: each `dispatch` call constructs a fresh [`Worker`]
 /// bound to the configured provider and runs the subtask through the full
-/// LLM â†’ verify â†’ retry loop.
+/// LLM -> verify -> retry loop.
 ///
 /// The provider is stored as a factory function rather than a boxed trait
-/// object so each dispatch gets its own owned `Box<dyn Provider>` â€”
+/// object so each dispatch gets its own owned `Box<dyn Provider>` --
 /// `phonton_providers::Provider` is not `Clone`, and the orchestrator may
 /// dispatch many subtasks concurrently.
 pub struct RealDispatcher {
@@ -44,7 +44,7 @@ pub struct RealDispatcher {
     guard: ExecutionGuard,
     /// Sandbox shared across all dispatches for this goal.
     sandbox: Arc<Sandbox>,
-    /// Optional memory store â€” wired through to the worker when present.
+    /// Optional memory store wired through to the worker when present.
     memory: Option<phonton_memory::MemoryStore>,
     task_id: Option<TaskId>,
     /// Shared context manager for all workers in this dispatch session.
@@ -167,7 +167,7 @@ impl WorkerDispatcher for RealDispatcher {
             worker = worker.with_task_id(task_id);
         }
 
-        // The worker's `execute` method runs the full LLM â†’ verify â†’ retry
+        // The worker's `execute` method runs the full LLM -> verify -> retry
         // loop and returns a SubtaskResult with a VerifyResult already set.
         // The orchestrator re-verifies independently per its own invariant.
         let mut result = worker.execute(subtask, context_slices).await?;
