@@ -4,6 +4,17 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.8 - TUI Polish
+
+### Fixed
+
+- The Active panel now shows the real worker subtask label when memory context is attached, instead of leaking the raw `# Prior context from memory` preamble.
+- The PHONTON splash wordmark keeps the same ASCII art and gradient styling but no longer animates the full-logo color phase, avoiding Windows terminal shimmer artifacts.
+
+### Changed
+
+- Exit confirmation now shows an in-TUI session summary with goal counts, token totals, estimated savings, and resume behavior before closing.
+
 ## 0.4.7 - Cloudflare Account Persistence
 
 ### Fixed

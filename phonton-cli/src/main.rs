@@ -1841,7 +1841,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_mcp_approval(frame, area, app);
     }
     if app.quit_confirmation_open {
-        render_quit_confirmation(frame, area);
+        render_quit_confirmation(frame, area, app);
     }
 }
 
@@ -1926,9 +1926,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
 }
 
 /// Confirmation modal shown before ending an interactive session.
-fn render_quit_confirmation(frame: &mut Frame, area: Rect) {
-    let popup_w = area.width.saturating_sub(4).clamp(32, 58);
-    let popup_h = area.height.saturating_sub(2).clamp(7, 9);
+fn render_quit_confirmation(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_w = area.width.saturating_sub(4).clamp(48, 76);
+    let popup_h = area.height.saturating_sub(2).clamp(13, 17);
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
         y: area.y + (area.height.saturating_sub(popup_h)) / 2,
@@ -1939,7 +1939,7 @@ fn render_quit_confirmation(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .title(Span::styled(
-            " End Session? ",
+            " End Session ",
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(vec![
@@ -1952,6 +1952,17 @@ fn render_quit_confirmation(frame: &mut Frame, area: Rect) {
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(block.clone(), popup_area);
 
+    let totals = app.session_totals();
+    let saved_label = if totals.estimated_tokens_saved >= 0 {
+        "saved"
+    } else {
+        "over"
+    };
+    let saved_value = totals.estimated_tokens_saved.saturating_abs();
+    let best = totals
+        .best_savings_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "n/a".into());
     let lines = vec![
         Line::raw(""),
         Line::from(Span::styled(
@@ -1961,8 +1972,47 @@ fn render_quit_confirmation(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Goals      ", Style::default().fg(MUTED)),
+            Span::styled(
+                totals.goals.to_string(),
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  done ", Style::default().fg(MUTED)),
+            Span::styled(totals.completed.to_string(), Style::default().fg(SUCCESS)),
+            Span::styled("  review ", Style::default().fg(MUTED)),
+            Span::styled(totals.reviewing.to_string(), Style::default().fg(WARN)),
+            Span::styled("  failed ", Style::default().fg(MUTED)),
+            Span::styled(totals.failed.to_string(), Style::default().fg(DANGER)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tokens     ", Style::default().fg(MUTED)),
+            Span::styled(
+                totals.tokens_used.to_string(),
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  vs baseline ", Style::default().fg(MUTED)),
+            Span::styled(
+                totals.naive_baseline_tokens.to_string(),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Efficiency ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{saved_label} {saved_value}"),
+                Style::default().fg(if totals.estimated_tokens_saved >= 0 {
+                    SUCCESS
+                } else {
+                    WARN
+                }),
+            ),
+            Span::styled("  best ", Style::default().fg(MUTED)),
+            Span::styled(best, Style::default().fg(SUCCESS)),
+        ]),
+        Line::raw(""),
         Line::from(Span::styled(
-            "  A receipt with token totals will print after the TUI closes.",
+            "  The session snapshot is saved locally for `phonton -r`.",
             Style::default().fg(MUTED),
         )),
     ];
@@ -2075,14 +2125,15 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
 fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
     // Keep the normal ANSI Shadow wordmark. The terminal-corruption fix is
     // keeping semantic-index downloads silent while Ratatui owns the screen.
-    let phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
+    let header_phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
+    let logo_phase = 0.17;
     if area.height >= LOGO.len() as u16 + 2 && area.width >= LOGO_WIDTH_THRESHOLD {
         let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 2);
         lines.push(Line::raw(""));
         lines.extend(
             LOGO.iter()
                 .enumerate()
-                .map(|(row_idx, row)| logo_line(row, phase, row_idx)),
+                .map(|(row_idx, row)| logo_line(row, logo_phase, row_idx)),
         );
         lines.push(Line::from(Span::styled(
             format!("v{}", env!("CARGO_PKG_VERSION")),
@@ -2094,7 +2145,7 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(p, area);
     } else {
         // Compact one-line header - gradient "phonton" + dim subtitle.
-        let mut spans = gradient_line("✦ phonton", phase * 0.8, true).spans;
+        let mut spans = gradient_line("✦ phonton", header_phase * 0.8, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
             "agentic dev environment",
@@ -2610,7 +2661,8 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         for w in &state.active_workers {
             let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
             spans.push(Span::raw(" "));
-            spans.push(Span::raw(short(&w.subtask_description, 50)));
+            let label = worker_display_description(&w.subtask_description);
+            spans.push(Span::raw(short(&label, 50)));
             if w.is_thinking {
                 let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
                 let frame_ch = SPINNER[frame_idx];
@@ -3393,6 +3445,20 @@ fn short(s: &str, n: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn worker_display_description(description: &str) -> String {
+    let trimmed = description.trim();
+    if trimmed.starts_with("# Prior context") {
+        return trimmed
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string();
+    }
+    trimmed.lines().next().unwrap_or(trimmed).trim().to_string()
 }
 
 /// Helper for rendering a `SubtaskStatus` using the same taxonomy as a
@@ -6443,6 +6509,20 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn worker_label_hides_memory_preamble() {
+        let description =
+            "# Prior context from memory\n- Honour previous decisions\n\nImplement chess board";
+        assert_eq!(
+            worker_display_description(description),
+            "Implement chess board"
+        );
+        assert_eq!(
+            worker_display_description("Write integration tests\nwith details"),
+            "Write integration tests"
+        );
+    }
+
+    #[test]
     fn session_totals_sum_tokens_and_estimated_savings() {
         let mut app = App::default();
         app.goals.push(GoalEntry {
@@ -6559,6 +6639,21 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn wide_splash_logo_is_stable_across_ticks() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let first = format!("{:?}", terminal.backend().buffer());
+
+        app.spinner_frame = 64;
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let second = format!("{:?}", terminal.backend().buffer());
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn renders_version_on_compact_header() {
         let backend = TestBackend::new(64, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6583,6 +6678,49 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(dump.contains("MCP Approval"));
         assert!(dump.contains("read_file"));
         assert!(dump.contains("Enter/Y approve"));
+    }
+
+    #[test]
+    fn quit_confirmation_renders_session_summary() {
+        let backend = TestBackend::new(120, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App {
+            quit_confirmation_open: true,
+            best_savings_pct: Some(75),
+            ..App::default()
+        };
+        app.goals.push(GoalEntry {
+            description: "done".into(),
+            status: TaskStatus::Done {
+                tokens_used: 250,
+                wall_time_ms: 1,
+            },
+            state: Some(GlobalState {
+                task_status: TaskStatus::Done {
+                    tokens_used: 250,
+                    wall_time_ms: 1,
+                },
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 250,
+                tokens_budget: None,
+                estimated_naive_tokens: 1000,
+                checkpoints: Vec::new(),
+            }),
+            task_id: TaskId::new(),
+            flight_log: Vec::new(),
+            checkpoint_cursor: None,
+        });
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("End Session"));
+        assert!(dump.contains("Goals"));
+        assert!(dump.contains("Tokens"));
+        assert!(dump.contains("Efficiency"));
+        assert!(dump.contains("phonton -r"));
     }
 
     #[test]
