@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
 
       - name: Push nightly branch
-        run: git push origin HEAD:nightly --force-with-lease
+        run: git push origin HEAD:refs/heads/nightly --force-with-lease
 
       - name: Capture version info
         id: sha
@@ -120,10 +120,10 @@ jobs:
         shell: bash
         run: |
           git tag -f nightly "$SHA"
-          git push origin refs/tags/nightly --force
+          git push origin refs/tags/nightly:refs/tags/nightly --force
           gh release delete nightly --yes --cleanup-tag >/dev/null 2>&1 || true
           git tag -f nightly "$SHA"
-          git push origin refs/tags/nightly --force
+          git push origin refs/tags/nightly:refs/tags/nightly --force
           cat > nightly-notes.md <<EOF
           Nightly snapshot from \`dev\`.
 
