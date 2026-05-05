@@ -3736,6 +3736,60 @@ fn make_api_provider_config(
     }
 }
 
+fn provider_config_failure_message(name: &str) -> String {
+    match name {
+        "cloudflare" => concat!(
+            "Cloudflare requires an Account ID or full Workers AI base URL. ",
+            "Set Account ID in Settings or set CLOUDFLARE_ACCOUNT_ID."
+        )
+        .into(),
+        "custom" | "openai-compatible" => {
+            "OpenAI-compatible providers require a Base URL in Settings.".into()
+        }
+        other => format!("Unknown provider `{other}`."),
+    }
+}
+
+fn provider_config_with_model(template: &ApiProviderConfig, model: String) -> ApiProviderConfig {
+    match template {
+        ApiProviderConfig::Anthropic { api_key, .. } => ApiProviderConfig::Anthropic {
+            api_key: api_key.clone(),
+            model,
+        },
+        ApiProviderConfig::OpenAI { api_key, .. } => ApiProviderConfig::OpenAI {
+            api_key: api_key.clone(),
+            model,
+        },
+        ApiProviderConfig::OpenRouter { api_key, .. } => ApiProviderConfig::OpenRouter {
+            api_key: api_key.clone(),
+            model,
+        },
+        ApiProviderConfig::Gemini { api_key, .. } => ApiProviderConfig::Gemini {
+            api_key: api_key.clone(),
+            model,
+        },
+        ApiProviderConfig::Ollama { base_url, .. } => ApiProviderConfig::Ollama {
+            base_url: base_url.clone(),
+            model,
+        },
+        ApiProviderConfig::AgentRouter { api_key, .. } => ApiProviderConfig::AgentRouter {
+            api_key: api_key.clone(),
+            model,
+        },
+        ApiProviderConfig::OpenAiCompatible {
+            name,
+            api_key,
+            base_url,
+            ..
+        } => ApiProviderConfig::OpenAiCompatible {
+            name: name.clone(),
+            api_key: api_key.clone(),
+            model,
+            base_url: base_url.clone(),
+        },
+    }
+}
+
 /// Smoke-test a provider configuration end-to-end.
 ///
 /// Builds the provider via `make_api_provider_config_with_url`, issues a
@@ -5379,20 +5433,44 @@ async fn spawn_goal(
             // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
             // model and worked; goals didn't, and the gap was invisible.
             let configured_model = cfg.provider.model.clone();
+            let validation_model = configured_model.clone().unwrap_or_else(|| {
+                phonton_providers::model_for_tier(&provider_name, phonton_types::ModelTier::Cheap)
+            });
+            let Some(provider_template) = make_api_provider_config(
+                &provider_name,
+                api_key.clone(),
+                validation_model,
+                account_id,
+                base_url,
+            ) else {
+                let reason = provider_config_failure_message(&provider_name);
+                let failed = GlobalState {
+                    task_status: TaskStatus::Failed {
+                        reason: reason.clone(),
+                        failed_subtask: None,
+                    },
+                    goal_contract: plan.goal_contract.clone(),
+                    handoff_packet: None,
+                    active_workers: Vec::new(),
+                    tokens_used: 0,
+                    tokens_budget: None,
+                    estimated_naive_tokens: plan.naive_baseline_tokens,
+                    checkpoints: Vec::new(),
+                };
+                if let Ok(g) = store.lock() {
+                    let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+                }
+                let _ = tx
+                    .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
+                    .await;
+                return;
+            };
 
             let factory = move |tier: phonton_types::ModelTier| {
                 let model = configured_model
                     .clone()
                     .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
-                let provider_cfg = make_api_provider_config(
-                    &provider_name,
-                    api_key.clone(),
-                    model,
-                    account_id.clone(),
-                    base_url.clone(),
-                )
-                .expect("unknown provider config");
-                provider_for(provider_cfg)
+                provider_for(provider_config_with_model(&provider_template, model))
             };
 
             let guard = ExecutionGuard::new(working_dir.clone());
@@ -5857,6 +5935,50 @@ fn extract_id(line: &str) -> Option<String> {
         match cfg {
             ApiProviderConfig::OpenAiCompatible { name, base_url, .. } => {
                 assert_eq!(name, "cloudflare");
+                assert_eq!(
+                    base_url,
+                    "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1"
+                );
+            }
+            other => panic!("unexpected provider config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cloudflare_without_account_reports_config_failure() {
+        let cfg = make_api_provider_config(
+            "cloudflare",
+            "cf-token".into(),
+            "@cf/moonshotai/kimi-k2.6".into(),
+            None,
+            None,
+        );
+        assert!(cfg.is_none());
+        assert!(provider_config_failure_message("cloudflare").contains("Account ID"));
+    }
+
+    #[test]
+    fn provider_config_template_replaces_model_without_losing_endpoint() {
+        let template = make_api_provider_config(
+            "cloudflare",
+            "cf-token".into(),
+            "@cf/moonshotai/kimi-k2.6".into(),
+            Some("abc123".into()),
+            None,
+        )
+        .expect("cloudflare template should build from account id");
+
+        let updated = provider_config_with_model(&template, "tier-model".into());
+        match updated {
+            ApiProviderConfig::OpenAiCompatible {
+                name,
+                api_key,
+                model,
+                base_url,
+            } => {
+                assert_eq!(name, "cloudflare");
+                assert_eq!(api_key, "cf-token");
+                assert_eq!(model, "tier-model");
                 assert_eq!(
                     base_url,
                     "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1"
