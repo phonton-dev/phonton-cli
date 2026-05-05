@@ -48,7 +48,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -74,8 +74,8 @@ use phonton_types::{
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
     OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
     PromptAttachment, PromptAttachmentKind, ProviderConfig as ApiProviderConfig, ProviderKind,
-    Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer,
-    VerifyResult,
+    SessionGoalSnapshot, SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -112,21 +112,29 @@ const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
 const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
 const UI_TICK_MS: u64 = 80;
-const LOGO_SHIMMER_SPEED: f32 = 0.018;
-const LOGO_ROW_PHASE: f32 = 0.085;
+const LOGO_SHIMMER_SPEED: f32 = 0.026;
+const LOGO_ROW_PHASE: f32 = 0.11;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "█████░  █   █░  ████░  █   █░ █████░  ████░  █   █░",
-    "█   █░  █   █░ █    █░ ██  █░   █  ░ █    █░ ██  █░",
-    "█████░  █████░ █    █░ █ █ █░   █  ░ █    █░ █ █ █░",
-    "█    ░  █   █░ █    █░ █  ██░   █  ░ █    █░ █  ██░",
-    "█    ░  █   █░  ████░  █   █░   █  ░  ████░  █   █░",
-    " ░░░░    ░   ░   ░░░░    ░   ░    ░     ░░░░    ░   ░",
+    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
+    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
+    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
+    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
+    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
 ];
 
-const LOGO_WIDTH_THRESHOLD: u16 = 72;
+const LOGO_WIDTH_THRESHOLD: u16 = 70;
 static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Options that control interactive TUI launch behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    /// Resume the latest saved session snapshot for the current workspace.
+    pub resume_last_session: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Visual helpers — gradient + pill primitives
@@ -201,7 +209,8 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let wave = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
 
     for (i, ch) in chars.into_iter().enumerate() {
         if ch == ' ' {
@@ -210,31 +219,65 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let style = if matches!(ch, '░' | '▒' | '▓') {
-            let shadow_t = ((x + phase * 0.45 + row_idx as f32 * 0.025).fract() - 0.5).abs();
-            let lift = (0.18 - shadow_t).max(0.0) / 0.18;
-            Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
-        } else {
-            let base = logo_grad((x * 0.82 + phase * 0.74 + row_idx as f32 * 0.04).fract());
-            let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
-            let glint = if distance < 0.075 {
-                (1.0 - distance / 0.075) * 0.55
-            } else {
-                0.0
-            };
-            let breathing = ((phase * std::f32::consts::TAU
-                + x * std::f32::consts::TAU * 1.4
-                + row_idx as f32 * 0.65)
-                .sin()
-                + 1.0)
-                * 0.07;
-            Style::default()
-                .fg(grad(
-                    base_rgb(base),
-                    LOGO_GLOW,
-                    (glint + breathing).clamp(0.0, 0.62),
-                ))
-                .add_modifier(Modifier::BOLD)
+        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
+        let base_color = base_rgb(base);
+        let dist = |w: f32| -> f32 {
+            let raw = (x - w).abs();
+            raw.min(1.0 - raw)
+        };
+        let d_a = dist(wave_a);
+        let d_b = dist(wave_b);
+
+        let style = match ch {
+            '░' | '▒' | '▓' => {
+                let body = match ch {
+                    '▓' => 0.55,
+                    '▒' => 0.32,
+                    _ => 0.16,
+                };
+                let glow = if d_a < 0.14 {
+                    (1.0 - d_a / 0.14) * 0.45
+                } else {
+                    0.0
+                };
+                Style::default().fg(grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9)))
+            }
+            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
+                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
+                let lift = if d_a < 0.07 {
+                    (1.0 - d_a / 0.07) * 0.35
+                } else {
+                    0.0
+                };
+                Style::default()
+                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
+                    .add_modifier(Modifier::BOLD)
+            }
+            _ => {
+                let glint_a = if d_a < 0.08 {
+                    (1.0 - d_a / 0.08) * 0.65
+                } else {
+                    0.0
+                };
+                let glint_b = if d_b < 0.05 {
+                    (1.0 - d_b / 0.05) * 0.45
+                } else {
+                    0.0
+                };
+                let breathing = ((phase * std::f32::consts::TAU
+                    + x * std::f32::consts::TAU * 1.4
+                    + row_idx as f32 * 0.65)
+                    .sin()
+                    + 1.0)
+                    * 0.08;
+                Style::default()
+                    .fg(grad(
+                        base_color,
+                        LOGO_GLOW,
+                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
+                    ))
+                    .add_modifier(Modifier::BOLD)
+            }
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
@@ -495,6 +538,8 @@ pub struct App {
     pub ask_pending: bool,
     /// When `true`, the render loop exits on the next frame.
     pub should_quit: bool,
+    /// True when Ctrl+C/Esc requested exit and the user must confirm it.
+    pub quit_confirmation_open: bool,
     /// Monotonic tick counter driving the running-tag spinner animation.
     pub spinner_frame: usize,
     /// True when the Flight Log panel is open. Toggled by Shift+L.
@@ -548,6 +593,7 @@ impl App {
             ask_answer: None,
             ask_pending: false,
             should_quit: false,
+            quit_confirmation_open: false,
             spinner_frame: 0,
             flight_log_open: false,
             settings: SettingsState::new(cfg),
@@ -576,6 +622,109 @@ impl App {
             if self.selected >= self.goals.len() {
                 self.selected = self.goals.len().saturating_sub(1);
             }
+        }
+    }
+
+    /// Summarize the visible session for the exit receipt.
+    pub fn session_totals(&self) -> SessionTotals {
+        let mut totals = SessionTotals {
+            goals: self.goals.len(),
+            best_savings_pct: self.best_savings_pct,
+            ..SessionTotals::default()
+        };
+        for goal in &self.goals {
+            match goal.status {
+                TaskStatus::Done { .. } => totals.completed += 1,
+                TaskStatus::Failed { .. } => totals.failed += 1,
+                TaskStatus::Reviewing { .. } => totals.reviewing += 1,
+                _ => {}
+            }
+            totals.tokens_used = totals.tokens_used.saturating_add(session_goal_tokens(goal));
+            totals.naive_baseline_tokens = totals
+                .naive_baseline_tokens
+                .saturating_add(session_goal_baseline(goal));
+        }
+        totals.estimated_tokens_saved =
+            token_delta_vs_naive(totals.naive_baseline_tokens, totals.tokens_used);
+        totals
+    }
+
+    /// Build a durable snapshot for resuming this workspace later.
+    pub fn to_session_snapshot(&self, workspace: String, saved_at: u64) -> SessionSnapshot {
+        SessionSnapshot {
+            workspace,
+            saved_at,
+            selected_goal: self.selected.min(self.goals.len().saturating_sub(1)),
+            goal_input: self.goal_input.clone(),
+            ask_input: self.ask_input.clone(),
+            ask_answer: self.ask_answer.clone(),
+            best_savings_pct: self.best_savings_pct,
+            goals: self
+                .goals
+                .iter()
+                .map(|goal| SessionGoalSnapshot {
+                    description: goal.description.clone(),
+                    status: goal.status.clone(),
+                    state: goal.state.clone(),
+                    task_id: goal.task_id,
+                    flight_log: goal.flight_log.clone(),
+                })
+                .collect(),
+            totals: self.session_totals(),
+        }
+    }
+
+    /// Restore review-safe session state from a saved snapshot.
+    pub fn restore_session_snapshot(&mut self, snapshot: SessionSnapshot) {
+        self.goals = snapshot
+            .goals
+            .into_iter()
+            .map(|goal| GoalEntry {
+                description: goal.description,
+                status: goal.status,
+                state: goal.state,
+                task_id: goal.task_id,
+                flight_log: goal.flight_log,
+                checkpoint_cursor: None,
+            })
+            .collect();
+        self.selected = snapshot
+            .selected_goal
+            .min(self.goals.len().saturating_sub(1));
+        self.goal_input = snapshot.goal_input;
+        self.goal_cursor = char_count(&self.goal_input);
+        self.ask_input = snapshot.ask_input;
+        self.ask_cursor = char_count(&self.ask_input);
+        self.ask_answer = snapshot.ask_answer;
+        self.ask_pending = false;
+        self.best_savings_pct = snapshot.best_savings_pct;
+        self.new_best_ticks = 0;
+        self.mode = Mode::Goal;
+        self.flight_log_open = false;
+        self.help_open = false;
+        self.quit_confirmation_open = false;
+        self.pending_mcp_approvals.clear();
+        self.mcp_approval_selected = 0;
+    }
+
+    fn request_quit_confirmation(&mut self) -> Option<Intent> {
+        self.quit_confirmation_open = true;
+        self.help_open = false;
+        None
+    }
+
+    fn handle_quit_confirmation_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.quit_confirmation_open = false;
+                self.should_quit = true;
+                Some(Intent::Quit)
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.quit_confirmation_open = false;
+                None
+            }
+            _ => None,
         }
     }
 }
@@ -630,6 +779,41 @@ fn delete_word_before(s: &mut String, char_idx: usize) -> usize {
 
 fn char_count(s: &str) -> usize {
     s.chars().count()
+}
+
+fn session_goal_tokens(goal: &GoalEntry) -> u64 {
+    goal.state
+        .as_ref()
+        .map(|s| s.tokens_used)
+        .unwrap_or_else(|| match goal.status {
+            TaskStatus::Reviewing { tokens_used, .. } | TaskStatus::Done { tokens_used, .. } => {
+                tokens_used
+            }
+            _ => 0,
+        })
+}
+
+fn session_goal_baseline(goal: &GoalEntry) -> u64 {
+    goal.state
+        .as_ref()
+        .map(|s| s.estimated_naive_tokens)
+        .unwrap_or_else(|| match goal.status {
+            TaskStatus::Reviewing {
+                tokens_used,
+                estimated_savings_tokens,
+            } => tokens_used.saturating_add(estimated_savings_tokens),
+            _ => 0,
+        })
+}
+
+fn token_delta_vs_naive(naive_baseline_tokens: u64, tokens_used: u64) -> i64 {
+    if naive_baseline_tokens >= tokens_used {
+        let saved = naive_baseline_tokens - tokens_used;
+        saved.min(i64::MAX as u64) as i64
+    } else {
+        let over = tokens_used - naive_baseline_tokens;
+        -(over.min(i64::MAX as u64) as i64)
+    }
 }
 
 /// Best-effort heuristic for "did the user paste an API key into the
@@ -765,6 +949,10 @@ impl App {
     /// Returns `Some(Intent)` when the caller should act on the outside
     /// world (queue a new goal, issue an ask, exit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if self.quit_confirmation_open {
+            return self.handle_quit_confirmation_key(key);
+        }
+
         if !self.pending_mcp_approvals.is_empty() {
             return self.handle_mcp_approval_key(key);
         }
@@ -786,8 +974,7 @@ impl App {
                 self.mode = Mode::Goal;
                 return None;
             }
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit_confirmation();
         }
 
         // `?` toggles the help overlay anywhere it isn't legitimate text input.
@@ -880,8 +1067,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
-                    self.should_quit = true;
-                    return Some(Intent::Quit);
+                    return self.request_quit_confirmation();
                 }
                 // Cmd/Ctrl+; toggles the Ask side panel.
                 KeyCode::Char(';') => {
@@ -915,8 +1101,7 @@ impl App {
 
     fn handle_mcp_approval_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit_confirmation();
         }
 
         match key.code {
@@ -1017,8 +1202,8 @@ impl App {
                         self.mode = Mode::Goal;
                     }
                     "Quit" => {
-                        self.should_quit = true;
-                        return Some(Intent::Quit);
+                        self.mode = self.prev_mode;
+                        return self.request_quit_confirmation();
                     }
                     _ => {}
                 }
@@ -1572,7 +1757,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // one-line header so the work area gets the screen real estate.
     let want_full_logo = app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD;
     let splash_h: u16 = if want_full_logo {
-        LOGO.len() as u16 + 1
+        LOGO.len() as u16 + 2
     } else {
         1
     };
@@ -1640,6 +1825,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.pending_mcp_approvals.is_empty() {
         render_mcp_approval(frame, area, app);
     }
+    if app.quit_confirmation_open {
+        render_quit_confirmation(frame, area);
+    }
 }
 
 /// Centred modal listing every keybinding in one place. Toggled by `?`,
@@ -1658,8 +1846,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Home / End", "jump to start/end of the input"),
         ("Ctrl+↑↓", "move the checkpoint cursor"),
         ("r", "rollback to the highlighted checkpoint (input empty)"),
-        ("Ctrl+C", "quit immediately"),
-        ("Esc", "close overlay / cancel / quit"),
+        ("Ctrl+C", "ask to save and quit"),
+        ("Esc", "close overlay / cancel / ask to quit"),
     ];
 
     // Fit the modal to the longest description so wrapping never bites.
@@ -1720,6 +1908,55 @@ fn render_help(frame: &mut Frame, area: Rect) {
 
     let p = Paragraph::new(lines).style(Style::default().bg(BG_DEEP));
     frame.render_widget(p, inner);
+}
+
+/// Confirmation modal shown before ending an interactive session.
+fn render_quit_confirmation(frame: &mut Frame, area: Rect) {
+    let popup_w = area.width.saturating_sub(4).clamp(32, 58);
+    let popup_h = area.height.saturating_sub(2).clamp(7, 9);
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Span::styled(
+            " End Session? ",
+            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(vec![
+            Span::styled(" Enter/Y save + exit ", Style::default().fg(SUCCESS)),
+            Span::styled("  N/Esc cancel ", Style::default().fg(MUTED)),
+        ]))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(WARN))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(block.clone(), popup_area);
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Save this workspace session and exit Phonton?",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  A receipt with token totals will print after the TUI closes.",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().bg(BG_DEEP)),
+        block.inner(popup_area),
+    );
 }
 
 /// Focused modal for approval-gated MCP operations.
@@ -1824,14 +2061,18 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
     // Slowly drifting phase so the logo gets a deliberate scanline shimmer
     // without turning the whole splash into a fast flashing surface.
     let phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
-    if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
-        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 1);
+    if area.height >= LOGO.len() as u16 + 2 && area.width >= LOGO_WIDTH_THRESHOLD {
+        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 2);
         lines.push(Line::raw(""));
         lines.extend(
             LOGO.iter()
                 .enumerate()
                 .map(|(row_idx, row)| logo_line(row, phase, row_idx)),
         );
+        lines.push(Line::from(Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(MUTED),
+        )));
         let p = Paragraph::new(lines)
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
@@ -1842,6 +2083,11 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
             "agentic dev environment",
+            Style::default().fg(MUTED),
+        ));
+        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
+        spans.push(Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(MUTED),
         ));
         let p = Paragraph::new(Line::from(spans))
@@ -1881,7 +2127,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(" del  ", txt),
             sep,
             Span::styled("Esc", key),
-            Span::styled(" quit", txt),
+            Span::styled(" exit?", txt),
         ],
         Mode::Ask => vec![
             Span::styled("Enter", key),
@@ -2325,7 +2571,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                     "    Esc",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("     quit", muted),
+                Span::styled("     save + exit?", muted),
             ]),
         ];
         let p = Paragraph::new(lines)
@@ -3864,7 +4110,9 @@ fn print_help() {
         "phonton — agentic dev environment\n\
          \n\
          USAGE:\n  \
-         phonton [SUBCOMMAND]\n\
+         phonton\n  \
+         phonton -r|--resume\n  \
+         phonton <SUBCOMMAND>\n\
          \n\
          SUBCOMMANDS:\n  \
          (none)            Launch the interactive TUI (default)\n  \
@@ -3884,6 +4132,7 @@ fn print_help() {
          help              Print this help and exit\n\
          \n\
          FLAGS:\n  \
+         -r, --resume     Resume the saved session for this workspace\n  \
          -h, --help        Same as `help`\n  \
          -V, --version     Same as `version`\n\
          \n\
@@ -3927,22 +4176,82 @@ fn print_version() {
     println!("phonton {}", env!("CARGO_PKG_VERSION"));
 }
 
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn workspace_session_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Render the plain terminal receipt printed after a confirmed TUI exit.
+pub fn render_exit_receipt(totals: &SessionTotals) -> String {
+    let saved_line = if totals.estimated_tokens_saved >= 0 {
+        format!(
+            "estimated saved vs naive: {}",
+            totals.estimated_tokens_saved
+        )
+    } else {
+        format!(
+            "estimated over naive: {}",
+            totals.estimated_tokens_saved.saturating_abs()
+        )
+    };
+    let best = totals
+        .best_savings_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "n/a".into());
+    format!(
+        "Session saved\n\
+         goals: {}  completed: {}  reviewing: {}  failed: {}\n\
+         tokens used: {}\n\
+         naive baseline: {}\n\
+         {}\n\
+         best savings: {}",
+        totals.goals,
+        totals.completed,
+        totals.reviewing,
+        totals.failed,
+        totals.tokens_used,
+        totals.naive_baseline_tokens,
+        saved_line,
+        best
+    )
+}
+
+/// Parse arguments that launch the interactive TUI instead of a subcommand.
+pub fn launch_options_from_args(args: &[String]) -> Option<LaunchOptions> {
+    match args {
+        [] => Some(LaunchOptions::default()),
+        [flag] if flag == "-r" || flag == "--resume" => Some(LaunchOptions {
+            resume_last_session: true,
+        }),
+        _ => None,
+    }
+}
+
 /// Handle CLI subcommands that exit before the TUI launches.
-/// Returns `Ok(true)` if a subcommand was handled (caller should exit),
-/// `Ok(false)` if the TUI should launch normally.
-async fn handle_cli_args() -> Result<bool> {
+/// Returns `Ok(Some(_))` when the TUI should launch, or `Ok(None)` when a
+/// subcommand was handled and the caller should exit.
+async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return Ok(false);
+    if let Some(options) = launch_options_from_args(&args) {
+        return Ok(Some(options));
     }
     match args[0].as_str() {
         "-h" | "--help" | "help" => {
             print_help();
-            Ok(true)
+            Ok(None)
         }
         "-V" | "--version" | "version" => {
             print_version();
-            Ok(true)
+            Ok(None)
         }
         "config" => {
             let sub = args.get(1).map(|s| s.as_str()).unwrap_or("path");
@@ -4002,7 +4311,7 @@ async fn handle_cli_args() -> Result<bool> {
                     std::process::exit(2);
                 }
             }
-            Ok(true)
+            Ok(None)
         }
         "doctor" => {
             let working_dir =
@@ -4011,7 +4320,7 @@ async fn handle_cli_args() -> Result<bool> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "extensions" => {
             let working_dir =
@@ -4020,7 +4329,7 @@ async fn handle_cli_args() -> Result<bool> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "skills" => {
             let working_dir =
@@ -4029,7 +4338,7 @@ async fn handle_cli_args() -> Result<bool> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "steering" => {
             let working_dir =
@@ -4038,7 +4347,7 @@ async fn handle_cli_args() -> Result<bool> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "mcp" => {
             let working_dir =
@@ -4047,28 +4356,28 @@ async fn handle_cli_args() -> Result<bool> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "plan" => {
             let code = plan_preview::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "review" => {
             let code = review::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "memory" => {
             let code = memory_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(true)
+            Ok(None)
         }
         "ask" => {
             let question = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();
@@ -4089,7 +4398,7 @@ async fn handle_cli_args() -> Result<bool> {
             {
                 Ok(resp) => {
                     println!("{}", resp.content);
-                    Ok(true)
+                    Ok(None)
                 }
                 Err(e) => {
                     eprintln!("phonton ask: {}", e);
@@ -4112,9 +4421,10 @@ async fn handle_cli_args() -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if handle_cli_args().await? {
-        return Ok(());
-    }
+    let launch_options = match handle_cli_args().await? {
+        Some(options) => options,
+        None => return Ok(()),
+    };
     // Load configuration first so the rest of startup can use it.
     let mut cfg = config::load().unwrap_or_default();
 
@@ -4149,6 +4459,7 @@ async fn main() -> Result<()> {
     // launch). Shared across every spawned goal so tool-execution policy
     // is uniform across the session.
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let workspace_key = workspace_session_key(&working_dir);
     let mut app = App::new(&cfg);
     app.nexus_status = detect_nexus_status(&working_dir);
 
@@ -4176,6 +4487,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if launch_options.resume_last_session {
+        match store.lock() {
+            Ok(s) => match s.load_session_snapshot(&workspace_key) {
+                Ok(Some(snapshot)) => app.restore_session_snapshot(snapshot),
+                Ok(None) => {
+                    app.settings.message = Some("No saved session for this workspace yet.".into());
+                }
+                Err(e) => {
+                    app.settings.message = Some(format!("Could not load saved session: {e}"));
+                }
+            },
+            Err(_) => {
+                app.settings.message =
+                    Some("Could not load saved session: store lock poisoned.".into());
+            }
+        }
+    }
+
     let sandbox = Arc::new(Sandbox::new(working_dir.clone(), "phonton-cli".to_string()));
     let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -4189,6 +4518,7 @@ async fn main() -> Result<()> {
     let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(64);
     spawn_input_task(evt_tx.clone());
 
+    let store_for_exit = Arc::clone(&store);
     let result = run_app(
         &mut terminal,
         &mut app,
@@ -4202,6 +4532,11 @@ async fn main() -> Result<()> {
         working_dir,
     )
     .await;
+    let exit_snapshot = if result.is_ok() && app.should_quit {
+        Some(app.to_session_snapshot(workspace_key, now_unix_secs()))
+    } else {
+        None
+    };
 
     disable_raw_mode()?;
     execute!(
@@ -4211,6 +4546,17 @@ async fn main() -> Result<()> {
         SetCursorStyle::DefaultUserShape,
     )?;
     terminal.show_cursor()?;
+    if let Some(snapshot) = exit_snapshot {
+        match store_for_exit.lock() {
+            Ok(s) => {
+                if let Err(e) = s.save_session_snapshot(&snapshot) {
+                    eprintln!("phonton: failed to save session snapshot: {e}");
+                }
+            }
+            Err(_) => eprintln!("phonton: failed to save session snapshot: store lock poisoned"),
+        }
+        println!("{}", render_exit_receipt(&snapshot.totals));
+    }
     result
 }
 
@@ -5804,11 +6150,59 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn esc_from_goal_quits() {
+    fn esc_from_goal_opens_quit_confirmation() {
         let mut app = App::default();
         let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(r, None);
+        assert!(!app.should_quit);
+        assert!(app.quit_confirmation_open);
+    }
+
+    #[test]
+    fn ctrl_c_opens_quit_confirmation_without_quitting() {
+        let mut app = App::default();
+        let r = app.handle_key(ctrl('c'));
+        assert_eq!(r, None);
+        assert!(!app.should_quit);
+        assert!(app.quit_confirmation_open);
+    }
+
+    #[test]
+    fn quit_confirmation_enter_emits_quit() {
+        let mut app = App::default();
+        app.handle_key(ctrl('c'));
+        let r = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(r, Some(Intent::Quit));
         assert!(app.should_quit);
+        assert!(!app.quit_confirmation_open);
+    }
+
+    #[test]
+    fn quit_confirmation_esc_cancels() {
+        let mut app = App::default();
+        app.handle_key(ctrl('c'));
+        let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(r, None);
+        assert!(!app.should_quit);
+        assert!(!app.quit_confirmation_open);
+    }
+
+    #[test]
+    fn resume_flag_parses_to_tui_launch() {
+        let args = vec!["-r".to_string()];
+        assert_eq!(
+            launch_options_from_args(&args),
+            Some(LaunchOptions {
+                resume_last_session: true
+            })
+        );
+        let args = vec!["--resume".to_string()];
+        assert_eq!(
+            launch_options_from_args(&args),
+            Some(LaunchOptions {
+                resume_last_session: true
+            })
+        );
     }
 
     #[test]
@@ -5852,6 +6246,120 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn app_session_snapshot_restores_goals_and_inputs() {
+        let mut app = App::default();
+        let task_id = TaskId::new();
+        let snapshot = phonton_types::SessionSnapshot {
+            workspace: "C:\\workspace".into(),
+            saved_at: 123,
+            selected_goal: 0,
+            goal_input: "draft follow-up".into(),
+            ask_input: "summarize state".into(),
+            ask_answer: Some("resume support is pending".into()),
+            best_savings_pct: Some(80),
+            goals: vec![phonton_types::SessionGoalSnapshot {
+                description: "ship session resume".into(),
+                status: TaskStatus::Queued,
+                state: None,
+                task_id,
+                flight_log: Vec::new(),
+            }],
+            totals: phonton_types::SessionTotals::default(),
+        };
+
+        app.restore_session_snapshot(snapshot);
+
+        assert_eq!(app.goals.len(), 1);
+        assert_eq!(app.goals[0].description, "ship session resume");
+        assert_eq!(app.goals[0].task_id, task_id);
+        assert_eq!(app.goal_input, "draft follow-up");
+        assert_eq!(app.ask_input, "summarize state");
+        assert_eq!(app.ask_answer.as_deref(), Some("resume support is pending"));
+        assert_eq!(app.best_savings_pct, Some(80));
+    }
+
+    #[test]
+    fn session_totals_sum_tokens_and_estimated_savings() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry {
+            description: "done".into(),
+            status: TaskStatus::Done {
+                tokens_used: 250,
+                wall_time_ms: 1,
+            },
+            state: Some(GlobalState {
+                task_status: TaskStatus::Done {
+                    tokens_used: 250,
+                    wall_time_ms: 1,
+                },
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 250,
+                tokens_budget: None,
+                estimated_naive_tokens: 1_000,
+                checkpoints: Vec::new(),
+            }),
+            task_id: TaskId::new(),
+            flight_log: Vec::new(),
+            checkpoint_cursor: None,
+        });
+        app.goals.push(GoalEntry {
+            description: "failed".into(),
+            status: TaskStatus::Failed {
+                reason: "verify failed".into(),
+                failed_subtask: None,
+            },
+            state: Some(GlobalState {
+                task_status: TaskStatus::Failed {
+                    reason: "verify failed".into(),
+                    failed_subtask: None,
+                },
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 100,
+                tokens_budget: None,
+                estimated_naive_tokens: 300,
+                checkpoints: Vec::new(),
+            }),
+            task_id: TaskId::new(),
+            flight_log: Vec::new(),
+            checkpoint_cursor: None,
+        });
+        app.best_savings_pct = Some(75);
+
+        let totals = app.session_totals();
+
+        assert_eq!(totals.goals, 2);
+        assert_eq!(totals.completed, 1);
+        assert_eq!(totals.failed, 1);
+        assert_eq!(totals.tokens_used, 350);
+        assert_eq!(totals.naive_baseline_tokens, 1_300);
+        assert_eq!(totals.estimated_tokens_saved, 950);
+        assert_eq!(totals.best_savings_pct, Some(75));
+    }
+
+    #[test]
+    fn exit_receipt_includes_estimated_token_savings() {
+        let receipt = render_exit_receipt(&phonton_types::SessionTotals {
+            goals: 2,
+            completed: 1,
+            failed: 0,
+            reviewing: 1,
+            tokens_used: 350,
+            naive_baseline_tokens: 1_300,
+            estimated_tokens_saved: 950,
+            best_savings_pct: Some(75),
+        });
+
+        assert!(receipt.contains("Session saved"));
+        assert!(receipt.contains("tokens used: 350"));
+        assert!(receipt.contains("estimated saved vs naive: 950"));
+        assert!(receipt.contains("best savings: 75%"));
+    }
+
+    #[test]
     fn renders_without_panicking_on_empty_state() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -5863,10 +6371,13 @@ fn extract_id(line: &str) -> Option<String> {
     fn splash_logo_is_compact_and_shadowed() {
         let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
-        assert!(max_width < 64, "logo should stay compact for the splash");
         assert!(
-            LOGO.iter().any(|row| row.contains('░')),
-            "logo should carry its own pixel shadow layer"
+            LOGO[0].contains("██████╗"),
+            "logo should use the standard ANSI Shadow wordmark"
+        );
+        assert!(
+            LOGO.last().unwrap_or(&"").contains("░▒▓"),
+            "logo should keep the soft glow strip"
         );
     }
 
@@ -5878,8 +6389,21 @@ fn extract_id(line: &str) -> Option<String> {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("█████"));
-        assert!(dump.contains("░░░░"));
+        assert!(dump.contains("██████"));
+        assert!(dump.contains("╚═════╝"));
+        assert!(dump.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn renders_version_on_compact_header() {
+        let backend = TestBackend::new(64, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("agentic dev environment"));
+        assert!(dump.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     }
 
     #[test]

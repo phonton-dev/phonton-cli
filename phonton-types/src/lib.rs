@@ -268,6 +268,76 @@ pub enum TaskStatus {
     Rejected,
 }
 
+// ---------------------------------------------------------------------------
+// Session snapshots
+// ---------------------------------------------------------------------------
+
+/// Persisted snapshot of one interactive CLI session for a workspace.
+///
+/// This is the durable "remember" surface for resuming the local ADE loop.
+/// It contains only review-safe UI state and typed task evidence, not private
+/// terminal handles or provider credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    /// Canonical workspace key this snapshot belongs to.
+    pub workspace: String,
+    /// Unix timestamp in seconds when the snapshot was saved.
+    pub saved_at: u64,
+    /// Selected goal index when the session ended.
+    pub selected_goal: usize,
+    /// Draft goal text that had not been submitted yet.
+    pub goal_input: String,
+    /// Draft Ask-mode text.
+    pub ask_input: String,
+    /// Last Ask-mode answer shown in the side panel.
+    pub ask_answer: Option<String>,
+    /// Highest observed savings percentage for this session.
+    pub best_savings_pct: Option<i64>,
+    /// Top-level goals visible in the TUI.
+    pub goals: Vec<SessionGoalSnapshot>,
+    /// Precomputed receipt totals for fast exit display and later inspection.
+    pub totals: SessionTotals,
+}
+
+/// Persisted view of one top-level goal in a [`SessionSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionGoalSnapshot {
+    /// Original goal text.
+    pub description: String,
+    /// Last known lifecycle status.
+    pub status: TaskStatus,
+    /// Last broadcast task state when available.
+    pub state: Option<GlobalState>,
+    /// Stable task id used to correlate history and Flight Log events.
+    pub task_id: TaskId,
+    /// Flight Log events observed for the goal.
+    pub flight_log: Vec<EventRecord>,
+}
+
+/// Token and lifecycle totals shown when a saved session exits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTotals {
+    /// Number of top-level goals in the session snapshot.
+    pub goals: usize,
+    /// Number of goals that reached `Done`.
+    pub completed: usize,
+    /// Number of goals that reached `Failed`.
+    pub failed: usize,
+    /// Number of goals awaiting review.
+    pub reviewing: usize,
+    /// Total actual tokens used across visible goals.
+    pub tokens_used: u64,
+    /// Total estimated naive baseline tokens across visible goals.
+    pub naive_baseline_tokens: u64,
+    /// Estimated token delta versus the naive baseline.
+    ///
+    /// Positive values mean estimated tokens saved. Negative values mean the
+    /// session used more tokens than the baseline estimate.
+    pub estimated_tokens_saved: i64,
+    /// Best observed savings percentage in the session.
+    pub best_savings_pct: Option<i64>,
+}
+
 /// Lifecycle state of a single subtask inside a task's DAG.
 ///
 /// Transitions:
