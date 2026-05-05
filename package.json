@@ -1,6 +1,6 @@
 {
   "name": "phonton-cli",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Local-first agentic development terminal with context packs, source handles, and verification gates.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/phonton-dev/phonton-cli#readme",

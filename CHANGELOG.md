@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.6 - Cloudflare Diagnostics
+
+### Fixed
+
+- Settings connection tests now report missing Cloudflare Account ID or Workers AI base URL instead of incorrectly saying `cloudflare` is an unknown provider.
+- Failed goal details are now shown in the Active panel so configuration failures remain visible after a goal stops.
+
 ## 0.4.5 - Provider Config Panic Fix
 
 ### Fixed

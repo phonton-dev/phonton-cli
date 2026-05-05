@@ -2617,6 +2617,30 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             app.new_best_ticks,
         ));
 
+        if let TaskStatus::Failed {
+            reason,
+            failed_subtask,
+        } = &state.task_status
+        {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Failure: ",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(reason.clone(), Style::default().fg(Color::White)),
+            ]));
+            if let Some(subtask) = failed_subtask {
+                lines.push(Line::from(vec![
+                    Span::styled("  subtask ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        subtask.to_string(),
+                        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        }
+
         if let Some(handoff) = &state.handoff_packet {
             append_handoff_lines(&mut lines, handoff);
         }
@@ -3808,7 +3832,7 @@ async fn test_provider(
         return Err("no API key — paste one in the API Key field or set the env var".into());
     }
     let cfg = make_api_provider_config(&name, api_key, model, account_id, base_url)
-        .ok_or_else(|| format!("unknown provider `{name}`"))?;
+        .ok_or_else(|| provider_config_failure_message(&name))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
     let resp = provider
         .call(
@@ -5957,6 +5981,22 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(provider_config_failure_message("cloudflare").contains("Account ID"));
     }
 
+    #[tokio::test]
+    async fn test_provider_missing_cloudflare_account_reports_account_id() {
+        let err = test_provider(
+            "cloudflare".into(),
+            "cf-token".into(),
+            "@cf/moonshotai/kimi-k2.6".into(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing Cloudflare account should fail before network call");
+
+        assert!(err.contains("Account ID"));
+        assert!(!err.contains("unknown provider"));
+    }
+
     #[test]
     fn provider_config_template_replaces_model_without_losing_endpoint() {
         let template = make_api_provider_config(
@@ -6635,6 +6675,36 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(dump.contains("Changed files"));
         assert!(dump.contains("chess.py"));
         assert!(dump.contains("Known gaps"));
+    }
+
+    #[test]
+    fn renders_failed_goal_reason() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_state(
+            0,
+            GlobalState {
+                task_status: TaskStatus::Failed {
+                    reason: "Cloudflare requires an Account ID".into(),
+                    failed_subtask: None,
+                },
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: None,
+                estimated_naive_tokens: 35000,
+                checkpoints: Vec::new(),
+            },
+        );
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("Failure"));
+        assert!(dump.contains("Cloudflare requires an Account ID"));
     }
 
     #[test]
