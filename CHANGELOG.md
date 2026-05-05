@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.5 - Provider Config Panic Fix
+
+### Fixed
+
+- Goal runs no longer panic when the selected provider cannot build a run configuration, such as Cloudflare without an Account ID or Workers AI base URL.
+- The TUI now marks the goal failed with an actionable provider setup message instead of tearing down the terminal.
+- Real worker dispatch now derives per-tier provider configs from a validated template, preserving custom endpoints while still honoring configured models.
+
 ## 0.4.4 - Shadow Logo Restore
 
 ### Changed
