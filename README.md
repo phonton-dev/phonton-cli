@@ -41,7 +41,7 @@ flowchart LR
     F --> B
 ```
 
-That gives Phonton a different shape from an IDE assistant or a terminal chatbot:
+That gives Phonton a different shape from an IDE assistant or a chat-first terminal assistant:
 
 - **Review first:** plans and diffs are first-class surfaces, not buried in a conversation.
 - **Verification first:** generated work is expected to pass checks before it is treated as ready.
@@ -241,9 +241,8 @@ Extension visibility:
 ```bash
 phonton extensions list --json
 phonton extensions doctor --json
-phonton extensions skills --json
-phonton extensions steering --json
-phonton extensions mcp --json
+phonton skills list --json
+phonton steering list --json
 phonton mcp list --json
 ```
 
@@ -345,7 +344,7 @@ Phonton is not trying to win by pretending the incumbents are weak.
 | Codex | Mature agent workflow, cloud/editor/CLI integration | Local-first ADE kernel, BYOK, explicit verification and review surfaces |
 | Claude Code | Excellent terminal-native coding agent | Less chat-first, more plan/verify/review oriented |
 | Cursor | Polished AI editor experience | Less editor polish, more auditable repo workflow |
-| Windsurf | Agentic IDE workflow | Narrower release scope, stronger local-first positioning |
+| Windsurf | Agentic IDE workflow | Narrower release scope, explicit local-first positioning |
 | Phonton CLI | Verified local ADE loop for serious repo tasks | Early product, smaller ecosystem, benchmark claims still being built |
 
 ## Development
