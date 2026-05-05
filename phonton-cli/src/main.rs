@@ -450,6 +450,24 @@ impl SettingsState {
     }
 }
 
+fn non_empty_setting(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn apply_settings_to_config(settings: &SettingsState, cfg: &mut config::Config) {
+    cfg.provider.name = settings.provider.clone();
+    cfg.provider.model = non_empty_setting(&settings.model);
+    cfg.provider.api_key = non_empty_setting(&settings.api_key);
+    cfg.provider.account_id = non_empty_setting(&settings.account_id);
+    cfg.provider.base_url = non_empty_setting(&settings.base_url);
+    cfg.budget.max_tokens = settings.max_tokens.parse().ok();
+    cfg.budget.max_usd_cents = settings.max_usd_cents.parse().ok();
+}
+
 /// A queued or running top-level goal entry in the left panel.
 #[derive(Debug, Clone)]
 pub struct GoalEntry {
@@ -4702,27 +4720,7 @@ async fn run_app<B: Backend>(
                             // explicitly saving would silently route goals
                             // through the previous provider while the System
                             // panel showed the new one (a real footgun).
-                            cfg.provider.name = app.settings.provider.clone();
-                            cfg.provider.model = if app.settings.model.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.model.clone())
-                            };
-                            cfg.provider.api_key = if app.settings.api_key.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.api_key.clone())
-                            };
-                            cfg.provider.account_id = if app.settings.account_id.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.account_id.clone())
-                            };
-                            cfg.provider.base_url = if app.settings.base_url.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.base_url.clone())
-                            };
+                            apply_settings_to_config(&app.settings, &mut cfg);
                             spawn_goal(
                                 0,
                                 task_id,
@@ -4760,24 +4758,7 @@ async fn run_app<B: Backend>(
                             }
                         }
                         Intent::SaveSettings => {
-                            cfg.provider.name = app.settings.provider.clone();
-                            cfg.provider.model = if app.settings.model.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.model.clone())
-                            };
-                            cfg.provider.api_key = if app.settings.api_key.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.api_key.clone())
-                            };
-                            cfg.provider.base_url = if app.settings.base_url.is_empty() {
-                                None
-                            } else {
-                                Some(app.settings.base_url.clone())
-                            };
-                            cfg.budget.max_tokens = app.settings.max_tokens.parse().ok();
-                            cfg.budget.max_usd_cents = app.settings.max_usd_cents.parse().ok();
+                            apply_settings_to_config(&app.settings, &mut cfg);
 
                             // Swap the in-memory ask provider so the next
                             // Ctrl+; question uses the new credentials
@@ -6433,6 +6414,32 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.ask_input, "summarize state");
         assert_eq!(app.ask_answer.as_deref(), Some("resume support is pending"));
         assert_eq!(app.best_savings_pct, Some(80));
+    }
+
+    #[test]
+    fn settings_sync_persists_cloudflare_account_id() {
+        let mut cfg = config::Config::default();
+        let mut settings = SettingsState::new(&cfg);
+        settings.provider = "cloudflare".into();
+        settings.model = "@cf/moonshotai/kimi-k2.6".into();
+        settings.api_key = "cf-token".into();
+        settings.account_id = "account-123".into();
+        settings.base_url.clear();
+        settings.max_tokens = "12345".into();
+        settings.max_usd_cents = "99".into();
+
+        apply_settings_to_config(&settings, &mut cfg);
+
+        assert_eq!(cfg.provider.name, "cloudflare");
+        assert_eq!(
+            cfg.provider.model.as_deref(),
+            Some("@cf/moonshotai/kimi-k2.6")
+        );
+        assert_eq!(cfg.provider.api_key.as_deref(), Some("cf-token"));
+        assert_eq!(cfg.provider.account_id.as_deref(), Some("account-123"));
+        assert_eq!(cfg.provider.base_url, None);
+        assert_eq!(cfg.budget.max_tokens, Some(12345));
+        assert_eq!(cfg.budget.max_usd_cents, Some(99));
     }
 
     #[test]
