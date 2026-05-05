@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use phonton_planner::{decompose, decompose_with_memory, Goal};
-use phonton_types::{PlannerOutput, SubtaskId};
+use phonton_types::{GoalContract, PlannerOutput, SubtaskId};
 use serde::Serialize;
 
 use crate::open_persistent_store;
@@ -39,6 +39,7 @@ pub struct PlanRequest {
 #[derive(Debug, Clone, Serialize)]
 struct PlanReport {
     goal: String,
+    goal_contract: Option<GoalContract>,
     memory_enabled: bool,
     memory_influence_count: usize,
     coverage_warnings: Vec<String>,
@@ -119,6 +120,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
 
     let report = PlanReport {
         goal: request.goal,
+        goal_contract: plan.goal_contract.clone(),
         memory_enabled: request.options.use_memory,
         memory_influence_count: memory_influence_count(&plan),
         coverage_warnings: coverage_warnings(&plan),
