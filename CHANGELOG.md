@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.4 - Shadow Logo Restore
+
+### Changed
+
+- Restored the normal animated ANSI Shadow Phonton splash logo, compact header glyphs, Braille spinner, and unicode token-savings bar.
+- Kept the v0.4.3 terminal-corruption fix: semantic-index model downloads remain silent while the Ratatui TUI owns the terminal.
+
 ## 0.4.3 - Terminal-Safe TUI
 
 ### Fixed
