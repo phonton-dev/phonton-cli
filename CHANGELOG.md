@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.4.7 - Cloudflare Account Persistence
+
+### Fixed
+
+- Settings saves now persist the Cloudflare Account ID, keeping the Workers AI endpoint configuration stable across new goals and CLI restarts.
+- Goal runs and Settings saves now share the same Settings-to-config sync path to avoid provider-field drift.
+
 ## 0.4.6 - Cloudflare Diagnostics
 
 ### Fixed
