@@ -4,6 +4,7 @@
 //! In particular, `SubtaskReviewReady` is emitted only after verification
 //! passes, so this command never presents an unverified worker diff as ready.
 
+use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -28,6 +29,7 @@ pub enum ReviewAction {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReviewOptions {
     pub json: bool,
+    pub markdown: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -88,9 +90,10 @@ pub fn parse_request(args: &[String]) -> Result<ReviewRequest> {
     for arg in args {
         match arg.as_str() {
             "--json" => options.json = true,
+            "--markdown" | "--md" => options.markdown = true,
             "-h" | "--help" => {
                 return Err(anyhow::anyhow!(
-                    "usage: phonton review [--json] [latest|<task-id>]\n       phonton review approve [--json] [latest|<task-id>]\n       phonton review reject [--json] [latest|<task-id>]\n       phonton review rollback [--json] [latest|<task-id>] <seq>"
+                    "usage: phonton review [--json|--markdown] [latest|<task-id>]\n       phonton review approve [--json] [latest|<task-id>]\n       phonton review reject [--json] [latest|<task-id>]\n       phonton review rollback [--json] [latest|<task-id>] <seq>"
                 ));
             }
             other if other.starts_with('-') => {
@@ -141,6 +144,12 @@ pub fn parse_request(args: &[String]) -> Result<ReviewRequest> {
             return Err(anyhow::anyhow!("review accepts at most one task id"));
         }
         task_ref = Some(positionals.remove(0));
+    }
+
+    if options.json && options.markdown {
+        return Err(anyhow::anyhow!(
+            "choose either --json or --markdown, not both"
+        ));
     }
 
     Ok(ReviewRequest {
@@ -216,6 +225,8 @@ pub async fn run(args: &[String]) -> Result<i32> {
 
     if request.options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if request.options.markdown {
+        print!("{}", format_markdown_report(&report));
     } else {
         print_text_report(&report);
     }
@@ -530,6 +541,181 @@ fn print_text_report(report: &ReviewReport) {
     }
 }
 
+fn format_markdown_report(report: &ReviewReport) -> String {
+    let mut out = String::new();
+    writeln!(out, "# Phonton Review Receipt").ok();
+    writeln!(out).ok();
+    writeln!(out, "- Task: `{}`", report.task_id).ok();
+    writeln!(out, "- Goal: {}", report.goal).ok();
+    writeln!(out, "- Status: `{}`", compact_json(&report.status)).ok();
+    writeln!(out, "- Tokens: {}", report.total_tokens).ok();
+    writeln!(out, "- Checkpoints: {}", report.checkpoints.len()).ok();
+
+    writeln!(out).ok();
+    writeln!(out, "## Result").ok();
+    if let Some(handoff) = &report.handoff {
+        writeln!(out, "{}", handoff.headline).ok();
+        writeln!(
+            out,
+            "Changed {} file(s), +{} -{}.",
+            handoff.diff_stats.files_changed,
+            handoff.diff_stats.added_lines,
+            handoff.diff_stats.removed_lines
+        )
+        .ok();
+    } else {
+        writeln!(out, "No handoff packet was recorded for this task.").ok();
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Changed Files").ok();
+    if let Some(handoff) = &report.handoff {
+        if handoff.changed_files.is_empty() {
+            writeln!(out, "- None recorded.").ok();
+        } else {
+            for file in &handoff.changed_files {
+                writeln!(
+                    out,
+                    "- `{}` (+{} -{}): {}",
+                    file.path.display(),
+                    file.added_lines,
+                    file.removed_lines,
+                    file.summary
+                )
+                .ok();
+            }
+        }
+    } else {
+        append_review_item_files(&mut out, report);
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Verification").ok();
+    if let Some(handoff) = &report.handoff {
+        append_markdown_list(&mut out, "Passed", &handoff.verification.passed);
+        append_markdown_list(&mut out, "Findings", &handoff.verification.findings);
+        append_markdown_list(&mut out, "Skipped", &handoff.verification.skipped);
+    } else if report.review_items.is_empty() {
+        writeln!(out, "- No verified review payloads found.").ok();
+    } else {
+        for item in &report.review_items {
+            writeln!(
+                out,
+                "- `{}`: {} using `{}`",
+                item.subtask_id, item.verify, item.model_name
+            )
+            .ok();
+        }
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Run Commands").ok();
+    if let Some(handoff) = &report.handoff {
+        if handoff.run_commands.is_empty() {
+            writeln!(out, "- None inferred.").ok();
+        } else {
+            for command in &handoff.run_commands {
+                writeln!(out, "- {}: `{}`", command.label, command.command.join(" ")).ok();
+            }
+        }
+    } else {
+        writeln!(out, "- No handoff packet was recorded.").ok();
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Known Gaps").ok();
+    if let Some(handoff) = &report.handoff {
+        append_markdown_items(&mut out, &handoff.known_gaps);
+    } else {
+        writeln!(out, "- Unknown; no handoff packet was recorded.").ok();
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Rollback").ok();
+    if let Some(handoff) = &report.handoff {
+        if handoff.rollback_points.is_empty() {
+            writeln!(out, "- No rollback checkpoints were recorded.").ok();
+        } else {
+            for rollback in &handoff.rollback_points {
+                writeln!(out, "- #{} {}", rollback.seq, rollback.label).ok();
+            }
+        }
+    } else if report.checkpoints.is_empty() {
+        writeln!(out, "- No checkpoints were recorded.").ok();
+    } else {
+        for checkpoint in &report.checkpoints {
+            writeln!(
+                out,
+                "- #{} `{}` ({})",
+                checkpoint.seq, checkpoint.commit_oid, checkpoint.subtask_id
+            )
+            .ok();
+        }
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Cost And Tokens").ok();
+    writeln!(out, "- Total tokens: {}", report.total_tokens).ok();
+    for item in &report.review_items {
+        let cost = if item.cost.pricing_known {
+            format!("{} micros", item.cost.total_usd_micros)
+        } else {
+            "unknown pricing".into()
+        };
+        writeln!(
+            out,
+            "- `{}`: {} tokens, {}",
+            item.subtask_id, item.tokens_used, cost
+        )
+        .ok();
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Influence And Memory").ok();
+    if let Some(handoff) = &report.handoff {
+        append_markdown_list(&mut out, "Memories", &handoff.influence.memories);
+        append_markdown_list(&mut out, "Index slices", &handoff.influence.index_slices);
+        append_markdown_list(&mut out, "Skills", &handoff.influence.skills);
+        append_markdown_list(&mut out, "Extensions", &handoff.influence.extensions);
+    } else {
+        writeln!(out, "- No influence summary was recorded.").ok();
+    }
+
+    out
+}
+
+fn append_review_item_files(out: &mut String, report: &ReviewReport) {
+    let mut wrote = false;
+    for item in &report.review_items {
+        for hunk in &item.diff_hunks {
+            writeln!(out, "- `{}`", hunk.file_path.display()).ok();
+            wrote = true;
+        }
+    }
+    if !wrote {
+        writeln!(out, "- None recorded.").ok();
+    }
+}
+
+fn append_markdown_list(out: &mut String, label: &str, items: &[String]) {
+    if items.is_empty() {
+        writeln!(out, "- {label}: none").ok();
+        return;
+    }
+    writeln!(out, "{label}:").ok();
+    append_markdown_items(out, items);
+}
+
+fn append_markdown_items(out: &mut String, items: &[String]) {
+    if items.is_empty() {
+        writeln!(out, "- None.").ok();
+        return;
+    }
+    for item in items {
+        writeln!(out, "- {item}").ok();
+    }
+}
+
 fn render_context(context: &[ContextAttribution]) {
     if context.is_empty() {
         println!("   context: (none selected)");
@@ -605,6 +791,15 @@ mod tests {
         let request = parse_request(&["--json".into(), "latest".into()]).unwrap();
         assert_eq!(request.task_ref.as_deref(), Some("latest"));
         assert!(request.options.json);
+        assert!(!request.options.markdown);
+    }
+
+    #[test]
+    fn parse_request_accepts_markdown() {
+        let request = parse_request(&["--markdown".into(), "latest".into()]).unwrap();
+
+        assert_eq!(request.task_ref.as_deref(), Some("latest"));
+        assert!(request.options.markdown);
     }
 
     #[test]
@@ -710,5 +905,78 @@ mod tests {
         assert_eq!(report.review_items[0].context[0].symbol_name, "foo");
         assert_eq!(report.review_items[0].token_usage.input_tokens, 80);
         assert_eq!(report.review_items[0].cost.total_usd_micros, 120);
+    }
+
+    #[test]
+    fn markdown_report_includes_receipt_sections() {
+        let task_id = TaskId::new();
+        let task = TaskRecord {
+            id: task_id,
+            goal_text: "add validation".into(),
+            status: serde_json::json!({"Reviewing": {"tokens_used": 12}}),
+            created_at: 1,
+            total_tokens: 12,
+            outcome_ledger: Some(phonton_types::OutcomeLedger {
+                task_id,
+                goal_contract: None,
+                context_manifest: phonton_types::ContextManifest::default(),
+                permission_ledger: phonton_types::PermissionLedger::default(),
+                verify_report: phonton_types::VerifyReport {
+                    passed: vec!["cargo test config_validation".into()],
+                    findings: Vec::new(),
+                    skipped: Vec::new(),
+                },
+                handoff: Some(HandoffPacket {
+                    task_id,
+                    goal: "add validation".into(),
+                    headline: "Review ready: validation added".into(),
+                    changed_files: vec![phonton_types::ChangedFileSummary {
+                        path: "src/config.rs".into(),
+                        added_lines: 4,
+                        removed_lines: 0,
+                        summary: "reject empty providers".into(),
+                    }],
+                    generated_artifacts: Vec::new(),
+                    diff_stats: phonton_types::DiffStats {
+                        files_changed: 1,
+                        added_lines: 4,
+                        removed_lines: 0,
+                    },
+                    verification: phonton_types::VerifyReport {
+                        passed: vec!["cargo test config_validation".into()],
+                        findings: Vec::new(),
+                        skipped: Vec::new(),
+                    },
+                    run_commands: vec![phonton_types::RunCommand {
+                        label: "Run tests".into(),
+                        command: vec!["cargo".into(), "test".into(), "config_validation".into()],
+                        cwd: None,
+                    }],
+                    known_gaps: vec!["No provider network check needed.".into()],
+                    review_actions: Vec::new(),
+                    rollback_points: vec![phonton_types::RollbackPoint {
+                        seq: 1,
+                        label: "before verified diff".into(),
+                    }],
+                    token_usage: TokenUsage::estimated(12),
+                    influence: phonton_types::InfluenceSummary {
+                        memories: vec!["empty providers are invalid".into()],
+                        ..phonton_types::InfluenceSummary::default()
+                    },
+                }),
+            }),
+        };
+        let report = build_report(task, Vec::new());
+
+        let markdown = format_markdown_report(&report);
+
+        assert!(markdown.contains("# Phonton Review Receipt"));
+        assert!(markdown.contains("## Changed Files"));
+        assert!(markdown.contains("`src/config.rs`"));
+        assert!(markdown.contains("## Verification"));
+        assert!(markdown.contains("cargo test config_validation"));
+        assert!(markdown.contains("## Run Commands"));
+        assert!(markdown.contains("## Known Gaps"));
+        assert!(markdown.contains("## Influence And Memory"));
     }
 }
