@@ -138,18 +138,19 @@ impl PromptBuffer {
     pub fn take_submission(&mut self) -> Option<PromptSubmission> {
         let display_text = std::mem::take(&mut self.text);
         self.cursor = 0;
-        if display_text.trim().is_empty() && self.artifacts.is_empty() {
+        let visible_artifacts = artifacts_visible_in_display(&display_text, &self.artifacts);
+        if display_text.trim().is_empty() && visible_artifacts.is_empty() {
             self.artifacts.clear();
             return None;
         }
 
         let mut model_text = display_text.clone();
-        if !self.artifacts.is_empty() {
+        if !visible_artifacts.is_empty() {
             if !model_text.ends_with('\n') {
                 model_text.push_str("\n\n");
             }
             model_text.push_str("# Pasted prompt artifacts\n");
-            for (idx, artifact) in self.artifacts.iter().enumerate() {
+            for (idx, artifact) in visible_artifacts.iter().enumerate() {
                 model_text.push_str(&format!(
                     "## paste-{} ({} {}, {}{})\n",
                     idx + 1,
@@ -186,6 +187,21 @@ impl PromptBuffer {
         self.text.insert_str(idx, text);
         self.cursor += char_count(text);
     }
+}
+
+fn artifacts_visible_in_display(
+    display_text: &str,
+    artifacts: &[PromptArtifact],
+) -> Vec<PromptArtifact> {
+    let mut visible = Vec::new();
+    let mut search_from = 0;
+    for artifact in artifacts {
+        if let Some(pos) = display_text[search_from..].find(&artifact.chip) {
+            search_from += pos + artifact.chip.len();
+            visible.push(artifact.clone());
+        }
+    }
+    visible
 }
 
 impl Default for PromptBuffer {
@@ -314,5 +330,30 @@ mod tests {
         buffer.clear_after_cursor();
         assert_eq!(buffer.display_text(), "abc");
         assert_eq!(buffer.cursor(), 3);
+    }
+
+    #[test]
+    fn cleared_paste_chip_does_not_submit_hidden_artifact() {
+        let mut buffer = PromptBuffer::new();
+        buffer.insert_paste("line one\nline two");
+        assert!(buffer.display_text().starts_with("[paste:"));
+
+        buffer.clear_before_cursor();
+
+        assert_eq!(buffer.display_text(), "");
+        assert_eq!(buffer.take_submission(), None);
+    }
+
+    #[test]
+    fn deleted_paste_chip_is_not_attached_to_new_prompt() {
+        let mut buffer = PromptBuffer::new();
+        buffer.insert_paste("line one\nline two");
+        buffer.clear_before_cursor();
+        buffer.insert_text("make a README");
+
+        let submission = buffer.take_submission().expect("prompt should submit");
+
+        assert_eq!(submission.display_text, "make a README");
+        assert_eq!(submission.model_text, "make a README");
     }
 }
