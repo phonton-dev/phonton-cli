@@ -120,14 +120,19 @@ impl ExecutionGuard {
     pub fn evaluate(&self, call: &ToolCall) -> GuardDecision {
         match call {
             ToolCall::Read { path } | ToolCall::Write { path, .. } => {
-                if let Some(reason) = blocked_path(path) {
+                let policy_path = self.policy_path(path);
+                if let Some(reason) = blocked_path(path).or_else(|| blocked_path(&policy_path)) {
                     return GuardDecision::Block { reason };
                 }
             }
             ToolCall::Run { .. } | ToolCall::Bash { .. } => {
                 for arg in arg_iter(call) {
                     if looks_like_path(arg) {
-                        if let Some(reason) = blocked_path(Path::new(arg)) {
+                        let raw_path = Path::new(arg);
+                        let policy_path = self.policy_path(raw_path);
+                        if let Some(reason) =
+                            blocked_path(raw_path).or_else(|| blocked_path(&policy_path))
+                        {
                             return GuardDecision::Block { reason };
                         }
                     }
@@ -184,13 +189,32 @@ impl ExecutionGuard {
     }
 
     fn is_inside_root(&self, path: &Path) -> bool {
+        self.policy_path(path)
+            .starts_with(lexical_normalize(&self.project_root))
+    }
+
+    fn policy_path(&self, path: &Path) -> PathBuf {
         let abs = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.project_root.join(path)
         };
-        abs.starts_with(&self.project_root)
+        lexical_normalize(&abs)
     }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn is_allowed_program(program: &str) -> bool {
@@ -559,6 +583,33 @@ mod tests {
         let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
         let d = g.evaluate(&ToolCall::Read {
             path: PathBuf::from("/work/proj/src/lib.rs"),
+        });
+        assert_eq!(d, GuardDecision::Allow);
+    }
+
+    #[test]
+    fn parent_traversal_outside_root_requires_approval() {
+        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
+        let d = g.evaluate(&ToolCall::Read {
+            path: PathBuf::from("../outside.txt"),
+        });
+        assert!(matches!(d, GuardDecision::Approve { .. }));
+    }
+
+    #[test]
+    fn parent_traversal_to_system_path_is_blocked_after_normalization() {
+        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
+        let d = g.evaluate(&ToolCall::Read {
+            path: PathBuf::from("../../etc/passwd"),
+        });
+        assert!(matches!(d, GuardDecision::Block { .. }));
+    }
+
+    #[test]
+    fn parent_traversal_back_inside_root_is_allowed() {
+        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
+        let d = g.evaluate(&ToolCall::Read {
+            path: PathBuf::from("src/../Cargo.toml"),
         });
         assert_eq!(d, GuardDecision::Allow);
     }

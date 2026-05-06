@@ -16,11 +16,13 @@ pub struct CommandRunSummary {
 
 pub fn parse_prompt_command(_input: &str) -> Option<ParsedCommand> {
     let input = _input.trim();
-    let command = if let Some(rest) = input.strip_prefix("/run") {
-        let rest = rest.trim_start();
-        if rest.is_empty() {
+    let command = if input == "/run" {
+        return None;
+    } else if let Some(rest) = input.strip_prefix("/run") {
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
             return None;
         }
+        let rest = rest.trim_start();
         rest
     } else if let Some(rest) = input.strip_prefix('!') {
         let rest = rest.trim_start();
@@ -72,7 +74,7 @@ pub fn summarize_output(
 }
 
 fn contains_shell_metachar(command: &str) -> bool {
-    let shell_tokens = ["&&", "||", "|", ";", ">", "<", "`", "$(", "${"];
+    let shell_tokens = ["&&", "||", "|", ";", "&", ">", "<", "`", "$(", "${"];
     shell_tokens.iter().any(|token| command.contains(token))
 }
 
@@ -160,6 +162,24 @@ mod tests {
             ToolCall::Bash { command } => assert_eq!(command, "npm test && npm run build"),
             other => panic!("expected bash command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn single_ampersand_routes_to_approval_gated_bash() {
+        let parsed =
+            parse_prompt_command("!npm test & npm run build").expect("shell command should parse");
+
+        match parsed.call {
+            ToolCall::Bash { command } => assert_eq!(command, "npm test & npm run build"),
+            other => panic!("expected bash command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_prefix_must_be_a_standalone_command() {
+        assert!(parse_prompt_command("/runfoo").is_none());
+        assert!(parse_prompt_command("/run").is_none());
+        assert!(parse_prompt_command("/run\tcargo test").is_some());
     }
 
     #[test]
