@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.4.8</h1>
+<h1 align="center">Phonton CLI · v0.5.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.4.8-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.5.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -53,6 +53,9 @@ That gives Phonton a different shape from an IDE assistant or a chat-first termi
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
 - Saved workspace sessions: use `phonton -r` or `phonton --resume` to reopen the last saved TUI conversation for the current repo.
+- Prompt bar paste artifacts: long or multiline pasted text collapses into a compact chip while the full content stays attached to the submitted goal.
+- Windows clipboard import in the TUI with `Ctrl+V`, including content selected from Windows clipboard history (`Win+V`) when the terminal does not emit bracketed paste directly.
+- Sandboxed command runs from the prompt bar with `/run <cmd>` or `!<cmd>`, plus command status and output previews in the TUI and Flight Log.
 - `phonton doctor` setup diagnostics for config, provider key, store, trust, git, cargo, and Nexus config.
 - `phonton plan` preview for task DAGs before edits happen.
 - `phonton review` surfaces for verified diff review payloads, approvals, rejections, and rollback.
@@ -63,6 +66,7 @@ That gives Phonton a different shape from an IDE assistant or a chat-first termi
 - `phonton mcp` commands for listing configured servers and lazily approving tool discovery or tool calls.
 - BYOK provider adapters for Anthropic, OpenAI, OpenRouter, Gemini, Cloudflare Workers AI, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints. `phonton doctor --provider` verifies your configured provider by checking model discovery and a tiny completion call through the same adapter used for runs.
 - Local store, memory, planner, worker, diff, sandbox, verification, and orchestration crates.
+- Prompt-section token manifests in the Flight Log so system, goal, memory, attachment, MCP, and retry-context costs are inspectable.
 - Semantic indexing behind the CLI stack for repo-aware workflows.
 
 ## What Is Still Early
@@ -103,7 +107,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.4.8 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.5.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -119,7 +123,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.4.8 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.5.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -211,6 +215,16 @@ phonton mcp list        Show configured MCP servers without starting them
 phonton config path     Print the resolved config file path
 phonton config show     Dump resolved config as TOML
 phonton version         Print version
+```
+
+Inside the TUI prompt bar:
+
+```text
+/run <cmd>              Run a sandboxed command
+!<cmd>                  Shorthand for a sandboxed command
+Ctrl+V                  Paste from the Windows clipboard
+Ctrl+U / Ctrl+K         Clear before / after cursor
+Tab                     Complete slash commands
 ```
 
 Plan preview:

@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ContextAttribution, CostSummary, DiffHunk, ExtensionId, ExtensionKind, ExtensionSource,
-    ModelTier, Permission, ProviderKind, SteeringSeverity, SubtaskId, TaskId, TokenUsage,
-    VerifyResult,
+    ModelTier, Permission, PromptContextManifest, ProviderKind, SteeringSeverity, SubtaskId,
+    TaskId, TokenUsage, VerifyResult,
 };
 
 /// Token threshold between successive [`OrchestratorEvent::TokenMilestone`]
@@ -79,6 +79,11 @@ pub enum OrchestratorEvent {
         subtask_id: SubtaskId,
         slices: Vec<ContextAttribution>,
         total_token_count: usize,
+    },
+    /// Approximate prompt section token costs for one provider call.
+    PromptManifest {
+        subtask_id: SubtaskId,
+        manifest: PromptContextManifest,
     },
     /// An extension manifest was loaded by the resolver.
     ExtensionLoaded {
@@ -223,6 +228,7 @@ impl EventRecord {
             OrchestratorEvent::TaskCompleted { .. } => "task-done",
             OrchestratorEvent::SubtaskDispatched { .. } => "dispatch",
             OrchestratorEvent::ContextSelected { .. } => "context",
+            OrchestratorEvent::PromptManifest { .. } => "prompt",
             OrchestratorEvent::ExtensionLoaded { .. } => "extension-loaded",
             OrchestratorEvent::ExtensionSkipped { .. } => "extension-skipped",
             OrchestratorEvent::ExtensionConflict { .. } => "extension-conflict",
@@ -290,6 +296,21 @@ impl EventRecord {
                     "context {subtask_id}: {} slices, {} indexed tokens",
                     slices.len(),
                     total_token_count
+                )
+            }
+            OrchestratorEvent::PromptManifest {
+                subtask_id,
+                manifest,
+            } => {
+                format!(
+                    "prompt {subtask_id}: system={} goal={} memory={} attachments={} mcp={} retry={} total~{}",
+                    manifest.system_tokens,
+                    manifest.user_goal_tokens,
+                    manifest.memory_tokens,
+                    manifest.attachment_tokens,
+                    manifest.mcp_tool_tokens,
+                    manifest.retry_error_tokens,
+                    manifest.total_estimated_tokens
                 )
             }
             OrchestratorEvent::ExtensionLoaded {

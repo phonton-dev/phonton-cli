@@ -34,12 +34,14 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod command_runner;
 mod config;
 mod doctor;
 mod extensions_cli;
 mod mcp_cli;
 mod memory_cli;
 mod plan_preview;
+mod prompt_buffer;
 mod review;
 mod trust;
 
@@ -53,8 +55,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
+use command_runner::{parse_prompt_command, summarize_output, CommandRunSummary};
 use crossterm::cursor::SetCursorStyle;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -74,9 +79,11 @@ use phonton_types::{
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
     OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
     PromptAttachment, PromptAttachmentKind, ProviderConfig as ApiProviderConfig, ProviderKind,
-    SessionGoalSnapshot, SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    RunCommand, SessionGoalSnapshot, SessionSnapshot, SessionTotals, Subtask, SubtaskId,
+    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    VerifyStepSpec,
 };
+use prompt_buffer::PromptBuffer;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -542,10 +549,10 @@ pub struct App {
     pub goals: Vec<GoalEntry>,
     /// The goal currently highlighted in the left pane (index into `goals`).
     pub selected: usize,
-    /// Goal-bar input buffer.
-    pub goal_input: String,
+    /// Goal-bar input buffer, including collapsed paste artifacts.
+    pub goal_prompt: PromptBuffer,
     /// Ask-mode input buffer, preserved across mode toggles.
-    pub ask_input: String,
+    pub ask_prompt: PromptBuffer,
     /// Most recent ask-mode answer, for display in the side panel.
     pub ask_answer: Option<String>,
     /// True while an ask-mode provider call is in flight; drives the
@@ -567,10 +574,12 @@ pub struct App {
     pub palette_selected: usize,
     /// Mode to restore after closing the palette.
     pub prev_mode: Mode,
-    /// Caret position (in chars) inside `goal_input`.
-    pub goal_cursor: usize,
-    /// Caret position (in chars) inside `ask_input`.
-    pub ask_cursor: usize,
+    /// Submitted prompt history, newest last.
+    pub prompt_history: Vec<String>,
+    /// Cursor into prompt history while browsing with Up/Down.
+    pub prompt_history_cursor: Option<usize>,
+    /// Recent user-run commands.
+    pub command_runs: Vec<CommandRunSummary>,
     /// Session-best token savings percentage (vs naive baseline). Updated
     /// whenever a goal completes with a higher savings rate than seen before.
     pub best_savings_pct: Option<i64>,
@@ -603,8 +612,8 @@ impl App {
             mode: Mode::Goal,
             goals: Vec::new(),
             selected: 0,
-            goal_input: String::new(),
-            ask_input: String::new(),
+            goal_prompt: PromptBuffer::new(),
+            ask_prompt: PromptBuffer::new(),
             ask_answer: None,
             ask_pending: false,
             should_quit: false,
@@ -615,8 +624,9 @@ impl App {
             palette_input: String::new(),
             palette_selected: 0,
             prev_mode: Mode::Goal,
-            goal_cursor: 0,
-            ask_cursor: 0,
+            prompt_history: Vec::new(),
+            prompt_history_cursor: None,
+            command_runs: Vec::new(),
             best_savings_pct: None,
             new_best_ticks: 0,
             help_open: false,
@@ -670,8 +680,8 @@ impl App {
             workspace,
             saved_at,
             selected_goal: self.selected.min(self.goals.len().saturating_sub(1)),
-            goal_input: self.goal_input.clone(),
-            ask_input: self.ask_input.clone(),
+            goal_input: self.goal_prompt.display_text().to_string(),
+            ask_input: self.ask_prompt.display_text().to_string(),
             ask_answer: self.ask_answer.clone(),
             best_savings_pct: self.best_savings_pct,
             goals: self
@@ -706,10 +716,8 @@ impl App {
         self.selected = snapshot
             .selected_goal
             .min(self.goals.len().saturating_sub(1));
-        self.goal_input = snapshot.goal_input;
-        self.goal_cursor = char_count(&self.goal_input);
-        self.ask_input = snapshot.ask_input;
-        self.ask_cursor = char_count(&self.ask_input);
+        self.goal_prompt = PromptBuffer::from_text(snapshot.goal_input);
+        self.ask_prompt = PromptBuffer::from_text(snapshot.ask_input);
         self.ask_answer = snapshot.ask_answer;
         self.ask_pending = false;
         self.best_savings_pct = snapshot.best_savings_pct;
@@ -742,58 +750,6 @@ impl App {
             _ => None,
         }
     }
-}
-
-/// Insert a character at a char-index position in `s`. Returns the new
-/// caret position (one past the inserted char).
-fn insert_char_at(s: &mut String, char_idx: usize, c: char) -> usize {
-    let byte_idx = s
-        .char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len());
-    s.insert(byte_idx, c);
-    char_idx + 1
-}
-
-/// Delete the character immediately before the caret. Returns the new caret.
-fn delete_char_before(s: &mut String, char_idx: usize) -> usize {
-    if char_idx == 0 {
-        return 0;
-    }
-    let new_idx = char_idx - 1;
-    let start = s.char_indices().nth(new_idx).map(|(b, _)| b).unwrap_or(0);
-    let end = s
-        .char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len());
-    s.replace_range(start..end, "");
-    new_idx
-}
-
-/// Delete the word (and trailing whitespace) immediately before the caret.
-fn delete_word_before(s: &mut String, char_idx: usize) -> usize {
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = char_idx.min(chars.len());
-    while i > 0 && chars[i - 1].is_whitespace() {
-        i -= 1;
-    }
-    while i > 0 && !chars[i - 1].is_whitespace() {
-        i -= 1;
-    }
-    let start = s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(0);
-    let end = s
-        .char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len());
-    s.replace_range(start..end, "");
-    i
-}
-
-fn char_count(s: &str) -> usize {
-    s.chars().count()
 }
 
 fn session_goal_tokens(goal: &GoalEntry) -> u64 {
@@ -829,6 +785,10 @@ fn token_delta_vs_naive(naive_baseline_tokens: u64, tokens_used: u64) -> i64 {
         let over = tokens_used - naive_baseline_tokens;
         -(over.min(i64::MAX as u64) as i64)
     }
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
 }
 
 /// Best-effort heuristic for "did the user paste an API key into the
@@ -928,6 +888,25 @@ impl App {
         }
     }
 
+    /// Insert pasted text into the active prompt surface. Long or multi-line
+    /// content is collapsed into a prompt artifact by [`PromptBuffer`].
+    pub fn handle_paste(&mut self, text: &str) {
+        match self.mode {
+            Mode::Goal | Mode::Task => self.goal_prompt.insert_paste(text),
+            Mode::Ask => self.ask_prompt.insert_paste(text),
+            _ => {}
+        }
+    }
+
+    pub fn push_command_run(&mut self, summary: CommandRunSummary) {
+        self.command_runs.push(summary);
+        const MAX_COMMAND_RUNS: usize = 20;
+        if self.command_runs.len() > MAX_COMMAND_RUNS {
+            let overflow = self.command_runs.len() - MAX_COMMAND_RUNS;
+            self.command_runs.drain(0..overflow);
+        }
+    }
+
     /// Add an MCP approval prompt and focus the newest request.
     pub fn push_mcp_approval(&mut self, prompt: PendingMcpApproval) {
         self.pending_mcp_approvals.push(prompt);
@@ -998,7 +977,7 @@ impl App {
                 self.mode,
                 Mode::Ask | Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
             )
-            && self.goal_input.is_empty()
+            && self.goal_prompt.is_empty()
         {
             self.help_open = !self.help_open;
             return None;
@@ -1009,8 +988,10 @@ impl App {
             return None;
         }
 
-        // Handle '/' as the command trigger (like gemini cli / slash commands)
+        // Ctrl+/ keeps the legacy command palette available while plain '/'
+        // is now real prompt input for slash commands like `/run`.
         if matches!(key.code, KeyCode::Char('/'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
             && !matches!(self.mode, Mode::CommandPalette | Mode::Ask | Mode::Settings)
         {
             self.prev_mode = self.mode;
@@ -1278,18 +1259,29 @@ impl App {
                 _ => {}
             }
         }
-        // Ctrl+W deletes the word before the caret.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
-            self.goal_cursor = delete_word_before(&mut self.goal_input, self.goal_cursor);
-            return None;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('w') => {
+                    self.goal_prompt.delete_word_before_cursor();
+                    return None;
+                }
+                KeyCode::Char('u') => {
+                    self.goal_prompt.clear_before_cursor();
+                    return None;
+                }
+                KeyCode::Char('k') => {
+                    self.goal_prompt.clear_after_cursor();
+                    return None;
+                }
+                KeyCode::Char('v') => return Some(Intent::PasteClipboard),
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Enter => {
-                let text = std::mem::take(&mut self.goal_input);
-                self.goal_cursor = 0;
-                if text.trim().is_empty() {
-                    return None;
-                }
+                let submission = self.goal_prompt.take_submission()?;
+                let display_text = submission.display_text;
+                let text = submission.model_text;
                 // Guard against the user pasting an API key into the
                 // goal bar (it has happened — see issue with AIza... in
                 // the wild). Keys would otherwise be sent verbatim to
@@ -1306,7 +1298,12 @@ impl App {
                     self.mode = Mode::Settings;
                     return None;
                 }
-                self.goals.insert(0, GoalEntry::new(text.clone()));
+                self.prompt_history.push(display_text.clone());
+                self.prompt_history_cursor = None;
+                if parse_prompt_command(&display_text).is_some() {
+                    return Some(Intent::RunCommand(display_text));
+                }
+                self.goals.insert(0, GoalEntry::new(display_text));
                 self.selected = 0;
                 if self.mode == Mode::Task {
                     Some(Intent::QueueTask(text))
@@ -1315,38 +1312,64 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                self.goal_cursor = delete_char_before(&mut self.goal_input, self.goal_cursor);
+                self.goal_prompt.delete_char_before_cursor();
                 None
             }
             KeyCode::Left => {
-                self.goal_cursor = self.goal_cursor.saturating_sub(1);
+                self.goal_prompt.move_left();
                 None
             }
             KeyCode::Right => {
-                if self.goal_cursor < char_count(&self.goal_input) {
-                    self.goal_cursor += 1;
-                }
+                self.goal_prompt.move_right();
                 None
             }
             KeyCode::Home => {
-                self.goal_cursor = 0;
+                self.goal_prompt.move_home();
                 None
             }
             KeyCode::End => {
-                self.goal_cursor = char_count(&self.goal_input);
+                self.goal_prompt.move_end();
                 None
             }
             KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                if self.goal_prompt.is_empty() && !self.prompt_history.is_empty() {
+                    let idx = self
+                        .prompt_history_cursor
+                        .map(|i| i.saturating_sub(1))
+                        .unwrap_or_else(|| self.prompt_history.len().saturating_sub(1));
+                    self.prompt_history_cursor = Some(idx);
+                    if let Some(entry) = self.prompt_history.get(idx) {
+                        self.goal_prompt.set_text(entry.clone());
+                    }
+                } else {
+                    self.selected = self.selected.saturating_sub(1);
+                }
                 None
             }
             KeyCode::Down => {
-                if self.selected + 1 < self.goals.len() {
+                if let Some(idx) = self.prompt_history_cursor {
+                    if idx + 1 < self.prompt_history.len() {
+                        let next = idx + 1;
+                        self.prompt_history_cursor = Some(next);
+                        if let Some(entry) = self.prompt_history.get(next) {
+                            self.goal_prompt.set_text(entry.clone());
+                        }
+                    } else {
+                        self.prompt_history_cursor = None;
+                        self.goal_prompt.set_text("");
+                    }
+                } else if self.selected + 1 < self.goals.len() {
                     self.selected += 1;
                 }
                 None
             }
-            KeyCode::Char('r') if self.goal_input.is_empty() => {
+            KeyCode::Tab => {
+                if self.goal_prompt.display_text() == "/r" {
+                    self.goal_prompt.set_text("/run ");
+                }
+                None
+            }
+            KeyCode::Char('r') if self.goal_prompt.is_empty() => {
                 // Rollback shortcut — only when the goal bar is empty so the
                 // user can still type words starting with 'r' normally.
                 let goal_index = self.selected;
@@ -1360,11 +1383,11 @@ impl App {
                         }
                     }
                 }
-                self.goal_cursor = insert_char_at(&mut self.goal_input, self.goal_cursor, 'r');
+                self.goal_prompt.insert_char('r');
                 None
             }
             KeyCode::Char(c) => {
-                self.goal_cursor = insert_char_at(&mut self.goal_input, self.goal_cursor, c);
+                self.goal_prompt.insert_char(c);
                 None
             }
             _ => None,
@@ -1372,43 +1395,53 @@ impl App {
     }
 
     fn handle_ask_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
-            self.ask_cursor = delete_word_before(&mut self.ask_input, self.ask_cursor);
-            return None;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('w') => {
+                    self.ask_prompt.delete_word_before_cursor();
+                    return None;
+                }
+                KeyCode::Char('u') => {
+                    self.ask_prompt.clear_before_cursor();
+                    return None;
+                }
+                KeyCode::Char('k') => {
+                    self.ask_prompt.clear_after_cursor();
+                    return None;
+                }
+                KeyCode::Char('v') => return Some(Intent::PasteClipboard),
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Enter => {
-                let q = std::mem::take(&mut self.ask_input);
-                self.ask_cursor = 0;
-                if q.trim().is_empty() {
-                    return None;
-                }
-                Some(Intent::Ask(q))
+                let submission = self.ask_prompt.take_submission()?;
+                self.prompt_history.push(submission.display_text);
+                self.prompt_history_cursor = None;
+                Some(Intent::Ask(submission.model_text))
             }
             KeyCode::Backspace => {
-                self.ask_cursor = delete_char_before(&mut self.ask_input, self.ask_cursor);
+                self.ask_prompt.delete_char_before_cursor();
                 None
             }
             KeyCode::Left => {
-                self.ask_cursor = self.ask_cursor.saturating_sub(1);
+                self.ask_prompt.move_left();
                 None
             }
             KeyCode::Right => {
-                if self.ask_cursor < char_count(&self.ask_input) {
-                    self.ask_cursor += 1;
-                }
+                self.ask_prompt.move_right();
                 None
             }
             KeyCode::Home => {
-                self.ask_cursor = 0;
+                self.ask_prompt.move_home();
                 None
             }
             KeyCode::End => {
-                self.ask_cursor = char_count(&self.ask_input);
+                self.ask_prompt.move_end();
                 None
             }
             KeyCode::Char(c) => {
-                self.ask_cursor = insert_char_at(&mut self.ask_input, self.ask_cursor, c);
+                self.ask_prompt.insert_char(c);
                 None
             }
             _ => None,
@@ -1640,6 +1673,12 @@ pub enum Intent {
     QueueTask(String),
     /// User submitted an ask-mode question. Isolated from goal context.
     Ask(String),
+    /// User submitted `/run <cmd>` or `!<cmd>` from the prompt bar.
+    RunCommand(String),
+    /// User requested OS clipboard paste. On Windows this supports Win+V
+    /// selections that land in the clipboard but are not emitted as terminal
+    /// bracketed-paste events.
+    PasteClipboard,
     /// User triggered a rollback to a specific checkpoint seq for the
     /// currently selected goal.
     Rollback { goal_index: usize, to_seq: u32 },
@@ -1850,12 +1889,17 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let rows: &[(&str, &str)] = &[
         ("Enter", "submit goal / question"),
-        ("/", "open the command palette"),
+        ("/run", "run a command through the sandbox"),
+        ("!", "run command shorthand, e.g. !npm test"),
+        ("Ctrl+/", "open the command palette"),
         ("?", "toggle this help"),
         ("Ctrl+;", "toggle the Ask side panel"),
+        ("Ctrl+V", "paste from Windows clipboard"),
         ("Shift+L", "toggle the Flight Log"),
         ("Ctrl+D", "delete the selected goal"),
         ("Ctrl+W", "delete the previous word in the input"),
+        ("Ctrl+U/K", "clear before / after the caret"),
+        ("Tab", "complete slash command prefix"),
         ("↑ / ↓", "move selection in Goals (or palette)"),
         ("← / →", "move caret in the input bar"),
         ("Home / End", "jump to start/end of the input"),
@@ -2177,8 +2221,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Enter", key),
             Span::styled(" run  ", txt),
             sep.clone(),
-            Span::styled("/", key),
-            Span::styled(" commands  ", txt),
+            Span::styled("/run", key),
+            Span::styled(" command  ", txt),
+            sep.clone(),
+            Span::styled("!", key),
+            Span::styled(" cmd  ", txt),
+            sep.clone(),
+            Span::styled("Ctrl+V", key),
+            Span::styled(" paste  ", txt),
             sep.clone(),
             Span::styled("?", key),
             Span::styled(" help  ", txt),
@@ -2198,6 +2248,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Ask => vec![
             Span::styled("Enter", key),
             Span::styled(" send  ", txt),
+            sep.clone(),
+            Span::styled("Ctrl+V", key),
+            Span::styled(" paste  ", txt),
             sep.clone(),
             Span::styled("Ctrl+;", key),
             Span::styled(" close ask  ", txt),
@@ -2574,7 +2627,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
         welcome_spans.push(Span::styled(".", muted));
-        let lines = vec![
+        let mut lines = vec![
             Line::raw(""),
             Line::from(welcome_spans),
             Line::raw(""),
@@ -2613,10 +2666,24 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::styled("  Shortcuts:", label)),
             Line::from(vec![
                 Span::styled(
-                    "    /",
+                    "    /run",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("       command palette", muted),
+                Span::styled("    sandboxed command", muted),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "    !",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("       command shorthand", muted),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "    Ctrl+V",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  paste clipboard", muted),
             ]),
             Line::from(vec![
                 Span::styled(
@@ -2640,6 +2707,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled("     save + exit?", muted),
             ]),
         ];
+        append_command_run_lines(&mut lines, &app.command_runs);
         let p = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false });
@@ -2715,6 +2783,8 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             append_handoff_lines(&mut lines, handoff);
         }
 
+        append_command_run_lines(&mut lines, &app.command_runs);
+
         // Checkpoint picker — one line per landed subtask, newest last.
         // Marked with a "↶ N" tag for "Rollback to step N" — the actual
         // rollback is dispatched through the orchestrator's control
@@ -2759,6 +2829,44 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
     frame.render_widget(p, area);
+}
+
+fn append_command_run_lines(lines: &mut Vec<Line<'static>>, runs: &[CommandRunSummary]) {
+    if runs.is_empty() {
+        return;
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Commands",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    for run in runs.iter().rev().take(3) {
+        let (label, color) = match run.exit_code {
+            None if run.stdout_preview == "running..." => ("run", WARN),
+            Some(0) => ("ok", SUCCESS),
+            Some(_) => ("fail", DANGER),
+            None => ("blocked", DANGER),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {label} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(short(&run.command, 72), Style::default().fg(Color::White)),
+        ]));
+        if !run.stdout_preview.is_empty() && run.stdout_preview != "running..." {
+            lines.push(Line::from(vec![
+                Span::styled("    out ", Style::default().fg(MUTED)),
+                Span::styled(short(&run.stdout_preview, 90), Style::default().fg(MUTED)),
+            ]));
+        }
+        if !run.stderr_preview.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("    err ", Style::default().fg(WARN)),
+                Span::styled(short(&run.stderr_preview, 90), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
 }
 
 fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket) {
@@ -3206,6 +3314,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::TaskFailed { .. } => (DANGER, "task-failed"),
         E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
         E::ContextSelected { .. } => (VIOLET, "context"),
+        E::PromptManifest { .. } => (VIOLET, "prompt"),
         E::ExtensionLoaded { .. } => (ACCENT, "ext-loaded"),
         E::ExtensionSkipped { .. } => (WARN, "ext-skipped"),
         E::ExtensionConflict { .. } => (WARN, "ext-conflict"),
@@ -3287,13 +3396,48 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let (icon, mode_label, buf, cursor) = match app.mode {
-        Mode::Goal => ("›", " GOAL ", &app.goal_input, app.goal_cursor),
-        Mode::Task => ("›", " TASK ", &app.goal_input, app.goal_cursor),
-        Mode::Ask => ("?", " ASK ", &app.ask_input, app.ask_cursor),
-        Mode::Settings => ("⚙", " SETTINGS ", &app.goal_input, app.goal_cursor),
-        Mode::Memory => ("M", " MEMORY ", &app.goal_input, app.goal_cursor),
-        Mode::History => ("H", " HISTORY ", &app.goal_input, app.goal_cursor),
-        Mode::CommandPalette => ("/", " COMMAND ", &app.goal_input, app.goal_cursor),
+        Mode::Goal => (
+            "›",
+            " GOAL ",
+            app.goal_prompt.display_text(),
+            app.goal_prompt.cursor(),
+        ),
+        Mode::Task => (
+            "›",
+            " TASK ",
+            app.goal_prompt.display_text(),
+            app.goal_prompt.cursor(),
+        ),
+        Mode::Ask => (
+            "?",
+            " ASK ",
+            app.ask_prompt.display_text(),
+            app.ask_prompt.cursor(),
+        ),
+        Mode::Settings => (
+            "⚙",
+            " SETTINGS ",
+            app.goal_prompt.display_text(),
+            app.goal_prompt.cursor(),
+        ),
+        Mode::Memory => (
+            "M",
+            " MEMORY ",
+            app.goal_prompt.display_text(),
+            app.goal_prompt.cursor(),
+        ),
+        Mode::History => (
+            "H",
+            " HISTORY ",
+            app.goal_prompt.display_text(),
+            app.goal_prompt.cursor(),
+        ),
+        Mode::CommandPalette => (
+            "/",
+            " COMMAND ",
+            app.goal_prompt.display_text(),
+            app.goal_prompt.cursor(),
+        ),
     };
 
     let mode_style = match app.mode {
@@ -3554,6 +3698,7 @@ impl WorkerDispatcher for StubDispatcher {
 /// state update the driver received on one of the watch channels.
 enum LoopEvent {
     Key(KeyEvent),
+    Paste(String),
     StateUpdate(usize, Box<GlobalState>),
     AskAnswer(String),
     McpApprovalRequested {
@@ -3571,6 +3716,8 @@ enum LoopEvent {
     /// Background model-list fetch completed for the picker overlay.
     /// Carries the full list on success or an error string.
     ModelsLoaded(Result<Vec<String>, String>),
+    /// A prompt-bar command finished running through the sandbox.
+    CommandFinished(CommandRunSummary),
     FlightEvent(usize, EventRecord),
     Tick,
 }
@@ -4667,7 +4814,7 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -4698,6 +4845,7 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show,
         SetCursorStyle::DefaultUserShape,
@@ -4723,21 +4871,53 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
         // preventing the splash animation and terminal cursor from feeling
         // like they are flashing on every frame.
         if event::poll(Duration::from_millis(UI_TICK_MS)).unwrap_or(false) {
-            if let Ok(Event::Key(k)) = event::read() {
-                // IMPORTANT: Filter for 'Press' events only. Windows and some
-                // modern terminal emulators send 'Release' events too. If we
-                // handle both, the user sees "double input" (e.g. 'ww') and
-                // the TUI flickers because we redraw twice.
-                if k.kind != event::KeyEventKind::Release
-                    && tx.blocking_send(LoopEvent::Key(k)).is_err()
+            match event::read() {
+                Ok(Event::Key(k))
+                    if k.kind != event::KeyEventKind::Release
+                        && tx.blocking_send(LoopEvent::Key(k)).is_err() =>
                 {
                     break;
                 }
+                Ok(Event::Paste(text)) => {
+                    if let Err(_err) = tx.blocking_send(LoopEvent::Paste(text)) {
+                        break;
+                    }
+                }
+                _ => {}
             }
         } else if tx.blocking_send(LoopEvent::Tick).is_err() {
             break;
         }
     });
+}
+
+fn read_clipboard_text() -> std::result::Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if err.is_empty() {
+                "PowerShell Get-Clipboard failed".into()
+            } else {
+                err
+            });
+        }
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let text = text.trim_end_matches(['\r', '\n']).to_string();
+        if text.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(text))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("clipboard paste is currently implemented for Windows only".into())
+    }
 }
 
 async fn run_app<B: Backend>(
@@ -4768,12 +4948,54 @@ async fn run_app<B: Backend>(
                     app.new_best_ticks -= 1;
                 }
             }
+            LoopEvent::Paste(text) => {
+                app.handle_paste(&text);
+            }
             LoopEvent::Key(k) => {
                 if let Some(intent) = app.handle_key(k) {
                     match intent {
                         Intent::Quit => {
                             deny_pending_mcp_approvals(&mut approval_replies);
                             break;
+                        }
+                        Intent::PasteClipboard => match read_clipboard_text() {
+                            Ok(Some(text)) => app.handle_paste(&text),
+                            Ok(None) => {
+                                app.settings.message = Some("Clipboard is empty.".into());
+                            }
+                            Err(e) => {
+                                app.settings.message = Some(format!("Clipboard paste failed: {e}"));
+                            }
+                        },
+                        Intent::RunCommand(text) => {
+                            if let Some(parsed) = parse_prompt_command(&text) {
+                                let command = parsed.original.clone();
+                                app.push_command_run(CommandRunSummary {
+                                    command: command.clone(),
+                                    exit_code: None,
+                                    stdout_preview: "running...".into(),
+                                    stderr_preview: String::new(),
+                                });
+                                let tx2 = tx.clone();
+                                let sandbox = Arc::clone(&sandbox);
+                                tokio::spawn(async move {
+                                    let summary = match sandbox.run_tool(parsed.call).await {
+                                        Ok(output) => summarize_output(
+                                            &command,
+                                            output.status.code(),
+                                            &output.stdout,
+                                            &output.stderr,
+                                        ),
+                                        Err(e) => CommandRunSummary {
+                                            command,
+                                            exit_code: None,
+                                            stdout_preview: String::new(),
+                                            stderr_preview: e.to_string(),
+                                        },
+                                    };
+                                    let _ = tx2.send(LoopEvent::CommandFinished(summary)).await;
+                                });
+                            }
                         }
                         Intent::QueueGoal(text) | Intent::QueueTask(text) => {
                             let direct_task = app.mode == Mode::Task;
@@ -5113,6 +5335,9 @@ async fn run_app<B: Backend>(
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
             }
+            LoopEvent::CommandFinished(summary) => {
+                app.push_command_run(summary);
+            }
             LoopEvent::McpApprovalRequested { prompt, reply_tx } => {
                 approval_replies.insert(prompt.id, reply_tx);
                 app.push_mcp_approval(prompt);
@@ -5185,6 +5410,117 @@ fn single_task_plan(description: String, attachments: Vec<PromptAttachment>) -> 
         coverage_summary: CoverageSummary::default(),
         goal_contract: Some(goal_contract),
     }
+}
+
+fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, goal_text: &str) {
+    let Some(contract) = plan.goal_contract.as_mut() else {
+        return;
+    };
+    let lower_goal = goal_text.to_ascii_lowercase();
+    let is_chess = lower_goal.contains("chess")
+        && (lower_goal.contains("make")
+            || lower_goal.contains("build")
+            || lower_goal.contains("create"));
+    let mut stack_detected = false;
+
+    let package_json = working_dir.join("package.json");
+    if package_json.is_file() {
+        stack_detected = true;
+        if let Ok(text) = std::fs::read_to_string(&package_json) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                let scripts = value.get("scripts").and_then(|scripts| scripts.as_object());
+                if scripts.and_then(|scripts| scripts.get("build")).is_some() {
+                    push_verify_step(
+                        contract,
+                        "npm build",
+                        vec!["npm".into(), "run".into(), "build".into()],
+                    );
+                }
+                if scripts.and_then(|scripts| scripts.get("test")).is_some() {
+                    push_verify_step(contract, "npm test", vec!["npm".into(), "test".into()]);
+                }
+                if scripts.and_then(|scripts| scripts.get("dev")).is_some() {
+                    push_run_command(
+                        contract,
+                        "Run dev server",
+                        vec!["npm".into(), "run".into(), "dev".into()],
+                    );
+                } else if scripts.and_then(|scripts| scripts.get("start")).is_some() {
+                    push_run_command(contract, "Run app", vec!["npm".into(), "start".into()]);
+                }
+            }
+        }
+        if is_chess {
+            contract.acceptance_criteria.push(
+                "In this web/npm workspace, the chess result must run in the app, not just compile as a toy script."
+                    .into(),
+            );
+        }
+    }
+
+    if working_dir.join("Cargo.toml").is_file() {
+        stack_detected = true;
+        push_verify_step(
+            contract,
+            "cargo test",
+            vec!["cargo".into(), "test".into(), "--locked".into()],
+        );
+        push_run_command(contract, "Run binary", vec!["cargo".into(), "run".into()]);
+    }
+
+    if working_dir.join("Makefile").is_file() || working_dir.join("makefile").is_file() {
+        stack_detected = true;
+        push_verify_step(contract, "make", vec!["make".into()]);
+        if is_chess {
+            push_run_command(contract, "Run chess binary", vec![".\\chess.exe".into()]);
+        }
+    }
+
+    if !stack_detected {
+        contract
+            .assumptions
+            .push("No package.json, Cargo.toml, or Makefile was detected before planning.".into());
+        if is_chess {
+            contract.clarification_questions.push(
+                "No project stack was detected. Should Phonton create chess as a web app, terminal game, or native binary?"
+                    .into(),
+            );
+        }
+    }
+}
+
+fn push_verify_step(contract: &mut phonton_types::GoalContract, label: &str, command: Vec<String>) {
+    if contract
+        .verify_plan
+        .iter()
+        .any(|step| step.command.as_ref().map(|cmd| &cmd.command) == Some(&command))
+    {
+        return;
+    }
+    contract.verify_plan.push(VerifyStepSpec {
+        name: label.into(),
+        layer: None,
+        command: Some(RunCommand {
+            label: label.into(),
+            command,
+            cwd: None,
+        }),
+    });
+}
+
+fn push_run_command(contract: &mut phonton_types::GoalContract, label: &str, command: Vec<String>) {
+    if contract
+        .run_plan
+        .iter()
+        .any(|existing| existing.command == command)
+    {
+        return;
+    }
+    contract.run_plan.push(RunCommand {
+        label: label.into(),
+        command,
+        cwd: None,
+    });
 }
 
 fn prepare_goal_attachments(text: &str, working_dir: &Path) -> Vec<PromptAttachment> {
@@ -5453,6 +5789,7 @@ async fn spawn_goal(
         Ok(p) => p,
         Err(_) => return,
     };
+    apply_workspace_preflight(&mut plan, working_dir, &text);
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
@@ -6081,7 +6418,98 @@ fn extract_id(line: &str) -> Option<String> {
         for c in "add fn foo".chars() {
             assert!(app.handle_key(key(c)).is_none());
         }
-        assert_eq!(app.goal_input, "add fn foo");
+        assert_eq!(app.goal_prompt.display_text(), "add fn foo");
+    }
+
+    #[test]
+    fn paste_event_collapses_long_prompt_content() {
+        let mut app = App::default();
+        app.handle_paste("line one\nline two");
+
+        assert_eq!(app.goal_prompt.display_text(), "[paste: 2 lines, 17 chars]");
+    }
+
+    #[test]
+    fn ctrl_v_requests_clipboard_paste() {
+        let mut app = App::default();
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        assert_eq!(intent, Some(Intent::PasteClipboard));
+    }
+
+    #[test]
+    fn run_command_submission_does_not_queue_goal() {
+        let mut app = App::default();
+        for ch in "/run cargo test".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, Some(Intent::RunCommand("/run cargo test".into())));
+        assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn workspace_preflight_adds_npm_verification_and_run_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"}}"#,
+        )
+        .unwrap();
+        let mut plan = single_task_plan("make chess".into(), Vec::new());
+
+        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
+
+        let contract = plan.goal_contract.unwrap();
+        assert!(contract.verify_plan.iter().any(|step| {
+            step.command
+                .as_ref()
+                .map(|cmd| cmd.command == vec!["npm".to_string(), "run".into(), "build".into()])
+                .unwrap_or(false)
+        }));
+        assert!(contract.verify_plan.iter().any(|step| {
+            step.command
+                .as_ref()
+                .map(|cmd| cmd.command == vec!["npm".to_string(), "test".into()])
+                .unwrap_or(false)
+        }));
+        assert!(contract
+            .run_plan
+            .iter()
+            .any(|cmd| cmd.command == vec!["npm".to_string(), "run".into(), "dev".into()]));
+    }
+
+    #[test]
+    fn workspace_preflight_marks_stackless_chess_as_clarification_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = single_task_plan("make chess".into(), Vec::new());
+
+        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
+
+        let contract = plan.goal_contract.unwrap();
+        assert!(contract
+            .clarification_questions
+            .iter()
+            .any(|question| question.contains("web app, terminal game, or native binary")));
+        assert!(contract
+            .assumptions
+            .iter()
+            .any(|assumption| assumption.contains("No package.json")));
+    }
+
+    #[test]
+    fn prompt_history_restores_last_submission_when_input_empty() {
+        let mut app = App::default();
+        for ch in "make chess".chars() {
+            app.handle_key(key(ch));
+        }
+        let _ = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.goal_prompt.display_text(), "make chess");
     }
 
     #[test]
@@ -6093,7 +6521,7 @@ fn extract_id(line: &str) -> Option<String> {
         let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(intent, Some(Intent::QueueGoal("hello".into())));
         assert_eq!(app.goals.len(), 1);
-        assert_eq!(app.goal_input, "");
+        assert_eq!(app.goal_prompt.display_text(), "");
     }
 
     #[test]
@@ -6476,8 +6904,8 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.goals.len(), 1);
         assert_eq!(app.goals[0].description, "ship session resume");
         assert_eq!(app.goals[0].task_id, task_id);
-        assert_eq!(app.goal_input, "draft follow-up");
-        assert_eq!(app.ask_input, "summarize state");
+        assert_eq!(app.goal_prompt.display_text(), "draft follow-up");
+        assert_eq!(app.ask_prompt.display_text(), "summarize state");
         assert_eq!(app.ask_answer.as_deref(), Some("resume support is pending"));
         assert_eq!(app.best_savings_pct, Some(80));
     }

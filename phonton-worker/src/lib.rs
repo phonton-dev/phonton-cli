@@ -35,8 +35,8 @@ use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
     CodeSlice, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord, ModelTier, Permission,
-    SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer,
-    VerifyResult,
+    PromptContextManifest, SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
+    TokenUsage, VerifyLayer, VerifyResult,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -159,9 +159,9 @@ impl Worker {
         self
     }
 
-    /// Attach the async memory facade. When present, a `Decision` record
-    /// is appended for every subtask that reaches `VerifyResult::Pass`,
-    /// giving the next planner run visibility into completed work.
+    /// Attach the async memory facade. The worker keeps this available for
+    /// future typed memory writes, but it does not record generic
+    /// "completed task" memories because those pollute later prompts.
     pub fn with_memory_store(mut self, memory: phonton_memory::MemoryStore) -> Self {
         self.memory = Some(memory);
         self
@@ -259,16 +259,6 @@ impl Worker {
             .map(|s| s.origin)
             .collect();
 
-        // Ensure system prompt is in context (Verbatim, priority 10).
-        // Only push if it's not already the first frame.
-        {
-            let mut ctx = self.context.lock().await;
-            if ctx.frames().is_empty() {
-                ctx.push(ContextFrame::Verbatim(system_prompt.clone()))
-                    .await?;
-            }
-        }
-
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
         let mut token_usage = TokenUsage::default();
@@ -300,10 +290,28 @@ impl Worker {
             // user prompt into the manager until we get a successful
             // response, to avoid polluting the history with failed attempts
             // that will be superseded by the error-retry prompt.
-            let full_prompt = {
+            let (rendered_context, full_prompt) = {
                 let ctx = self.context.lock().await;
-                format!("{}\n\n{}", ctx.render(), user_prompt)
+                let rendered_context = ctx.render();
+                let full_prompt = render_full_prompt(&rendered_context, &user_prompt);
+                (rendered_context, full_prompt)
             };
+            if let Some(tx) = &self.msg_tx {
+                let manifest = prompt_context_manifest(
+                    &system_prompt,
+                    &subtask,
+                    &rendered_context,
+                    last_errors.as_slice(),
+                    mcp_results.as_slice(),
+                    self.mcp.as_deref(),
+                );
+                let _ = tx.try_send(
+                    phonton_types::messages::OrchestratorMessage::PromptManifest {
+                        id: subtask.id,
+                        manifest,
+                    },
+                );
+            }
 
             let response = self
                 .provider
@@ -449,15 +457,11 @@ impl Worker {
                     if let Err(e) = self.persist_decisions(&subtask) {
                         warn!(error = %e, "failed to persist subtask decisions");
                     }
-                    if let Some(memory) = &self.memory {
-                        let rec = MemoryRecord::Decision {
-                            title: subtask.description.clone(),
-                            body: format!("completed: {}", subtask.description),
-                            task_id: self.task_id,
-                        };
-                        if let Err(e) = memory.record(rec).await {
-                            warn!(error = %e, "failed to record completion memory");
-                        }
+                    if self.memory.is_some() {
+                        debug!(
+                            subtask = %subtask.id,
+                            "skipping generic completion memory record"
+                        );
                     }
                     return Ok(SubtaskResult {
                         id: subtask.id,
@@ -823,7 +827,8 @@ fn next_tier(t: ModelTier) -> ModelTier {
 // ---------------------------------------------------------------------------
 
 /// Base system prompt. Pinned `Verbatim` in the worker's context window —
-/// never compressed. The diff-only constraint is hard-coded here because
+/// Sent only in the provider system slot so it is not duplicated inside the
+/// user-context render. The diff-only constraint is hard-coded here because
 /// review and verification expect parseable unified diffs.
 fn base_system_prompt() -> String {
     "You are a Phonton worker. You produce code changes as unified diffs ONLY.\n\
@@ -939,6 +944,73 @@ fn render_user_prompt(
     out.push_str("Output the UNIFIED DIFF for the above subtask. START with `--- a/` or `--- /dev/null`. NO PREAMBLE. NO PROSE.\n");
 
     out
+}
+
+fn render_full_prompt(rendered_context: &str, user_prompt: &str) -> String {
+    let context = rendered_context.trim();
+    if context.is_empty() {
+        user_prompt.to_string()
+    } else {
+        format!("{context}\n\n{user_prompt}")
+    }
+}
+
+fn prompt_context_manifest(
+    system_prompt: &str,
+    subtask: &Subtask,
+    rendered_context: &str,
+    prior_errors: &[String],
+    mcp_results: &[McpResultContext],
+    mcp: Option<&McpRuntime>,
+) -> PromptContextManifest {
+    let system_tokens = estimate_prompt_tokens(system_prompt);
+    let user_goal_tokens = estimate_prompt_tokens(&subtask.description);
+    let memory_tokens = estimate_prompt_tokens(rendered_context);
+    let attachment_tokens = estimate_prompt_tokens(&phonton_types::render_prompt_attachments(
+        &subtask.attachments,
+    ));
+    let retry_error_tokens = estimate_prompt_tokens(&prior_errors.join("\n"));
+    let mut mcp_text = String::new();
+    if let Some(runtime) = mcp {
+        for server in runtime.servers() {
+            mcp_text.push_str(server.id.as_str());
+            mcp_text.push(' ');
+            mcp_text.push_str(&server.name);
+            mcp_text.push('\n');
+        }
+    }
+    for result in mcp_results {
+        mcp_text.push_str(&result.server_id.to_string());
+        mcp_text.push(' ');
+        mcp_text.push_str(&result.tool_name);
+        mcp_text.push(' ');
+        mcp_text.push_str(&result.content);
+        mcp_text.push('\n');
+    }
+    let mcp_tool_tokens = estimate_prompt_tokens(&mcp_text);
+    let total_estimated_tokens = system_tokens
+        .saturating_add(user_goal_tokens)
+        .saturating_add(memory_tokens)
+        .saturating_add(attachment_tokens)
+        .saturating_add(mcp_tool_tokens)
+        .saturating_add(retry_error_tokens);
+
+    PromptContextManifest {
+        system_tokens,
+        user_goal_tokens,
+        memory_tokens,
+        attachment_tokens,
+        mcp_tool_tokens,
+        retry_error_tokens,
+        total_estimated_tokens,
+    }
+}
+
+fn estimate_prompt_tokens(text: &str) -> u64 {
+    if text.trim().is_empty() {
+        return 0;
+    }
+    ((text.chars().count() as u64).saturating_add(3)) / 4
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1451,6 +1523,120 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("arguments"));
+    }
+
+    #[test]
+    fn full_prompt_omits_empty_context_padding() {
+        assert_eq!(
+            render_full_prompt("", "# Subtask\nmake chess"),
+            "# Subtask\nmake chess"
+        );
+        assert_eq!(
+            render_full_prompt("prior", "# Subtask\nmake chess"),
+            "prior\n\n# Subtask\nmake chess"
+        );
+    }
+
+    #[test]
+    fn prompt_manifest_breaks_out_section_costs() {
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "make chess".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let manifest = prompt_context_manifest(
+            &base_system_prompt(),
+            &subtask,
+            "prior decision context",
+            &["syntax failed".into()],
+            &[],
+            None,
+        );
+        assert!(manifest.system_tokens > 0);
+        assert!(manifest.user_goal_tokens > 0);
+        assert!(manifest.memory_tokens > 0);
+        assert!(manifest.retry_error_tokens > 0);
+        assert_eq!(
+            manifest.total_estimated_tokens,
+            manifest
+                .system_tokens
+                .saturating_add(manifest.user_goal_tokens)
+                .saturating_add(manifest.memory_tokens)
+                .saturating_add(manifest.attachment_tokens)
+                .saturating_add(manifest.mcp_tool_tokens)
+                .saturating_add(manifest.retry_error_tokens)
+        );
+    }
+
+    #[derive(Clone)]
+    struct RecordingProvider {
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        async fn call(
+            &self,
+            system: &str,
+            user: &str,
+            _slice_origins: &[SliceOrigin],
+        ) -> Result<phonton_types::LLMResponse> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((system.to_string(), user.to_string()));
+            Ok(phonton_types::LLMResponse {
+                content: "this is not a diff".into(),
+                input_tokens: 10,
+                output_tokens: 2,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                provider: phonton_types::ProviderKind::Anthropic,
+                model_name: "recording".into(),
+            })
+        }
+
+        fn kind(&self) -> phonton_types::ProviderKind {
+            phonton_types::ProviderKind::Anthropic
+        }
+
+        fn model(&self) -> String {
+            "recording".into()
+        }
+
+        fn clone_box(&self) -> Box<dyn Provider> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_duplicate_system_prompt_in_user_context() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), guard());
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "make chess".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let _ = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        let (system, user) = &calls[0];
+        assert!(system.contains("You are a Phonton worker"));
+        assert!(user.contains("# Subtask"));
+        assert!(user.contains("make chess"));
+        assert!(!user.contains("You are a Phonton worker"));
     }
 
     #[test]

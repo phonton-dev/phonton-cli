@@ -950,6 +950,29 @@ pub struct ContextManifest {
     pub sources: Vec<ContextSource>,
 }
 
+/// Estimated token shape of one prompt sent to a provider.
+///
+/// These values are deliberately approximate. Provider-reported usage is
+/// still the billing source of truth; this manifest exists to make prompt
+/// composition and avoidable context waste visible in the Flight Log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptContextManifest {
+    /// Tokens attributed to the provider system prompt.
+    pub system_tokens: u64,
+    /// Tokens attributed to the current user goal/subtask.
+    pub user_goal_tokens: u64,
+    /// Tokens attributed to prior context or memory.
+    pub memory_tokens: u64,
+    /// Tokens attributed to user-mentioned attachments.
+    pub attachment_tokens: u64,
+    /// Tokens attributed to MCP/tool instructions and results.
+    pub mcp_tool_tokens: u64,
+    /// Tokens attributed to retry/verification error context.
+    pub retry_error_tokens: u64,
+    /// Sum of the approximate section buckets above.
+    pub total_estimated_tokens: u64,
+}
+
 /// Record of one privileged action request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionRecord {

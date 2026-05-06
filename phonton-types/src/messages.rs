@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
+    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier,
+    PromptContextManifest, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,6 +51,13 @@ pub enum OrchestratorMessage {
         slices: Vec<ContextAttribution>,
         /// Sum of slice token counts where known.
         total_token_count: usize,
+    },
+    /// Worker built a provider prompt and estimated the section costs.
+    PromptManifest {
+        /// Subtask receiving the prompt.
+        id: SubtaskId,
+        /// Approximate prompt section token counts.
+        manifest: PromptContextManifest,
     },
     /// Worker finished a subtask successfully.
     SubtaskDone {

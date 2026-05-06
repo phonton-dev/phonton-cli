@@ -81,12 +81,45 @@ impl Goal {
     /// Build a conservative first-pass contract for the goal.
     pub fn contract(&self) -> GoalContract {
         let task_class = phonton_types::classify_task(&self.description);
+        let chess_goal = is_chess_goal(&self.description);
         let mut assumptions = Vec::new();
         if !self.attachments.is_empty() {
             assumptions.push(format!(
                 "{} mentioned file/image attachment(s) should influence the plan.",
                 self.attachments.len()
             ));
+        }
+        let mut acceptance_criteria = vec![
+            "Produce a focused, reviewable diff for the requested change.".into(),
+            "Respect mentioned file/image attachments when planning and editing.".into(),
+            "Do not claim correctness beyond checks that actually ran.".into(),
+        ];
+        let mut quality_criteria = vec![
+            "Diff is parseable and reviewable.".into(),
+            "Verification outcome is surfaced honestly.".into(),
+        ];
+        let mut expected_artifacts: Vec<ExpectedArtifact> = self
+            .attachments
+            .iter()
+            .map(|a| ExpectedArtifact {
+                description: format!("Use mentioned attachment {}", a.path.display()),
+                path: Some(a.path.clone()),
+            })
+            .collect();
+        if chess_goal {
+            acceptance_criteria.extend([
+                "Produce a playable chess artifact, not a placeholder or greeting.".into(),
+                "Represent an 8x8 board, named chess pieces, turns, legal move handling, and reset/new-game behavior.".into(),
+                "Provide a concrete run command and at least one build/test/verification command.".into(),
+            ]);
+            quality_criteria.extend([
+                "Trivial output such as printing \"Chess\" is below the quality floor.".into(),
+                "The result must include enough game logic for a user to interact with chess moves.".into(),
+            ]);
+            expected_artifacts.push(ExpectedArtifact {
+                description: "Playable chess implementation".into(),
+                path: None,
+            });
         }
         GoalContract {
             goal: self.description.clone(),
@@ -96,19 +129,8 @@ impl Goal {
             } else {
                 75
             },
-            acceptance_criteria: vec![
-                "Produce a focused, reviewable diff for the requested change.".into(),
-                "Respect mentioned file/image attachments when planning and editing.".into(),
-                "Do not claim correctness beyond checks that actually ran.".into(),
-            ],
-            expected_artifacts: self
-                .attachments
-                .iter()
-                .map(|a| ExpectedArtifact {
-                    description: format!("Use mentioned attachment {}", a.path.display()),
-                    path: Some(a.path.clone()),
-                })
-                .collect(),
+            acceptance_criteria,
+            expected_artifacts,
             likely_files: self.attachments.iter().map(|a| a.path.clone()).collect(),
             verify_plan: vec![VerifyStepSpec {
                 name: "Run configured Phonton verification layers".into(),
@@ -117,10 +139,7 @@ impl Goal {
             }],
             run_plan: Vec::<RunCommand>::new(),
             quality_floor: QualityFloor {
-                criteria: vec![
-                    "Diff is parseable and reviewable.".into(),
-                    "Verification outcome is surfaced honestly.".into(),
-                ],
+                criteria: quality_criteria,
             },
             clarification_questions: if self.description.split_whitespace().count() <= 2 {
                 vec!["What exact behavior or artifact should Phonton produce?".into()]
@@ -130,6 +149,12 @@ impl Goal {
             assumptions,
         }
     }
+}
+
+fn is_chess_goal(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    (lower.contains("make") || lower.contains("build") || lower.contains("create"))
+        && lower.contains("chess")
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +548,12 @@ pub async fn decompose_with_memory_store(
     let records = memory.query(&goal.description, 5).await?;
     let mut plan = decompose(goal);
 
+    let records: Vec<MemoryRecord> = records
+        .into_iter()
+        .filter(|record| !is_generic_completion_memory(record))
+        .take(5)
+        .collect();
+
     if records.is_empty() {
         return Ok(plan);
     }
@@ -533,7 +564,7 @@ pub async fn decompose_with_memory_store(
     }
 
     if let Some(first) = plan.subtasks.first_mut() {
-        first.description = format!("{preamble}\n{}", first.description);
+        first.description = format!("{}\n{}", cap_memory_preamble(preamble), first.description);
     }
     Ok(plan)
 }
@@ -555,6 +586,14 @@ fn render_record_line(rec: &MemoryRecord) -> String {
             None => format!("convention: {rule}"),
         },
     }
+}
+
+fn is_generic_completion_memory(rec: &MemoryRecord) -> bool {
+    matches!(
+        rec,
+        MemoryRecord::Decision { body, .. }
+            if body.trim_start().to_ascii_lowercase().starts_with("completed:")
+    )
 }
 
 /// Collect distinct keyword queries to fan out against memory.
@@ -641,6 +680,16 @@ fn is_noise_word(s: &str) -> bool {
 /// Render the "Prior context" preamble from matched memory records. Empty
 /// when no records matched — caller should skip injection in that case.
 fn render_memory_preamble(rejected: &[MemoryRecord], decisions: &[MemoryRecord]) -> String {
+    let rejected: Vec<&MemoryRecord> = rejected
+        .iter()
+        .filter(|record| !is_generic_completion_memory(record))
+        .take(3)
+        .collect();
+    let decisions: Vec<&MemoryRecord> = decisions
+        .iter()
+        .filter(|record| !is_generic_completion_memory(record))
+        .take(5)
+        .collect();
     if rejected.is_empty() && decisions.is_empty() {
         return String::new();
     }
@@ -661,7 +710,17 @@ fn render_memory_preamble(rejected: &[MemoryRecord], decisions: &[MemoryRecord])
             }
         }
     }
-    out
+    cap_memory_preamble(out)
+}
+
+fn cap_memory_preamble(mut preamble: String) -> String {
+    const MAX_MEMORY_PREAMBLE_CHARS: usize = 1_200;
+    if preamble.chars().count() <= MAX_MEMORY_PREAMBLE_CHARS {
+        return preamble;
+    }
+    preamble = preamble.chars().take(MAX_MEMORY_PREAMBLE_CHARS).collect();
+    preamble.push_str("\n- [memory context truncated]\n");
+    preamble
 }
 
 /// Tier used for auto-generated test subtasks. Tests are routine output
@@ -863,6 +922,24 @@ mod tests {
     }
 
     #[test]
+    fn chess_goal_contract_requires_playable_artifact() {
+        let contract = Goal::new("make chess").contract();
+        assert!(contract
+            .acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.contains("playable chess")));
+        assert!(contract
+            .quality_floor
+            .criteria
+            .iter()
+            .any(|criterion| criterion.contains("Trivial output")));
+        assert!(contract
+            .expected_artifacts
+            .iter()
+            .any(|artifact| artifact.description.contains("Playable chess")));
+    }
+
+    #[test]
     fn coverage_summary_renders_honest_signal() {
         let plan = decompose(&Goal::new("add function a and add function b"));
         assert_eq!(
@@ -888,6 +965,25 @@ mod tests {
         let first = &plan.subtasks[0];
         assert!(first.description.contains("Prior context from memory"));
         assert!(first.description.contains("parse_callsites"));
+    }
+
+    #[tokio::test]
+    async fn generic_completion_memory_is_filtered_from_preamble() {
+        let store = Store::in_memory().unwrap();
+        store
+            .append_memory(&MemoryRecord::Decision {
+                title: "make chess".into(),
+                body: "completed: make chess".into(),
+                task_id: None,
+            })
+            .unwrap();
+        let plan = decompose_with_memory(&Goal::new("make chess"), &store, None)
+            .await
+            .unwrap();
+        assert!(!plan.subtasks[0]
+            .description
+            .contains("Prior context from memory"));
+        assert!(!plan.subtasks[0].description.contains("completed:"));
     }
 
     #[tokio::test]

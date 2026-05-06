@@ -4,6 +4,23 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.5.0 - Prompt, Commands, And Quality Gates
+
+### Added
+
+- Long or multiline TUI pastes now collapse into prompt artifacts like `[paste: 18 lines, 3.4k chars]` while preserving bounded full content for the submitted goal.
+- Added Windows clipboard import with `Ctrl+V`, including content selected via Windows clipboard history (`Win+V`) when the terminal does not emit bracketed paste directly.
+- Added `/run <cmd>` and `!<cmd>` prompt-bar command execution with sandbox routing, command status, exit code, duration/output previews, and Flight Log evidence.
+- Added prompt-section token manifests in the Flight Log to expose approximate system, goal, memory, attachment, MCP, and retry-context costs per provider call.
+- Added stack-aware preflight for `package.json`, `Cargo.toml`, and `Makefile` workspaces so contracts include concrete verification and run commands when detectable.
+
+### Changed
+
+- The worker no longer duplicates the system prompt inside rendered user context.
+- Generic completion memories such as `completed: make chess` are filtered from future memory preambles.
+- Broad chess goals now require playable-game acceptance criteria and fail the quality gate before review when the result is only a placeholder.
+- Prompt editing gained `Ctrl+U`, `Ctrl+K`, history navigation, and slash-command completion QoL.
+
 ## 0.4.8 - TUI Polish
 
 ### Fixed

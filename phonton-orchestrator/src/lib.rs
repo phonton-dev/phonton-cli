@@ -541,6 +541,13 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                             });
                             continue;
                         }
+                        Some(OrchestratorMessage::PromptManifest { id, manifest }) => {
+                            self.emit(OrchestratorEvent::PromptManifest {
+                                subtask_id: id,
+                                manifest,
+                            });
+                            continue;
+                        }
                         Some(OrchestratorMessage::SubtaskProgress { id, tokens_so_far }) => {
                             if let Some(rt) = runtimes.get_mut(&id) {
                                 rt.tokens_used = tokens_so_far;
@@ -748,6 +755,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // 5. Final task status. Paused takes priority over a simultaneous
         //    failure (the pause aborted the joinset so any failure that
         //    raced in is noise). Real failures take priority over nothing.
+        let quality_failures = if failure.is_none() && paused.is_none() {
+            self.quality_gate_failures(&plan, &runtimes)
+        } else {
+            Vec::new()
+        };
+
         let terminal = if let Some((_, limit, observed, ceiling)) = paused {
             TaskStatus::Paused {
                 limit,
@@ -763,6 +776,17 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             TaskStatus::Failed {
                 reason,
                 failed_subtask: Some(fid),
+            }
+        } else if !quality_failures.is_empty() {
+            let reason = format!("quality gate failed: {}", quality_failures.join("; "));
+            self.emit(OrchestratorEvent::TaskFailed {
+                task_id: self.task_id,
+                reason: reason.clone(),
+                failed_subtask: None,
+            });
+            TaskStatus::Failed {
+                reason,
+                failed_subtask: None,
             }
         } else {
             self.emit(OrchestratorEvent::TaskCompleted {
@@ -1190,6 +1214,71 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         Ok(())
     }
 
+    fn quality_gate_failures(
+        &self,
+        plan: &PlannerOutput,
+        runtimes: &HashMap<SubtaskId, SubtaskRuntime>,
+    ) -> Vec<String> {
+        let Some(contract) = &plan.goal_contract else {
+            return Vec::new();
+        };
+        if !is_chess_goal_text(&contract.goal) && !is_chess_goal_text(&self.goal_text) {
+            return Vec::new();
+        }
+
+        let mut added_lines = 0usize;
+        let mut added_text = String::new();
+        for rt in runtimes.values() {
+            for hunk in &rt.diff_hunks {
+                for line in &hunk.lines {
+                    if let DiffLine::Added(text) = line {
+                        added_lines = added_lines.saturating_add(1);
+                        added_text.push_str(text);
+                        added_text.push('\n');
+                    }
+                }
+            }
+        }
+        let lower = added_text.to_ascii_lowercase();
+        let mut failures = Vec::new();
+        if added_lines < 80 {
+            failures.push(format!(
+                "playable chess requires substantial implementation; only {added_lines} added line(s) were produced"
+            ));
+        }
+        let piece_hits = ["king", "queen", "rook", "bishop", "knight", "pawn"]
+            .iter()
+            .filter(|piece| lower.contains(**piece))
+            .count();
+        if piece_hits < 4 {
+            failures.push("playable chess must represent named chess pieces".into());
+        }
+        if !(lower.contains("board") || lower.contains("chessboard")) {
+            failures.push("playable chess must represent an 8x8 board".into());
+        }
+        if !(lower.contains("turn") && lower.contains("move")) {
+            failures.push("playable chess must include turn and move handling".into());
+        }
+        if !(lower.contains("legal") || lower.contains("valid")) {
+            failures.push("playable chess must include legal or valid move checks".into());
+        }
+        if !(lower.contains("reset") || lower.contains("new game") || lower.contains("new_game")) {
+            failures.push("playable chess must include reset or new-game behavior".into());
+        }
+        if contract.run_plan.is_empty() {
+            failures.push("playable chess requires a concrete run command".into());
+        }
+        if !contract
+            .verify_plan
+            .iter()
+            .any(|step| step.command.is_some())
+        {
+            failures
+                .push("playable chess requires a concrete build/test/verification command".into());
+        }
+        failures
+    }
+
     fn build_handoff_packet(
         &self,
         plan: &PlannerOutput,
@@ -1276,6 +1365,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
         if usage.budget_tokens() == 0 && tokens_used > 0 {
             usage = TokenUsage::estimated(tokens_used);
+        }
+
+        for failure in self.quality_gate_failures(plan, runtimes) {
+            findings.push(format!("Quality gate: {failure}"));
         }
 
         verified.sort();
@@ -1431,6 +1524,12 @@ fn compact_description(description: &str) -> String {
         .unwrap_or(description)
         .trim()
         .to_string()
+}
+
+fn is_chess_goal_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("chess")
+        && (lower.contains("make") || lower.contains("build") || lower.contains("create"))
 }
 
 fn short_text(text: &str, max_chars: usize) -> String {
@@ -1705,7 +1804,8 @@ fn task_status_from(
 mod tests {
     use super::*;
     use phonton_types::{
-        CoverageSummary, DiffHunk, DiffLine, Subtask, SubtaskId, SubtaskStatus, VerifyLayer,
+        CoverageSummary, DiffHunk, DiffLine, GoalContract, QualityFloor, RunCommand, Subtask,
+        SubtaskId, SubtaskStatus, TaskClass, VerifyLayer, VerifyStepSpec,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1884,6 +1984,77 @@ mod tests {
             .passed
             .iter()
             .any(|line| line.contains("passed")));
+    }
+
+    #[test]
+    fn trivial_chess_output_fails_quality_gate_before_review() {
+        let a = subtask("make chess", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(GoalContract {
+                goal: "make chess".into(),
+                task_class: TaskClass::CoreLogic,
+                confidence_percent: 60,
+                acceptance_criteria: vec!["Produce playable chess.".into()],
+                expected_artifacts: Vec::new(),
+                likely_files: Vec::new(),
+                verify_plan: vec![VerifyStepSpec {
+                    name: "make".into(),
+                    layer: None,
+                    command: Some(RunCommand {
+                        label: "make".into(),
+                        command: vec!["make".into()],
+                        cwd: None,
+                    }),
+                }],
+                run_plan: vec![RunCommand {
+                    label: "Run chess".into(),
+                    command: vec![".\\chess.exe".into()],
+                    cwd: None,
+                }],
+                quality_floor: QualityFloor {
+                    criteria: vec!["Playable chess".into()],
+                },
+                clarification_questions: Vec::new(),
+                assumptions: Vec::new(),
+            }),
+        };
+        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
+        runtime.status = SubtaskStatus::Done {
+            tokens_used: 100,
+            diff_hunk_count: 1,
+        };
+        runtime.diff_hunks = vec![DiffHunk {
+            file_path: PathBuf::from("chess.c"),
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 6,
+            lines: vec![
+                DiffLine::Added("#include <stdio.h>".into()),
+                DiffLine::Added("".into()),
+                DiffLine::Added("int main(void) {".into()),
+                DiffLine::Added("    printf(\"Chess\\n\");".into()),
+                DiffLine::Added("    return 0;".into()),
+                DiffLine::Added("}".into()),
+            ],
+        }];
+        let mut runtimes = HashMap::new();
+        runtimes.insert(a.id, runtime);
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let orch = Orchestrator::new(dispatcher);
+
+        let failures = orch.quality_gate_failures(&plan, &runtimes);
+
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("only 6 added line")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("named chess pieces")));
     }
 
     #[tokio::test]
