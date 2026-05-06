@@ -4,6 +4,22 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.6.0 - Command UX And Trust Demo Loop
+
+### Added
+
+- Restored first-class TUI slash commands through a shared command registry used by prompt submission, Tab completion, the command palette, and the command drawer.
+- Added `/settings` and `/config` back as stable settings shortcuts, plus `/status`, `/review`, `/memory`, `/permissions`, `/model`, `/commands`, `/goal`, `/task`, `/ask`, `/clear`, `/delete`, `/quit`, and `/exit`.
+- Added `/model set <name>` for fast model preference changes without digging through the settings form.
+- Added a prompt-adjacent command drawer when the input starts with `/`, making command discovery visible while typing.
+- Added `phonton init` to create the default config path for first-run setup.
+- Added `phonton demo trust-loop`, a compact first-run evidence-trail walkthrough centered on GoalContract, verification, review receipt, and memory.
+
+### Fixed
+
+- Unknown slash commands now show a suggestion and do not get queued as agent goals.
+- `/run <cmd>` and `!<cmd>` continue to route through sandboxed command execution while coexisting with normal slash commands.
+
 ## 0.5.0 - Prompt, Commands, And Quality Gates
 
 ### Added
