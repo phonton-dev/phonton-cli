@@ -4,6 +4,15 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.6.2 - Sandbox And Prompt Hotfix
+
+### Fixed
+
+- Worker filesystem tools now honor sandbox approval decisions before reading or writing files.
+- Sandbox path evaluation now normalizes parent traversal before root and blocked-path checks, closing lexical `..` escapes.
+- Deleted or cleared paste artifact chips no longer submit hidden pasted content with the next prompt.
+- `/run` parsing now requires a standalone `/run` command and routes single-ampersand shell commands through approval-gated bash handling.
+
 ## 0.6.1 - Cloudflare Provider Hotfix
 
 ### Fixed
