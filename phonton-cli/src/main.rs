@@ -44,6 +44,7 @@ mod plan_preview;
 mod prompt_buffer;
 mod review;
 mod trust;
+mod tui_commands;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -91,6 +92,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tui_commands::{
+    command_suggestions, complete_command_prefix, parse_slash_command, render_command_label,
+    unknown_command_message, SlashAction, SlashParse,
+};
 
 // ---------------------------------------------------------------------------
 // Visual identity
@@ -580,6 +585,8 @@ pub struct App {
     pub prompt_history_cursor: Option<usize>,
     /// Recent user-run commands.
     pub command_runs: Vec<CommandRunSummary>,
+    /// One-line prompt feedback for slash-command errors and trust-loop hints.
+    pub command_notice: Option<String>,
     /// Session-best token savings percentage (vs naive baseline). Updated
     /// whenever a goal completes with a higher savings rate than seen before.
     pub best_savings_pct: Option<i64>,
@@ -627,6 +634,7 @@ impl App {
             prompt_history: Vec::new(),
             prompt_history_cursor: None,
             command_runs: Vec::new(),
+            command_notice: None,
             best_savings_pct: None,
             new_best_ticks: 0,
             help_open: false,
@@ -647,6 +655,129 @@ impl App {
             if self.selected >= self.goals.len() {
                 self.selected = self.goals.len().saturating_sub(1);
             }
+        }
+    }
+
+    fn apply_slash_action(&mut self, action: SlashAction) -> Option<Intent> {
+        self.help_open = false;
+        self.settings.message = None;
+        self.command_notice = None;
+        match action {
+            SlashAction::GoalMode => {
+                self.mode = Mode::Goal;
+                None
+            }
+            SlashAction::TaskMode => {
+                self.mode = Mode::Task;
+                None
+            }
+            SlashAction::AskMode => {
+                self.mode = Mode::Ask;
+                None
+            }
+            SlashAction::OpenSettings | SlashAction::ManageModel => {
+                self.mode = Mode::Settings;
+                None
+            }
+            SlashAction::ShowCommands => {
+                self.help_open = true;
+                None
+            }
+            SlashAction::ToggleLog => {
+                self.flight_log_open = !self.flight_log_open;
+                if self.flight_log_open {
+                    self.flight_log_scroll = None;
+                }
+                None
+            }
+            SlashAction::OpenMemory => {
+                self.mode = Mode::Memory;
+                Some(Intent::OpenMemory)
+            }
+            SlashAction::OpenHistory => {
+                self.mode = Mode::History;
+                Some(Intent::OpenHistory)
+            }
+            SlashAction::ClearGoals => {
+                self.goals.clear();
+                self.selected = 0;
+                self.mode = Mode::Goal;
+                None
+            }
+            SlashAction::DeleteSelectedGoal => {
+                self.delete_selected_goal();
+                None
+            }
+            SlashAction::Quit => self.request_quit_confirmation(),
+            SlashAction::ShowStatus => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.status_command_summary());
+                None
+            }
+            SlashAction::ShowPermissions => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.permissions_command_summary());
+                None
+            }
+            SlashAction::ShowReview => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.review_command_summary());
+                None
+            }
+        }
+    }
+
+    fn status_command_summary(&self) -> String {
+        let totals = self.session_totals();
+        let workspace = std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let store = self
+            .store_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not open".into());
+        format!(
+            "Status\nversion: v{}\nprovider: {}\nmodel: {}\nworkspace: {}\nstore: {}\ngoals: {} total, {} complete, {} failed\ntokens: {} used, {} estimated saved",
+            env!("CARGO_PKG_VERSION"),
+            self.settings.provider,
+            self.settings.model,
+            workspace,
+            store,
+            totals.goals,
+            totals.completed,
+            totals.failed,
+            totals.tokens_used,
+            totals.estimated_tokens_saved
+        )
+    }
+
+    fn permissions_command_summary(&self) -> String {
+        let pending = self.pending_mcp_approvals.len();
+        format!(
+            "Permissions\nsandbox: local execution guard\ncommands: /run and ! route through sandbox approval\nmcp approvals pending: {pending}\ntrust: workspace trust prompt gates first launch"
+        )
+    }
+
+    fn review_command_summary(&self) -> String {
+        if let Some(goal) = self.goals.get(self.selected) {
+            let status = match &goal.status {
+                TaskStatus::Queued => "queued",
+                TaskStatus::Planning => "planning",
+                TaskStatus::Running { .. } => "running",
+                TaskStatus::Reviewing { .. } => "review ready",
+                TaskStatus::Done { .. } => "done",
+                TaskStatus::Failed { .. } => "failed",
+                TaskStatus::Paused { .. } => "paused",
+                TaskStatus::Rejected => "rejected",
+            };
+            format!(
+                "Review\nselected goal: {}\nstatus: {}\nreceipt: run `phonton review latest` outside the TUI for the exportable handoff packet\nflight log: use /log for the evidence trail",
+                goal.description, status
+            )
+        } else {
+            "Review\nNo goal is selected yet. Submit a goal first, then use /review or `phonton review latest`.".into()
         }
     }
 
@@ -1122,32 +1253,7 @@ impl App {
     }
 
     fn handle_palette_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        let all_options = vec![
-            "Goal Mode",
-            "Task Mode",
-            "Ask Mode",
-            "Memory",
-            "History",
-            "Settings",
-            "Toggle Log",
-            "Help",
-            "Delete Selected Goal",
-            "Clear History",
-            "Quit",
-        ];
-
-        let filtered_options: Vec<&str> = if self.palette_input.is_empty() {
-            all_options.clone()
-        } else {
-            all_options
-                .iter()
-                .filter(|opt| {
-                    opt.to_lowercase()
-                        .contains(&self.palette_input.to_lowercase())
-                })
-                .copied()
-                .collect()
-        };
+        let filtered_options = command_suggestions(&self.palette_input);
 
         match key.code {
             KeyCode::Esc => {
@@ -1159,51 +1265,8 @@ impl App {
                     return None;
                 }
                 let selected = filtered_options[self.palette_selected % filtered_options.len()];
-                match selected {
-                    "Goal Mode" => {
-                        self.mode = Mode::Goal;
-                    }
-                    "Task Mode" => {
-                        self.mode = Mode::Task;
-                    }
-                    "Ask Mode" => {
-                        self.mode = Mode::Ask;
-                    }
-                    "Memory" => {
-                        self.mode = Mode::Memory;
-                        return Some(Intent::OpenMemory);
-                    }
-                    "History" => {
-                        self.mode = Mode::History;
-                        return Some(Intent::OpenHistory);
-                    }
-                    "Settings" => {
-                        self.mode = Mode::Settings;
-                    }
-                    "Toggle Log" => {
-                        self.flight_log_open = !self.flight_log_open;
-                        self.mode = self.prev_mode;
-                    }
-                    "Help" => {
-                        self.help_open = true;
-                        self.mode = self.prev_mode;
-                    }
-                    "Delete Selected Goal" => {
-                        self.delete_selected_goal();
-                        self.mode = self.prev_mode;
-                    }
-                    "Clear History" => {
-                        self.goals.clear();
-                        self.selected = 0;
-                        self.mode = Mode::Goal;
-                    }
-                    "Quit" => {
-                        self.mode = self.prev_mode;
-                        return self.request_quit_confirmation();
-                    }
-                    _ => {}
-                }
-                None
+                self.mode = self.prev_mode;
+                self.apply_slash_action(selected.action)
             }
             KeyCode::Up => {
                 self.palette_selected = self.palette_selected.saturating_sub(1);
@@ -1300,8 +1363,34 @@ impl App {
                 }
                 self.prompt_history.push(display_text.clone());
                 self.prompt_history_cursor = None;
-                if parse_prompt_command(&display_text).is_some() {
-                    return Some(Intent::RunCommand(display_text));
+                if let Some(model) = display_text.trim().strip_prefix("/model set ") {
+                    let model = model.trim();
+                    if model.is_empty() {
+                        self.command_notice = Some("Usage: /model set <name>".into());
+                        return None;
+                    }
+                    self.settings.model = model.to_string();
+                    self.command_notice = Some(format!("Model set to `{model}`"));
+                    self.mode = Mode::Settings;
+                    return Some(Intent::SaveSettings);
+                }
+                match parse_slash_command(&display_text) {
+                    SlashParse::RunCommand => return Some(Intent::RunCommand(display_text)),
+                    SlashParse::Command(action) => return self.apply_slash_action(action),
+                    SlashParse::Unknown {
+                        command,
+                        suggestion,
+                    } => {
+                        let message = unknown_command_message(&command, suggestion.as_deref());
+                        self.settings.message = Some(message.clone());
+                        self.command_notice = Some(message);
+                        return None;
+                    }
+                    SlashParse::NotCommand => {
+                        if parse_prompt_command(&display_text).is_some() {
+                            return Some(Intent::RunCommand(display_text));
+                        }
+                    }
                 }
                 self.goals.insert(0, GoalEntry::new(display_text));
                 self.selected = 0;
@@ -1312,6 +1401,7 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
+                self.command_notice = None;
                 self.goal_prompt.delete_char_before_cursor();
                 None
             }
@@ -1364,8 +1454,8 @@ impl App {
                 None
             }
             KeyCode::Tab => {
-                if self.goal_prompt.display_text() == "/r" {
-                    self.goal_prompt.set_text("/run ");
+                if let Some(completion) = complete_command_prefix(self.goal_prompt.display_text()) {
+                    self.goal_prompt.set_text(completion);
                 }
                 None
             }
@@ -1387,6 +1477,7 @@ impl App {
                 None
             }
             KeyCode::Char(c) => {
+                self.command_notice = None;
                 self.goal_prompt.insert_char(c);
                 None
             }
@@ -1865,6 +1956,9 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_ask(frame, body_chunks[2], app);
     }
     render_input(frame, input_row, app);
+    if command_drawer_visible(app) {
+        render_command_drawer(frame, area, input_row, app);
+    }
     render_footer(frame, footer_row, app);
 
     if app.mode == Mode::Settings {
@@ -1884,11 +1978,75 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
 }
 
+fn command_drawer_visible(app: &App) -> bool {
+    matches!(app.mode, Mode::Goal | Mode::Task)
+        && app.goal_prompt.display_text().starts_with('/')
+        && !app.help_open
+        && !app.quit_confirmation_open
+}
+
+fn render_command_drawer(frame: &mut Frame, area: Rect, input_row: Rect, app: &App) {
+    let suggestions = command_suggestions(app.goal_prompt.display_text());
+    if suggestions.is_empty() {
+        return;
+    }
+    let max_rows = suggestions.len().min(6);
+    let popup_h = max_rows as u16 + 2;
+    if input_row.y <= area.y + 1 {
+        return;
+    }
+    let popup_w = area.width.saturating_sub(6).clamp(44, 90);
+    let popup_area = Rect {
+        x: area.x + 3,
+        y: input_row.y.saturating_sub(popup_h),
+        width: popup_w,
+        height: popup_h,
+    };
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Span::styled(
+            " Commands ",
+            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(block.clone(), popup_area);
+    let inner = block.inner(popup_area);
+    let lines: Vec<ListItem> = suggestions
+        .iter()
+        .take(max_rows)
+        .map(|spec| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    spec.name,
+                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(if spec.args.is_empty() { "" } else { " " }),
+                Span::styled(spec.args, Style::default().fg(WARN)),
+                Span::styled("  ", Style::default().fg(DIM)),
+                Span::styled(spec.description, Style::default().fg(MUTED)),
+            ]))
+            .style(Style::default().bg(BG_DEEP))
+        })
+        .collect();
+    frame.render_widget(List::new(lines), inner);
+}
+
 /// Centred modal listing every keybinding in one place. Toggled by `?`,
 /// dismissed with `?` again or `Esc`. Drawn last so it always sits on top.
 fn render_help(frame: &mut Frame, area: Rect) {
     let rows: &[(&str, &str)] = &[
         ("Enter", "submit goal / question"),
+        ("/settings", "open provider, model, and budget settings"),
+        ("/status", "show provider, model, session, and token state"),
+        (
+            "/memory",
+            "inspect memories that can influence future tasks",
+        ),
+        ("/review", "use `phonton review latest` outside the TUI"),
+        ("/commands", "show command and keyboard help"),
         ("/run", "run a command through the sandbox"),
         ("!", "run command shorthand, e.g. !npm test"),
         ("Ctrl+/", "open the command palette"),
@@ -2298,31 +2456,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
-    let all_options = vec![
-        "Goal Mode",
-        "Task Mode",
-        "Ask Mode",
-        "Memory",
-        "History",
-        "Settings",
-        "Toggle Log",
-        "Delete Selected Goal",
-        "Clear History",
-        "Quit",
-    ];
-
-    let filtered_options: Vec<&str> = if app.palette_input.is_empty() {
-        all_options.clone()
-    } else {
-        all_options
-            .iter()
-            .filter(|opt| {
-                opt.to_lowercase()
-                    .contains(&app.palette_input.to_lowercase())
-            })
-            .copied()
-            .collect()
-    };
+    let all_options = command_suggestions("");
+    let filtered_options = command_suggestions(&app.palette_input);
 
     let block = Block::default()
         .title(Line::from(vec![
@@ -2339,7 +2474,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(BG_DEEP));
 
-    let popup_w = 40;
+    let popup_w = 72;
     let popup_h = (all_options.len() as u16 + 4).max(8);
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
@@ -2380,7 +2515,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     let list_items: Vec<ListItem> = filtered_options
         .iter()
         .enumerate()
-        .map(|(i, &opt)| {
+        .map(|(i, spec)| {
             let selected = i == app.palette_selected % filtered_options.len().max(1);
             let (marker, style) = if selected {
                 (
@@ -2393,7 +2528,11 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 ("  ", Style::default().fg(MUTED))
             };
-            ListItem::new(Line::from(format!("{marker}{opt}"))).style(style)
+            ListItem::new(Line::from(format!(
+                "{marker}{}",
+                render_command_label(spec)
+            )))
+            .style(style)
         })
         .collect();
 
@@ -3474,11 +3613,17 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         _ => ACCENT,
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(BG_DEEP));
+    if let Some(notice) = &app.command_notice {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" {notice} "),
+            Style::default().fg(WARN),
+        )));
+    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -4420,7 +4565,9 @@ fn print_help() {
          \n\
          SUBCOMMANDS:\n  \
          (none)            Launch the interactive TUI (default)\n  \
+         init              Create ~/.phonton/config.toml if it is missing\n  \
          ask <question>    One-shot Q&A using the configured provider\n  \
+         demo trust-loop   Print the evidence-trail demo loop\n  \
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
          extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
          skills            Inspect loaded skills\n  \
@@ -4443,6 +4590,13 @@ fn print_help() {
          CONFIG:\n  \
          Settings live in ~/.phonton/config.toml. Override the provider key with\n  \
          ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
+         \n\
+         TUI SLASH COMMANDS:\n  \
+         /settings, /config, /status, /review, /memory, /permissions,\n  \
+         /model set <name>, /commands, /run <cmd>, and !<cmd>\n\
+         \n\
+         DEMO:\n  \
+         phonton demo trust-loop\n\
          \n\
          DOCTOR:\n  \
          phonton doctor [--json] [--provider]\n\
@@ -4478,6 +4632,64 @@ fn print_help() {
 
 fn print_version() {
     println!("phonton {}", env!("CARGO_PKG_VERSION"));
+}
+
+fn run_init() -> Result<()> {
+    let path =
+        config::config_path().ok_or_else(|| anyhow::anyhow!("could not resolve config path"))?;
+    if path.exists() {
+        println!("Phonton already initialized at {}", path.display());
+    } else {
+        config::save(&config::Config::default())?;
+        println!("Created {}", path.display());
+    }
+    println!("Next: phonton doctor");
+    println!("Then: phonton plan \"add validation to config loading\"");
+    Ok(())
+}
+
+pub fn render_trust_demo() -> String {
+    "Phonton Trust Demo Loop\n\
+         \n\
+         Promise\n\
+         Give Phonton a goal. It shows the contract, makes the change, verifies it,\n\
+         hands you a receipt, and remembers what mattered.\n\
+         \n\
+         Fixture\n\
+         workspace: tiny config loader fixture\n\
+         goal: add validation to config loading\n\
+         \n\
+         1. GoalContract\n\
+         - acceptance: reject empty provider names; keep valid config behavior unchanged\n\
+         - likely files: src/config.rs, tests/config_validation.rs\n\
+         - assumptions: existing TOML parser remains the source of truth\n\
+         - verify plan: cargo test config_validation\n\
+         \n\
+         2. Plan Preview\n\
+         - edit validation boundary\n\
+         - add focused tests\n\
+         - run verifier before review\n\
+         \n\
+         3. Verification Caught A Weak Attempt\n\
+         - first edit only checked for missing file\n\
+         - verifier failed: empty provider name still passed\n\
+         - retry required a real validation branch and regression test\n\
+         \n\
+         4. Review Receipt\n\
+         - changed files: src/config.rs, tests/config_validation.rs\n\
+         - checks: cargo test config_validation\n\
+         - known gaps: no provider network check needed for this local validation task\n\
+         - rollback: git checkpoint before applying verified diff\n\
+         \n\
+         5. Memory Prompt\n\
+         Remember: config loading treats empty provider names as invalid input.\n\
+         \n\
+         Next commands\n\
+         phonton init\n\
+         phonton doctor\n\
+         phonton plan \"add validation to config loading\"\n\
+         phonton review latest"
+        .to_string()
 }
 
 fn now_unix_secs() -> u64 {
@@ -4555,6 +4767,27 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
         }
         "-V" | "--version" | "version" => {
             print_version();
+            Ok(None)
+        }
+        "init" => {
+            run_init()?;
+            Ok(None)
+        }
+        "demo" => {
+            match args.get(1).map(|s| s.as_str()) {
+                Some("trust-loop") => println!("{}", render_trust_demo()),
+                Some(other) => {
+                    eprintln!("phonton: unknown demo `{}`\n", other);
+                    eprintln!("available demos: trust-loop");
+                    std::process::exit(2);
+                }
+                None => {
+                    eprintln!(
+                        "phonton: `demo` requires a demo name.\n  e.g. phonton demo trust-loop"
+                    );
+                    std::process::exit(2);
+                }
+            }
             Ok(None)
         }
         "config" => {
@@ -6451,6 +6684,110 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn slash_settings_opens_settings_without_queueing_goal() {
+        let mut app = App::default();
+        for ch in "/settings".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, None);
+        assert_eq!(app.mode, Mode::Settings);
+        assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn slash_config_alias_opens_settings() {
+        let mut app = App::default();
+        for ch in "/config".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, None);
+        assert_eq!(app.mode, Mode::Settings);
+        assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn unknown_slash_command_is_not_queued_as_goal() {
+        let mut app = App::default();
+        for ch in "/settngs".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, None);
+        assert!(app.goals.is_empty());
+        assert!(app
+            .settings
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Unknown command"));
+    }
+
+    #[test]
+    fn tab_completes_slash_command_prefix() {
+        let mut app = App::default();
+        for ch in "/sett".chars() {
+            app.handle_key(key(ch));
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.goal_prompt.display_text(), "/settings");
+    }
+
+    #[test]
+    fn slash_status_opens_visible_status_surface() {
+        let mut app = App::default();
+        for ch in "/status".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, None);
+        assert_eq!(app.mode, Mode::Ask);
+        assert!(app.ask_answer.as_deref().unwrap_or("").contains("Status"));
+        assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn slash_model_set_updates_model_and_requests_save() {
+        let mut app = App::default();
+        for ch in "/model set gpt-5-mini".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, Some(Intent::SaveSettings));
+        assert_eq!(app.settings.model, "gpt-5-mini");
+        assert_eq!(app.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn slash_command_drawer_renders_suggestions() {
+        let backend = TestBackend::new(100, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        for ch in "/sett".chars() {
+            app.handle_key(key(ch));
+        }
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(dump.contains("/settings"));
+        assert!(dump.contains("provider"));
+    }
+
+    #[test]
     fn workspace_preflight_adds_npm_verification_and_run_plan() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -7248,6 +7585,17 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(dump.contains("Changed files"));
         assert!(dump.contains("chess.py"));
         assert!(dump.contains("Known gaps"));
+    }
+
+    #[test]
+    fn trust_demo_explains_contract_verification_receipt_and_memory() {
+        let demo = render_trust_demo();
+
+        assert!(demo.contains("GoalContract"));
+        assert!(demo.contains("Verification Caught"));
+        assert!(demo.contains("Review Receipt"));
+        assert!(demo.contains("Memory Prompt"));
+        assert!(demo.contains("phonton plan"));
     }
 
     #[test]
