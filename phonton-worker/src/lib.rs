@@ -208,11 +208,17 @@ impl Worker {
     /// Execute a single tool call and return its textual output.
     ///
     /// The guard is consulted before dispatch; hard-blocked calls never run.
-    /// Approval decisions are handled by the orchestrator layer, so this
-    /// low-level executor only enforces terminal blocks.
+    /// Approval decisions are surfaced as tool output here; this low-level
+    /// executor has no interactive approval channel of its own.
     pub async fn execute_tool(&self, call: ToolCall) -> Result<String> {
-        if let GuardDecision::Block { .. } = self.guard.evaluate(&call) {
-            return Ok("[blocked by sandbox policy]".into());
+        match self.guard.evaluate(&call) {
+            GuardDecision::Allow => {}
+            GuardDecision::Approve { reason } => {
+                return Ok(format!("[requires approval: {reason}]"));
+            }
+            GuardDecision::Block { reason } => {
+                return Ok(format!("[blocked by sandbox policy: {reason}]"));
+            }
         }
 
         match call {
@@ -545,6 +551,16 @@ async fn read_tool(root: &Path, path: &Path) -> Result<String> {
         Ok(path) => path,
         Err(e) => return Ok(describe_io_error("read", path, &e)),
     };
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(e) => return Ok(describe_io_error("read", root, &e)),
+    };
+    if !path.starts_with(&root) {
+        return Ok(format!(
+            "refusing to read outside project root: {}",
+            path.display()
+        ));
+    }
     match tokio::fs::read_to_string(&path).await {
         Ok(text) => Ok(truncate_with_notice(text, 8000)),
         Err(e) => Ok(describe_io_error("read", &path, &e)),
@@ -563,6 +579,16 @@ async fn write_tool(root: &Path, path: &Path, content: &str) -> Result<String> {
         Ok(path) => path,
         Err(e) => return Ok(describe_io_error("write", path, &e)),
     };
+    let root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(e) => return Ok(describe_io_error("write", root, &e)),
+    };
+    if !path.starts_with(&root) {
+        return Ok(format!(
+            "refusing to write outside project root: {}",
+            path.display()
+        ));
+    }
     let tmp_path = tmp_path_for(&path);
 
     if let Err(e) = tokio::fs::write(&tmp_path, content).await {
@@ -1387,9 +1413,24 @@ fn parse_range(s: &str) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn guard() -> ExecutionGuard {
         ExecutionGuard::new(PathBuf::from("/work/proj"))
+    }
+
+    fn temp_workspace(name: &str) -> (PathBuf, PathBuf) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "phonton-worker-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).expect("create temp workspace");
+        (base, root)
     }
 
     #[test]
@@ -1406,6 +1447,33 @@ mod tests {
             path: PathBuf::from("/tmp/other.txt"),
         });
         assert!(matches!(d, GuardDecision::Approve { .. }));
+    }
+
+    #[tokio::test]
+    async fn read_tool_refuses_canonical_escape_outside_root() {
+        let (base, root) = temp_workspace("read-escape");
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "secret").expect("write outside file");
+
+        let result = read_tool(&root, &outside).await.expect("read tool result");
+
+        assert!(result.contains("refusing to read outside project root"));
+        assert!(!result.contains("secret"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn write_tool_refuses_absolute_path_outside_root() {
+        let (base, root) = temp_workspace("write-escape");
+        let outside = base.join("outside.txt");
+
+        let result = write_tool(&root, &outside, "secret")
+            .await
+            .expect("write tool result");
+
+        assert!(result.contains("refusing to write outside project root"));
+        assert!(!outside.exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
