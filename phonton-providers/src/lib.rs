@@ -663,6 +663,7 @@ fn annotate_http_error(provider: &str, status: StatusCode, body: &str) -> anyhow
                 .or_else(|| v.pointer("/message"))
                 .or_else(|| v.pointer("/error"))
                 .and_then(|x| x.as_str().map(String::from))
+                .or_else(|| provider_error_detail(&v))
                 .or_else(|| Some(v.to_string()))
         })
         .unwrap_or_else(|| body.to_string());
@@ -1231,8 +1232,10 @@ impl Provider for AnthropicProvider {
 
 /// Adaptor for APIs that expose OpenAI-style `/chat/completions`.
 ///
-/// OpenAI and OpenRouter share this wire shape: Bearer auth, a `messages`
-/// array, and `choices[0].message.content` in the response.
+/// OpenAI and OpenRouter share the strict wire shape: Bearer auth, a
+/// `messages` array, and `choices[0].message.content` in the response.
+/// Some compatible providers, notably Cloudflare Workers AI, may wrap that
+/// shape in a provider envelope, so response parsing stays tolerant here.
 #[derive(Clone)]
 pub struct OpenAiCompatibleProvider {
     api_key: String,
@@ -1300,6 +1303,121 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+fn chat_content_at_path(resp: &Value, pointer: &str) -> Option<String> {
+    match resp.pointer(pointer)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part
+                    .get("text")
+                    .or_else(|| part.get("content"))
+                    .and_then(Value::as_str)
+                {
+                    out.push_str(text);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn json_object_keys(value: &Value) -> String {
+    value
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .take(8)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|keys| !keys.is_empty())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn provider_error_detail(resp: &Value) -> Option<String> {
+    if let Some(message) = resp.pointer("/error/message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    if let Some(message) = resp.get("message").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    if let Some(error) = resp.get("error").and_then(Value::as_str) {
+        return Some(error.to_string());
+    }
+
+    let errors = resp.get("errors")?.as_array()?;
+    let messages = errors
+        .iter()
+        .filter_map(|err| {
+            let message = err
+                .get("message")
+                .or_else(|| err.get("detail"))
+                .and_then(Value::as_str)?;
+            let code = err.get("code").and_then(Value::as_i64);
+            Some(match code {
+                Some(code) => format!("{code}: {message}"),
+                None => message.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages.join("; "))
+    }
+}
+
+fn parse_openai_compatible_chat_response(
+    kind: ProviderKind,
+    resp: &Value,
+) -> Result<(String, &Value)> {
+    if let Some(false) = resp.get("success").and_then(Value::as_bool) {
+        let detail = provider_error_detail(resp).unwrap_or_else(|| resp.to_string());
+        return Err(anyhow!("{kind} response error: {detail}"));
+    }
+
+    let checked_paths = [
+        "/choices/0/message/content",
+        "/result/choices/0/message/content",
+        "/result/response",
+        "/result/output_text",
+        "/response",
+        "/output_text",
+    ];
+
+    for path in checked_paths {
+        if let Some(content) = chat_content_at_path(resp, path) {
+            let usage = resp
+                .get("usage")
+                .or_else(|| resp.pointer("/result/usage"))
+                .unwrap_or(&Value::Null);
+            return Ok((content, usage));
+        }
+    }
+
+    if let Some(detail) = provider_error_detail(resp) {
+        return Err(anyhow!("{kind} response error: {detail}"));
+    }
+
+    let result_keys = resp
+        .get("result")
+        .map(json_object_keys)
+        .unwrap_or_else(|| "none".to_string());
+    Err(anyhow!(
+        "{kind} response missing model text content (checked {}; top-level keys: {}; result keys: {})",
+        checked_paths.join(", "),
+        json_object_keys(resp),
+        result_keys
+    ))
+}
+
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
     async fn call(
@@ -1320,14 +1438,13 @@ impl Provider for OpenAiCompatibleProvider {
         attachments: &[PromptAttachment],
     ) -> Result<LLMResponse> {
         let system = build_system_prompt(system, slice_origins);
-        // OpenAI's *current* spec uses `max_completion_tokens` and o1/o3/o4
-        // *reject* `max_tokens` outright. Every other OpenAI-compat provider
-        // (DeepSeek, xAI, Together, Groq's deprecated path, OpenRouter,
-        // AgentRouter, vLLM, LM Studio, …) was built against the original
-        // spec and either ignores `max_completion_tokens` (silently truncating
-        // to a tiny default) or rejects it as an unknown field. Picking the
-        // right key per back-end is what makes "BYOK" actually work.
-        let token_key = if self.kind == ProviderKind::OpenAI {
+        // OpenAI's current spec uses `max_completion_tokens` and o1/o3/o4
+        // reject `max_tokens` outright. Cloudflare's current Workers AI
+        // schema also prefers `max_completion_tokens` for chat completions.
+        // Most other OpenAI-compat providers were built against the original
+        // spec and either ignore `max_completion_tokens` or reject it.
+        // Picking the right key per back-end is what makes BYOK work.
+        let token_key = if matches!(self.kind, ProviderKind::OpenAI | ProviderKind::Cloudflare) {
             "max_completion_tokens"
         } else {
             "max_tokens"
@@ -1337,7 +1454,7 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             json!(user)
         };
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             token_key: 4096,
             "messages": [
@@ -1345,6 +1462,12 @@ impl Provider for OpenAiCompatibleProvider {
                 { "role": "user", "content": user_content },
             ],
         });
+        if self.kind == ProviderKind::Cloudflare {
+            body["chat_template_kwargs"] = json!({
+                "thinking": false,
+                "clear_thinking": true,
+            });
+        }
 
         let mut req = self
             .http
@@ -1384,12 +1507,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
             .map_err(|e| ProviderError::ParseFail(e.to_string()))?;
 
-        let content = resp
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("{} response missing choices[0].message.content", self.kind))?
-            .to_string();
-        let usage = resp.get("usage").unwrap_or(&Value::Null);
+        let (content, usage) = parse_openai_compatible_chat_response(self.kind, &resp)?;
 
         Ok(LLMResponse {
             content,
@@ -1906,14 +2024,108 @@ mod tests {
         }
     }
 
-    /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`
-    /// (and o1/o3/o4 *reject* `max_tokens`); every other OpenAI-compat
-    /// back-end (DeepSeek, xAI, Together, Groq, OpenRouter, AgentRouter,
-    /// vLLM, LM Studio) was built against the original spec and either
-    /// ignores `max_completion_tokens` (silently truncating to a tiny
-    /// default) or rejects it as unknown. This test pins the per-kind
-    /// branching so a refactor can't quietly regress every non-OpenAI
-    /// provider.
+    #[test]
+    fn openai_compat_parses_top_level_chat_response() {
+        let resp = json!({
+            "choices": [{ "message": { "content": "diff --git a/a b/a" } }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 3,
+                "prompt_tokens_details": { "cached_tokens": 2 }
+            }
+        });
+
+        let (content, usage) =
+            parse_openai_compatible_chat_response(ProviderKind::OpenAI, &resp).unwrap();
+
+        assert_eq!(content, "diff --git a/a b/a");
+        assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(10));
+        assert_eq!(
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cloudflare_parses_workers_ai_response_envelope() {
+        let resp = json!({
+            "success": true,
+            "result": {
+                "response": "diff --git a/chess.c b/chess.c",
+                "usage": {
+                    "prompt_tokens": 21,
+                    "completion_tokens": 8
+                }
+            },
+            "errors": [],
+            "messages": []
+        });
+
+        let (content, usage) =
+            parse_openai_compatible_chat_response(ProviderKind::Cloudflare, &resp).unwrap();
+
+        assert_eq!(content, "diff --git a/chess.c b/chess.c");
+        assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(21));
+        assert_eq!(
+            usage.get("completion_tokens").and_then(Value::as_u64),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn cloudflare_parses_wrapped_chat_completion_envelope() {
+        let resp = json!({
+            "success": true,
+            "result": {
+                "choices": [{
+                    "message": {
+                        "content": "diff --git a/Makefile b/Makefile"
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 34,
+                    "completion_tokens": 13
+                }
+            }
+        });
+
+        let (content, usage) =
+            parse_openai_compatible_chat_response(ProviderKind::Cloudflare, &resp).unwrap();
+
+        assert_eq!(content, "diff --git a/Makefile b/Makefile");
+        assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(34));
+    }
+
+    #[test]
+    fn cloudflare_error_envelope_reports_upstream_message() {
+        let resp = json!({
+            "success": false,
+            "errors": [{
+                "code": 7003,
+                "message": "Could not route to the requested model"
+            }],
+            "messages": [],
+            "result": null
+        });
+
+        let err = parse_openai_compatible_chat_response(ProviderKind::Cloudflare, &resp)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("cloudflare response error"));
+        assert!(err.contains("7003: Could not route"));
+        assert!(
+            !err.contains("missing choices[0].message.content"),
+            "must not hide Cloudflare's real error behind the old parser fallback"
+        );
+    }
+
+    /// Regression: OpenAI's current chat-completions spec and Cloudflare's
+    /// current Workers AI schema use `max_completion_tokens`; most other
+    /// OpenAI-compat back-ends still expect `max_tokens`. This test pins the
+    /// per-kind branching so a refactor can't quietly regress BYOK providers.
     #[tokio::test]
     async fn openai_compat_uses_max_tokens_for_non_openai() {
         use std::net::SocketAddr;
@@ -1923,6 +2135,7 @@ mod tests {
         async fn body_capture_server(
             saw_max_tokens: Arc<AtomicBool>,
             saw_max_completion: Arc<AtomicBool>,
+            saw_cloudflare_no_thinking: Arc<AtomicBool>,
         ) -> SocketAddr {
             // Tiny TCP listener that reads one HTTP request, records which
             // token field the caller sent, and answers a valid chat shape.
@@ -1940,6 +2153,12 @@ mod tests {
                     if raw.contains("\"max_completion_tokens\"") {
                         saw_max_completion.store(true, Ordering::SeqCst);
                     }
+                    if raw.contains("\"chat_template_kwargs\"")
+                        && raw.contains("\"thinking\":false")
+                        && raw.contains("\"clear_thinking\":true")
+                    {
+                        saw_cloudflare_no_thinking.store(true, Ordering::SeqCst);
+                    }
                     let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -1954,7 +2173,8 @@ mod tests {
         // Non-OpenAI compat (e.g. DeepSeek / xAI / Together) → must send `max_tokens`.
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
+        let saw_ct = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone(), saw_ct.clone()).await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
         let _ = p.call("sys", "u", &[]).await;
@@ -1970,7 +2190,8 @@ mod tests {
         // OpenAI proper → must send `max_completion_tokens`.
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
+        let saw_ct = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone(), saw_ct.clone()).await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p =
             OpenAiCompatibleProvider::new("k".into(), "m".into(), &endpoint, ProviderKind::OpenAI);
@@ -1982,6 +2203,32 @@ mod tests {
         assert!(
             !saw_mt.load(Ordering::SeqCst),
             "OpenAI proper must NOT send max_tokens (rejected by o-series)"
+        );
+
+        // Cloudflare Workers AI current schema also prefers `max_completion_tokens`.
+        let saw_mt = Arc::new(AtomicBool::new(false));
+        let saw_mc = Arc::new(AtomicBool::new(false));
+        let saw_ct = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone(), saw_ct.clone()).await;
+        let endpoint = format!("http://{}/chat/completions", addr);
+        let p = OpenAiCompatibleProvider::new(
+            "k".into(),
+            "m".into(),
+            &endpoint,
+            ProviderKind::Cloudflare,
+        );
+        let _ = p.call("sys", "u", &[]).await;
+        assert!(
+            saw_mc.load(Ordering::SeqCst),
+            "Cloudflare must send max_completion_tokens"
+        );
+        assert!(
+            !saw_mt.load(Ordering::SeqCst),
+            "Cloudflare must NOT send deprecated max_tokens"
+        );
+        assert!(
+            saw_ct.load(Ordering::SeqCst),
+            "Cloudflare must disable provider-side thinking for diff-only worker calls"
         );
     }
 

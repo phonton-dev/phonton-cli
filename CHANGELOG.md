@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.6.1 - Cloudflare Provider Hotfix
+
+### Fixed
+
+- Cloudflare Workers AI responses are now parsed through a tolerant adapter that accepts both strict OpenAI-compatible chat completions and Cloudflare-style result envelopes.
+- Cloudflare upstream error envelopes now surface their actual error message instead of being hidden behind `missing choices[0].message.content`.
+- Cloudflare chat completion requests now send `max_completion_tokens` and disable provider-side thinking for worker calls, matching the current Workers AI schema for Kimi K2.6 while keeping worker output diff-focused.
+
 ## 0.6.0 - Command UX And Trust Demo Loop
 
 ### Added
