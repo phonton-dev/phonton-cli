@@ -42,6 +42,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
+        if: runner.os != 'Windows'
         uses: Swatinem/rust-cache@v2
 
       - name: Build CLI
