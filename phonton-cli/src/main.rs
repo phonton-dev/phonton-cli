@@ -36,6 +36,8 @@
 
 mod command_runner;
 mod config;
+mod contract_preflight;
+mod demo;
 mod doctor;
 mod extensions_cli;
 mod mcp_cli;
@@ -43,6 +45,7 @@ mod memory_cli;
 mod plan_preview;
 mod prompt_buffer;
 mod review;
+mod run_command;
 mod trust;
 mod tui_commands;
 
@@ -57,6 +60,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use command_runner::{parse_prompt_command, summarize_output, CommandRunSummary};
+use contract_preflight::apply_workspace_preflight;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -80,9 +84,8 @@ use phonton_types::{
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
     OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
     PromptAttachment, PromptAttachmentKind, ProviderConfig as ApiProviderConfig, ProviderKind,
-    RunCommand, SessionGoalSnapshot, SessionSnapshot, SessionTotals, Subtask, SubtaskId,
-    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
-    VerifyStepSpec,
+    SessionGoalSnapshot, SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use prompt_buffer::PromptBuffer;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -4575,6 +4578,7 @@ fn print_help() {
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
+         run [task-id]     Run a receipt-suggested command from latest task\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
          config path       Print the resolved config file path\n  \
          config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
@@ -4596,7 +4600,7 @@ fn print_help() {
          /model set <name>, /commands, /run <cmd>, and !<cmd>\n\
          \n\
          DEMO:\n  \
-         phonton demo trust-loop\n\
+         phonton demo trust-loop [--json]\n\
          \n\
          DOCTOR:\n  \
          phonton doctor [--json] [--provider]\n\
@@ -4605,10 +4609,13 @@ fn print_help() {
          phonton plan [--json] [--no-memory] [--no-tests] <goal>\n\
          \n\
          REVIEW:\n  \
-         phonton review [--json] [latest|<task-id>]\n  \
+         phonton review [--json|--markdown] [latest|<task-id>]\n  \
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
          phonton review rollback [--json] [latest|<task-id>] <seq>\n\
+         \n\
+         RUN:\n  \
+         phonton run [--json] [--index <n>] [latest|<task-id>]\n\
          \n\
          MCP:\n  \
          phonton mcp list [--json]\n  \
@@ -4649,47 +4656,7 @@ fn run_init() -> Result<()> {
 }
 
 pub fn render_trust_demo() -> String {
-    "Phonton Trust Demo Loop\n\
-         \n\
-         Promise\n\
-         Give Phonton a goal. It shows the contract, makes the change, verifies it,\n\
-         hands you a receipt, and remembers what mattered.\n\
-         \n\
-         Fixture\n\
-         workspace: tiny config loader fixture\n\
-         goal: add validation to config loading\n\
-         \n\
-         1. GoalContract\n\
-         - acceptance: reject empty provider names; keep valid config behavior unchanged\n\
-         - likely files: src/config.rs, tests/config_validation.rs\n\
-         - assumptions: existing TOML parser remains the source of truth\n\
-         - verify plan: cargo test config_validation\n\
-         \n\
-         2. Plan Preview\n\
-         - edit validation boundary\n\
-         - add focused tests\n\
-         - run verifier before review\n\
-         \n\
-         3. Verification Caught A Weak Attempt\n\
-         - first edit only checked for missing file\n\
-         - verifier failed: empty provider name still passed\n\
-         - retry required a real validation branch and regression test\n\
-         \n\
-         4. Review Receipt\n\
-         - changed files: src/config.rs, tests/config_validation.rs\n\
-         - checks: cargo test config_validation\n\
-         - known gaps: no provider network check needed for this local validation task\n\
-         - rollback: git checkpoint before applying verified diff\n\
-         \n\
-         5. Memory Prompt\n\
-         Remember: config loading treats empty provider names as invalid input.\n\
-         \n\
-         Next commands\n\
-         phonton init\n\
-         phonton doctor\n\
-         phonton plan \"add validation to config loading\"\n\
-         phonton review latest"
-        .to_string()
+    demo::render_trust_demo()
 }
 
 fn now_unix_secs() -> u64 {
@@ -4774,19 +4741,9 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             Ok(None)
         }
         "demo" => {
-            match args.get(1).map(|s| s.as_str()) {
-                Some("trust-loop") => println!("{}", render_trust_demo()),
-                Some(other) => {
-                    eprintln!("phonton: unknown demo `{}`\n", other);
-                    eprintln!("available demos: trust-loop");
-                    std::process::exit(2);
-                }
-                None => {
-                    eprintln!(
-                        "phonton: `demo` requires a demo name.\n  e.g. phonton demo trust-loop"
-                    );
-                    std::process::exit(2);
-                }
+            let code = demo::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
             }
             Ok(None)
         }
@@ -4904,6 +4861,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
         }
         "review" => {
             let code = review::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
+        "run" => {
+            let code = run_command::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -5643,117 +5607,6 @@ fn single_task_plan(description: String, attachments: Vec<PromptAttachment>) -> 
         coverage_summary: CoverageSummary::default(),
         goal_contract: Some(goal_contract),
     }
-}
-
-fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, goal_text: &str) {
-    let Some(contract) = plan.goal_contract.as_mut() else {
-        return;
-    };
-    let lower_goal = goal_text.to_ascii_lowercase();
-    let is_chess = lower_goal.contains("chess")
-        && (lower_goal.contains("make")
-            || lower_goal.contains("build")
-            || lower_goal.contains("create"));
-    let mut stack_detected = false;
-
-    let package_json = working_dir.join("package.json");
-    if package_json.is_file() {
-        stack_detected = true;
-        if let Ok(text) = std::fs::read_to_string(&package_json) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                let scripts = value.get("scripts").and_then(|scripts| scripts.as_object());
-                if scripts.and_then(|scripts| scripts.get("build")).is_some() {
-                    push_verify_step(
-                        contract,
-                        "npm build",
-                        vec!["npm".into(), "run".into(), "build".into()],
-                    );
-                }
-                if scripts.and_then(|scripts| scripts.get("test")).is_some() {
-                    push_verify_step(contract, "npm test", vec!["npm".into(), "test".into()]);
-                }
-                if scripts.and_then(|scripts| scripts.get("dev")).is_some() {
-                    push_run_command(
-                        contract,
-                        "Run dev server",
-                        vec!["npm".into(), "run".into(), "dev".into()],
-                    );
-                } else if scripts.and_then(|scripts| scripts.get("start")).is_some() {
-                    push_run_command(contract, "Run app", vec!["npm".into(), "start".into()]);
-                }
-            }
-        }
-        if is_chess {
-            contract.acceptance_criteria.push(
-                "In this web/npm workspace, the chess result must run in the app, not just compile as a toy script."
-                    .into(),
-            );
-        }
-    }
-
-    if working_dir.join("Cargo.toml").is_file() {
-        stack_detected = true;
-        push_verify_step(
-            contract,
-            "cargo test",
-            vec!["cargo".into(), "test".into(), "--locked".into()],
-        );
-        push_run_command(contract, "Run binary", vec!["cargo".into(), "run".into()]);
-    }
-
-    if working_dir.join("Makefile").is_file() || working_dir.join("makefile").is_file() {
-        stack_detected = true;
-        push_verify_step(contract, "make", vec!["make".into()]);
-        if is_chess {
-            push_run_command(contract, "Run chess binary", vec![".\\chess.exe".into()]);
-        }
-    }
-
-    if !stack_detected {
-        contract
-            .assumptions
-            .push("No package.json, Cargo.toml, or Makefile was detected before planning.".into());
-        if is_chess {
-            contract.clarification_questions.push(
-                "No project stack was detected. Should Phonton create chess as a web app, terminal game, or native binary?"
-                    .into(),
-            );
-        }
-    }
-}
-
-fn push_verify_step(contract: &mut phonton_types::GoalContract, label: &str, command: Vec<String>) {
-    if contract
-        .verify_plan
-        .iter()
-        .any(|step| step.command.as_ref().map(|cmd| &cmd.command) == Some(&command))
-    {
-        return;
-    }
-    contract.verify_plan.push(VerifyStepSpec {
-        name: label.into(),
-        layer: None,
-        command: Some(RunCommand {
-            label: label.into(),
-            command,
-            cwd: None,
-        }),
-    });
-}
-
-fn push_run_command(contract: &mut phonton_types::GoalContract, label: &str, command: Vec<String>) {
-    if contract
-        .run_plan
-        .iter()
-        .any(|existing| existing.command == command)
-    {
-        return;
-    }
-    contract.run_plan.push(RunCommand {
-        label: label.into(),
-        command,
-        cwd: None,
-    });
 }
 
 fn prepare_goal_attachments(text: &str, working_dir: &Path) -> Vec<PromptAttachment> {

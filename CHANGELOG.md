@@ -4,6 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.7.0 - Trust Loop Receipts
+
+### Added
+
+- `phonton plan` text output now shows the visible GoalContract, including acceptance criteria, expected artifacts, likely files, verification plan, run plan, quality floor, assumptions, and clarifying questions.
+- `phonton demo trust-loop --json` now emits a deterministic fixture-style trust demo for reproducible onboarding and release evidence.
+- `phonton review --markdown` now exports review receipts with changed files, verification, run commands, known gaps, rollback, tokens, and influence/memory sections.
+- `phonton run [latest|<task-id>]` now executes receipt-suggested structured run commands through the existing sandbox and reports exit code, duration, and output previews.
+
+### Changed
+
+- Shared stack-aware contract preflight between the TUI and `phonton plan` so npm, Cargo, and Makefile workspaces expose the same inferred verification and run plans before execution.
+- First-run trust-loop docs now point users toward contract preview, Markdown receipts, and running receipt commands rather than benchmark claims.
+
 ## 0.6.2 - Sandbox And Prompt Hotfix
 
 ### Fixed
