@@ -82,10 +82,11 @@ use phonton_store::{Store, TaskRecord};
 use phonton_types::{
     BudgetLimits, ContextManifest, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId,
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
-    OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
-    PromptAttachment, PromptAttachmentKind, ProviderConfig as ApiProviderConfig, ProviderKind,
-    SessionGoalSnapshot, SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PermissionMode,
+    PlannerOutput, PromptAttachment, PromptAttachmentKind, PromptContextManifest,
+    ProviderConfig as ApiProviderConfig, ProviderKind, SessionGoalSnapshot, SessionSnapshot,
+    SessionTotals, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus,
+    TokenUsage, VerifyLayer, VerifyResult,
 };
 use prompt_buffer::PromptBuffer;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -429,6 +430,7 @@ pub struct SettingsState {
     pub base_url: String,
     pub max_tokens: String,
     pub max_usd_cents: String,
+    pub permission_mode: PermissionMode,
     pub message: Option<String>,
     /// Whether the model picker overlay is visible.
     pub picker_open: bool,
@@ -457,6 +459,7 @@ impl SettingsState {
                 .max_usd_cents
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
+            permission_mode: cfg.permissions.mode,
             message: None,
             picker_open: false,
             picker: ModelPickerState::default(),
@@ -481,6 +484,7 @@ fn apply_settings_to_config(settings: &SettingsState, cfg: &mut config::Config) 
     cfg.provider.base_url = non_empty_setting(&settings.base_url);
     cfg.budget.max_tokens = settings.max_tokens.parse().ok();
     cfg.budget.max_usd_cents = settings.max_usd_cents.parse().ok();
+    cfg.permissions.mode = settings.permission_mode;
 }
 
 /// A queued or running top-level goal entry in the left panel.
@@ -614,6 +618,12 @@ pub struct App {
     pub pending_mcp_approvals: Vec<PendingMcpApproval>,
     /// Cursor into `pending_mcp_approvals` when more than one request is queued.
     pub mcp_approval_selected: usize,
+    /// Latest prompt-section token manifest emitted by a worker.
+    pub last_prompt_manifest: Option<PromptContextManifest>,
+    /// Sum of prompt manifest totals observed in this TUI session.
+    pub session_prompt_tokens: u64,
+    /// Tokens the user has explicitly compacted from the visible context meter.
+    pub compacted_prompt_tokens: u64,
 }
 
 impl App {
@@ -648,6 +658,9 @@ impl App {
             store_path: None,
             pending_mcp_approvals: Vec::new(),
             mcp_approval_selected: 0,
+            last_prompt_manifest: None,
+            session_prompt_tokens: 0,
+            compacted_prompt_tokens: 0,
         }
     }
 
@@ -722,6 +735,25 @@ impl App {
                 self.ask_answer = Some(self.permissions_command_summary());
                 None
             }
+            SlashAction::SetPermissionMode(mode) => {
+                self.settings.permission_mode = mode;
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.permissions_command_summary());
+                self.command_notice = Some(format!("Permission mode set to `{mode}`"));
+                Some(Intent::SaveSettings)
+            }
+            SlashAction::ShowContext => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.context_command_summary());
+                None
+            }
+            SlashAction::CompactContext => {
+                let intent = self.compact_context_intent();
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.compact_command_summary(intent.is_some()));
+                intent
+            }
+            SlashAction::StopGoal => self.stop_selected_goal_intent(),
             SlashAction::ShowReview => {
                 self.mode = Mode::Ask;
                 self.ask_answer = Some(self.review_command_summary());
@@ -742,25 +774,107 @@ impl App {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "not open".into());
         format!(
-            "Status\nversion: v{}\nprovider: {}\nmodel: {}\nworkspace: {}\nstore: {}\ngoals: {} total, {} complete, {} failed\ntokens: {} used, {} estimated saved",
+            "Status\nversion: v{}\nprovider: {}\nmodel: {}\npermissions: {}\nworkspace: {}\nstore: {}\ngoals: {} total, {} complete, {} failed\ntokens: {} used, {} estimated saved\ncontext: {} latest prompt tokens, {} session prompt tokens",
             env!("CARGO_PKG_VERSION"),
             self.settings.provider,
             self.settings.model,
+            self.settings.permission_mode,
             workspace,
             store,
             totals.goals,
             totals.completed,
             totals.failed,
             totals.tokens_used,
-            totals.estimated_tokens_saved
+            totals.estimated_tokens_saved,
+            self.last_prompt_manifest
+                .as_ref()
+                .map(|m| m.total_estimated_tokens)
+                .unwrap_or(0),
+            self.session_prompt_tokens
         )
     }
 
     fn permissions_command_summary(&self) -> String {
         let pending = self.pending_mcp_approvals.len();
         format!(
-            "Permissions\nsandbox: local execution guard\ncommands: /run and ! route through sandbox approval\nmcp approvals pending: {pending}\ntrust: workspace trust prompt gates first launch"
+            "Permissions\nmode: {}\nread-only: blocks file writes and approval-gates commands\nask: safe workspace actions run, risky actions require approval\nworkspace-write: allowlisted commands and workspace writes run\nfull-access: non-sensitive actions run without approval\nmcp approvals pending: {pending}\ncommands: /permissions set ask|read-only|workspace-write|full-access",
+            self.settings.permission_mode
         )
+    }
+
+    fn context_command_summary(&self) -> String {
+        let Some(m) = &self.last_prompt_manifest else {
+            return format!(
+                "Context\nlatest prompt: none yet\nsession prompt total: {}\ncompacted by user: {}\nworker compression: automatic near the context threshold\ncommand: /compact",
+                self.session_prompt_tokens, self.compacted_prompt_tokens
+            );
+        };
+        format!(
+            "Context\nlatest prompt total: {}\nsystem: {}\ngoal: {}\nmemory/context: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
+            m.total_estimated_tokens,
+            m.system_tokens,
+            m.user_goal_tokens,
+            m.memory_tokens,
+            m.attachment_tokens,
+            m.mcp_tool_tokens,
+            m.retry_error_tokens,
+            self.session_prompt_tokens,
+            self.compacted_prompt_tokens
+        )
+    }
+
+    fn compact_command_summary(&self, sent_to_worker: bool) -> String {
+        let target = if sent_to_worker {
+            "active worker context was asked to compact"
+        } else {
+            "no active worker context is selected"
+        };
+        format!(
+            "Compact\n{target}\nlatest prompt meter reset locally\ncompacted by user: {}\nworker compression also runs automatically near its threshold",
+            self.compacted_prompt_tokens
+        )
+    }
+
+    fn compact_context_intent(&mut self) -> Option<Intent> {
+        if let Some(manifest) = self.last_prompt_manifest.take() {
+            self.compacted_prompt_tokens = self
+                .compacted_prompt_tokens
+                .saturating_add(manifest.total_estimated_tokens);
+        }
+        if self.selected_goal_can_be_controlled() {
+            Some(Intent::CompactContext {
+                goal_index: self.selected,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn stop_selected_goal_intent(&mut self) -> Option<Intent> {
+        if self.selected_goal_can_be_controlled() {
+            if let Some(goal) = self.goals.get_mut(self.selected) {
+                goal.status = TaskStatus::Rejected;
+            }
+            self.command_notice = Some("Stop requested for selected goal.".into());
+            Some(Intent::StopGoal {
+                goal_index: self.selected,
+            })
+        } else {
+            self.command_notice = Some("No running goal is selected.".into());
+            None
+        }
+    }
+
+    fn selected_goal_can_be_controlled(&self) -> bool {
+        self.goals
+            .get(self.selected)
+            .map(|goal| {
+                matches!(
+                    goal.status,
+                    TaskStatus::Planning | TaskStatus::Running { .. }
+                )
+            })
+            .unwrap_or(false)
     }
 
     fn review_command_summary(&self) -> String {
@@ -863,6 +977,9 @@ impl App {
         self.quit_confirmation_open = false;
         self.pending_mcp_approvals.clear();
         self.mcp_approval_selected = 0;
+        self.last_prompt_manifest = None;
+        self.session_prompt_tokens = 0;
+        self.compacted_prompt_tokens = 0;
     }
 
     fn request_quit_confirmation(&mut self) -> Option<Intent> {
@@ -985,6 +1102,7 @@ impl Default for App {
                 max_tokens: None,
                 max_usd_cents: None,
             },
+            permissions: crate::config::PermissionsConfig::default(),
         };
         Self::new(&default_cfg)
     }
@@ -1018,9 +1136,19 @@ impl App {
 
     /// Append a flight-log event to the goal at `index`.
     pub fn apply_event(&mut self, index: usize, event: EventRecord) {
+        if let OrchestratorEvent::PromptManifest { manifest, .. } = &event.event {
+            self.record_prompt_manifest(manifest.clone());
+        }
         if let Some(g) = self.goals.get_mut(index) {
             g.flight_log.push(event);
         }
+    }
+
+    pub fn record_prompt_manifest(&mut self, manifest: PromptContextManifest) {
+        self.session_prompt_tokens = self
+            .session_prompt_tokens
+            .saturating_add(manifest.total_estimated_tokens);
+        self.last_prompt_manifest = Some(manifest);
     }
 
     /// Insert pasted text into the active prompt surface. Long or multi-line
@@ -1777,6 +1905,10 @@ pub enum Intent {
     /// User triggered a rollback to a specific checkpoint seq for the
     /// currently selected goal.
     Rollback { goal_index: usize, to_seq: u32 },
+    /// User requested context compaction for the selected active goal.
+    CompactContext { goal_index: usize },
+    /// User requested cancellation of the selected active goal.
+    StopGoal { goal_index: usize },
     /// User approved or denied a pending MCP approval prompt.
     ResolveMcpApproval { approval_id: u64, approved: bool },
     /// Save settings.
@@ -2628,7 +2760,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(7)])
+        .constraints([Constraint::Min(1), Constraint::Length(9)])
         .split(area);
 
     frame.render_widget(list, chunks[0]);
@@ -2668,6 +2800,19 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 },
                 Style::default().fg(if app.flight_log_open { SUCCESS } else { MUTED }),
             ),
+        ]),
+        Line::from(vec![
+            Span::styled(" PM ", Style::default().fg(WARN)),
+            Span::styled("perm      ", Style::default().fg(MUTED)),
+            Span::styled(
+                app.settings.permission_mode.as_str(),
+                Style::default().fg(ACCENT_HI),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" CTX ", Style::default().fg(ACCENT)),
+            Span::styled("context   ", Style::default().fg(MUTED)),
+            Span::styled(context_meter_label(app), Style::default().fg(ACCENT_HI)),
         ]),
     ];
     let mut sys_info = sys_info;
@@ -3425,6 +3570,21 @@ fn nexus_label(status: &NexusStatus) -> String {
     }
 }
 
+fn context_meter_label(app: &App) -> String {
+    let latest = app
+        .last_prompt_manifest
+        .as_ref()
+        .map(|m| m.total_estimated_tokens)
+        .unwrap_or(0);
+    if latest == 0 {
+        "none".into()
+    } else if app.compacted_prompt_tokens > 0 {
+        format!("{} tok, {} compacted", latest, app.compacted_prompt_tokens)
+    } else {
+        format!("{latest} tok")
+    }
+}
+
 fn permissions_label(permissions: &[Permission]) -> String {
     if permissions.is_empty() {
         return "none".into();
@@ -3484,6 +3644,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
         E::ContextSelected { .. } => (VIOLET, "context"),
         E::PromptManifest { .. } => (VIOLET, "prompt"),
+        E::ContextCompacted { .. } => (WARN, "compact"),
         E::ExtensionLoaded { .. } => (ACCENT, "ext-loaded"),
         E::ExtensionSkipped { .. } => (WARN, "ext-skipped"),
         E::ExtensionConflict { .. } => (WARN, "ext-conflict"),
@@ -4626,8 +4787,9 @@ fn print_help() {
          ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
          \n\
          TUI SLASH COMMANDS:\n  \
-         /settings, /config, /status, /review, /memory, /permissions,\n  \
-         /model set <name>, /commands, /run <cmd>, and !<cmd>\n\
+         /settings, /config, /status, /context, /compact, /stop,\n  \
+         /review, /memory, /permissions set <mode>, /model set <name>,\n  \
+         /commands, /run <cmd>, and !<cmd>\n\
          \n\
          DEMO:\n  \
          phonton demo trust-loop [--json]\n\
@@ -5036,7 +5198,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let sandbox = Arc::new(Sandbox::new(working_dir.clone(), "phonton-cli".to_string()));
+    let sandbox = Arc::new(Sandbox::new_with_mode(
+        working_dir.clone(),
+        "phonton-cli".to_string(),
+        cfg.permissions.mode,
+    ));
     let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     enable_raw_mode()?;
@@ -5154,7 +5320,7 @@ async fn run_app<B: Backend>(
     tx: mpsc::Sender<LoopEvent>,
     store: Arc<std::sync::Mutex<Store>>,
     ask_provider: Option<Arc<dyn Provider>>,
-    sandbox: Arc<Sandbox>,
+    mut sandbox: Arc<Sandbox>,
     controls: ControlRegistry,
     mut cfg: config::Config,
     working_dir: std::path::PathBuf,
@@ -5267,6 +5433,22 @@ async fn run_app<B: Backend>(
                                 }
                             }
                         }
+                        Intent::CompactContext { goal_index } => {
+                            if let Ok(reg) = controls.lock() {
+                                if let Some(gc) = reg.get(&goal_index) {
+                                    let _ =
+                                        gc.control_tx.try_send(OrchestratorMessage::CompactContext);
+                                }
+                            }
+                        }
+                        Intent::StopGoal { goal_index } => {
+                            if let Ok(reg) = controls.lock() {
+                                if let Some(gc) = reg.get(&goal_index) {
+                                    let _ =
+                                        gc.control_tx.try_send(OrchestratorMessage::UserCancelled);
+                                }
+                            }
+                        }
                         Intent::ResolveMcpApproval {
                             approval_id,
                             approved,
@@ -5282,6 +5464,11 @@ async fn run_app<B: Backend>(
                         }
                         Intent::SaveSettings => {
                             apply_settings_to_config(&app.settings, &mut cfg);
+                            sandbox = Arc::new(Sandbox::new_with_mode(
+                                working_dir.clone(),
+                                "phonton-cli".to_string(),
+                                cfg.permissions.mode,
+                            ));
 
                             // Swap the in-memory ask provider so the next
                             // Ctrl+; question uses the new credentials
@@ -5904,6 +6091,22 @@ async fn spawn_goal(
     cfg: config::Config,
     working_dir: std::path::PathBuf,
 ) {
+    let _ = tx
+        .send(LoopEvent::StateUpdate(
+            goal_index,
+            Box::new(GlobalState {
+                task_status: TaskStatus::Planning,
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: cfg.budget.max_tokens,
+                estimated_naive_tokens: 0,
+                checkpoints: Vec::new(),
+            }),
+        ))
+        .await;
+
     let attachments = prepare_goal_attachments(&text, &working_dir);
     if let Ok(g) = store.lock() {
         let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
@@ -5926,6 +6129,33 @@ async fn spawn_goal(
     let _ = tx
         .send(LoopEvent::StateUpdate(goal_index, Box::new(planning_state)))
         .await;
+
+    if provider_key_for_run(&cfg.provider).is_none() && provider_requires_key(&cfg.provider.name) {
+        let reason = format!(
+            "provider `{}` needs an API key before dispatch; open /settings or set the provider env var",
+            cfg.provider.name
+        );
+        let failed = GlobalState {
+            task_status: TaskStatus::Failed {
+                reason: reason.clone(),
+                failed_subtask: None,
+            },
+            goal_contract: plan.goal_contract.clone(),
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: cfg.budget.max_tokens,
+            estimated_naive_tokens: plan.naive_baseline_tokens,
+            checkpoints: Vec::new(),
+        };
+        if let Ok(g) = store.lock() {
+            let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+        }
+        let _ = tx
+            .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
+            .await;
+        return;
+    }
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
@@ -5957,7 +6187,7 @@ async fn spawn_goal(
         Some(Arc::new(
             phonton_mcp::McpRuntime::new(
                 extension_set.mcp_servers.clone(),
-                ExecutionGuard::new(working_dir.clone()),
+                ExecutionGuard::new_with_mode(working_dir.clone(), cfg.permissions.mode),
             )
             .with_approver(approver)
             .with_event_sink(task_id, event_tx.clone()),
@@ -6017,7 +6247,7 @@ async fn spawn_goal(
                 provider_for(provider_config_with_model(&provider_template, model))
             };
 
-            let guard = ExecutionGuard::new(working_dir.clone());
+            let guard = ExecutionGuard::new_with_mode(working_dir.clone(), cfg.permissions.mode);
             let mut d =
                 phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
                     .with_task_id(task_id)
@@ -6658,6 +6888,94 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.mode, Mode::Ask);
         assert!(app.ask_answer.as_deref().unwrap_or("").contains("Status"));
         assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn slash_context_opens_context_surface() {
+        let mut app = App::default();
+        app.record_prompt_manifest(phonton_types::PromptContextManifest {
+            system_tokens: 10,
+            user_goal_tokens: 5,
+            memory_tokens: 3,
+            attachment_tokens: 2,
+            mcp_tool_tokens: 1,
+            retry_error_tokens: 0,
+            total_estimated_tokens: 21,
+        });
+        for ch in "/context".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, None);
+        assert_eq!(app.mode, Mode::Ask);
+        let answer = app.ask_answer.as_deref().unwrap_or("");
+        assert!(answer.contains("Context"));
+        assert!(answer.contains("total: 21"));
+        assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn slash_compact_requests_context_compaction() {
+        let mut app = App::default();
+        app.goals.insert(0, GoalEntry::new("make chess".into()));
+        app.goals[0].status = TaskStatus::Running {
+            active_subtasks: Vec::new(),
+            completed: 0,
+            total: 1,
+        };
+
+        for ch in "/compact".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, Some(Intent::CompactContext { goal_index: 0 }));
+        assert_eq!(app.mode, Mode::Ask);
+        assert!(app.ask_answer.as_deref().unwrap_or("").contains("Compact"));
+    }
+
+    #[test]
+    fn slash_stop_requests_selected_goal_cancel() {
+        let mut app = App::default();
+        app.goals.insert(0, GoalEntry::new("make chess".into()));
+        app.goals[0].status = TaskStatus::Running {
+            active_subtasks: Vec::new(),
+            completed: 0,
+            total: 1,
+        };
+
+        for ch in "/stop".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, Some(Intent::StopGoal { goal_index: 0 }));
+        assert!(!matches!(app.goals[0].status, TaskStatus::Queued));
+    }
+
+    #[test]
+    fn slash_permissions_set_updates_mode_and_requests_save() {
+        let mut app = App::default();
+        for ch in "/permissions set read-only".chars() {
+            app.handle_key(key(ch));
+        }
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(intent, Some(Intent::SaveSettings));
+        assert_eq!(
+            app.settings.permission_mode,
+            phonton_types::PermissionMode::ReadOnly
+        );
+        assert!(app
+            .ask_answer
+            .as_deref()
+            .unwrap_or("")
+            .contains("mode: read-only"));
     }
 
     #[test]

@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2437,6 +2437,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nix",
+ "phonton-types",
  "tokio",
  "tracing",
  "windows",

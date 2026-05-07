@@ -4,6 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.7.3 - Context And Permission Controls
+
+### Added
+
+- Added `/context` to show the latest prompt-section token manifest and session prompt totals from inside the TUI.
+- Added `/compact` to request a worker context-compression pass for the selected running goal and reset the local context meter.
+- Added `/stop` to cancel the selected planning/running goal through the orchestrator control channel.
+- Added persisted permission modes: `ask`, `read-only`, `workspace-write`, and `full-access`, with `/permissions set <mode>` and System panel visibility.
+
+### Fixed
+
+- Goal submission now sends an immediate Planning state before attachment, memory, provider, and preflight setup, so Enter does not look frozen while background work starts.
+- Hosted providers now fail before dispatch when no API key is resolved instead of silently falling back to the stub dispatcher.
+
 ## 0.7.2 - Goal Dispatch Hotfix
 
 ### Fixed

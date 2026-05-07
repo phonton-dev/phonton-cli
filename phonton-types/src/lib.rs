@@ -976,6 +976,53 @@ pub struct PromptContextManifest {
     pub total_estimated_tokens: u64,
 }
 
+/// Local execution permission posture for shell, filesystem, and network work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionMode {
+    /// Keep the default guard behavior: safe workspace actions run, risky
+    /// actions require approval or are blocked.
+    #[default]
+    Ask,
+    /// Allow reads but block writes and require approval for command/network
+    /// activity.
+    ReadOnly,
+    /// Allow normal workspace writes and allowlisted commands; keep risky
+    /// shell/network activity approval-gated.
+    WorkspaceWrite,
+    /// Allow all non-sensitive actions inside the local sandbox guard.
+    FullAccess,
+}
+
+impl PermissionMode {
+    /// Stable user/config spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionMode::Ask => "ask",
+            PermissionMode::ReadOnly => "read-only",
+            PermissionMode::WorkspaceWrite => "workspace-write",
+            PermissionMode::FullAccess => "full-access",
+        }
+    }
+
+    /// Parse a user-facing permission mode.
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "ask" | "default" => Some(PermissionMode::Ask),
+            "read-only" | "readonly" | "read" => Some(PermissionMode::ReadOnly),
+            "workspace-write" | "workspace" | "write" => Some(PermissionMode::WorkspaceWrite),
+            "full-access" | "full" | "danger" => Some(PermissionMode::FullAccess),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Record of one privileged action request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionRecord {

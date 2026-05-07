@@ -17,6 +17,9 @@
 //! [budget]
 //! max_tokens = 500000
 //! # max_usd_cents = 100   # hard stop at $1.00 per session
+//!
+//! [permissions]
+//! mode = "ask" # ask | read-only | workspace-write | full-access
 //! ```
 //!
 //! **Security note:** the file is read from disk at startup only. The API
@@ -26,6 +29,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use phonton_types::PermissionMode;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -43,6 +47,10 @@ pub struct Config {
     /// Spending / token limits.
     #[serde(default)]
     pub budget: BudgetConfig,
+
+    /// Local execution permission posture.
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
 }
 
 /// `[provider]` table.
@@ -101,6 +109,15 @@ pub struct BudgetConfig {
     /// Hard stop at this many US cents per session (`None` = unlimited).
     /// Stored as cents so the TOML value is human-readable.
     pub max_usd_cents: Option<u64>,
+}
+
+/// `[permissions]` table.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsConfig {
+    /// Local execution posture for shell/filesystem/network actions.
+    #[serde(default)]
+    pub mode: PermissionMode,
 }
 
 #[allow(dead_code)]
@@ -258,6 +275,27 @@ max_usd_cents = 50
     fn empty_file_is_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.provider.name, "anthropic");
+    }
+
+    #[test]
+    fn default_permissions_mode_is_ask() {
+        let cfg: Config = toml::from_str("").unwrap();
+
+        assert_eq!(cfg.permissions.mode, phonton_types::PermissionMode::Ask);
+    }
+
+    #[test]
+    fn parses_permissions_mode() {
+        let raw = r#"
+[permissions]
+mode = "workspace-write"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+
+        assert_eq!(
+            cfg.permissions.mode,
+            phonton_types::PermissionMode::WorkspaceWrite
+        );
     }
 
     #[test]
