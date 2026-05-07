@@ -5892,32 +5892,6 @@ fn state_for_plan_status(plan: &PlannerOutput, task_status: TaskStatus) -> Globa
     }
 }
 
-fn clarification_status_for_plan(plan: &PlannerOutput) -> Option<TaskStatus> {
-    let contract = plan.goal_contract.as_ref()?;
-    if contract.clarification_questions.is_empty() {
-        return None;
-    }
-
-    let has_run_command = contract.run_plan.iter().any(|cmd| !cmd.command.is_empty());
-    let has_verify_command = contract.verify_plan.iter().any(|step| {
-        step.command
-            .as_ref()
-            .is_some_and(|cmd| !cmd.command.is_empty())
-    });
-    let stackless_question = contract
-        .clarification_questions
-        .iter()
-        .any(|question| question.contains("No project stack was detected"));
-
-    if stackless_question || !has_run_command || !has_verify_command {
-        Some(TaskStatus::NeedsClarification {
-            questions: contract.clarification_questions.clone(),
-        })
-    } else {
-        None
-    }
-}
-
 async fn spawn_goal(
     goal_index: usize,
     task_id: TaskId,
@@ -5947,17 +5921,6 @@ async fn spawn_goal(
         Err(_) => return,
     };
     apply_workspace_preflight(&mut plan, &working_dir, &text);
-
-    if let Some(status) = clarification_status_for_plan(&plan) {
-        let state = state_for_plan_status(&plan, status);
-        if let Ok(g) = store.lock() {
-            let _ = g.upsert_task(task_id, &text, &state.task_status, 0);
-        }
-        let _ = tx
-            .send(LoopEvent::StateUpdate(goal_index, Box::new(state)))
-            .await;
-        return;
-    }
 
     let planning_state = state_for_plan_status(&plan, TaskStatus::Planning);
     let _ = tx
@@ -6759,32 +6722,38 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn workspace_preflight_marks_stackless_chess_as_clarification_gap() {
+    fn workspace_preflight_defaults_stackless_chess_without_clarifying() {
         let temp = tempfile::tempdir().unwrap();
         let mut plan = single_task_plan("make chess".into(), Vec::new());
 
         apply_workspace_preflight(&mut plan, temp.path(), "make chess");
 
         let contract = plan.goal_contract.unwrap();
-        assert!(contract
-            .clarification_questions
-            .iter()
-            .any(|question| question.contains("web app, terminal game, or native binary")));
+        assert!(contract.clarification_questions.is_empty());
         assert!(contract
             .assumptions
             .iter()
-            .any(|assumption| assumption.contains("No package.json")));
+            .any(|assumption| assumption.contains("defaulting to a self-contained Python")));
+        assert!(contract
+            .likely_files
+            .iter()
+            .any(|path| path == &std::path::PathBuf::from("chess.py")));
     }
 
     #[test]
-    fn stackless_chess_preflight_pauses_before_worker_dispatch() {
+    fn stackless_chess_preflight_remains_dispatchable_in_goal_mode() {
         let temp = tempfile::tempdir().unwrap();
         let mut plan = single_task_plan("make chess".into(), Vec::new());
 
         apply_workspace_preflight(&mut plan, temp.path(), "make chess");
 
-        let status = clarification_status_for_plan(&plan).expect("clarification status");
-        assert!(matches!(status, TaskStatus::NeedsClarification { .. }));
+        let contract = plan.goal_contract.unwrap();
+        assert!(contract.clarification_questions.is_empty());
+        assert!(!contract.run_plan.is_empty());
+        assert!(contract
+            .verify_plan
+            .iter()
+            .any(|step| step.command.is_some()));
     }
 
     #[test]
@@ -6799,7 +6768,13 @@ fn extract_id(line: &str) -> Option<String> {
 
         apply_workspace_preflight(&mut plan, temp.path(), "make chess");
 
-        assert!(clarification_status_for_plan(&plan).is_none());
+        let contract = plan.goal_contract.unwrap();
+        assert!(contract.clarification_questions.is_empty());
+        assert!(!contract.run_plan.is_empty());
+        assert!(contract
+            .verify_plan
+            .iter()
+            .any(|step| step.command.is_some()));
     }
 
     #[test]

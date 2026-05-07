@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.7.2 - Goal Dispatch Hotfix
+
+### Fixed
+
+- Goal-mode chess requests now dispatch immediately instead of stopping at a clarification state.
+- Empty-workspace chess goals now default to a concrete terminal Python target with `chess.py`, `python -m py_compile chess.py`, and `python chess.py` in the visible contract.
+- Short chess goals no longer inherit the generic "What exact behavior or artifact should Phonton produce?" clarification question.
+
 ## 0.7.1 - Clarification Hotfix
 
 ### Fixed

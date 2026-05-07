@@ -141,7 +141,9 @@ impl Goal {
             quality_floor: QualityFloor {
                 criteria: quality_criteria,
             },
-            clarification_questions: if self.description.split_whitespace().count() <= 2 {
+            clarification_questions: if !chess_goal
+                && self.description.split_whitespace().count() <= 2
+            {
                 vec!["What exact behavior or artifact should Phonton produce?".into()]
             } else {
                 Vec::new()
@@ -937,6 +939,7 @@ mod tests {
             .expected_artifacts
             .iter()
             .any(|artifact| artifact.description.contains("Playable chess")));
+        assert!(contract.clarification_questions.is_empty());
     }
 
     #[test]
