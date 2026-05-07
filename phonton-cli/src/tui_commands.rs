@@ -9,6 +9,45 @@ pub enum CommandCategory {
     Shell,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FocusView {
+    #[default]
+    Receipt,
+    Code,
+    Commands,
+    Log,
+}
+
+impl FocusView {
+    pub fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "receipt" | "review" => Some(Self::Receipt),
+            "code" | "diff" => Some(Self::Code),
+            "commands" | "command" | "cmd" | "run" => Some(Self::Commands),
+            "log" | "flight-log" | "flight" => Some(Self::Log),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Receipt => "Receipt",
+            Self::Code => "Code",
+            Self::Commands => "Commands",
+            Self::Log => "Log",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Receipt => Self::Code,
+            Self::Code => Self::Commands,
+            Self::Commands => Self::Log,
+            Self::Log => Self::Receipt,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashAction {
     GoalMode,
@@ -28,6 +67,11 @@ pub enum SlashAction {
     ShowContext,
     CompactContext,
     StopGoal,
+    OpenGoals,
+    SetFocus(FocusView),
+    CopyFocus,
+    RerunCommand,
+    ShowStats,
     ShowReview,
     ManageModel,
 }
@@ -120,11 +164,51 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/compact",
-        aliases: &[],
+        aliases: &["/compress"],
         args: "",
         description: "compact active worker context",
         category: CommandCategory::Trust,
         action: SlashAction::CompactContext,
+    },
+    CommandSpec {
+        name: "/goals",
+        aliases: &["/switch"],
+        args: "",
+        description: "open the searchable goal switcher",
+        category: CommandCategory::Loop,
+        action: SlashAction::OpenGoals,
+    },
+    CommandSpec {
+        name: "/focus",
+        aliases: &[],
+        args: "code|commands|receipt|log",
+        description: "switch the Active panel focus view",
+        category: CommandCategory::Loop,
+        action: SlashAction::SetFocus(FocusView::Receipt),
+    },
+    CommandSpec {
+        name: "/copy",
+        aliases: &[],
+        args: "",
+        description: "copy the current focus view to the clipboard",
+        category: CommandCategory::Loop,
+        action: SlashAction::CopyFocus,
+    },
+    CommandSpec {
+        name: "/rerun",
+        aliases: &[],
+        args: "",
+        description: "rerun the most recent command",
+        category: CommandCategory::Shell,
+        action: SlashAction::RerunCommand,
+    },
+    CommandSpec {
+        name: "/stats",
+        aliases: &[],
+        args: "",
+        description: "show session token, goal, and command stats",
+        category: CommandCategory::Trust,
+        action: SlashAction::ShowStats,
     },
     CommandSpec {
         name: "/stop",
@@ -265,6 +349,17 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
                 suggestion: Some(
                     "/permissions set ask|read-only|workspace-write|full-access".into(),
                 ),
+            }
+        };
+    }
+
+    if head == "/focus" {
+        return if let Some(view) = FocusView::parse(rest) {
+            SlashParse::Command(SlashAction::SetFocus(view))
+        } else {
+            SlashParse::Unknown {
+                command: "/focus".into(),
+                suggestion: Some("/focus code|commands|receipt|log".into()),
             }
         };
     }
@@ -442,6 +537,42 @@ mod tests {
         assert_eq!(
             parse_slash_command("/stop"),
             SlashParse::Command(SlashAction::StopGoal)
+        );
+    }
+
+    #[test]
+    fn goal_focus_copy_rerun_stats_and_compress_parse_as_commands() {
+        assert_eq!(
+            parse_slash_command("/goals"),
+            SlashParse::Command(SlashAction::OpenGoals)
+        );
+        assert_eq!(
+            parse_slash_command("/switch"),
+            SlashParse::Command(SlashAction::OpenGoals)
+        );
+        assert_eq!(
+            parse_slash_command("/focus code"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Code))
+        );
+        assert_eq!(
+            parse_slash_command("/focus commands"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Commands))
+        );
+        assert_eq!(
+            parse_slash_command("/copy"),
+            SlashParse::Command(SlashAction::CopyFocus)
+        );
+        assert_eq!(
+            parse_slash_command("/rerun"),
+            SlashParse::Command(SlashAction::RerunCommand)
+        );
+        assert_eq!(
+            parse_slash_command("/stats"),
+            SlashParse::Command(SlashAction::ShowStats)
+        );
+        assert_eq!(
+            parse_slash_command("/compress"),
+            SlashParse::Command(SlashAction::CompactContext)
         );
     }
 

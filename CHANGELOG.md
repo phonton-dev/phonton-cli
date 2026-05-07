@@ -4,6 +4,21 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.7.4 - Goal Switching And Focus QoL
+
+### Added
+
+- Added stable numeric goal indexes plus `Alt+Up`, `Alt+Down`, and `Alt+1` through `Alt+9` for faster multi-goal switching.
+- Added `/goals` and `/switch` for a searchable goal switcher drawer.
+- Added Active panel focus tabs: Receipt, Code, Commands, and Log. Review-ready goals with diff hunks default to Code focus.
+- Added `f` to cycle focus views and `[` / `]` to move through changed files or command runs when the prompt is empty.
+- Added `/focus code|commands|receipt|log`, `/copy`, `/rerun`, `/stats`, and `/compress` as an alias for `/compact`.
+
+### Changed
+
+- Command run summaries now stay collapsed unless the Commands focus view is selected, where Phonton shows status, exit code, duration, and stdout/stderr previews.
+- Code focus renders review-ready diff hunks directly when available, falling back to changed-file summaries.
+
 ## 0.7.3 - Context And Permission Controls
 
 ### Added

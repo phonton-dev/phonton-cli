@@ -59,7 +59,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use command_runner::{parse_prompt_command, summarize_output, CommandRunSummary};
+use command_runner::{parse_prompt_command, summarize_output_with_duration, CommandRunSummary};
 use contract_preflight::apply_workspace_preflight;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -98,7 +98,7 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tui_commands::{
     command_suggestions, complete_command_prefix, parse_slash_command, render_command_label,
-    unknown_command_message, SlashAction, SlashParse,
+    unknown_command_message, FocusView, SlashAction, SlashParse,
 };
 
 // ---------------------------------------------------------------------------
@@ -420,6 +420,39 @@ impl ModelPickerState {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GoalSwitcherState {
+    pub open: bool,
+    pub filter: String,
+    pub selected: usize,
+}
+
+impl GoalSwitcherState {
+    pub fn filtered_indices(&self, goals: &[GoalEntry]) -> Vec<usize> {
+        let query = self.filter.trim().to_ascii_lowercase();
+        goals
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, goal)| {
+                if query.is_empty()
+                    || goal.description.to_ascii_lowercase().contains(&query)
+                    || goal_status_label(&goal.status).contains(&query)
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn clamp(&mut self, goals: &[GoalEntry]) {
+        self.selected = self
+            .selected
+            .min(self.filtered_indices(goals).len().saturating_sub(1));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SettingsState {
     pub active_field: SettingsField,
@@ -624,6 +657,14 @@ pub struct App {
     pub session_prompt_tokens: u64,
     /// Tokens the user has explicitly compacted from the visible context meter.
     pub compacted_prompt_tokens: u64,
+    /// Active panel focus view.
+    pub focus_view: FocusView,
+    /// Cursor into changed files shown by Code focus.
+    pub focused_changed_file: usize,
+    /// Cursor into command runs shown by Commands focus.
+    pub focused_command_run: usize,
+    /// Searchable goal switcher overlay.
+    pub goal_switcher: GoalSwitcherState,
 }
 
 impl App {
@@ -661,6 +702,10 @@ impl App {
             last_prompt_manifest: None,
             session_prompt_tokens: 0,
             compacted_prompt_tokens: 0,
+            focus_view: FocusView::Receipt,
+            focused_changed_file: 0,
+            focused_command_run: 0,
+            goal_switcher: GoalSwitcherState::default(),
         }
     }
 
@@ -754,6 +799,31 @@ impl App {
                 intent
             }
             SlashAction::StopGoal => self.stop_selected_goal_intent(),
+            SlashAction::OpenGoals => {
+                self.goal_switcher.open = true;
+                self.goal_switcher.filter.clear();
+                self.goal_switcher.selected = self.selected.min(self.goals.len().saturating_sub(1));
+                None
+            }
+            SlashAction::SetFocus(view) => {
+                self.focus_view = view;
+                self.command_notice = Some(format!("Active focus: {}", view.as_str()));
+                None
+            }
+            SlashAction::CopyFocus => Some(Intent::CopyFocus(self.focus_text())),
+            SlashAction::RerunCommand => {
+                if let Some(command) = self.command_runs.last().map(|run| run.command.clone()) {
+                    Some(Intent::RunCommand(format!("/run {command}")))
+                } else {
+                    self.command_notice = Some("No command has run yet.".into());
+                    None
+                }
+            }
+            SlashAction::ShowStats => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.stats_command_summary());
+                None
+            }
             SlashAction::ShowReview => {
                 self.mode = Mode::Ask;
                 self.ask_answer = Some(self.review_command_summary());
@@ -820,6 +890,36 @@ impl App {
             m.retry_error_tokens,
             self.session_prompt_tokens,
             self.compacted_prompt_tokens
+        )
+    }
+
+    fn stats_command_summary(&self) -> String {
+        let totals = self.session_totals();
+        let active = self
+            .goals
+            .iter()
+            .filter(|goal| {
+                matches!(
+                    goal.status,
+                    TaskStatus::Planning | TaskStatus::Running { .. }
+                )
+            })
+            .count();
+        format!(
+            "Stats\ngoals: {} total, {} active, {} review, {} done, {} failed\ntokens: {} used, {} estimated saved\ncontext: {} latest prompt tokens, {} session prompt tokens\ncommands: {} recent runs",
+            totals.goals,
+            active,
+            totals.reviewing,
+            totals.completed,
+            totals.failed,
+            totals.tokens_used,
+            totals.estimated_tokens_saved,
+            self.last_prompt_manifest
+                .as_ref()
+                .map(|m| m.total_estimated_tokens)
+                .unwrap_or(0),
+            self.session_prompt_tokens,
+            self.command_runs.len()
         )
     }
 
@@ -980,6 +1080,10 @@ impl App {
         self.last_prompt_manifest = None;
         self.session_prompt_tokens = 0;
         self.compacted_prompt_tokens = 0;
+        self.focus_view = FocusView::Receipt;
+        self.focused_changed_file = 0;
+        self.focused_command_run = 0;
+        self.goal_switcher = GoalSwitcherState::default();
     }
 
     fn request_quit_confirmation(&mut self) -> Option<Intent> {
@@ -1136,11 +1240,19 @@ impl App {
 
     /// Append a flight-log event to the goal at `index`.
     pub fn apply_event(&mut self, index: usize, event: EventRecord) {
+        let should_default_code_focus = index == self.selected
+            && matches!(
+                &event.event,
+                OrchestratorEvent::SubtaskReviewReady { diff_hunks, .. } if !diff_hunks.is_empty()
+            );
         if let OrchestratorEvent::PromptManifest { manifest, .. } = &event.event {
             self.record_prompt_manifest(manifest.clone());
         }
         if let Some(g) = self.goals.get_mut(index) {
             g.flight_log.push(event);
+        }
+        if should_default_code_focus && self.focus_view == FocusView::Receipt {
+            self.focus_view = FocusView::Code;
         }
     }
 
@@ -1149,6 +1261,66 @@ impl App {
             .session_prompt_tokens
             .saturating_add(manifest.total_estimated_tokens);
         self.last_prompt_manifest = Some(manifest);
+    }
+
+    pub fn active_focus_view_for_current_goal(&self) -> FocusView {
+        self.focus_view
+    }
+
+    pub fn focus_text(&self) -> String {
+        let Some(goal) = self.current_goal() else {
+            return "Phonton\nNo goal selected.".into();
+        };
+        match self.active_focus_view_for_current_goal() {
+            FocusView::Receipt => receipt_focus_text(goal),
+            FocusView::Code => code_focus_text(goal, self.focused_changed_file),
+            FocusView::Commands => {
+                commands_focus_text(&self.command_runs, self.focused_command_run)
+            }
+            FocusView::Log => log_focus_text(goal),
+        }
+    }
+
+    fn cycle_focus_view(&mut self) {
+        self.focus_view = self.active_focus_view_for_current_goal().next();
+    }
+
+    fn previous_goal(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+        self.clamp_focus_indices();
+        self.default_to_code_focus_for_reviewable_goal();
+    }
+
+    fn next_goal(&mut self) {
+        if self.selected + 1 < self.goals.len() {
+            self.selected += 1;
+        }
+        self.clamp_focus_indices();
+        self.default_to_code_focus_for_reviewable_goal();
+    }
+
+    fn jump_to_goal_number(&mut self, number: usize) {
+        if number > 0 && number <= self.goals.len() {
+            self.selected = number - 1;
+            self.clamp_focus_indices();
+            self.default_to_code_focus_for_reviewable_goal();
+        }
+    }
+
+    fn clamp_focus_indices(&mut self) {
+        let changed_len = self.current_goal().map(focused_file_count).unwrap_or(0);
+        self.focused_changed_file = self.focused_changed_file.min(changed_len.saturating_sub(1));
+        self.focused_command_run = self
+            .focused_command_run
+            .min(self.command_runs.len().saturating_sub(1));
+    }
+
+    fn default_to_code_focus_for_reviewable_goal(&mut self) {
+        if self.focus_view == FocusView::Receipt
+            && self.current_goal().map(focused_file_count).unwrap_or(0) > 0
+        {
+            self.focus_view = FocusView::Code;
+        }
     }
 
     /// Insert pasted text into the active prompt surface. Long or multi-line
@@ -1163,10 +1335,12 @@ impl App {
 
     pub fn push_command_run(&mut self, summary: CommandRunSummary) {
         self.command_runs.push(summary);
+        self.focused_command_run = self.command_runs.len().saturating_sub(1);
         const MAX_COMMAND_RUNS: usize = 20;
         if self.command_runs.len() > MAX_COMMAND_RUNS {
             let overflow = self.command_runs.len() - MAX_COMMAND_RUNS;
             self.command_runs.drain(0..overflow);
+            self.focused_command_run = self.focused_command_run.saturating_sub(overflow);
         }
     }
 
@@ -1210,8 +1384,33 @@ impl App {
             return self.handle_quit_confirmation_key(key);
         }
 
+        if self.goal_switcher.open {
+            return self.handle_goal_switcher_key(key);
+        }
+
         if !self.pending_mcp_approvals.is_empty() {
             return self.handle_mcp_approval_key(key);
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) && matches!(self.mode, Mode::Goal | Mode::Task)
+        {
+            match key.code {
+                KeyCode::Up => {
+                    self.previous_goal();
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.next_goal();
+                    return None;
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(number) = c.to_digit(10) {
+                        self.jump_to_goal_number(number as usize);
+                    }
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         // Global shortcuts first, regardless of mode.
@@ -1356,6 +1555,45 @@ impl App {
             Mode::Memory | Mode::History => None,
             Mode::CommandPalette => self.handle_palette_key(key),
         }
+    }
+
+    fn handle_goal_switcher_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        match key.code {
+            KeyCode::Esc => {
+                self.goal_switcher.open = false;
+            }
+            KeyCode::Enter => {
+                let filtered = self.goal_switcher.filtered_indices(&self.goals);
+                if let Some(goal_index) = filtered.get(self.goal_switcher.selected).copied() {
+                    self.selected = goal_index;
+                    self.clamp_focus_indices();
+                    self.default_to_code_focus_for_reviewable_goal();
+                }
+                self.goal_switcher.open = false;
+            }
+            KeyCode::Up => {
+                self.goal_switcher.selected = self.goal_switcher.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = self
+                    .goal_switcher
+                    .filtered_indices(&self.goals)
+                    .len()
+                    .saturating_sub(1);
+                self.goal_switcher.selected = (self.goal_switcher.selected + 1).min(max);
+            }
+            KeyCode::Backspace => {
+                self.goal_switcher.filter.pop();
+                self.goal_switcher.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                self.goal_switcher.filter.push(c);
+                self.goal_switcher.selected = 0;
+            }
+            _ => {}
+        }
+        self.goal_switcher.clamp(&self.goals);
+        None
     }
 
     fn handle_mcp_approval_key(&mut self, key: KeyEvent) -> Option<Intent> {
@@ -1564,7 +1802,7 @@ impl App {
                         self.goal_prompt.set_text(entry.clone());
                     }
                 } else {
-                    self.selected = self.selected.saturating_sub(1);
+                    self.previous_goal();
                 }
                 None
             }
@@ -1580,8 +1818,8 @@ impl App {
                         self.prompt_history_cursor = None;
                         self.goal_prompt.set_text("");
                     }
-                } else if self.selected + 1 < self.goals.len() {
-                    self.selected += 1;
+                } else {
+                    self.next_goal();
                 }
                 None
             }
@@ -1606,6 +1844,40 @@ impl App {
                     }
                 }
                 self.goal_prompt.insert_char('r');
+                None
+            }
+            KeyCode::Char('f') if self.goal_prompt.is_empty() => {
+                self.cycle_focus_view();
+                None
+            }
+            KeyCode::Char('[') if self.goal_prompt.is_empty() => {
+                match self.active_focus_view_for_current_goal() {
+                    FocusView::Code => {
+                        self.focused_changed_file = self.focused_changed_file.saturating_sub(1)
+                    }
+                    FocusView::Commands => {
+                        self.focused_command_run = self.focused_command_run.saturating_sub(1)
+                    }
+                    _ => {}
+                }
+                None
+            }
+            KeyCode::Char(']') if self.goal_prompt.is_empty() => {
+                match self.active_focus_view_for_current_goal() {
+                    FocusView::Code => {
+                        let max = self
+                            .current_goal()
+                            .map(focused_file_count)
+                            .unwrap_or(0)
+                            .saturating_sub(1);
+                        self.focused_changed_file = (self.focused_changed_file + 1).min(max);
+                    }
+                    FocusView::Commands => {
+                        let max = self.command_runs.len().saturating_sub(1);
+                        self.focused_command_run = (self.focused_command_run + 1).min(max);
+                    }
+                    _ => {}
+                }
                 None
             }
             KeyCode::Char(c) => {
@@ -1898,6 +2170,8 @@ pub enum Intent {
     Ask(String),
     /// User submitted `/run <cmd>` or `!<cmd>` from the prompt bar.
     RunCommand(String),
+    /// User requested copying the current focus surface to the OS clipboard.
+    CopyFocus(String),
     /// User requested OS clipboard paste. On Windows this supports Win+V
     /// selections that land in the clipboard but are not emitted as terminal
     /// bracketed-paste events.
@@ -2102,6 +2376,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     }
     if app.mode == Mode::CommandPalette {
         render_palette(frame, area, app);
+    }
+    if app.goal_switcher.open {
+        render_goal_switcher(frame, area, app);
     }
     if app.help_open {
         render_help(frame, area);
@@ -2527,6 +2804,12 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("?", key),
             Span::styled(" help  ", txt),
             sep.clone(),
+            Span::styled("Alt+↑↓", key),
+            Span::styled(" goal  ", txt),
+            sep.clone(),
+            Span::styled("f", key),
+            Span::styled(" focus  ", txt),
+            sep.clone(),
             Span::styled("Ctrl+;", key),
             Span::styled(" ask  ", txt),
             sep.clone(),
@@ -2683,6 +2966,96 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn render_goal_switcher(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_w = area.width.saturating_sub(8).clamp(48, 90);
+    let popup_h = area.height.saturating_sub(6).clamp(8, 18);
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
+        width: popup_w.min(area.width),
+        height: popup_h.min(area.height),
+    };
+
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Span::styled(
+            " Goals ",
+            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Thick)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(block, popup_area);
+
+    let inner = popup_area.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "/",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::raw(app.goal_switcher.filter.clone()),
+        ])),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize)).style(Style::default().fg(MUTED)),
+        chunks[1],
+    );
+
+    let filtered = app.goal_switcher.filtered_indices(&app.goals);
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(row, goal_idx)| {
+            let goal = &app.goals[*goal_idx];
+            let selected = row == app.goal_switcher.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(BG_DEEP)
+                    .bg(ACCENT_HI)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            ListItem::new(Line::from(format!(
+                "{:>2}. {:<7} {}",
+                goal_idx + 1,
+                goal_status_label(&goal.status),
+                short(&goal.description, inner.width.saturating_sub(14) as usize)
+            )))
+            .style(style)
+        })
+        .collect();
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching goals.").style(Style::default().fg(MUTED)),
+            chunks[2],
+        );
+    } else {
+        frame.render_widget(List::new(items), chunks[2]);
+    }
+    frame.render_widget(
+        Paragraph::new("Alt+1-9 jump · Enter select · Esc close").style(Style::default().fg(MUTED)),
+        chunks[3],
+    );
+}
+
 fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .goals
@@ -2699,6 +3072,10 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 ("  ", Style::default().fg(MUTED))
             };
             let mut spans = vec![Span::styled(marker, base_style)];
+            spans.push(Span::styled(
+                format!("{:>2} ", i + 1),
+                Style::default().fg(if selected { ACCENT_HI } else { MUTED }),
+            ));
             spans.extend(status_tag_spans(&g.status, app.spinner_frame));
             // Parallel-worker indicator: one spinner glyph per concurrently
             // active subtask, capped at 5 so the sidebar stays readable.
@@ -2995,7 +3372,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled("     save + exit?", muted),
             ]),
         ];
-        append_command_run_lines(&mut lines, &app.command_runs);
+        append_command_run_lines(&mut lines, &app.command_runs, app.focused_command_run);
         let p = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false });
@@ -3091,18 +3468,33 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ]));
         }
 
-        if let Some(handoff) = &state.handoff_packet {
-            append_handoff_lines(&mut lines, handoff);
+        append_focus_tabs(&mut lines, app.active_focus_view_for_current_goal());
+        match app.active_focus_view_for_current_goal() {
+            FocusView::Receipt => {
+                if let Some(handoff) = &state.handoff_packet {
+                    append_handoff_lines(&mut lines, handoff);
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "  No handoff packet yet.",
+                        Style::default().fg(MUTED),
+                    )));
+                }
+            }
+            FocusView::Code => append_code_focus_lines(&mut lines, g, app.focused_changed_file),
+            FocusView::Commands => {
+                append_command_run_lines(&mut lines, &app.command_runs, app.focused_command_run)
+            }
+            FocusView::Log => append_log_focus_lines(&mut lines, g),
         }
-
-        append_command_run_lines(&mut lines, &app.command_runs);
 
         // Checkpoint picker — one line per landed subtask, newest last.
         // Marked with a "↶ N" tag for "Rollback to step N" — the actual
         // rollback is dispatched through the orchestrator's control
         // channel (see `OrchestratorMessage::RollbackRequest`); this
         // panel only surfaces the picker.
-        if !state.checkpoints.is_empty() {
+        if !state.checkpoints.is_empty()
+            && app.active_focus_view_for_current_goal() == FocusView::Receipt
+        {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 format!(
@@ -3143,7 +3535,235 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(p, area);
 }
 
-fn append_command_run_lines(lines: &mut Vec<Line<'static>>, runs: &[CommandRunSummary]) {
+fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusView) {
+    lines.push(Line::raw(""));
+    let tabs = [
+        FocusView::Receipt,
+        FocusView::Code,
+        FocusView::Commands,
+        FocusView::Log,
+    ];
+    let mut spans = vec![Span::styled(
+        "Focus ",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    )];
+    for view in tabs {
+        let selected = view == active;
+        let style = if selected {
+            Style::default()
+                .fg(BG_DEEP)
+                .bg(ACCENT_HI)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        spans.push(Span::styled(format!(" {} ", view.as_str()), style));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        " f cycle  [ ] item",
+        Style::default().fg(MUTED),
+    ));
+    lines.push(Line::from(spans));
+}
+
+fn focused_file_count(goal: &GoalEntry) -> usize {
+    let groups = diff_hunks_by_file(goal);
+    if !groups.is_empty() {
+        groups.len()
+    } else {
+        goal.state
+            .as_ref()
+            .and_then(|state| state.handoff_packet.as_ref())
+            .map(|handoff| handoff.changed_files.len())
+            .unwrap_or(0)
+    }
+}
+
+fn diff_hunks_by_file(goal: &GoalEntry) -> Vec<(PathBuf, Vec<DiffHunk>)> {
+    let mut groups: Vec<(PathBuf, Vec<DiffHunk>)> = Vec::new();
+    for record in &goal.flight_log {
+        if let OrchestratorEvent::SubtaskReviewReady { diff_hunks, .. } = &record.event {
+            for hunk in diff_hunks {
+                if let Some((_, hunks)) =
+                    groups.iter_mut().find(|(path, _)| path == &hunk.file_path)
+                {
+                    hunks.push(hunk.clone());
+                } else {
+                    groups.push((hunk.file_path.clone(), vec![hunk.clone()]));
+                }
+            }
+        }
+    }
+    groups
+}
+
+fn append_code_focus_lines(lines: &mut Vec<Line<'static>>, goal: &GoalEntry, selected_file: usize) {
+    for line in code_focus_text(goal, selected_file).lines() {
+        let style = if line.starts_with('+') {
+            Style::default().fg(SUCCESS)
+        } else if line.starts_with('-') {
+            Style::default().fg(DANGER)
+        } else if line.starts_with("@@") {
+            Style::default().fg(ACCENT_HI)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_string(), style)));
+    }
+}
+
+fn code_focus_text(goal: &GoalEntry, selected_file: usize) -> String {
+    let groups = diff_hunks_by_file(goal);
+    if let Some((path, hunks)) = groups.get(selected_file.min(groups.len().saturating_sub(1))) {
+        let mut out = format!(
+            "Code {}/{}\nfile: {}\n",
+            selected_file.min(groups.len().saturating_sub(1)) + 1,
+            groups.len(),
+            path.display()
+        );
+        for hunk in hunks.iter().take(4) {
+            out.push_str(&format!(
+                "@@ -{},{} +{},{} @@\n",
+                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+            ));
+            for line in hunk.lines.iter().take(40) {
+                match line {
+                    DiffLine::Context(text) => {
+                        out.push(' ');
+                        out.push_str(text);
+                    }
+                    DiffLine::Added(text) => {
+                        out.push('+');
+                        out.push_str(text);
+                    }
+                    DiffLine::Removed(text) => {
+                        out.push('-');
+                        out.push_str(text);
+                    }
+                }
+                out.push('\n');
+            }
+            if hunk.lines.len() > 40 {
+                out.push_str(&format!(
+                    "... {} more hunk line(s)\n",
+                    hunk.lines.len() - 40
+                ));
+            }
+        }
+        return out;
+    }
+
+    if let Some(handoff) = goal
+        .state
+        .as_ref()
+        .and_then(|state| state.handoff_packet.as_ref())
+    {
+        let mut out = String::from("Code\n");
+        if handoff.changed_files.is_empty() {
+            out.push_str("No changed files recorded yet.");
+        } else {
+            for file in &handoff.changed_files {
+                out.push_str(&format!(
+                    "- {} +{} -{} {}\n",
+                    file.path.display(),
+                    file.added_lines,
+                    file.removed_lines,
+                    file.summary
+                ));
+            }
+        }
+        return out;
+    }
+
+    "Code\nNo diff hunks recorded yet.".into()
+}
+
+fn append_log_focus_lines(lines: &mut Vec<Line<'static>>, goal: &GoalEntry) {
+    for line in log_focus_text(goal).lines() {
+        lines.push(Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(MUTED),
+        )));
+    }
+}
+
+fn receipt_focus_text(goal: &GoalEntry) -> String {
+    let Some(state) = &goal.state else {
+        return format!(
+            "Receipt\ngoal: {}\nNo state snapshot yet.",
+            goal.description
+        );
+    };
+    let Some(handoff) = &state.handoff_packet else {
+        return format!(
+            "Receipt\ngoal: {}\nNo handoff packet yet.",
+            goal.description
+        );
+    };
+    let mut out = format!("Receipt\n{}\n", handoff.headline);
+    out.push_str(&format!(
+        "files: {} +{} -{}\n",
+        handoff.diff_stats.files_changed,
+        handoff.diff_stats.added_lines,
+        handoff.diff_stats.removed_lines
+    ));
+    for file in &handoff.changed_files {
+        out.push_str(&format!("- {} {}\n", file.path.display(), file.summary));
+    }
+    for gap in &handoff.known_gaps {
+        out.push_str(&format!("gap: {gap}\n"));
+    }
+    out
+}
+
+fn commands_focus_text(runs: &[CommandRunSummary], selected_run: usize) -> String {
+    let mut out = String::from("Commands\n");
+    if runs.is_empty() {
+        out.push_str("No commands have run yet.");
+        return out;
+    }
+    for (idx, run) in runs.iter().enumerate() {
+        let marker = if idx == selected_run { ">" } else { "-" };
+        let exit = run
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "running/blocked".into());
+        let duration = run
+            .duration_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "duration unknown".into());
+        out.push_str(&format!(
+            "{marker} {}  exit={}  {duration}\n",
+            run.command, exit
+        ));
+        if !run.stdout_preview.is_empty() && run.stdout_preview != "running..." {
+            out.push_str(&format!("stdout: {}\n", run.stdout_preview));
+        }
+        if !run.stderr_preview.is_empty() {
+            out.push_str(&format!("stderr: {}\n", run.stderr_preview));
+        }
+    }
+    out
+}
+
+fn log_focus_text(goal: &GoalEntry) -> String {
+    let mut out = String::from("Log\n");
+    if goal.flight_log.is_empty() {
+        out.push_str("No flight-log events yet.");
+        return out;
+    }
+    for record in goal.flight_log.iter().rev().take(12).rev() {
+        out.push_str(&format!("{} {}\n", record.kind(), record.render_line()));
+    }
+    out
+}
+
+fn append_command_run_lines(
+    lines: &mut Vec<Line<'static>>,
+    runs: &[CommandRunSummary],
+    selected_run: usize,
+) {
     if runs.is_empty() {
         return;
     }
@@ -3152,19 +3772,27 @@ fn append_command_run_lines(lines: &mut Vec<Line<'static>>, runs: &[CommandRunSu
         "Commands",
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
-    for run in runs.iter().rev().take(3) {
+    for (visible_idx, run) in runs.iter().rev().take(8).enumerate() {
         let (label, color) = match run.exit_code {
             None if run.stdout_preview == "running..." => ("run", WARN),
             Some(0) => ("ok", SUCCESS),
             Some(_) => ("fail", DANGER),
             None => ("blocked", DANGER),
         };
+        let source_idx = runs.len().saturating_sub(1).saturating_sub(visible_idx);
+        let marker = if source_idx == selected_run { ">" } else { " " };
+        let duration = run
+            .duration_ms
+            .map(|ms| format!("  {ms}ms"))
+            .unwrap_or_default();
         lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(ACCENT_HI)),
             Span::styled(
                 format!("  {label} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(short(&run.command, 72), Style::default().fg(Color::White)),
+            Span::styled(duration, Style::default().fg(MUTED)),
         ]));
         if !run.stdout_preview.is_empty() && run.stdout_preview != "running..." {
             lines.push(Line::from(vec![
@@ -3540,6 +4168,20 @@ fn task_status_label(status: &serde_json::Value) -> &'static str {
         "paused"
     } else {
         "task"
+    }
+}
+
+fn goal_status_label(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Planning => "planning",
+        TaskStatus::Running { .. } => "running",
+        TaskStatus::Reviewing { .. } => "review",
+        TaskStatus::Done { .. } => "done",
+        TaskStatus::Failed { .. } => "failed",
+        TaskStatus::NeedsClarification { .. } => "clarify",
+        TaskStatus::Paused { .. } => "paused",
+        TaskStatus::Rejected => "rejected",
     }
 }
 
@@ -4787,7 +5429,8 @@ fn print_help() {
          ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
          \n\
          TUI SLASH COMMANDS:\n  \
-         /settings, /config, /status, /context, /compact, /stop,\n  \
+         /settings, /config, /status, /context, /compact, /compress,\n  \
+         /goals, /switch, /focus <view>, /copy, /rerun, /stats, /stop,\n  \
          /review, /memory, /permissions set <mode>, /model set <name>,\n  \
          /commands, /run <cmd>, and !<cmd>\n\
          \n\
@@ -5313,6 +5956,40 @@ fn read_clipboard_text() -> std::result::Result<Option<String>, String> {
     }
 }
 
+fn write_clipboard_text(text: &str) -> std::result::Result<(), String> {
+    #[cfg(windows)]
+    {
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Set-Clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if err.is_empty() {
+                "PowerShell Set-Clipboard failed".into()
+            } else {
+                err
+            })
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        Err("clipboard copy is currently implemented for Windows only".into())
+    }
+}
+
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -5360,6 +6037,14 @@ async fn run_app<B: Backend>(
                                 app.settings.message = Some(format!("Clipboard paste failed: {e}"));
                             }
                         },
+                        Intent::CopyFocus(text) => match write_clipboard_text(&text) {
+                            Ok(()) => {
+                                app.command_notice = Some("Copied current focus view.".into());
+                            }
+                            Err(e) => {
+                                app.command_notice = Some(format!("Copy failed: {e}"));
+                            }
+                        },
                         Intent::RunCommand(text) => {
                             if let Some(parsed) = parse_prompt_command(&text) {
                                 let command = parsed.original.clone();
@@ -5368,22 +6053,26 @@ async fn run_app<B: Backend>(
                                     exit_code: None,
                                     stdout_preview: "running...".into(),
                                     stderr_preview: String::new(),
+                                    duration_ms: None,
                                 });
                                 let tx2 = tx.clone();
                                 let sandbox = Arc::clone(&sandbox);
                                 tokio::spawn(async move {
+                                    let started = std::time::Instant::now();
                                     let summary = match sandbox.run_tool(parsed.call).await {
-                                        Ok(output) => summarize_output(
+                                        Ok(output) => summarize_output_with_duration(
                                             &command,
                                             output.status.code(),
                                             &output.stdout,
                                             &output.stderr,
+                                            Some(started.elapsed().as_millis() as u64),
                                         ),
                                         Err(e) => CommandRunSummary {
                                             command,
                                             exit_code: None,
                                             stdout_preview: String::new(),
                                             stderr_preview: e.to_string(),
+                                            duration_ms: Some(started.elapsed().as_millis() as u64),
                                         },
                                     };
                                     let _ = tx2.send(LoopEvent::CommandFinished(summary)).await;
@@ -6545,6 +7234,38 @@ mod tests {
         }
     }
 
+    fn review_ready_event(path: &str) -> EventRecord {
+        EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 1,
+            event: OrchestratorEvent::SubtaskReviewReady {
+                subtask_id: SubtaskId::new(),
+                description: "make chess".into(),
+                tier: ModelTier::Standard,
+                tokens_used: 10,
+                token_usage: TokenUsage::estimated(10),
+                cost: phonton_types::CostSummary::default(),
+                diff_hunks: vec![DiffHunk {
+                    file_path: PathBuf::from(path),
+                    old_start: 1,
+                    old_count: 1,
+                    new_start: 1,
+                    new_count: 2,
+                    lines: vec![
+                        DiffLine::Removed("print('Hello')".into()),
+                        DiffLine::Added("print('Chess')".into()),
+                        DiffLine::Context("return".into()),
+                    ],
+                }],
+                verify_result: VerifyResult::Pass {
+                    layer: VerifyLayer::Syntax,
+                },
+                provider: ProviderKind::OpenAiCompatible,
+                model_name: "fixture".into(),
+            },
+        }
+    }
+
     #[derive(Clone, Default)]
     struct McpE2eProvider {
         calls: Arc<AtomicU64>,
@@ -7447,6 +8168,151 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.selected, 2); // clamp
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn alt_goal_shortcuts_switch_even_with_prompt_text() {
+        let mut app = App::default();
+        app.goals
+            .extend(["a", "b", "c"].iter().map(|s| GoalEntry::new((*s).into())));
+        app.selected = 1;
+        app.goal_prompt.set_text("draft goal");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(app.selected, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(app.selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.goal_prompt.display_text(), "draft goal");
+    }
+
+    #[test]
+    fn goal_switcher_selects_filtered_goal() {
+        let mut app = App::default();
+        app.goals.extend(
+            ["make chess", "write docs"]
+                .iter()
+                .map(|s| GoalEntry::new((*s).into())),
+        );
+
+        for ch in "/goals".chars() {
+            app.handle_key(key(ch));
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert!(app.goal_switcher.open);
+
+        for ch in "docs".chars() {
+            app.handle_key(key(ch));
+        }
+        assert_eq!(app.goal_switcher.filtered_indices(&app.goals), vec![1]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(app.selected, 1);
+        assert!(!app.goal_switcher.open);
+    }
+
+    #[test]
+    fn focus_defaults_to_code_for_review_hunks_and_can_cycle() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+
+        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Code);
+        app.handle_key(key('f'));
+        assert_eq!(app.focus_view, FocusView::Commands);
+    }
+
+    #[test]
+    fn code_focus_text_preserves_diff_markers() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+
+        let text = app.focus_text();
+
+        assert!(text.contains("Code"));
+        assert!(text.contains("chess.py"));
+        assert!(text.contains("+print('Chess')"));
+        assert!(text.contains("-print('Hello')"));
+    }
+
+    #[test]
+    fn copy_and_rerun_build_expected_intents() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+        app.push_command_run(CommandRunSummary {
+            command: "python chess.py".into(),
+            exit_code: Some(0),
+            stdout_preview: "ok".into(),
+            stderr_preview: String::new(),
+            duration_ms: Some(42),
+        });
+
+        for ch in "/copy".chars() {
+            app.handle_key(key(ch));
+        }
+        match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Some(Intent::CopyFocus(text)) => assert!(text.contains("chess.py")),
+            other => panic!("expected copy intent, got {other:?}"),
+        }
+
+        for ch in "/rerun".chars() {
+            app.handle_key(key(ch));
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Intent::RunCommand("/run python chess.py".into()))
+        );
+    }
+
+    #[test]
+    fn command_completion_does_not_move_code_focus() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+
+        app.push_command_run(CommandRunSummary {
+            command: "python chess.py".into(),
+            exit_code: Some(0),
+            stdout_preview: "ok".into(),
+            stderr_preview: String::new(),
+            duration_ms: Some(42),
+        });
+
+        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Code);
+    }
+
+    #[test]
+    fn focus_text_payloads_cover_code_commands_and_log() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+        app.push_command_run(CommandRunSummary {
+            command: "python chess.py".into(),
+            exit_code: Some(0),
+            stdout_preview: "ok".into(),
+            stderr_preview: String::new(),
+            duration_ms: Some(42),
+        });
+
+        app.focus_view = FocusView::Receipt;
+        assert!(app.focus_text().contains("Receipt"));
+
+        app.focus_view = FocusView::Code;
+        assert!(app.focus_text().contains("chess.py"));
+
+        app.focus_view = FocusView::Commands;
+        assert!(app.focus_text().contains("python chess.py"));
+
+        app.focus_view = FocusView::Log;
+        assert!(app.focus_text().contains("review-ready"));
     }
 
     #[test]

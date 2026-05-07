@@ -12,6 +12,7 @@ pub struct CommandRunSummary {
     pub exit_code: Option<i32>,
     pub stdout_preview: String,
     pub stderr_preview: String,
+    pub duration_ms: Option<u64>,
 }
 
 pub fn parse_prompt_command(_input: &str) -> Option<ParsedCommand> {
@@ -65,11 +66,22 @@ pub fn summarize_output(
     _stdout: &[u8],
     _stderr: &[u8],
 ) -> CommandRunSummary {
+    summarize_output_with_duration(_command, _exit_code, _stdout, _stderr, None)
+}
+
+pub fn summarize_output_with_duration(
+    _command: &str,
+    _exit_code: Option<i32>,
+    _stdout: &[u8],
+    _stderr: &[u8],
+    duration_ms: Option<u64>,
+) -> CommandRunSummary {
     CommandRunSummary {
         command: _command.to_string(),
         exit_code: _exit_code,
         stdout_preview: preview_bytes(_stdout, 180),
         stderr_preview: preview_bytes(_stderr, 180),
+        duration_ms,
     }
 }
 
