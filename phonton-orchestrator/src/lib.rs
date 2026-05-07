@@ -214,6 +214,12 @@ pub trait WorkerDispatcher: Send + Sync + 'static {
         attempt: u8,
         msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
     ) -> Result<SubtaskResult>;
+
+    /// Request a best-effort compression pass on the dispatcher's shared
+    /// context window. Dispatchers without shared context return `Ok(false)`.
+    async fn compact_context(&self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +461,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut tokens_used: u64 = 0;
         let mut task_status = TaskStatus::Planning;
         let mut failure: Option<(SubtaskId, String)> = None;
+        let mut cancelled = false;
         // Budget-pause: (triggering_subtask_id, limit_name, observed, ceiling).
         // Set when BudgetGuard fires; produces TaskStatus::Paused at the end.
         let mut paused: Option<(SubtaskId, String, u64, u64)> = None;
@@ -563,26 +570,45 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(OrchestratorMessage::RollbackRequest { to_seq }) = msg {
-                        joinset.abort_all();
-                        let requeued = self.handle_rollback(
-                            to_seq,
-                            &mut runtimes,
-                            &mut checkpoints,
-                            &mut checkpointed,
-                            &mut next_seq,
-                        );
-                        self.emit(OrchestratorEvent::RollbackPerformed {
-                            task_id: self.task_id,
-                            to_seq,
-                            requeued_subtasks: requeued,
-                        });
-                        continue;
+                    match msg {
+                        Some(OrchestratorMessage::RollbackRequest { to_seq }) => {
+                            joinset.abort_all();
+                            let requeued = self.handle_rollback(
+                                to_seq,
+                                &mut runtimes,
+                                &mut checkpoints,
+                                &mut checkpointed,
+                                &mut next_seq,
+                            );
+                            self.emit(OrchestratorEvent::RollbackPerformed {
+                                task_id: self.task_id,
+                                to_seq,
+                                requeued_subtasks: requeued,
+                            });
+                            continue;
+                        }
+                        Some(OrchestratorMessage::CompactContext) => {
+                            let compacted = self.dispatcher.compact_context().await.unwrap_or(false);
+                            self.emit(OrchestratorEvent::ContextCompacted {
+                                task_id: self.task_id,
+                                compacted,
+                            });
+                            continue;
+                        }
+                        Some(OrchestratorMessage::UserCancelled) => {
+                            cancelled = true;
+                            joinset.abort_all();
+                            None
+                        }
+                        _ => joinset.join_next().await,
                     }
-                    joinset.join_next().await
                 }
                 j = joinset.join_next() => j,
             };
+
+            if cancelled {
+                break;
+            }
 
             let Some(joined) = joined else {
                 break;
@@ -755,13 +781,20 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // 5. Final task status. Paused takes priority over a simultaneous
         //    failure (the pause aborted the joinset so any failure that
         //    raced in is noise). Real failures take priority over nothing.
-        let quality_failures = if failure.is_none() && paused.is_none() {
+        let quality_failures = if failure.is_none() && paused.is_none() && !cancelled {
             self.quality_gate_failures(&plan, &runtimes)
         } else {
             Vec::new()
         };
 
-        let terminal = if let Some((_, limit, observed, ceiling)) = paused {
+        let terminal = if cancelled {
+            self.emit(OrchestratorEvent::TaskFailed {
+                task_id: self.task_id,
+                reason: "cancelled by user".into(),
+                failed_subtask: None,
+            });
+            TaskStatus::Rejected
+        } else if let Some((_, limit, observed, ceiling)) = paused {
             TaskStatus::Paused {
                 limit,
                 observed,
@@ -1487,6 +1520,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             TaskStatus::Failed { reason, .. } => {
                 format!("Task failed before review: {}", short_text(reason, 96))
             }
+            TaskStatus::Rejected => "Task cancelled by user before review".into(),
             _ => "Task state updated".into(),
         };
 
@@ -1941,6 +1975,53 @@ mod tests {
         assert_eq!(calls[0].0, a.id);
         assert_eq!(calls[1].0, b.id);
         assert_eq!(calls[2].0, c.id);
+    }
+
+    #[tokio::test]
+    async fn user_cancel_rejects_running_task() {
+        struct SleepingDispatcher;
+
+        #[async_trait]
+        impl WorkerDispatcher for SleepingDispatcher {
+            async fn dispatch(
+                &self,
+                _subtask: Subtask,
+                _prior_errors: Vec<String>,
+                _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
+            ) -> Result<SubtaskResult> {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Err(anyhow!("unexpected wake"))
+            }
+        }
+
+        let a = subtask("long run", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+        };
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::new(SleepingDispatcher))
+            .with_working_dir(tmp.path())
+            .with_control_channel(control_rx);
+        let run = tokio::spawn(async move { orch.run_task(plan, empty_state()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        control_tx
+            .send(OrchestratorMessage::UserCancelled)
+            .await
+            .unwrap();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(status, TaskStatus::Rejected));
     }
 
     #[tokio::test]

@@ -84,6 +84,8 @@ pub enum OrchestratorMessage {
     },
     /// User aborted the task from the UI.
     UserCancelled,
+    /// User requested an explicit context-compression pass for the active task.
+    CompactContext,
     /// Token budget exhausted — orchestrator must cancel all workers.
     BudgetExceeded {
         /// Configured token limit.

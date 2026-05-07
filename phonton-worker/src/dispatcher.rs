@@ -122,6 +122,11 @@ impl RealDispatcher {
 
 #[async_trait]
 impl WorkerDispatcher for RealDispatcher {
+    async fn compact_context(&self) -> Result<bool> {
+        let mut context = self.context.lock().await;
+        context.compress_frames().await
+    }
+
     async fn dispatch(
         &self,
         subtask: Subtask,

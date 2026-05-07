@@ -1,3 +1,5 @@
+use phonton_types::PermissionMode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandCategory {
     Loop,
@@ -22,6 +24,10 @@ pub enum SlashAction {
     ShowStatus,
     ShowCommands,
     ShowPermissions,
+    SetPermissionMode(PermissionMode),
+    ShowContext,
+    CompactContext,
+    StopGoal,
     ShowReview,
     ManageModel,
 }
@@ -99,10 +105,34 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/permissions",
         aliases: &["/trust"],
-        args: "",
-        description: "show sandbox, approval, and trust status",
+        args: "set <mode>",
+        description: "show or set sandbox, approval, and trust status",
         category: CommandCategory::Trust,
         action: SlashAction::ShowPermissions,
+    },
+    CommandSpec {
+        name: "/context",
+        aliases: &[],
+        args: "",
+        description: "show prompt context usage and token sections",
+        category: CommandCategory::Trust,
+        action: SlashAction::ShowContext,
+    },
+    CommandSpec {
+        name: "/compact",
+        aliases: &[],
+        args: "",
+        description: "compact active worker context",
+        category: CommandCategory::Trust,
+        action: SlashAction::CompactContext,
+    },
+    CommandSpec {
+        name: "/stop",
+        aliases: &["/cancel"],
+        args: "",
+        description: "cancel the selected running goal",
+        category: CommandCategory::Loop,
+        action: SlashAction::StopGoal,
     },
     CommandSpec {
         name: "/memory",
@@ -209,6 +239,33 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
             }
         } else {
             SlashParse::RunCommand
+        };
+    }
+
+    if head == "/permissions" {
+        let mut parts = rest.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+        if subcommand.is_empty() {
+            return SlashParse::Command(SlashAction::ShowPermissions);
+        }
+        if subcommand != "set" {
+            return SlashParse::Unknown {
+                command: format!("/permissions {subcommand}"),
+                suggestion: Some(
+                    "/permissions set ask|read-only|workspace-write|full-access".into(),
+                ),
+            };
+        }
+        let mode = parts.next().unwrap_or_default();
+        return if let Some(mode) = PermissionMode::parse(mode) {
+            SlashParse::Command(SlashAction::SetPermissionMode(mode))
+        } else {
+            SlashParse::Unknown {
+                command: "/permissions set".into(),
+                suggestion: Some(
+                    "/permissions set ask|read-only|workspace-write|full-access".into(),
+                ),
+            }
         };
     }
 
@@ -370,6 +427,38 @@ mod tests {
     fn slash_prefix_completion_returns_best_command() {
         assert_eq!(complete_command_prefix("/sett"), Some("/settings".into()));
         assert_eq!(complete_command_prefix("/r"), Some("/run ".into()));
+    }
+
+    #[test]
+    fn context_compact_and_stop_parse_as_commands() {
+        assert_eq!(
+            parse_slash_command("/context"),
+            SlashParse::Command(SlashAction::ShowContext)
+        );
+        assert_eq!(
+            parse_slash_command("/compact"),
+            SlashParse::Command(SlashAction::CompactContext)
+        );
+        assert_eq!(
+            parse_slash_command("/stop"),
+            SlashParse::Command(SlashAction::StopGoal)
+        );
+    }
+
+    #[test]
+    fn permissions_set_parses_mode() {
+        assert_eq!(
+            parse_slash_command("/permissions set read-only"),
+            SlashParse::Command(SlashAction::SetPermissionMode(
+                phonton_types::PermissionMode::ReadOnly
+            ))
+        );
+        assert_eq!(
+            parse_slash_command("/permissions set full-access"),
+            SlashParse::Command(SlashAction::SetPermissionMode(
+                phonton_types::PermissionMode::FullAccess
+            ))
+        );
     }
 
     #[test]

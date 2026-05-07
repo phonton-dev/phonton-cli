@@ -12,6 +12,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use phonton_types::PermissionMode;
 use tokio::process::Command;
 
 #[cfg(target_os = "windows")]
@@ -102,17 +103,32 @@ pub enum GuardDecision {
 #[derive(Debug, Clone)]
 pub struct ExecutionGuard {
     project_root: PathBuf,
+    permission_mode: PermissionMode,
 }
 
 impl ExecutionGuard {
     /// Construct a guard scoped to `project_root`.
     pub fn new(project_root: PathBuf) -> Self {
-        Self { project_root }
+        Self::new_with_mode(project_root, PermissionMode::Ask)
+    }
+
+    /// Construct a guard scoped to `project_root` with an explicit permission
+    /// posture.
+    pub fn new_with_mode(project_root: PathBuf, permission_mode: PermissionMode) -> Self {
+        Self {
+            project_root,
+            permission_mode,
+        }
     }
 
     /// Project root this guard was constructed with.
     pub fn project_root(&self) -> &Path {
         &self.project_root
+    }
+
+    /// Active permission posture.
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
     }
 
     /// Evaluate a tool call. The returned [`GuardDecision`] is the only
@@ -152,6 +168,11 @@ impl ExecutionGuard {
                 }
             }
             ToolCall::Write { path, .. } => {
+                if self.permission_mode == PermissionMode::ReadOnly {
+                    return GuardDecision::Block {
+                        reason: "read-only permission mode blocks file writes".into(),
+                    };
+                }
                 if self.is_inside_root(path) {
                     GuardDecision::Allow
                 } else {
@@ -161,9 +182,20 @@ impl ExecutionGuard {
                 }
             }
             ToolCall::Run { program, args } => {
-                if !is_allowed_program(program) {
+                if self.permission_mode == PermissionMode::ReadOnly {
                     return GuardDecision::Approve {
-                        reason: format!("program `{program}` is not on the allowlist"),
+                        reason: format!(
+                            "read-only permission mode requires approval to run `{program}`"
+                        ),
+                    };
+                }
+                if !is_allowed_program(program) {
+                    return if self.permission_mode == PermissionMode::FullAccess {
+                        GuardDecision::Allow
+                    } else {
+                        GuardDecision::Approve {
+                            reason: format!("program `{program}` is not on the allowlist"),
+                        }
                     };
                 }
                 if is_destructive_program(program) {
@@ -179,12 +211,30 @@ impl ExecutionGuard {
                 }
                 GuardDecision::Allow
             }
-            ToolCall::Bash { command } => GuardDecision::Approve {
-                reason: format!("arbitrary bash requires approval: {command}"),
-            },
-            ToolCall::Network { url } => GuardDecision::Approve {
-                reason: format!("network request to {url} requires approval"),
-            },
+            ToolCall::Bash { command } => {
+                if self.permission_mode == PermissionMode::FullAccess {
+                    GuardDecision::Allow
+                } else if self.permission_mode == PermissionMode::ReadOnly {
+                    GuardDecision::Approve {
+                        reason: format!(
+                            "read-only permission mode requires approval for shell: {command}"
+                        ),
+                    }
+                } else {
+                    GuardDecision::Approve {
+                        reason: format!("arbitrary bash requires approval: {command}"),
+                    }
+                }
+            }
+            ToolCall::Network { url } => {
+                if self.permission_mode == PermissionMode::FullAccess {
+                    GuardDecision::Allow
+                } else {
+                    GuardDecision::Approve {
+                        reason: format!("network request to {url} requires approval"),
+                    }
+                }
+            }
         }
     }
 
@@ -300,8 +350,17 @@ impl Sandbox {
     /// Create a new sandbox bound to `project_root`. Typically the
     /// orchestrator's working directory.
     pub fn new(project_root: PathBuf, task_id: String) -> Self {
+        Self::new_with_mode(project_root, task_id, PermissionMode::Ask)
+    }
+
+    /// Create a sandbox with an explicit local permission posture.
+    pub fn new_with_mode(
+        project_root: PathBuf,
+        task_id: String,
+        permission_mode: PermissionMode,
+    ) -> Self {
         Self {
-            guard: ExecutionGuard::new(project_root),
+            guard: ExecutionGuard::new_with_mode(project_root, permission_mode),
             task_id,
         }
     }
@@ -594,6 +653,29 @@ mod tests {
             path: PathBuf::from("../outside.txt"),
         });
         assert!(matches!(d, GuardDecision::Approve { .. }));
+    }
+
+    #[test]
+    fn read_only_blocks_workspace_writes() {
+        let g =
+            ExecutionGuard::new_with_mode(PathBuf::from("/work/proj"), PermissionMode::ReadOnly);
+        let d = g.evaluate(&ToolCall::Write {
+            path: PathBuf::from("/work/proj/src/lib.rs"),
+            content: "x".into(),
+        });
+
+        assert!(matches!(d, GuardDecision::Block { .. }));
+    }
+
+    #[test]
+    fn full_access_allows_bash_after_sensitive_path_filter() {
+        let g =
+            ExecutionGuard::new_with_mode(PathBuf::from("/work/proj"), PermissionMode::FullAccess);
+        let d = g.evaluate(&ToolCall::Bash {
+            command: "npm test && npm run build".into(),
+        });
+
+        assert_eq!(d, GuardDecision::Allow);
     }
 
     #[test]

@@ -85,6 +85,8 @@ pub enum OrchestratorEvent {
         subtask_id: SubtaskId,
         manifest: PromptContextManifest,
     },
+    /// A user requested explicit context compaction for the active task.
+    ContextCompacted { task_id: TaskId, compacted: bool },
     /// An extension manifest was loaded by the resolver.
     ExtensionLoaded {
         extension_id: ExtensionId,
@@ -229,6 +231,7 @@ impl EventRecord {
             OrchestratorEvent::SubtaskDispatched { .. } => "dispatch",
             OrchestratorEvent::ContextSelected { .. } => "context",
             OrchestratorEvent::PromptManifest { .. } => "prompt",
+            OrchestratorEvent::ContextCompacted { .. } => "compact",
             OrchestratorEvent::ExtensionLoaded { .. } => "extension-loaded",
             OrchestratorEvent::ExtensionSkipped { .. } => "extension-skipped",
             OrchestratorEvent::ExtensionConflict { .. } => "extension-conflict",
@@ -312,6 +315,13 @@ impl EventRecord {
                     manifest.retry_error_tokens,
                     manifest.total_estimated_tokens
                 )
+            }
+            OrchestratorEvent::ContextCompacted { compacted, .. } => {
+                if *compacted {
+                    "context compaction completed".to_string()
+                } else {
+                    "context compaction skipped: no compressible frames".to_string()
+                }
             }
             OrchestratorEvent::ExtensionLoaded {
                 extension_id,
