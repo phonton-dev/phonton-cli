@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use phonton_types::{PlannerOutput, RunCommand, VerifyStepSpec};
+use phonton_types::{ExpectedArtifact, PlannerOutput, RunCommand, VerifyStepSpec};
 
 /// Apply local workspace signals to a visible goal contract.
 ///
@@ -76,10 +76,50 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
             .assumptions
             .push("No package.json, Cargo.toml, or Makefile was detected before planning.".into());
         if is_chess {
-            contract.clarification_questions.push(
-                "No project stack was detected. Should Phonton create chess as a web app, terminal game, or native binary?"
+            contract.clarification_questions.retain(|question| {
+                !question.contains("No project stack was detected")
+                    && !question.contains("What exact behavior or artifact")
+            });
+            contract.assumptions.push(
+                "No project stack was detected; defaulting to a self-contained Python terminal chess game."
                     .into(),
             );
+            contract.acceptance_criteria.push(
+                "In an empty workspace, create a self-contained terminal chess game in chess.py."
+                    .into(),
+            );
+            push_expected_artifact(
+                contract,
+                "Terminal chess game",
+                Some(PathBuf::from("chess.py")),
+            );
+            push_likely_file(contract, PathBuf::from("chess.py"));
+            push_verify_step(
+                contract,
+                "python syntax check",
+                vec![
+                    "python".into(),
+                    "-m".into(),
+                    "py_compile".into(),
+                    "chess.py".into(),
+                ],
+            );
+            push_run_command(
+                contract,
+                "Run terminal chess",
+                vec!["python".into(), "chess.py".into()],
+            );
+            for subtask in &mut plan.subtasks {
+                if subtask
+                    .description
+                    .trim()
+                    .eq_ignore_ascii_case(goal_text.trim())
+                {
+                    subtask.description = format!(
+                        "{goal_text}\n\nDefault empty-workspace target: create a self-contained Python terminal chess game in chess.py. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python chess.py`."
+                    );
+                }
+            }
         }
     }
 }
@@ -118,19 +158,42 @@ fn push_run_command(contract: &mut phonton_types::GoalContract, label: &str, com
     });
 }
 
+fn push_expected_artifact(
+    contract: &mut phonton_types::GoalContract,
+    description: &str,
+    path: Option<PathBuf>,
+) {
+    if contract
+        .expected_artifacts
+        .iter()
+        .any(|artifact| artifact.path == path)
+    {
+        return;
+    }
+    contract.expected_artifacts.push(ExpectedArtifact {
+        description: description.into(),
+        path,
+    });
+}
+
+fn push_likely_file(contract: &mut phonton_types::GoalContract, path: PathBuf) {
+    if contract
+        .likely_files
+        .iter()
+        .any(|existing| existing == &path)
+    {
+        return;
+    }
+    contract.likely_files.push(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use phonton_planner::Goal;
 
     fn plan_for(goal: &str) -> PlannerOutput {
-        PlannerOutput {
-            subtasks: Vec::new(),
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: phonton_types::CoverageSummary::default(),
-            goal_contract: Some(Goal::new(goal).contract()),
-        }
+        phonton_planner::decompose(&Goal::new(goal))
     }
 
     #[test]
@@ -162,20 +225,40 @@ mod tests {
     }
 
     #[test]
-    fn empty_chess_workspace_requires_clarification() {
+    fn empty_chess_workspace_defaults_to_terminal_python_game() {
         let temp = tempfile::tempdir().unwrap();
         let mut plan = plan_for("make chess");
 
         apply_workspace_preflight(&mut plan, temp.path(), "make chess");
 
-        let contract = plan.goal_contract.unwrap();
+        let contract = plan.goal_contract.as_ref().unwrap();
         assert!(contract
             .assumptions
             .iter()
             .any(|assumption| assumption.contains("No package.json")));
+        assert!(contract.clarification_questions.is_empty());
         assert!(contract
-            .clarification_questions
+            .likely_files
             .iter()
-            .any(|question| question.contains("web app, terminal game, or native binary")));
+            .any(|path| path == &PathBuf::from("chess.py")));
+        assert!(contract.verify_plan.iter().any(|step| {
+            step.command.as_ref().is_some_and(|cmd| {
+                cmd.command
+                    == vec![
+                        "python".to_string(),
+                        "-m".to_string(),
+                        "py_compile".to_string(),
+                        "chess.py".to_string(),
+                    ]
+            })
+        }));
+        assert!(contract
+            .run_plan
+            .iter()
+            .any(|cmd| cmd.command == vec!["python".to_string(), "chess.py".to_string()]));
+        assert!(plan
+            .subtasks
+            .iter()
+            .any(|subtask| subtask.description.contains("python chess.py")));
     }
 }
