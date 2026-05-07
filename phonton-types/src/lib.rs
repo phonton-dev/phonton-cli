@@ -252,10 +252,13 @@ pub enum TaskStatus {
         /// Specific subtask that caused the failure, if localised.
         failed_subtask: Option<SubtaskId>,
     },
+    /// Planning found unanswered contract questions that should be resolved
+    /// before workers spend provider tokens or edit files.
+    NeedsClarification {
+        /// Questions the user should answer before resubmitting the goal.
+        questions: Vec<String>,
+    },
     /// Run halted because a `BudgetGuard` ceiling was crossed. Not terminal —
-    /// the UI presents a "Approve to continue?" prompt; the user can raise
-    /// the limit and resubmit. Distinct from `Failed` so the UI renders it
-    /// in amber rather than red.
     Paused {
         /// Which limit tripped — `"tokens"` or `"usd"`.
         limit: String,

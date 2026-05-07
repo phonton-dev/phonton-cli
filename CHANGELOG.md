@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.7.1 - Clarification Hotfix
+
+### Fixed
+
+- Stackless broad goals such as `make chess` now stop at a visible clarification state instead of dispatching a worker and spending provider tokens on an under-specified contract.
+- Submitting a goal in the TUI now starts goal setup in the background so the prompt returns control immediately while planning and local context setup continue.
+
 ## 0.7.0 - Trust Loop Receipts
 
 ### Added

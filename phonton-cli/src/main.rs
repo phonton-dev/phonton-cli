@@ -73,7 +73,7 @@ use phonton_diff::DiffApplier;
 use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions, ExtensionSet};
 use phonton_mcp::{McpApprovalDecision, McpApprovalRequest, McpApprover};
 use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
-use phonton_planner::{decompose_with_memory, Goal};
+use phonton_planner::{decompose_with_memory_store, Goal};
 use phonton_providers::{
     discover_models, pick_default_from_list, provider_for, select_best_working_model, Provider,
 };
@@ -772,6 +772,7 @@ impl App {
                 TaskStatus::Reviewing { .. } => "review ready",
                 TaskStatus::Done { .. } => "done",
                 TaskStatus::Failed { .. } => "failed",
+                TaskStatus::NeedsClarification { .. } => "needs clarification",
                 TaskStatus::Paused { .. } => "paused",
                 TaskStatus::Rejected => "rejected",
             };
@@ -2921,6 +2922,30 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
 
+        if let TaskStatus::NeedsClarification { questions } = &state.task_status {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Needs clarification",
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" before workers run", Style::default().fg(MUTED)),
+            ]));
+            for question in questions.iter().take(5) {
+                lines.push(Line::from(vec![
+                    Span::styled("  - ", Style::default().fg(WARN)),
+                    Span::styled(question.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("  answer: ", Style::default().fg(MUTED)),
+                Span::styled(
+                    "submit a more specific goal, for example `make chess as a terminal game`",
+                    Style::default().fg(MUTED),
+                ),
+            ]));
+        }
+
         if let Some(handoff) = &state.handoff_packet {
             append_handoff_lines(&mut lines, handoff);
         }
@@ -3362,6 +3387,8 @@ fn task_status_label(status: &serde_json::Value) -> &'static str {
         "review"
     } else if status.get("Failed").is_some() {
         "failed"
+    } else if status.get("NeedsClarification").is_some() {
+        "clarify"
     } else if status.get("Running").is_some() {
         "running"
     } else if status.get("Paused").is_some() {
@@ -3708,6 +3735,9 @@ fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> 
         TaskStatus::Reviewing { .. } => vec![pill("review", Color::Rgb(180, 100, 255), BG_DEEP)],
         TaskStatus::Done { .. } => vec![pill("done", Color::Rgb(0, 200, 100), BG_DEEP)],
         TaskStatus::Failed { .. } => vec![pill("fail", Color::Rgb(255, 50, 50), Color::White)],
+        TaskStatus::NeedsClarification { .. } => {
+            vec![pill("clarify", Color::Rgb(255, 200, 0), BG_DEEP)]
+        }
         TaskStatus::Paused {
             limit,
             observed,
@@ -5206,19 +5236,27 @@ async fn run_app<B: Backend>(
                             // through the previous provider while the System
                             // panel showed the new one (a real footgun).
                             apply_settings_to_config(&app.settings, &mut cfg);
-                            spawn_goal(
-                                0,
-                                task_id,
-                                text,
-                                direct_task,
-                                &tx,
-                                &store,
-                                &sandbox,
-                                &controls,
-                                &cfg,
-                                &working_dir,
-                            )
-                            .await;
+                            let tx_goal = tx.clone();
+                            let store_goal = Arc::clone(&store);
+                            let sandbox_goal = Arc::clone(&sandbox);
+                            let controls_goal = Arc::clone(&controls);
+                            let cfg_goal = cfg.clone();
+                            let working_dir_goal = working_dir.clone();
+                            tokio::spawn(async move {
+                                spawn_goal(
+                                    0,
+                                    task_id,
+                                    text,
+                                    direct_task,
+                                    tx_goal,
+                                    store_goal,
+                                    sandbox_goal,
+                                    controls_goal,
+                                    cfg_goal,
+                                    working_dir_goal,
+                                )
+                                .await;
+                            });
                         }
                         Intent::Rollback { goal_index, to_seq } => {
                             if let Ok(reg) = controls.lock() {
@@ -5841,41 +5879,90 @@ fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<Out
     })
 }
 
+fn state_for_plan_status(plan: &PlannerOutput, task_status: TaskStatus) -> GlobalState {
+    GlobalState {
+        task_status,
+        goal_contract: plan.goal_contract.clone(),
+        handoff_packet: None,
+        active_workers: Vec::new(),
+        tokens_used: 0,
+        tokens_budget: None,
+        estimated_naive_tokens: plan.naive_baseline_tokens,
+        checkpoints: Vec::new(),
+    }
+}
+
+fn clarification_status_for_plan(plan: &PlannerOutput) -> Option<TaskStatus> {
+    let contract = plan.goal_contract.as_ref()?;
+    if contract.clarification_questions.is_empty() {
+        return None;
+    }
+
+    let has_run_command = contract.run_plan.iter().any(|cmd| !cmd.command.is_empty());
+    let has_verify_command = contract.verify_plan.iter().any(|step| {
+        step.command
+            .as_ref()
+            .is_some_and(|cmd| !cmd.command.is_empty())
+    });
+    let stackless_question = contract
+        .clarification_questions
+        .iter()
+        .any(|question| question.contains("No project stack was detected"));
+
+    if stackless_question || !has_run_command || !has_verify_command {
+        Some(TaskStatus::NeedsClarification {
+            questions: contract.clarification_questions.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 async fn spawn_goal(
     goal_index: usize,
     task_id: TaskId,
     text: String,
     direct_task: bool,
-    tx: &mpsc::Sender<LoopEvent>,
-    store: &Arc<std::sync::Mutex<Store>>,
-    sandbox: &Arc<Sandbox>,
-    controls: &ControlRegistry,
-    cfg: &config::Config,
-    working_dir: &std::path::PathBuf,
+    tx: mpsc::Sender<LoopEvent>,
+    store: Arc<std::sync::Mutex<Store>>,
+    sandbox: Arc<Sandbox>,
+    controls: ControlRegistry,
+    cfg: config::Config,
+    working_dir: std::path::PathBuf,
 ) {
-    let attachments = prepare_goal_attachments(&text, working_dir);
+    let attachments = prepare_goal_attachments(&text, &working_dir);
     if let Ok(g) = store.lock() {
         let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
     }
-    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(store)).await;
+    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(&store)).await;
 
     let plan_result = if direct_task {
         Ok(single_task_plan(text.clone(), attachments.clone()))
     } else {
-        let store_guard = match store.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
         let goal = Goal::new(text.clone()).with_attachments(attachments.clone());
-        let result = decompose_with_memory(&goal, &store_guard, None).await;
-        drop(store_guard);
-        result
+        decompose_with_memory_store(&goal, &memory_store).await
     };
     let mut plan = match plan_result {
         Ok(p) => p,
         Err(_) => return,
     };
-    apply_workspace_preflight(&mut plan, working_dir, &text);
+    apply_workspace_preflight(&mut plan, &working_dir, &text);
+
+    if let Some(status) = clarification_status_for_plan(&plan) {
+        let state = state_for_plan_status(&plan, status);
+        if let Ok(g) = store.lock() {
+            let _ = g.upsert_task(task_id, &text, &state.task_status, 0);
+        }
+        let _ = tx
+            .send(LoopEvent::StateUpdate(goal_index, Box::new(state)))
+            .await;
+        return;
+    }
+
+    let planning_state = state_for_plan_status(&plan, TaskStatus::Planning);
+    let _ = tx
+        .send(LoopEvent::StateUpdate(goal_index, Box::new(planning_state)))
+        .await;
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
@@ -5894,12 +5981,12 @@ async fn spawn_goal(
     let mut event_rx_ui = event_tx.subscribe();
     let mut event_rx_store = event_tx.subscribe();
 
-    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(working_dir));
+    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(&working_dir));
     apply_extension_context_to_plan(&mut plan, &extension_set);
     publish_extension_events(task_id, &extension_set, &event_tx);
 
     let naive = plan.naive_baseline_tokens;
-    let semantic_context = build_semantic_context(working_dir).await;
+    let semantic_context = build_semantic_context(&working_dir).await;
     let mcp_runtime = if extension_set.mcp_servers.is_empty() {
         None
     } else {
@@ -5985,7 +6072,7 @@ async fn spawn_goal(
 
     // Wire phonton-diff so the orchestrator takes a checkpoint commit
     // after every subtask passes verify.
-    let diff_applier = DiffApplier::open(working_dir)
+    let diff_applier = DiffApplier::open(&working_dir)
         .ok()
         .map(|d| Arc::new(std::sync::Mutex::new(d)));
 
@@ -6687,6 +6774,32 @@ fn extract_id(line: &str) -> Option<String> {
             .assumptions
             .iter()
             .any(|assumption| assumption.contains("No package.json")));
+    }
+
+    #[test]
+    fn stackless_chess_preflight_pauses_before_worker_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = single_task_plan("make chess".into(), Vec::new());
+
+        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
+
+        let status = clarification_status_for_plan(&plan).expect("clarification status");
+        assert!(matches!(status, TaskStatus::NeedsClarification { .. }));
+    }
+
+    #[test]
+    fn npm_chess_preflight_is_dispatchable_after_run_and_verify_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"}}"#,
+        )
+        .unwrap();
+        let mut plan = single_task_plan("make chess".into(), Vec::new());
+
+        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
+
+        assert!(clarification_status_for_plan(&plan).is_none());
     }
 
     #[test]
