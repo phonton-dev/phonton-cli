@@ -293,27 +293,19 @@ fn looks_like_path(s: &str) -> bool {
 fn blocked_path(path: &Path) -> Option<String> {
     let s = path.to_string_lossy();
     let lower = s.to_ascii_lowercase();
+    let lower_slash = lower.replace('\\', "/");
 
-    for needle in [
-        "/.ssh/",
-        "\\.ssh\\",
-        "/.aws/",
-        "\\.aws\\",
-        "/.config/anthropic",
-        "\\.config\\anthropic",
-        "/.env",
-        "\\.env",
-    ] {
-        if lower.contains(needle) {
+    for needle in ["/.ssh/", "/.aws/", "/.config/anthropic", "/.env"] {
+        if lower_slash.contains(needle) {
             return Some(format!("blocked: sensitive path {s}"));
         }
     }
-    if lower.ends_with("/.env") || lower.ends_with("\\.env") || lower == ".env" {
+    if lower_slash.ends_with("/.env") || lower_slash == ".env" {
         return Some(format!("blocked: sensitive path {s}"));
     }
 
     for prefix in ["/etc/", "/usr/", "/bin/", "/sbin/", "/boot/"] {
-        if lower.starts_with(prefix) {
+        if lower_slash.starts_with(prefix) {
             return Some(format!("blocked: system path {s}"));
         }
     }

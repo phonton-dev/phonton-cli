@@ -1192,6 +1192,15 @@ pub fn looks_like_api_key(s: &str) -> bool {
     false
 }
 
+fn paste_contains_likely_secret(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ':' | '=' | ',' | ';')
+        })
+        .any(looks_like_api_key)
+    })
+}
+
 impl Default for App {
     fn default() -> Self {
         let default_cfg = crate::config::Config {
@@ -1327,10 +1336,58 @@ impl App {
     /// content is collapsed into a prompt artifact by [`PromptBuffer`].
     pub fn handle_paste(&mut self, text: &str) {
         match self.mode {
-            Mode::Goal | Mode::Task => self.goal_prompt.insert_paste(text),
+            Mode::Goal | Mode::Task => {
+                if looks_like_api_key(text.trim()) {
+                    self.help_open = false;
+                    self.settings.active_field = SettingsField::ApiKey;
+                    self.settings.message = Some(
+                        "That looked like an API key — open Settings (/settings) and paste it into the API Key field, not the Goal bar."
+                            .into(),
+                    );
+                    self.mode = Mode::Settings;
+                    return;
+                }
+                if paste_contains_likely_secret(text) {
+                    self.command_notice = Some(
+                        "Paste blocked: it looks like it contains credentials. Use /settings for API keys."
+                            .into(),
+                    );
+                    return;
+                }
+                self.goal_prompt.insert_paste(text)
+            }
             Mode::Ask => self.ask_prompt.insert_paste(text),
+            Mode::Settings => self.paste_into_settings(text),
             _ => {}
         }
+    }
+
+    fn paste_into_settings(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = text.trim_end_matches('\n');
+        match self.settings.active_field {
+            SettingsField::Provider => self.settings.provider.push_str(text),
+            SettingsField::Model => {
+                self.settings.model.push_str(text);
+                self.settings.model_ok = None;
+            }
+            SettingsField::ApiKey => self.settings.api_key.push_str(text),
+            SettingsField::AccountId => self.settings.account_id.push_str(text),
+            SettingsField::BaseUrl => self.settings.base_url.push_str(text),
+            SettingsField::MaxTokens => self.settings.max_tokens.push_str(
+                &text
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+            ),
+            SettingsField::MaxUsdCents => self.settings.max_usd_cents.push_str(
+                &text
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+            ),
+        }
+        self.settings.message = None;
     }
 
     pub fn push_command_run(&mut self, summary: CommandRunSummary) {
@@ -7522,6 +7579,50 @@ fn extract_id(line: &str) -> Option<String> {
         let intent = app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
 
         assert_eq!(intent, Some(Intent::PasteClipboard));
+    }
+
+    #[test]
+    fn pasted_api_key_redirects_to_settings_before_artifact_creation() {
+        let mut app = App::default();
+
+        app.handle_paste("sk-ant-FAKE_TEST_KEY_123456");
+
+        assert_eq!(app.mode, Mode::Settings);
+        assert_eq!(app.settings.active_field, SettingsField::ApiKey);
+        assert!(app.goal_prompt.display_text().is_empty());
+        assert!(app
+            .settings
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("API key"));
+    }
+
+    #[test]
+    fn multiline_paste_with_secret_is_blocked() {
+        let mut app = App::default();
+
+        app.handle_paste("goal context\nkey=sk-ant-FAKE_TEST_KEY_123456");
+
+        assert!(app.goal_prompt.display_text().is_empty());
+        assert!(app
+            .command_notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("blocked"));
+    }
+
+    #[test]
+    fn paste_in_settings_updates_active_field() {
+        let mut app = App {
+            mode: Mode::Settings,
+            ..App::default()
+        };
+        app.settings.active_field = SettingsField::ApiKey;
+
+        app.handle_paste("sk-ant-FAKE_TEST_KEY_123456");
+
+        assert_eq!(app.settings.api_key, "sk-ant-FAKE_TEST_KEY_123456");
     }
 
     #[test]

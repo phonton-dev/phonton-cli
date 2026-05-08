@@ -22,7 +22,7 @@ pub struct PromptBuffer {
 
 const PASTE_LINE_THRESHOLD: usize = 2;
 const PASTE_CHAR_THRESHOLD: usize = 600;
-const MAX_PASTE_ARTIFACT_CHARS: usize = 12_000;
+const MAX_PASTE_ARTIFACT_CHARS: usize = 32_000;
 
 impl PromptBuffer {
     pub fn new() -> Self {
@@ -70,13 +70,14 @@ impl PromptBuffer {
     }
 
     pub fn insert_paste(&mut self, text: &str) {
-        if should_collapse_paste(text) {
-            let artifact = make_paste_artifact(text);
+        let text = normalize_paste(text);
+        if should_collapse_paste(&text) {
+            let artifact = make_paste_artifact(&text);
             let chip = artifact.chip.clone();
             self.artifacts.push(artifact);
             self.insert_str(&chip);
         } else {
-            self.insert_str(text);
+            self.insert_str(&text);
         }
     }
 
@@ -214,6 +215,10 @@ fn should_collapse_paste(text: &str) -> bool {
     line_count(text) >= PASTE_LINE_THRESHOLD || char_count(text) > PASTE_CHAR_THRESHOLD
 }
 
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn make_paste_artifact(text: &str) -> PromptArtifact {
     let char_count = char_count(text);
     let line_count = line_count(text);
@@ -309,6 +314,19 @@ mod tests {
                 .model_text,
             "short paste"
         );
+    }
+
+    #[test]
+    fn paste_normalizes_windows_line_endings() {
+        let mut buffer = PromptBuffer::new();
+        buffer.insert_paste("do x\r\ndo y\rdo z");
+
+        assert_eq!(buffer.display_text(), "[paste: 3 lines, 14 chars]");
+        assert!(buffer
+            .take_submission()
+            .expect("prompt should submit")
+            .model_text
+            .contains("do x\ndo y\ndo z"));
     }
 
     #[test]

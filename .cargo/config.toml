@@ -9,7 +9,7 @@ install-phonton = "install --path phonton-cli --force"
 # Without these, test harnesses for crates that transitively link libgit2
 # (phonton-diff, phonton-orchestrator) fail with LNK2019 on:
 #   __imp_CryptAcquireContextA, __imp_GetNamedSecurityInfoW, etc.
-[target.'cfg(windows)']
+[target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = [
     "-C", "link-arg=advapi32.lib",
     "-C", "link-arg=crypt32.lib",

@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.7.4</h1>
+<h1 align="center">Phonton CLI · v0.8.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.7.4-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.8.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -74,7 +74,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Code, Commands, and Log tabs in the Active panel plus `f` / `[` / `]` keyboard navigation.
 - Command run receipts stay collapsed by default; the Commands focus view shows status, exit code, duration, and short stdout/stderr previews. `/rerun` repeats the latest command through the same sandbox path and `/copy` copies the current focus view to the Windows clipboard.
 - Saved workspace sessions: use `phonton -r` or `phonton --resume` to reopen the last saved TUI conversation for the current repo.
-- Prompt bar paste artifacts: long or multiline pasted text collapses into a compact chip while the full content stays attached to the submitted goal.
+- Prompt bar paste artifacts: long or multiline pasted text collapses into a compact chip while the full content stays attached to the submitted goal; credential-looking pasted blocks are blocked before they can reach the model.
 - Windows clipboard import in the TUI with `Ctrl+V`, including content selected from Windows clipboard history (`Win+V`) when the terminal does not emit bracketed paste directly.
 - Sandboxed command runs from the prompt bar with `/run <cmd>` or `!<cmd>`, plus command status, output previews, context meters, and permission mode controls in the TUI and Flight Log.
 - `phonton doctor` setup diagnostics for config, provider key, store, trust, git, cargo, and Nexus config.
@@ -130,7 +130,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.7.4 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.8.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -146,7 +146,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.7.4 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.8.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |

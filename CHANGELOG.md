@@ -4,6 +4,22 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.8.0 - Prompt Artifact Paste System
+
+### Added
+
+- Enabled bracketed-paste support for the TUI build so terminal paste arrives as one paste event instead of repeated Enter keys.
+- Allowed clipboard paste directly into Settings fields so API keys can be entered without leaking through the Goal bar.
+
+### Changed
+
+- Long or multiline clipboard content remains collapsed as a paste chip until the user intentionally presses Enter.
+- Windows and Unix pasted line endings are normalized before creating paste artifacts.
+
+### Fixed
+
+- Blocked credential-looking pasted blocks from becoming goal/model context and redirected single API-key pastes to Settings.
+
 ## 0.7.4 - Goal Switching And Focus QoL
 
 ### Added
