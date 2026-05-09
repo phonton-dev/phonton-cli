@@ -5912,7 +5912,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(64);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(512);
     spawn_input_task(evt_tx.clone());
 
     let store_for_exit = Arc::clone(&store);
@@ -5965,11 +5965,20 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
         // like they are flashing on every frame.
         if event::poll(Duration::from_millis(UI_TICK_MS)).unwrap_or(false) {
             match event::read() {
-                Ok(Event::Key(k))
-                    if k.kind != event::KeyEventKind::Release
-                        && tx.blocking_send(LoopEvent::Key(k)).is_err() =>
-                {
-                    break;
+                Ok(Event::Key(k)) if k.kind != event::KeyEventKind::Release => {
+                    let mut keys = vec![k];
+                    drain_queued_key_events(&mut keys);
+                    if let Some(text) = bracketless_paste_text(&keys) {
+                        if tx.blocking_send(LoopEvent::Paste(text)).is_err() {
+                            break;
+                        }
+                    } else {
+                        for key in keys {
+                            if tx.blocking_send(LoopEvent::Key(key)).is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
                 Ok(Event::Paste(text)) => {
                     if let Err(_err) = tx.blocking_send(LoopEvent::Paste(text)) {
@@ -5982,6 +5991,61 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
             break;
         }
     });
+}
+
+fn drain_queued_key_events(keys: &mut Vec<KeyEvent>) {
+    while keys.len() < 4096 && event::poll(Duration::from_millis(1)).unwrap_or(false) {
+        match event::read() {
+            Ok(Event::Key(k)) if k.kind != event::KeyEventKind::Release => keys.push(k),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn bracketless_paste_text(keys: &[KeyEvent]) -> Option<String> {
+    if keys.len() < 2 {
+        return None;
+    }
+
+    let mut text = String::new();
+    let mut line_breaks = 0usize;
+    let mut printable = 0usize;
+    for key in keys {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char(c) => {
+                text.push(c);
+                printable += 1;
+            }
+            KeyCode::Enter => {
+                text.push('\n');
+                line_breaks += 1;
+            }
+            KeyCode::Tab => {
+                text.push('\t');
+                printable += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    if printable == 0 {
+        return None;
+    }
+
+    let looks_like_multiline_paste = line_breaks >= 2 || (line_breaks >= 1 && keys.len() >= 8);
+    let looks_like_long_single_line_paste = line_breaks == 0 && printable >= 64;
+    if looks_like_multiline_paste || looks_like_long_single_line_paste {
+        Some(text)
+    } else {
+        None
+    }
 }
 
 fn read_clipboard_text() -> std::result::Result<Option<String>, String> {
@@ -7277,6 +7341,9 @@ mod tests {
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
@@ -7596,6 +7663,49 @@ fn extract_id(line: &str) -> Option<String> {
             .as_deref()
             .unwrap_or_default()
             .contains("API key"));
+    }
+
+    #[test]
+    fn bracketless_multiline_paste_burst_collapses_to_one_goal() {
+        let mut keys = Vec::new();
+        for ch in "# Benchmark Prompt".chars() {
+            keys.push(key(ch));
+        }
+        keys.push(enter());
+        keys.push(enter());
+        for ch in "1. Do x".chars() {
+            keys.push(key(ch));
+        }
+        keys.push(enter());
+        for ch in "2. Do y".chars() {
+            keys.push(key(ch));
+        }
+
+        let text = bracketless_paste_text(&keys).expect("burst should become paste text");
+        let mut app = App::default();
+        app.handle_paste(&text);
+
+        assert!(app.goal_prompt.display_text().starts_with("[paste:"));
+        assert!(app.goals.is_empty());
+        assert!(matches!(
+            app.handle_key(enter()),
+            Some(Intent::QueueGoal(goal)) if goal.contains("# Benchmark Prompt")
+        ));
+        assert_eq!(app.goals.len(), 1);
+    }
+
+    #[test]
+    fn short_typing_with_enter_is_not_treated_as_paste() {
+        let keys = vec![key('g'), key('o'), enter()];
+
+        assert!(bracketless_paste_text(&keys).is_none());
+    }
+
+    #[test]
+    fn control_shortcuts_are_not_treated_as_paste() {
+        let keys = vec![ctrl('v'), key('x'), enter(), key('y')];
+
+        assert!(bracketless_paste_text(&keys).is_none());
     }
 
     #[test]

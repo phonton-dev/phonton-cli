@@ -4,6 +4,15 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.8.1 - Paste Burst Hotfix
+
+### Fixed
+
+- Fixed Windows/VS Code terminal paste fallback when bracketed paste is not
+  delivered by the terminal: rapid multiline key bursts are now collapsed into a
+  single paste artifact instead of queueing each line as a separate goal.
+- Increased the TUI input channel capacity for large paste bursts.
+
 ## 0.8.0 - Prompt Artifact Paste System
 
 ### Added
