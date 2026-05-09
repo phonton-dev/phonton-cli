@@ -4,6 +4,17 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.9.2 - Quality Gate Repair Hotfix
+
+### Fixed
+
+- Quality-gate failures now feed back into the worker once as repair context
+  instead of immediately failing the whole task after syntax/build/test
+  verification passes.
+- Chess benchmark runs that miss a specific contract requirement, such as
+  reset/new-game behavior, now get one targeted repair pass before Phonton
+  reports a terminal failure.
+
 ## 0.9.1 - npm Wrapper Cache Hotfix
 
 ### Fixed

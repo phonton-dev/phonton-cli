@@ -50,6 +50,10 @@ pub const MAX_RETRIES_PER_TIER: u8 = 1;
 /// Escalations permitted before the orchestrator surfaces a hard failure.
 pub const MAX_ESCALATIONS: u8 = 3;
 
+/// Repair attempts permitted when task-specific quality gates fail after
+/// ordinary syntax/build/test verification has passed.
+pub const MAX_QUALITY_REPAIR_ATTEMPTS: u8 = 1;
+
 /// Deprecated — budget pauses now produce `TaskStatus::Paused` directly.
 /// Kept for any downstream code that may still substring-match the old sentinel.
 #[deprecated(note = "budget pauses now emit TaskStatus::Paused; remove this check")]
@@ -468,6 +472,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut checkpoints: Vec<Checkpoint> = Vec::new();
         let mut checkpointed: HashSet<SubtaskId> = HashSet::new();
         let mut next_seq: u32 = 1;
+        let mut quality_repair_attempts: u8 = 0;
 
         // Channel for worker-to-orchestrator intermediate messages.
         let (worker_msg_tx, mut worker_msg_rx) = mpsc::channel::<OrchestratorMessage>(32);
@@ -499,6 +504,23 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
             let any_active = runtimes.values().any(|r| r.is_active());
             if !any_active && joinset.is_empty() {
+                if failure.is_none() && paused.is_none() && !cancelled {
+                    let quality_failures = self.quality_gate_failures(&plan, &runtimes);
+                    if !quality_failures.is_empty()
+                        && quality_repair_attempts < MAX_QUALITY_REPAIR_ATTEMPTS
+                        && self.redispatch_quality_gate_repair(
+                            &plan,
+                            &quality_failures,
+                            &mut runtimes,
+                            &mut checkpointed,
+                            &mut joinset,
+                            worker_msg_tx.clone(),
+                        )
+                    {
+                        quality_repair_attempts = quality_repair_attempts.saturating_add(1);
+                        continue;
+                    }
+                }
                 // Nothing in flight and nothing scheduled — terminal.
                 break;
             }
@@ -1247,6 +1269,59 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         Ok(())
     }
 
+    fn redispatch_quality_gate_repair(
+        &self,
+        plan: &PlannerOutput,
+        failures: &[String],
+        runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>,
+        checkpointed: &mut HashSet<SubtaskId>,
+        joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
+        worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
+    ) -> bool {
+        let Some(id) = plan
+            .subtasks
+            .iter()
+            .find(|subtask| {
+                runtimes
+                    .get(&subtask.id)
+                    .map(|rt| rt.is_done() && !rt.diff_hunks.is_empty())
+                    .unwrap_or(false)
+            })
+            .map(|subtask| subtask.id)
+        else {
+            return false;
+        };
+
+        let errors: Vec<String> = failures
+            .iter()
+            .map(|failure| format!("Quality gate: {failure}"))
+            .collect();
+        let attempt = runtimes
+            .get(&id)
+            .map(|rt| rt.attempts_at_tier.saturating_add(1))
+            .unwrap_or(1);
+
+        if let Some(rt) = runtimes.get_mut(&id) {
+            rt.verify_result = Some(VerifyResult::Fail {
+                layer: VerifyLayer::Test,
+                errors: errors.clone(),
+                attempt,
+            });
+            rt.prior_errors = errors.clone();
+            rt.status = SubtaskStatus::Ready;
+            rt.is_thinking = false;
+        }
+        checkpointed.remove(&id);
+        self.emit(OrchestratorEvent::VerifyFail {
+            subtask_id: id,
+            layer: VerifyLayer::Test,
+            errors,
+            attempt,
+        });
+        self.spawn_worker(runtimes, id, joinset, worker_msg_tx);
+        true
+    }
+
     fn quality_gate_failures(
         &self,
         plan: &PlannerOutput,
@@ -1968,7 +2043,10 @@ mod tests {
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = orch.run_task(plan, empty_state()).await.unwrap();
-        assert!(matches!(status, TaskStatus::Reviewing { .. }));
+        assert!(
+            matches!(status, TaskStatus::Reviewing { .. }),
+            "unexpected status: {status:?}"
+        );
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         // Linear: first dispatch must be a, then b, then c.
@@ -2049,7 +2127,10 @@ mod tests {
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
 
         let status = orch.run_task(plan, state_tx).await.unwrap();
-        assert!(matches!(status, TaskStatus::Reviewing { .. }));
+        assert!(
+            matches!(status, TaskStatus::Reviewing { .. }),
+            "unexpected status: {status:?}"
+        );
 
         let state = state_rx.borrow().clone();
         let handoff = state
@@ -2136,6 +2217,160 @@ mod tests {
         assert!(failures
             .iter()
             .any(|failure| failure.contains("named chess pieces")));
+    }
+
+    fn chess_contract(goal: &str) -> GoalContract {
+        GoalContract {
+            goal: goal.into(),
+            task_class: TaskClass::CoreLogic,
+            confidence_percent: 60,
+            acceptance_criteria: vec!["Produce playable chess.".into()],
+            expected_artifacts: Vec::new(),
+            likely_files: Vec::new(),
+            verify_plan: vec![VerifyStepSpec {
+                name: "python compile".into(),
+                layer: None,
+                command: Some(RunCommand {
+                    label: "python -m py_compile chess.py".into(),
+                    command: vec![
+                        "python".into(),
+                        "-m".into(),
+                        "py_compile".into(),
+                        "chess.py".into(),
+                    ],
+                    cwd: None,
+                }),
+            }],
+            run_plan: vec![RunCommand {
+                label: "Run chess".into(),
+                command: vec!["python".into(), "chess.py".into()],
+                cwd: None,
+            }],
+            quality_floor: QualityFloor {
+                criteria: vec!["Playable chess".into()],
+            },
+            clarification_questions: Vec::new(),
+            assumptions: Vec::new(),
+        }
+    }
+
+    fn chess_hunk(include_reset: bool) -> DiffHunk {
+        let mut lines = vec![
+            "BOARD_SIZE = 8".to_string(),
+            "PIECES = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn']".to_string(),
+            "class ChessGame:".to_string(),
+            "    def __init__(self):".to_string(),
+            "        self.board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]"
+                .to_string(),
+            "        self.turn = 'white'".to_string(),
+            "        self.move_history = []".to_string(),
+            "    def legal_move(self, start, end):".to_string(),
+            "        return self.valid_move(start, end)".to_string(),
+            "    def valid_move(self, start, end):".to_string(),
+            "        return start != end and all(0 <= value < BOARD_SIZE for value in (*start, *end))"
+                .to_string(),
+            "    def move(self, start, end):".to_string(),
+            "        if not self.legal_move(start, end):".to_string(),
+            "            return False".to_string(),
+            "        self.turn = 'black' if self.turn == 'white' else 'white'".to_string(),
+            "        self.move_history.append((start, end))".to_string(),
+            "        return True".to_string(),
+        ];
+        if include_reset {
+            lines.extend([
+                "    def reset_game(self):".to_string(),
+                "        self.board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]"
+                    .to_string(),
+                "        self.turn = 'white'".to_string(),
+                "        self.move_history.clear()".to_string(),
+            ]);
+        } else {
+            lines.extend([
+                "    def start_position(self):".to_string(),
+                "        return self.board".to_string(),
+            ]);
+        }
+        while lines.len() < 90 {
+            lines.push(format!(
+                "# board turn move legal valid playable chess filler {}",
+                lines.len()
+            ));
+        }
+
+        DiffHunk {
+            file_path: PathBuf::from("chess.py"),
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: lines.len() as u32,
+            lines: lines.into_iter().map(DiffLine::Added).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn quality_gate_failure_redispatches_repair_once() {
+        struct ChessRepairDispatcher {
+            prior_errors: Mutex<Vec<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl WorkerDispatcher for ChessRepairDispatcher {
+            async fn dispatch(
+                &self,
+                subtask: Subtask,
+                prior_errors: Vec<String>,
+                _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
+            ) -> Result<SubtaskResult> {
+                let include_reset = !prior_errors.is_empty();
+                self.prior_errors.lock().unwrap().push(prior_errors);
+                let hunks = vec![chess_hunk(include_reset)];
+                Ok(SubtaskResult {
+                    id: subtask.id,
+                    status: SubtaskStatus::Done {
+                        tokens_used: 100,
+                        diff_hunk_count: hunks.len(),
+                    },
+                    diff_hunks: hunks,
+                    model_tier: subtask.model_tier,
+                    verify_result: VerifyResult::Pass {
+                        layer: VerifyLayer::Syntax,
+                    },
+                    provider: ProviderKind::Anthropic,
+                    model_name: "test-model".into(),
+                    token_usage: TokenUsage {
+                        input_tokens: 50,
+                        output_tokens: 50,
+                        ..TokenUsage::default()
+                    },
+                })
+            }
+        }
+
+        let a = subtask("make chess", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(chess_contract("make chess")),
+        };
+        let dispatcher = Arc::new(ChessRepairDispatcher {
+            prior_errors: Mutex::new(Vec::new()),
+        });
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+
+        let status = orch.run_task(plan, empty_state()).await.unwrap();
+
+        assert!(
+            matches!(status, TaskStatus::Reviewing { .. }),
+            "unexpected status: {status:?}"
+        );
+        let calls = dispatcher.prior_errors.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].is_empty());
+        assert!(calls[1].iter().any(|error| error.contains("reset")));
     }
 
     #[tokio::test]
