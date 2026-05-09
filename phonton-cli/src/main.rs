@@ -63,7 +63,8 @@ use command_runner::{parse_prompt_command, summarize_output_with_duration, Comma
 use contract_preflight::apply_workspace_preflight;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -659,6 +660,8 @@ pub struct App {
     pub compacted_prompt_tokens: u64,
     /// Active panel focus view.
     pub focus_view: FocusView,
+    /// Vertical scroll offset for the active focus surface.
+    pub focus_scroll: usize,
     /// Cursor into changed files shown by Code focus.
     pub focused_changed_file: usize,
     /// Cursor into command runs shown by Commands focus.
@@ -703,6 +706,7 @@ impl App {
             session_prompt_tokens: 0,
             compacted_prompt_tokens: 0,
             focus_view: FocusView::Receipt,
+            focus_scroll: 0,
             focused_changed_file: 0,
             focused_command_run: 0,
             goal_switcher: GoalSwitcherState::default(),
@@ -1292,10 +1296,12 @@ impl App {
 
     fn cycle_focus_view(&mut self) {
         self.focus_view = self.active_focus_view_for_current_goal().next();
+        self.focus_scroll = 0;
     }
 
     fn previous_goal(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.focus_scroll = 0;
         self.clamp_focus_indices();
         self.default_to_code_focus_for_reviewable_goal();
     }
@@ -1304,6 +1310,7 @@ impl App {
         if self.selected + 1 < self.goals.len() {
             self.selected += 1;
         }
+        self.focus_scroll = 0;
         self.clamp_focus_indices();
         self.default_to_code_focus_for_reviewable_goal();
     }
@@ -1311,6 +1318,7 @@ impl App {
     fn jump_to_goal_number(&mut self, number: usize) {
         if number > 0 && number <= self.goals.len() {
             self.selected = number - 1;
+            self.focus_scroll = 0;
             self.clamp_focus_indices();
             self.default_to_code_focus_for_reviewable_goal();
         }
@@ -1329,6 +1337,7 @@ impl App {
             && self.current_goal().map(focused_file_count).unwrap_or(0) > 0
         {
             self.focus_view = FocusView::Code;
+            self.focus_scroll = 0;
         }
     }
 
@@ -1388,6 +1397,34 @@ impl App {
             ),
         }
         self.settings.message = None;
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_visible_surface(-3),
+            MouseEventKind::ScrollDown => self.scroll_visible_surface(3),
+            _ => {}
+        }
+    }
+
+    fn scroll_visible_surface(&mut self, delta: isize) {
+        if self.flight_log_open && matches!(self.mode, Mode::Goal | Mode::Task) {
+            if delta < 0 {
+                let cur = self.flight_log_scroll.unwrap_or(usize::MAX);
+                self.flight_log_scroll = Some(cur.saturating_sub(delta.unsigned_abs()));
+            } else if let Some(s) = self.flight_log_scroll {
+                self.flight_log_scroll = Some(s.saturating_add(delta as usize));
+            }
+            return;
+        }
+
+        if matches!(self.mode, Mode::Goal | Mode::Task) {
+            if delta < 0 {
+                self.focus_scroll = self.focus_scroll.saturating_sub(delta.unsigned_abs());
+            } else {
+                self.focus_scroll = self.focus_scroll.saturating_add(delta as usize);
+            }
+        }
     }
 
     pub fn push_command_run(&mut self, summary: CommandRunSummary) {
@@ -1574,6 +1611,30 @@ impl App {
                 }
                 KeyCode::End => {
                     self.flight_log_scroll = None;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if !self.flight_log_open
+            && matches!(self.mode, Mode::Goal | Mode::Task)
+            && self.goal_prompt.is_empty()
+        {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.focus_scroll = self.focus_scroll.saturating_sub(12);
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    self.focus_scroll = self.focus_scroll.saturating_add(12);
+                    return None;
+                }
+                KeyCode::Home => {
+                    self.focus_scroll = 0;
+                    return None;
+                }
+                KeyCode::End => {
+                    self.focus_scroll = usize::MAX;
                     return None;
                 }
                 _ => {}
@@ -3163,7 +3224,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(short(&g.description, 40), base_style));
+            spans.extend(artifact_text_spans(&short(&g.description, 40), base_style));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -3319,7 +3380,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         MUTED
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled("◉ ", Style::default().fg(pulse_color)),
@@ -3438,13 +3499,16 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "goal: ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(g.description.clone()),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "goal: ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]));
+    if let Some(last) = lines.last_mut() {
+        last.spans.extend(artifact_text_spans(
+            &g.description,
+            Style::default().fg(Color::White),
+        ));
+    }
     lines.push(Line::raw(""));
 
     if let Some(state) = &g.state {
@@ -3588,7 +3652,22 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(inner_h);
+    let focus_scroll = app.focus_scroll.min(max_scroll);
+    if max_scroll > 0 {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(
+                " PgUp/PgDn scroll {}/{} · Home/End ",
+                focus_scroll, max_scroll
+            ),
+            Style::default().fg(MUTED),
+        )));
+    }
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .scroll((focus_scroll.min(u16::MAX as usize) as u16, 0))
+        .block(block);
     frame.render_widget(p, area);
 }
 
@@ -4535,16 +4614,17 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
     let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
 
-    let prompt = Paragraph::new(Line::from(vec![
-        Span::styled(
-            prompt_prefix,
-            Style::default()
-                .fg(border_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(visible, Style::default().fg(Color::White)),
-    ]))
-    .style(Style::default().bg(BG_DEEP));
+    let mut prompt_spans = vec![Span::styled(
+        prompt_prefix,
+        Style::default()
+            .fg(border_color)
+            .add_modifier(Modifier::BOLD),
+    )];
+    prompt_spans.extend(artifact_text_spans(
+        &visible,
+        Style::default().fg(Color::White),
+    ));
+    let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
 
     let badge = Paragraph::new(Line::from(Span::styled(mode_label, mode_style)))
@@ -4626,6 +4706,61 @@ fn short(s: &str, n: usize) -> String {
         out
     } else {
         s.to_string()
+    }
+}
+
+const ARTIFACT_CHIP_COLORS: [Color; 8] = [
+    Color::Rgb(99, 179, 237),
+    Color::Rgb(160, 122, 234),
+    Color::Rgb(237, 100, 166),
+    Color::Rgb(72, 199, 142),
+    Color::Rgb(246, 173, 85),
+    Color::Rgb(69, 144, 255),
+    Color::Rgb(56, 217, 169),
+    Color::Rgb(255, 121, 198),
+];
+
+fn artifact_chip_color(chip: &str) -> Color {
+    let hash = chip.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(33).wrapping_add(b as usize)
+    });
+    ARTIFACT_CHIP_COLORS[hash % ARTIFACT_CHIP_COLORS.len()]
+}
+
+fn artifact_text_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = find_artifact_chip_start(rest) {
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), base_style));
+        }
+        let tail = &rest[start..];
+        let Some(end) = tail.find(']').map(|idx| idx + 1) else {
+            spans.push(Span::styled(tail.to_string(), base_style));
+            return spans;
+        };
+        let chip = &tail[..end];
+        spans.push(Span::styled(
+            chip.to_string(),
+            Style::default()
+                .fg(BG_DEEP)
+                .bg(artifact_chip_color(chip))
+                .add_modifier(Modifier::BOLD),
+        ));
+        rest = &tail[end..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base_style));
+    }
+    spans
+}
+
+fn find_artifact_chip_start(text: &str) -> Option<usize> {
+    match (text.find("[paste:"), text.find("[image:")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -4736,6 +4871,7 @@ impl WorkerDispatcher for StubDispatcher {
 /// state update the driver received on one of the watch channels.
 enum LoopEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Paste(String),
     StateUpdate(usize, Box<GlobalState>),
     AskAnswer(String),
@@ -5907,7 +6043,12 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -5938,6 +6079,7 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show,
@@ -5982,6 +6124,11 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
                 }
                 Ok(Event::Paste(text)) => {
                     if let Err(_err) = tx.blocking_send(LoopEvent::Paste(text)) {
+                        break;
+                    }
+                }
+                Ok(Event::Mouse(mouse)) => {
+                    if let Err(_err) = tx.blocking_send(LoopEvent::Mouse(mouse)) {
                         break;
                     }
                 }
@@ -6142,6 +6289,7 @@ async fn run_app<B: Backend>(
             LoopEvent::Paste(text) => {
                 app.handle_paste(&text);
             }
+            LoopEvent::Mouse(mouse) => app.handle_mouse(mouse),
             LoopEvent::Key(k) => {
                 if let Some(intent) = app.handle_key(k) {
                     match intent {
@@ -8451,6 +8599,54 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(text.contains("chess.py"));
         assert!(text.contains("+print('Chess')"));
         assert!(text.contains("-print('Hello')"));
+    }
+
+    #[test]
+    fn page_keys_scroll_active_code_focus_when_prompt_empty() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+        app.focus_view = FocusView::Code;
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(app.focus_scroll > 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.focus_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_active_focus_surface() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+        app.focus_view = FocusView::Code;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.focus_scroll > 0);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus_scroll, 0);
+    }
+
+    #[test]
+    fn artifact_chip_style_is_colorful_and_stable() {
+        let paste = artifact_chip_color("[paste: 30 lines, 1.5k chars]");
+        let image = artifact_chip_color("[image: board.png]");
+
+        assert_eq!(paste, artifact_chip_color("[paste: 30 lines, 1.5k chars]"));
+        assert_ne!(paste, Color::White);
+        assert_ne!(image, Color::White);
     }
 
     #[test]

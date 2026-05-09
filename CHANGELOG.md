@@ -4,6 +4,21 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.8.2 - Artifact Scroll And Image Chips
+
+### Added
+
+- Added mouse-wheel and `PgUp` / `PgDn` scrolling for the Active receipt/code
+  surface so large review-ready diffs remain readable in the TUI.
+- Added image path paste/drop artifacts. Pasting an image file path now creates
+  an `[image: name.png]` chip and submits the path as an image artifact instead
+  of plain goal text.
+
+### Changed
+
+- Prompt artifact chips now get stable accent colors instead of rendering as
+  plain white text in the prompt bar, sidebar, and Active goal header.
+
 ## 0.8.1 - Paste Burst Hotfix
 
 ### Fixed

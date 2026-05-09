@@ -1,11 +1,20 @@
+use std::path::Path;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSubmission {
     pub display_text: String,
     pub model_text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptArtifactKind {
+    PastedText,
+    ImagePath,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptArtifact {
+    pub kind: PromptArtifactKind,
     pub chip: String,
     pub text: String,
     pub line_count: usize,
@@ -71,7 +80,11 @@ impl PromptBuffer {
 
     pub fn insert_paste(&mut self, text: &str) {
         let text = normalize_paste(text);
-        if should_collapse_paste(&text) {
+        if let Some(artifact) = make_image_artifact(&text) {
+            let chip = artifact.chip.clone();
+            self.artifacts.push(artifact);
+            self.insert_str(&chip);
+        } else if should_collapse_paste(&text) {
             let artifact = make_paste_artifact(&text);
             let chip = artifact.chip.clone();
             self.artifacts.push(artifact);
@@ -146,12 +159,21 @@ impl PromptBuffer {
         }
 
         let mut model_text = display_text.clone();
-        if !visible_artifacts.is_empty() {
+        let text_artifacts: Vec<_> = visible_artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == PromptArtifactKind::PastedText)
+            .collect();
+        let image_artifacts: Vec<_> = visible_artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == PromptArtifactKind::ImagePath)
+            .collect();
+
+        if !text_artifacts.is_empty() {
             if !model_text.ends_with('\n') {
                 model_text.push_str("\n\n");
             }
             model_text.push_str("# Pasted prompt artifacts\n");
-            for (idx, artifact) in visible_artifacts.iter().enumerate() {
+            for (idx, artifact) in text_artifacts.iter().enumerate() {
                 model_text.push_str(&format!(
                     "## paste-{} ({} {}, {}{})\n",
                     idx + 1,
@@ -174,6 +196,17 @@ impl PromptBuffer {
                     model_text.push('\n');
                 }
                 model_text.push_str("</paste-content>\n");
+            }
+        }
+        if !image_artifacts.is_empty() {
+            if !model_text.ends_with('\n') {
+                model_text.push_str("\n\n");
+            }
+            model_text.push_str("# Pasted image artifacts\n");
+            for (idx, artifact) in image_artifacts.iter().enumerate() {
+                let escaped = artifact.text.replace('"', "\\\"");
+                model_text.push_str(&format!("## image-{} ({})\n", idx + 1, artifact.chip));
+                model_text.push_str(&format!("image path: @\"{}\"\n", escaped));
             }
         }
         self.artifacts.clear();
@@ -235,12 +268,70 @@ fn make_paste_artifact(text: &str) -> PromptArtifact {
         format_char_count(char_count)
     );
     PromptArtifact {
+        kind: PromptArtifactKind::PastedText,
         chip,
         text: stored,
         line_count,
         char_count,
         truncated,
     }
+}
+
+fn make_image_artifact(text: &str) -> Option<PromptArtifact> {
+    let path = normalize_dropped_path(text)?;
+    if !is_image_path_text(&path) {
+        return None;
+    }
+    let label = Path::new(&path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(path.as_str());
+    let char_count = char_count(&path);
+    Some(PromptArtifact {
+        kind: PromptArtifactKind::ImagePath,
+        chip: format!("[image: {label}]"),
+        text: path,
+        line_count: 1,
+        char_count,
+        truncated: false,
+    })
+}
+
+fn normalize_dropped_path(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.lines().count() > 1 {
+        return None;
+    }
+    let trimmed = trimmed.trim_matches(|c| c == '"' || c == '\'');
+    let path = if let Some(rest) = trimmed.strip_prefix("file:///") {
+        #[cfg(windows)]
+        {
+            rest.replace('/', "\\")
+        }
+        #[cfg(not(windows))]
+        {
+            format!("/{rest}")
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("file://") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    Some(path)
+}
+
+fn is_image_path_text(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn line_count(text: &str) -> usize {
@@ -327,6 +418,19 @@ mod tests {
             .expect("prompt should submit")
             .model_text
             .contains("do x\ndo y\ndo z"));
+    }
+
+    #[test]
+    fn image_path_paste_collapses_to_image_artifact() {
+        let mut buffer = PromptBuffer::new();
+        buffer.insert_paste(r#"C:\screenshots\board.png"#);
+
+        assert_eq!(buffer.display_text(), "[image: board.png]");
+        let submission = buffer.take_submission().expect("prompt should submit");
+        assert!(submission.model_text.contains("# Pasted image artifacts"));
+        assert!(submission
+            .model_text
+            .contains(r#"image path: @"C:\screenshots\board.png""#));
     }
 
     #[test]
