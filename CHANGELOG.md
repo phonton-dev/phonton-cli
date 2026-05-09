@@ -4,6 +4,26 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.9.0 - Token Budget, History, And Workspace Trust
+
+### Added
+
+- Added structured workspace trust records with per-workspace permission mode,
+  source, trusted-at, and last-seen metadata.
+- Added `/trust current`, `/trust list`, and `/trust revoke-current` surfaces
+  for inspecting and revoking workspace trust from the TUI.
+- Added resumable prompt history to saved session snapshots.
+- Added in-place filtering and selected-row details to the TUI History view.
+
+### Changed
+
+- Worker first-attempt prompts now omit bulky diff examples unless retry errors
+  indicate the model needs diff-format guidance.
+- Worker repo context now deduplicates overlapping planner/semantic slices and
+  reports deduped tokens in the prompt manifest.
+- Prompt manifests now expose repo-code tokens, budget limit, auto-compacted
+  tokens, and deduped tokens in the Flight Log and `/context` output.
+
 ## 0.8.2 - Artifact Scroll And Image Chips
 
 ### Added

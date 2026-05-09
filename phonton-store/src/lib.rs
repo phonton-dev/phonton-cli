@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use phonton_types::{
     EventRecord, MemoryRecord, OutcomeLedger, SessionSnapshot, TaskId, TaskStatus,
+    WorkspaceTrustRecord,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -69,6 +70,13 @@ CREATE TABLE IF NOT EXISTS session_snapshots (
     workspace     TEXT PRIMARY KEY,
     body_json     TEXT NOT NULL,
     saved_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_trust (
+    workspace     TEXT PRIMARY KEY,
+    body_json     TEXT NOT NULL,
+    trusted_at    INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL
 );
 ";
 
@@ -149,6 +157,50 @@ impl Store {
             .optional()?;
         body.map(|s| serde_json::from_str::<SessionSnapshot>(&s).map_err(Into::into))
             .transpose()
+    }
+
+    /// Insert or replace a structured workspace trust record.
+    pub fn upsert_workspace_trust(&self, record: &WorkspaceTrustRecord) -> Result<()> {
+        let body = serde_json::to_string(record)?;
+        self.conn.execute(
+            "INSERT INTO workspace_trust (workspace, body_json, trusted_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace) DO UPDATE SET
+                 body_json    = excluded.body_json,
+                 last_seen_at = excluded.last_seen_at",
+            params![
+                record.canonical_path.as_str(),
+                body,
+                record.trusted_at as i64,
+                record.last_seen_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List structured workspace trust records, newest-seen first.
+    pub fn list_workspace_trust(&self, limit: usize) -> Result<Vec<WorkspaceTrustRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT body_json FROM workspace_trust
+             ORDER BY last_seen_at DESC, trusted_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|s| serde_json::from_str::<WorkspaceTrustRecord>(&s).map_err(Into::into))
+            .collect()
+    }
+
+    /// Remove one workspace trust mirror row. The JSON trust file remains
+    /// canonical for launch gating; callers should revoke both when needed.
+    pub fn delete_workspace_trust(&self, workspace: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "DELETE FROM workspace_trust WHERE workspace = ?1",
+            params![workspace],
+        )?;
+        Ok(changed > 0)
     }
 
     // -----------------------------------------------------------------
@@ -736,7 +788,10 @@ fn ensure_memory_columns(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phonton_types::{MemoryRecord, SessionGoalSnapshot, SessionSnapshot, SessionTotals};
+    use phonton_types::{
+        MemoryRecord, PermissionMode, SessionGoalSnapshot, SessionSnapshot, SessionTotals,
+        WorkspaceTrustRecord, WorkspaceTrustSource,
+    };
 
     #[test]
     fn open_creates_schema() {
@@ -872,6 +927,7 @@ mod tests {
             goal_input: "finish docs".into(),
             ask_input: "what changed?".into(),
             ask_answer: Some("the CLI now resumes sessions".into()),
+            prompt_history: vec!["add resume support".into()],
             best_savings_pct: Some(71),
             goals: vec![SessionGoalSnapshot {
                 description: "add resume support".into(),
@@ -903,6 +959,30 @@ mod tests {
             .expect("snapshot exists");
         assert_eq!(loaded, snapshot);
         assert!(s.load_session_snapshot("C:\\other").unwrap().is_none());
+    }
+
+    #[test]
+    fn workspace_trust_round_trips_and_updates_last_seen() {
+        let s = Store::in_memory().unwrap();
+        let mut record = WorkspaceTrustRecord {
+            canonical_path: "C:\\work\\repo".into(),
+            display_name: "repo".into(),
+            trusted_at: 10,
+            last_seen_at: 10,
+            permission_mode: PermissionMode::Ask,
+            source: WorkspaceTrustSource::JsonRecord,
+        };
+
+        s.upsert_workspace_trust(&record).unwrap();
+        record.last_seen_at = 20;
+        record.permission_mode = PermissionMode::WorkspaceWrite;
+        s.upsert_workspace_trust(&record).unwrap();
+
+        let rows = s.list_workspace_trust(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_seen_at, 20);
+        assert_eq!(rows[0].permission_mode, PermissionMode::WorkspaceWrite);
+        assert!(s.delete_workspace_trust("C:\\work\\repo").unwrap());
     }
 
     #[test]

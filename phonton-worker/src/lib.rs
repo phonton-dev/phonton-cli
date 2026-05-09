@@ -23,6 +23,7 @@
 //!   before any [`ToolCall`] is dispatched. `Block` is terminal — there is
 //!   no override flag and no debug bypass.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -245,7 +246,6 @@ impl Worker {
         context_slices: Vec<CodeSlice>,
     ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
-        let system_prompt = base_system_prompt();
 
         let relevant_slices: Vec<CodeSlice> = match &self.semantic {
             Some(ctx) => {
@@ -259,11 +259,8 @@ impl Worker {
             }
             None => Vec::new(),
         };
-        let origins: Vec<SliceOrigin> = context_slices
-            .iter()
-            .chain(relevant_slices.iter())
-            .map(|s| s.origin)
-            .collect();
+        let repo_context = dedupe_code_slices(&context_slices, &relevant_slices);
+        let origins: Vec<SliceOrigin> = repo_context.slices.iter().map(|s| s.origin).collect();
 
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
@@ -274,10 +271,10 @@ impl Worker {
         let mut mcp_calls = 0usize;
 
         for attempt in 1..=MAX_ATTEMPTS {
+            let system_prompt = system_prompt_for_attempt(&last_errors, self.mcp.is_some());
             let user_prompt = render_user_prompt(
                 &subtask,
-                &context_slices,
-                &relevant_slices,
+                &repo_context.slices,
                 &last_errors,
                 self.mcp.as_deref(),
                 &mcp_results,
@@ -296,21 +293,44 @@ impl Worker {
             // user prompt into the manager until we get a successful
             // response, to avoid polluting the history with failed attempts
             // that will be superseded by the error-retry prompt.
-            let (rendered_context, full_prompt) = {
-                let ctx = self.context.lock().await;
+            let (rendered_context, full_prompt, compacted_tokens, budget_limit) = {
+                let mut ctx = self.context.lock().await;
+                let budget_limit = Some(ctx.limit_tokens() as u64);
+                let before_tokens = ctx.total_tokens();
+                let compacted_tokens = if before_tokens >= ctx.compress_threshold() {
+                    match ctx.compress_frames().await {
+                        Ok(true) => before_tokens.saturating_sub(ctx.total_tokens()) as u64,
+                        Ok(false) => 0,
+                        Err(err) => {
+                            warn!(error = %err, "context compaction failed before worker prompt");
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
                 let rendered_context = ctx.render();
                 let full_prompt = render_full_prompt(&rendered_context, &user_prompt);
-                (rendered_context, full_prompt)
+                (
+                    rendered_context,
+                    full_prompt,
+                    compacted_tokens,
+                    budget_limit,
+                )
             };
             if let Some(tx) = &self.msg_tx {
-                let manifest = prompt_context_manifest(
-                    &system_prompt,
-                    &subtask,
-                    &rendered_context,
-                    last_errors.as_slice(),
-                    mcp_results.as_slice(),
-                    self.mcp.as_deref(),
-                );
+                let manifest = prompt_context_manifest(PromptManifestInput {
+                    system_prompt: &system_prompt,
+                    subtask: &subtask,
+                    rendered_context: &rendered_context,
+                    repo_context: &repo_context.slices,
+                    prior_errors: last_errors.as_slice(),
+                    mcp_results: mcp_results.as_slice(),
+                    mcp: self.mcp.as_deref(),
+                    deduped_tokens: repo_context.deduped_tokens,
+                    compacted_tokens,
+                    budget_limit,
+                });
                 let _ = tx.try_send(
                     phonton_types::messages::OrchestratorMessage::PromptManifest {
                         id: subtask.id,
@@ -848,6 +868,36 @@ fn next_tier(t: ModelTier) -> ModelTier {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DedupeCodeContext {
+    slices: Vec<CodeSlice>,
+    deduped_tokens: u64,
+}
+
+fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeCodeContext {
+    let mut seen = HashSet::new();
+    let mut slices = Vec::with_capacity(primary.len().saturating_add(secondary.len()));
+    let mut deduped_tokens = 0u64;
+
+    for slice in primary.iter().chain(secondary.iter()) {
+        let key = (
+            slice.file_path.clone(),
+            slice.symbol_name.clone(),
+            slice.signature.clone(),
+        );
+        if seen.insert(key) {
+            slices.push(slice.clone());
+        } else {
+            deduped_tokens = deduped_tokens.saturating_add(slice.token_count as u64);
+        }
+    }
+
+    DedupeCodeContext {
+        slices,
+        deduped_tokens,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prompt rendering and diff parsing
 // ---------------------------------------------------------------------------
@@ -856,30 +906,47 @@ fn next_tier(t: ModelTier) -> ModelTier {
 /// Sent only in the provider system slot so it is not duplicated inside the
 /// user-context render. The diff-only constraint is hard-coded here because
 /// review and verification expect parseable unified diffs.
+#[cfg(test)]
 fn base_system_prompt() -> String {
-    "You are a Phonton worker. You produce code changes as unified diffs ONLY.\n\
-     Your output must be a single, parseable unified diff. NO PROSE. NO COMMENTARY. NO EXPLANATION.\n\
-     The only exception is when the user prompt explicitly lists MCP servers: then you may output exactly one MCP_TOOL_CALL JSON marker instead of a diff, and nothing else. After MCP results are provided, return to unified-diff output.\n\n\
-     EXAMPLE OF CREATING A NEW FILE `main.c`:\n\
-     --- /dev/null\n\
-     +++ b/main.c\n\
-     @@ -0,0 +1,1 @@\n\
-     +int main() { return 0; }\n\n\
-     CRITICAL RULES:\n\
-     1. START YOUR RESPONSE WITH `--- a/` OR `--- /dev/null`. DO NOT ADD ANY TEXT BEFORE IT.\n\
-     2. Do NOT wrap your output in markdown code fences (```diff).\n\
-     3. Do NOT explain what you are doing. Output the diff and nothing else.\n\
-     4. Do NOT include unchanged code in the diff unless it is for context (max 3 lines).\n\
-     5. If you have nothing to change, output an empty response.\n\
-     6. If requesting MCP, output exactly `MCP_TOOL_CALL {\"server\":\"<server-id>\",\"tool\":\"<tool-name>\",\"arguments\":{...}}`.\n\
-     7. ANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n"
-        .to_string()
+    system_prompt_for_attempt(&[], false)
+}
+
+fn system_prompt_for_attempt(prior_errors: &[String], mcp_enabled: bool) -> String {
+    let lower_errors = prior_errors.join("\n").to_ascii_lowercase();
+    let include_diff_example = lower_errors.contains("diff")
+        || lower_errors.contains("parse")
+        || lower_errors.contains("unified")
+        || lower_errors.contains("no hunks");
+    render_system_prompt(include_diff_example, mcp_enabled)
+}
+
+fn render_system_prompt(include_diff_example: bool, mcp_enabled: bool) -> String {
+    let mut out = String::from(
+        "You are a Phonton worker. Produce a single parseable unified diff only.\n\
+         No prose, no markdown fences, no commentary, no explanations.\n\
+         Start with `--- a/` or `--- /dev/null`; output empty text only when there is nothing to change.\n",
+    );
+    if mcp_enabled {
+        out.push_str(
+            "If the user prompt lists MCP servers, you may output exactly one MCP_TOOL_CALL JSON marker instead of a diff. After MCP results are provided, return to unified-diff output.\n",
+        );
+    }
+    if include_diff_example {
+        out.push_str(
+            "\nEXAMPLE OF CREATING A NEW FILE `main.c`:\n\
+             --- /dev/null\n\
+             +++ b/main.c\n\
+             @@ -0,0 +1,1 @@\n\
+             +int main() { return 0; }\n",
+        );
+    }
+    out.push_str("\nANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n");
+    out
 }
 
 fn render_user_prompt(
     subtask: &Subtask,
-    slices: &[CodeSlice],
-    relevant: &[CodeSlice],
+    repo_context: &[CodeSlice],
     prior_errors: &[String],
     mcp: Option<&McpRuntime>,
     mcp_results: &[McpResultContext],
@@ -890,9 +957,11 @@ fn render_user_prompt(
         out.push_str(&attachment_context);
         out.push('\n');
     }
-    if !relevant.is_empty() {
-        out.push_str("# Relevant code\n");
-        for s in relevant {
+    out.push_str("# Subtask\n");
+    out.push_str(&subtask.description);
+    if !repo_context.is_empty() {
+        out.push_str("\n\n# Repo context\n");
+        for s in repo_context {
             out.push_str(&format!(
                 "- {} ({}): {}\n",
                 s.symbol_name,
@@ -900,18 +969,6 @@ fn render_user_prompt(
                 s.signature
             ));
         }
-        out.push('\n');
-    }
-    out.push_str("# Subtask\n");
-    out.push_str(&subtask.description);
-    out.push_str("\n\n# Context slices\n");
-    for s in slices {
-        out.push_str(&format!(
-            "- {} ({}): {}\n",
-            s.symbol_name,
-            s.file_path.display(),
-            s.signature
-        ));
     }
     if !prior_errors.is_empty() {
         out.push_str("\n# Previous verification failed; address these errors\n");
@@ -981,20 +1038,42 @@ fn render_full_prompt(rendered_context: &str, user_prompt: &str) -> String {
     }
 }
 
-fn prompt_context_manifest(
-    system_prompt: &str,
-    subtask: &Subtask,
-    rendered_context: &str,
-    prior_errors: &[String],
-    mcp_results: &[McpResultContext],
-    mcp: Option<&McpRuntime>,
-) -> PromptContextManifest {
+struct PromptManifestInput<'a> {
+    system_prompt: &'a str,
+    subtask: &'a Subtask,
+    rendered_context: &'a str,
+    repo_context: &'a [CodeSlice],
+    prior_errors: &'a [String],
+    mcp_results: &'a [McpResultContext],
+    mcp: Option<&'a McpRuntime>,
+    deduped_tokens: u64,
+    compacted_tokens: u64,
+    budget_limit: Option<u64>,
+}
+
+fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManifest {
+    let PromptManifestInput {
+        system_prompt,
+        subtask,
+        rendered_context,
+        repo_context,
+        prior_errors,
+        mcp_results,
+        mcp,
+        deduped_tokens,
+        compacted_tokens,
+        budget_limit,
+    } = input;
     let system_tokens = estimate_prompt_tokens(system_prompt);
     let user_goal_tokens = estimate_prompt_tokens(&subtask.description);
     let memory_tokens = estimate_prompt_tokens(rendered_context);
     let attachment_tokens = estimate_prompt_tokens(&phonton_types::render_prompt_attachments(
         &subtask.attachments,
     ));
+    let code_context_tokens = repo_context
+        .iter()
+        .map(|slice| slice.token_count as u64)
+        .sum();
     let retry_error_tokens = estimate_prompt_tokens(&prior_errors.join("\n"));
     let mut mcp_text = String::new();
     if let Some(runtime) = mcp {
@@ -1018,6 +1097,7 @@ fn prompt_context_manifest(
         .saturating_add(user_goal_tokens)
         .saturating_add(memory_tokens)
         .saturating_add(attachment_tokens)
+        .saturating_add(code_context_tokens)
         .saturating_add(mcp_tool_tokens)
         .saturating_add(retry_error_tokens);
 
@@ -1026,9 +1106,13 @@ fn prompt_context_manifest(
         user_goal_tokens,
         memory_tokens,
         attachment_tokens,
+        code_context_tokens,
         mcp_tool_tokens,
         retry_error_tokens,
         total_estimated_tokens,
+        budget_limit,
+        compacted_tokens,
+        deduped_tokens,
     }
 }
 
@@ -1615,14 +1699,19 @@ mod tests {
             attachments: Vec::new(),
             status: SubtaskStatus::Queued,
         };
-        let manifest = prompt_context_manifest(
-            &base_system_prompt(),
-            &subtask,
-            "prior decision context",
-            &["syntax failed".into()],
-            &[],
-            None,
-        );
+        let errors = vec!["syntax failed".into()];
+        let manifest = prompt_context_manifest(PromptManifestInput {
+            system_prompt: &base_system_prompt(),
+            subtask: &subtask,
+            rendered_context: "prior decision context",
+            repo_context: &[],
+            prior_errors: &errors,
+            mcp_results: &[],
+            mcp: None,
+            deduped_tokens: 0,
+            compacted_tokens: 0,
+            budget_limit: Some(DEFAULT_WINDOW_LIMIT as u64),
+        });
         assert!(manifest.system_tokens > 0);
         assert!(manifest.user_goal_tokens > 0);
         assert!(manifest.memory_tokens > 0);
@@ -1634,9 +1723,40 @@ mod tests {
                 .saturating_add(manifest.user_goal_tokens)
                 .saturating_add(manifest.memory_tokens)
                 .saturating_add(manifest.attachment_tokens)
+                .saturating_add(manifest.code_context_tokens)
                 .saturating_add(manifest.mcp_tool_tokens)
                 .saturating_add(manifest.retry_error_tokens)
         );
+    }
+
+    #[test]
+    fn repo_context_dedupe_keeps_one_copy_and_tracks_saved_tokens() {
+        let slice = CodeSlice {
+            file_path: PathBuf::from("src/lib.rs"),
+            symbol_name: "parse".into(),
+            signature: "fn parse()".into(),
+            docstring: None,
+            callsites: Vec::new(),
+            token_count: 42,
+            origin: SliceOrigin::Semantic,
+        };
+        let duplicate = slice.clone();
+        let deduped = dedupe_code_slices(
+            std::slice::from_ref(&slice),
+            std::slice::from_ref(&duplicate),
+        );
+
+        assert_eq!(deduped.slices.len(), 1);
+        assert_eq!(deduped.deduped_tokens, 42);
+    }
+
+    #[test]
+    fn first_attempt_system_prompt_omits_bulky_diff_example() {
+        let prompt = system_prompt_for_attempt(&[], false);
+
+        assert!(prompt.contains("You are a Phonton worker"));
+        assert!(!prompt.contains("EXAMPLE OF CREATING A NEW FILE"));
+        assert!(!prompt.contains("MCP_TOOL_CALL"));
     }
 
     #[derive(Clone)]
@@ -1738,7 +1858,7 @@ mod tests {
             success: true,
             content: "- read_file".into(),
         }];
-        let prompt = render_user_prompt(&subtask, &[], &[], &[], Some(&runtime), &results);
+        let prompt = render_user_prompt(&subtask, &[], &[], Some(&runtime), &results);
         assert!(prompt.contains("# MCP servers"));
         assert!(prompt.contains("docs (Docs)"));
         assert!(prompt.contains("# MCP results"));

@@ -63,6 +63,8 @@ pub enum SlashAction {
     ShowStatus,
     ShowCommands,
     ShowPermissions,
+    ShowTrust,
+    RevokeCurrentTrust,
     SetPermissionMode(PermissionMode),
     ShowContext,
     CompactContext,
@@ -148,11 +150,19 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/permissions",
-        aliases: &["/trust"],
+        aliases: &[],
         args: "set <mode>",
         description: "show or set sandbox, approval, and trust status",
         category: CommandCategory::Trust,
         action: SlashAction::ShowPermissions,
+    },
+    CommandSpec {
+        name: "/trust",
+        aliases: &[],
+        args: "current|list|revoke-current",
+        description: "show or revoke workspace trust records",
+        category: CommandCategory::Trust,
+        action: SlashAction::ShowTrust,
     },
     CommandSpec {
         name: "/context",
@@ -350,6 +360,18 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
                     "/permissions set ask|read-only|workspace-write|full-access".into(),
                 ),
             }
+        };
+    }
+
+    if head == "/trust" {
+        let subcommand = rest.split_whitespace().next().unwrap_or_default();
+        return match subcommand {
+            "" | "current" | "list" => SlashParse::Command(SlashAction::ShowTrust),
+            "revoke-current" => SlashParse::Command(SlashAction::RevokeCurrentTrust),
+            other => SlashParse::Unknown {
+                command: format!("/trust {other}"),
+                suggestion: Some("/trust current|list|revoke-current".into()),
+            },
         };
     }
 
@@ -589,6 +611,22 @@ mod tests {
             SlashParse::Command(SlashAction::SetPermissionMode(
                 phonton_types::PermissionMode::FullAccess
             ))
+        );
+    }
+
+    #[test]
+    fn trust_commands_parse_without_touching_permissions_aliases() {
+        assert_eq!(
+            parse_slash_command("/trust"),
+            SlashParse::Command(SlashAction::ShowTrust)
+        );
+        assert_eq!(
+            parse_slash_command("/trust list"),
+            SlashParse::Command(SlashAction::ShowTrust)
+        );
+        assert_eq!(
+            parse_slash_command("/trust revoke-current"),
+            SlashParse::Command(SlashAction::RevokeCurrentTrust)
         );
     }
 

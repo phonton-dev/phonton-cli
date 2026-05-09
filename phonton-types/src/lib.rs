@@ -294,6 +294,9 @@ pub struct SessionSnapshot {
     pub ask_input: String,
     /// Last Ask-mode answer shown in the side panel.
     pub ask_answer: Option<String>,
+    /// Recent submitted prompt history, newest last, for Up/Down recall after resume.
+    #[serde(default)]
+    pub prompt_history: Vec<String>,
     /// Highest observed savings percentage for this session.
     pub best_savings_pct: Option<i64>,
     /// Top-level goals visible in the TUI.
@@ -961,19 +964,82 @@ pub struct ContextManifest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptContextManifest {
     /// Tokens attributed to the provider system prompt.
+    #[serde(default)]
     pub system_tokens: u64,
     /// Tokens attributed to the current user goal/subtask.
+    #[serde(default)]
     pub user_goal_tokens: u64,
     /// Tokens attributed to prior context or memory.
+    #[serde(default)]
     pub memory_tokens: u64,
     /// Tokens attributed to user-mentioned attachments.
+    #[serde(default)]
     pub attachment_tokens: u64,
+    /// Tokens attributed to selected repository code context.
+    #[serde(default)]
+    pub code_context_tokens: u64,
     /// Tokens attributed to MCP/tool instructions and results.
+    #[serde(default)]
     pub mcp_tool_tokens: u64,
     /// Tokens attributed to retry/verification error context.
+    #[serde(default)]
     pub retry_error_tokens: u64,
     /// Sum of the approximate section buckets above.
+    #[serde(default)]
     pub total_estimated_tokens: u64,
+    /// Configured prompt/context budget limit when known.
+    #[serde(default)]
+    pub budget_limit: Option<u64>,
+    /// Approximate tokens removed by context compaction before this prompt.
+    #[serde(default)]
+    pub compacted_tokens: u64,
+    /// Approximate tokens removed by context deduplication before this prompt.
+    #[serde(default)]
+    pub deduped_tokens: u64,
+}
+
+/// Origin for a workspace trust record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceTrustSource {
+    /// Loaded from the legacy `trusted_workspaces.json` path list.
+    LegacyJson,
+    /// Loaded from the structured trust JSON record list.
+    #[default]
+    JsonRecord,
+    /// Loaded from the SQLite store mirror.
+    Store,
+    /// Granted by `PHONTON_TRUST_ALL`.
+    EnvOverride,
+}
+
+impl std::fmt::Display for WorkspaceTrustSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::LegacyJson => "legacy-json",
+            Self::JsonRecord => "json-record",
+            Self::Store => "store",
+            Self::EnvOverride => "env-override",
+        };
+        f.write_str(value)
+    }
+}
+
+/// Persistent trust metadata for one workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceTrustRecord {
+    /// Canonical absolute workspace path.
+    pub canonical_path: String,
+    /// Human-readable workspace label.
+    pub display_name: String,
+    /// Unix timestamp when trust was first granted.
+    pub trusted_at: u64,
+    /// Unix timestamp when this workspace was last opened.
+    pub last_seen_at: u64,
+    /// Permission mode active when trust was recorded or last mirrored.
+    pub permission_mode: PermissionMode,
+    /// Where this record came from.
+    pub source: WorkspaceTrustSource,
 }
 
 /// Local execution permission posture for shell, filesystem, and network work.
@@ -1171,4 +1237,47 @@ pub struct OutcomeLedger {
 pub struct MemoryUpdate {
     /// Records that should be written if accepted.
     pub records: Vec<MemoryRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_context_manifest_backfills_new_budget_fields() {
+        let raw = r#"{
+            "system_tokens": 10,
+            "user_goal_tokens": 5,
+            "memory_tokens": 3,
+            "attachment_tokens": 2,
+            "mcp_tool_tokens": 1,
+            "retry_error_tokens": 0,
+            "total_estimated_tokens": 21
+        }"#;
+
+        let manifest: PromptContextManifest = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(manifest.system_tokens, 10);
+        assert_eq!(manifest.code_context_tokens, 0);
+        assert_eq!(manifest.compacted_tokens, 0);
+        assert_eq!(manifest.deduped_tokens, 0);
+        assert_eq!(manifest.budget_limit, None);
+    }
+
+    #[test]
+    fn workspace_trust_record_serializes_permission_mode() {
+        let record = WorkspaceTrustRecord {
+            canonical_path: "/repo/phonton".into(),
+            display_name: "phonton".into(),
+            trusted_at: 1,
+            last_seen_at: 2,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            source: WorkspaceTrustSource::JsonRecord,
+        };
+
+        let value = serde_json::to_value(record).unwrap();
+
+        assert_eq!(value["permission_mode"], "workspace-write");
+        assert_eq!(value["source"], "json-record");
+    }
 }

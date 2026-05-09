@@ -644,6 +644,12 @@ pub struct App {
     pub memory_records: Vec<MemoryRecord>,
     /// Last task-history rows loaded from the persistent store.
     pub history_records: Vec<TaskRecord>,
+    /// In-view history browser filter.
+    pub history_filter: String,
+    /// Selected row within the filtered history browser.
+    pub history_selected: usize,
+    /// Vertical scroll offset for the history browser.
+    pub history_scroll: usize,
     /// Local index/Nexus status shown in the ambient system strip.
     pub nexus_status: NexusStatus,
     /// Path of the SQLite store backing this session.
@@ -698,6 +704,9 @@ impl App {
             flight_log_scroll: None,
             memory_records: Vec::new(),
             history_records: Vec::new(),
+            history_filter: String::new(),
+            history_selected: 0,
+            history_scroll: 0,
             nexus_status: NexusStatus::default(),
             store_path: None,
             pending_mcp_approvals: Vec::new(),
@@ -783,6 +792,16 @@ impl App {
                 self.mode = Mode::Ask;
                 self.ask_answer = Some(self.permissions_command_summary());
                 None
+            }
+            SlashAction::ShowTrust => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.trust_command_summary());
+                None
+            }
+            SlashAction::RevokeCurrentTrust => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some("Trust\nRevoking current workspace trust...".into());
+                Some(Intent::RevokeCurrentTrust)
             }
             SlashAction::SetPermissionMode(mode) => {
                 self.settings.permission_mode = mode;
@@ -870,10 +889,49 @@ impl App {
 
     fn permissions_command_summary(&self) -> String {
         let pending = self.pending_mcp_approvals.len();
+        let workspace_trust = std::env::current_dir()
+            .ok()
+            .and_then(|path| trust::trust_record(&path))
+            .map(|record| {
+                format!(
+                    "{} ({}, last seen {})",
+                    record.display_name, record.source, record.last_seen_at
+                )
+            })
+            .unwrap_or_else(|| "untrusted current workspace".into());
         format!(
-            "Permissions\nmode: {}\nread-only: blocks file writes and approval-gates commands\nask: safe workspace actions run, risky actions require approval\nworkspace-write: allowlisted commands and workspace writes run\nfull-access: non-sensitive actions run without approval\nmcp approvals pending: {pending}\ncommands: /permissions set ask|read-only|workspace-write|full-access",
-            self.settings.permission_mode
+            "Permissions\nmode: {}\nworkspace trust: {}\nread-only: blocks file writes and approval-gates commands\nask: safe workspace actions run, risky actions require approval\nworkspace-write: allowlisted commands and workspace writes run\nfull-access: non-sensitive actions run without approval\nmcp approvals pending: {pending}\ncommands: /permissions set ask|read-only|workspace-write|full-access",
+            self.settings.permission_mode,
+            workspace_trust
         )
+    }
+
+    fn trust_command_summary(&self) -> String {
+        let current = std::env::current_dir()
+            .ok()
+            .and_then(|path| trust::trust_record(&path))
+            .map(|record| {
+                format!(
+                    "current: {} ({})\npath: {}\nmode: {}\ntrusted: {}\nlast seen: {}",
+                    record.display_name,
+                    record.source,
+                    record.canonical_path,
+                    record.permission_mode,
+                    record.trusted_at,
+                    record.last_seen_at
+                )
+            })
+            .unwrap_or_else(|| "current: untrusted".into());
+        let records = trust::list_trust_records();
+        let mut out = format!("Trust\n{current}\n\nknown workspaces: {}", records.len());
+        for record in records.iter().take(8) {
+            out.push_str(&format!(
+                "\n- {}  {}  {}",
+                record.display_name, record.permission_mode, record.source
+            ));
+        }
+        out.push_str("\ncommands: /trust current, /trust list, /trust revoke-current");
+        out
     }
 
     fn context_command_summary(&self) -> String {
@@ -884,14 +942,20 @@ impl App {
             );
         };
         format!(
-            "Context\nlatest prompt total: {}\nsystem: {}\ngoal: {}\nmemory/context: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
+            "Context\nlatest prompt total: {}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo code: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
             m.total_estimated_tokens,
             m.system_tokens,
             m.user_goal_tokens,
             m.memory_tokens,
+            m.code_context_tokens,
             m.attachment_tokens,
             m.mcp_tool_tokens,
             m.retry_error_tokens,
+            m.budget_limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            m.compacted_tokens,
+            m.deduped_tokens,
             self.session_prompt_tokens,
             self.compacted_prompt_tokens
         )
@@ -1036,6 +1100,7 @@ impl App {
             goal_input: self.goal_prompt.display_text().to_string(),
             ask_input: self.ask_prompt.display_text().to_string(),
             ask_answer: self.ask_answer.clone(),
+            prompt_history: bounded_prompt_history(&self.prompt_history, 100),
             best_savings_pct: self.best_savings_pct,
             goals: self
                 .goals
@@ -1072,6 +1137,8 @@ impl App {
         self.goal_prompt = PromptBuffer::from_text(snapshot.goal_input);
         self.ask_prompt = PromptBuffer::from_text(snapshot.ask_input);
         self.ask_answer = snapshot.ask_answer;
+        self.prompt_history = bounded_prompt_history(&snapshot.prompt_history, 100);
+        self.prompt_history_cursor = None;
         self.ask_pending = false;
         self.best_savings_pct = snapshot.best_savings_pct;
         self.new_best_ticks = 0;
@@ -1145,6 +1212,25 @@ fn token_delta_vs_naive(naive_baseline_tokens: u64, tokens_used: u64) -> i64 {
         let over = tokens_used - naive_baseline_tokens;
         -(over.min(i64::MAX as u64) as i64)
     }
+}
+
+fn bounded_prompt_history(history: &[String], max_entries: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let start = history.len().saturating_sub(max_entries.saturating_mul(2));
+    for item in history.iter().skip(start) {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if out.last().is_some_and(|last| last == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_string());
+        if out.len() > max_entries {
+            out.remove(0);
+        }
+    }
+    out
 }
 
 fn char_count(s: &str) -> usize {
@@ -1670,9 +1756,97 @@ impl App {
             Mode::Goal | Mode::Task => self.handle_goal_key(key),
             Mode::Ask => self.handle_ask_key(key),
             Mode::Settings => self.handle_settings_key(key),
-            Mode::Memory | Mode::History => None,
+            Mode::Memory => None,
+            Mode::History => self.handle_history_key(key),
             Mode::CommandPalette => self.handle_palette_key(key),
         }
+    }
+
+    fn handle_history_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Goal;
+            }
+            KeyCode::Char('r') if self.history_filter.is_empty() => {
+                return Some(Intent::OpenHistory);
+            }
+            KeyCode::Up => {
+                self.history_selected = self.history_selected.saturating_sub(1);
+                if self.history_selected < self.history_scroll {
+                    self.history_scroll = self.history_selected;
+                }
+            }
+            KeyCode::Down => {
+                let max = self.filtered_history_indices().len().saturating_sub(1);
+                self.history_selected = (self.history_selected + 1).min(max);
+                if self.history_selected > self.history_scroll.saturating_add(12) {
+                    self.history_scroll = self.history_selected.saturating_sub(12);
+                }
+            }
+            KeyCode::PageUp => {
+                self.history_selected = self.history_selected.saturating_sub(10);
+                self.history_scroll = self.history_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let max = self.filtered_history_indices().len().saturating_sub(1);
+                self.history_selected = (self.history_selected + 10).min(max);
+                self.history_scroll = self.history_scroll.saturating_add(10).min(max);
+            }
+            KeyCode::Home => {
+                self.history_selected = 0;
+                self.history_scroll = 0;
+            }
+            KeyCode::End => {
+                let max = self.filtered_history_indices().len().saturating_sub(1);
+                self.history_selected = max;
+                self.history_scroll = max.saturating_sub(12);
+            }
+            KeyCode::Backspace => {
+                self.history_filter.pop();
+                self.history_selected = 0;
+                self.history_scroll = 0;
+            }
+            KeyCode::Char(c) => {
+                self.history_filter.push(c);
+                self.history_selected = 0;
+                self.history_scroll = 0;
+            }
+            _ => {}
+        }
+        self.clamp_history_selection();
+        None
+    }
+
+    fn filtered_history_indices(&self) -> Vec<usize> {
+        let query = self.history_filter.trim().to_ascii_lowercase();
+        self.history_records
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| {
+                if query.is_empty()
+                    || row.goal_text.to_ascii_lowercase().contains(&query)
+                    || task_status_label(&row.status).contains(&query)
+                    || row.id.to_string().contains(&query)
+                {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn selected_history_record(&self) -> Option<&TaskRecord> {
+        let indices = self.filtered_history_indices();
+        indices
+            .get(self.history_selected.min(indices.len().saturating_sub(1)))
+            .and_then(|idx| self.history_records.get(*idx))
+    }
+
+    fn clamp_history_selection(&mut self) {
+        let max = self.filtered_history_indices().len().saturating_sub(1);
+        self.history_selected = self.history_selected.min(max);
+        self.history_scroll = self.history_scroll.min(max);
     }
 
     fn handle_goal_switcher_key(&mut self, key: KeyEvent) -> Option<Intent> {
@@ -2319,6 +2493,8 @@ pub enum Intent {
     OpenMemory,
     /// Open the history browser and refresh rows from the store.
     OpenHistory,
+    /// Revoke trust for the current workspace.
+    RevokeCurrentTrust,
     /// User accepted the workspace-trust prompt — proceed into the TUI.
     AcceptTrust,
     /// User declined trust. Caller should exit cleanly.
@@ -4215,6 +4391,41 @@ fn render_memory(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(short(&body, 90)),
             ]));
         }
+        if let Some(row) = app.selected_history_record() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Selected",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("id ", Style::default().fg(MUTED)),
+                Span::styled(row.id.to_string(), Style::default().fg(ACCENT_HI)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("goal ", Style::default().fg(MUTED)),
+                Span::styled(
+                    short(&row.goal_text, 120),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("status ", Style::default().fg(MUTED)),
+                Span::styled(
+                    task_status_label(&row.status),
+                    Style::default().fg(ACCENT_HI),
+                ),
+                Span::styled("  tokens ", Style::default().fg(MUTED)),
+                Span::styled(row.total_tokens.to_string(), Style::default().fg(ACCENT_HI)),
+            ]));
+            if let Some(ledger) = &row.outcome_ledger {
+                if let Some(handoff) = &ledger.handoff {
+                    lines.push(Line::from(vec![
+                        Span::styled("receipt ", Style::default().fg(MUTED)),
+                        Span::styled(short(&handoff.headline, 120), Style::default().fg(SUCCESS)),
+                    ]));
+                }
+            }
+        }
     }
 
     frame.render_widget(
@@ -4224,9 +4435,10 @@ fn render_memory(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_history(frame: &mut Frame, area: Rect, app: &App) {
+    let filtered = app.filtered_history_indices();
     let block = Block::default()
         .title(Span::styled(
-            " History ",
+            format!(" History {}/{} ", filtered.len(), app.history_records.len()),
             Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
@@ -4239,13 +4451,41 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_PANEL));
 
     let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("filter: ", Style::default().fg(MUTED)),
+        Span::styled(
+            if app.history_filter.is_empty() {
+                "<none>".into()
+            } else {
+                app.history_filter.clone()
+            },
+            Style::default().fg(ACCENT_HI),
+        ),
+    ]));
+    lines.push(Line::raw(""));
     if app.history_records.is_empty() {
         lines.push(Line::from(Span::styled(
             "No persisted task history yet.",
             Style::default().fg(MUTED),
         )));
+    } else if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No history rows match this filter.",
+            Style::default().fg(MUTED),
+        )));
     } else {
-        for row in app.history_records.iter().take(20) {
+        let visible_count = (area.height.saturating_sub(9) as usize).clamp(6, 20);
+        let start = app.history_scroll.min(filtered.len().saturating_sub(1));
+        for (visible_idx, row_index) in filtered
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(start)
+            .take(visible_count)
+        {
+            let Some(row) = app.history_records.get(row_index) else {
+                continue;
+            };
             let status = task_status_label(&row.status);
             let outcome = row
                 .outcome_ledger
@@ -4260,10 +4500,22 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
                     )
                 })
                 .unwrap_or_default();
+            let selected = visible_idx == app.history_selected;
             lines.push(Line::from(vec![
                 Span::styled(
+                    if selected { "> " } else { "  " },
+                    Style::default().fg(ACCENT_HI),
+                ),
+                Span::styled(
                     format!("{status:<9} "),
-                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                    if selected {
+                        Style::default()
+                            .fg(BG_DEEP)
+                            .bg(ACCENT_HI)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD)
+                    },
                 ),
                 Span::styled(
                     format!("{} tok  ", row.total_tokens),
@@ -5624,7 +5876,7 @@ fn print_help() {
          TUI SLASH COMMANDS:\n  \
          /settings, /config, /status, /context, /compact, /compress,\n  \
          /goals, /switch, /focus <view>, /copy, /rerun, /stats, /stop,\n  \
-         /review, /memory, /permissions set <mode>, /model set <name>,\n  \
+         /review, /memory, /permissions set <mode>, /trust, /model set <name>,\n  \
          /commands, /run <cmd>, and !<cmd>\n\
          \n\
          DEMO:\n  \
@@ -6014,6 +6266,15 @@ async fn main() -> Result<()> {
     // the user's normal terminal stays clean.
     if !trust::prompt_if_needed(&working_dir)? {
         return Ok(());
+    }
+    let trust_source = trust::trust_record(&working_dir)
+        .map(|record| record.source)
+        .unwrap_or(phonton_types::WorkspaceTrustSource::JsonRecord);
+    let _ = trust::record_trust_with_mode(&working_dir, cfg.permissions.mode, trust_source);
+    if let Some(record) = trust::trust_record(&working_dir) {
+        if let Ok(s) = store.lock() {
+            let _ = s.upsert_workspace_trust(&record);
+        }
     }
 
     if launch_options.resume_last_session {
@@ -6668,7 +6929,10 @@ async fn run_app<B: Backend>(
                         },
                         Intent::OpenHistory => match store.lock() {
                             Ok(s) => match s.list_tasks(50).await {
-                                Ok(rows) => app.history_records = rows,
+                                Ok(rows) => {
+                                    app.history_records = rows;
+                                    app.clamp_history_selection();
+                                }
                                 Err(e) => {
                                     app.settings.message = Some(format!("History load failed: {e}"))
                                 }
@@ -6678,6 +6942,22 @@ async fn run_app<B: Backend>(
                                     Some("History load failed: store lock poisoned".into())
                             }
                         },
+                        Intent::RevokeCurrentTrust => {
+                            let revoked = trust::revoke_trust(&working_dir).unwrap_or(false);
+                            if revoked {
+                                if let Ok(s) = store.lock() {
+                                    let workspace = workspace_session_key(&working_dir);
+                                    let _ = s.delete_workspace_trust(&workspace);
+                                }
+                                app.ask_answer = Some(
+                                    "Trust\nCurrent workspace trust revoked. Restart Phonton to re-approve before more work."
+                                        .into(),
+                                );
+                            } else {
+                                app.ask_answer =
+                                    Some("Trust\nCurrent workspace was not trusted.".into());
+                            }
+                        }
                         Intent::AcceptTrust | Intent::DeclineTrust => {
                             // Trust prompt is handled before the TUI loop
                             // starts; if we ever see one in here it is
@@ -7978,9 +8258,13 @@ fn extract_id(line: &str) -> Option<String> {
             user_goal_tokens: 5,
             memory_tokens: 3,
             attachment_tokens: 2,
+            code_context_tokens: 0,
             mcp_tool_tokens: 1,
             retry_error_tokens: 0,
             total_estimated_tokens: 21,
+            budget_limit: Some(120_000),
+            compacted_tokens: 0,
+            deduped_tokens: 0,
         });
         for ch in "/context".chars() {
             app.handle_key(key(ch));
@@ -8186,6 +8470,25 @@ fn extract_id(line: &str) -> Option<String> {
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         assert_eq!(app.goal_prompt.display_text(), "make chess");
+    }
+
+    #[test]
+    fn session_snapshot_carries_bounded_prompt_history() {
+        let app = App {
+            prompt_history: vec![
+                "make chess".into(),
+                "make chess".into(),
+                "fix validation".into(),
+            ],
+            ..App::default()
+        };
+
+        let snapshot = app.to_session_snapshot("C:\\workspace".into(), 123);
+
+        assert_eq!(
+            snapshot.prompt_history,
+            vec!["make chess".to_string(), "fix validation".to_string()]
+        );
     }
 
     #[test]
@@ -8757,6 +9060,7 @@ fn extract_id(line: &str) -> Option<String> {
             goal_input: "draft follow-up".into(),
             ask_input: "summarize state".into(),
             ask_answer: Some("resume support is pending".into()),
+            prompt_history: vec!["ship session resume".into()],
             best_savings_pct: Some(80),
             goals: vec![phonton_types::SessionGoalSnapshot {
                 description: "ship session resume".into(),
@@ -8776,6 +9080,7 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.goal_prompt.display_text(), "draft follow-up");
         assert_eq!(app.ask_prompt.display_text(), "summarize state");
         assert_eq!(app.ask_answer.as_deref(), Some("resume support is pending"));
+        assert_eq!(app.prompt_history, vec!["ship session resume"]);
         assert_eq!(app.best_savings_pct, Some(80));
     }
 

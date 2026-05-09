@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2461,6 +2461,7 @@ name = "phonton-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]
