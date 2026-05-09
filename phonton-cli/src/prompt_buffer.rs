@@ -282,11 +282,7 @@ fn make_image_artifact(text: &str) -> Option<PromptArtifact> {
     if !is_image_path_text(&path) {
         return None;
     }
-    let label = Path::new(&path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or(path.as_str());
+    let label = image_artifact_label(&path);
     let char_count = char_count(&path);
     Some(PromptArtifact {
         kind: PromptArtifactKind::ImagePath,
@@ -319,6 +315,12 @@ fn normalize_dropped_path(text: &str) -> Option<String> {
         trimmed.to_string()
     };
     Some(path)
+}
+
+fn image_artifact_label(path: &str) -> &str {
+    path.rsplit(['\\', '/'])
+        .find(|segment| !segment.trim().is_empty())
+        .unwrap_or(path)
 }
 
 fn is_image_path_text(path: &str) -> bool {
