@@ -4,6 +4,15 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.9.1 - npm Wrapper Cache Hotfix
+
+### Fixed
+
+- Fixed the npm wrapper so cached `npm/vendor` binaries are version-pinned to
+  the installed package and refreshed when stale.
+- Added npm-wrapper coverage for stale vendor metadata, preventing `npx` or
+  cached installs from running an older Phonton binary after a package update.
+
 ## 0.9.0 - Token Budget, History, And Workspace Trust
 
 ### Added
