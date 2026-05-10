@@ -9045,6 +9045,17 @@ fn extract_id(line: &str) -> Option<String> {
     fn failed_goal_defaults_to_problems_focus() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(
+            0,
+            EventRecord {
+                task_id: TaskId::new(),
+                timestamp_ms: 1,
+                event: OrchestratorEvent::Thinking {
+                    subtask_id: SubtaskId::new(),
+                    model_name: "kimi-k2.6".into(),
+                },
+            },
+        );
         app.apply_event(0, verify_fail_event("chess.py"));
         app.apply_state(0, failed_state("syntax verification failed"));
 
@@ -9053,6 +9064,7 @@ fn extract_id(line: &str) -> Option<String> {
             FocusView::Problems
         );
         assert!(app.focus_text().contains("[python syntax] chess.py"));
+        assert!(app.focus_text().contains("Kimi was used"));
     }
 
     #[test]

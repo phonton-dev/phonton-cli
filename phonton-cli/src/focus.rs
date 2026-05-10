@@ -246,6 +246,9 @@ pub(crate) fn problems_focus_text(goal: &GoalEntry, selected_file: usize) -> Str
     if let Some(note) = token_note(goal) {
         out.push_str(&format!("\nTokens\n{note}\n"));
     }
+    if let Some(note) = routing_note(goal) {
+        out.push_str(&format!("\nRouting\n{note}\n"));
+    }
     out.push_str("\nRepair\n- Press r or run /retry to queue a repair with compact diagnostics.\n- Use /why-tokens to inspect retry/context token buckets.\n");
 
     let groups = diff_hunks_by_file(goal);
@@ -468,6 +471,32 @@ fn token_note(goal: &GoalEntry) -> Option<String> {
         note.push_str(&format!("; context target exceeded by {over}"));
     }
     Some(note)
+}
+
+fn routing_note(goal: &GoalEntry) -> Option<String> {
+    let desc = goal.description.to_ascii_lowercase();
+    let broad_generated = desc.contains("chess")
+        || desc.contains("game")
+        || desc.contains("app")
+        || desc.contains("html")
+        || desc.contains("web");
+    if !broad_generated {
+        return None;
+    }
+    let used_kimi = goal.flight_log.iter().any(|record| {
+        matches!(
+            &record.event,
+            OrchestratorEvent::Thinking { model_name, .. }
+                if model_name.to_ascii_lowercase().contains("kimi")
+        )
+    });
+    if used_kimi {
+        Some(
+            "Kimi was used for a broad generated-code task; if quality gates repeat, use a stronger code model or narrow the prompt.".into(),
+        )
+    } else {
+        None
+    }
 }
 
 pub(crate) fn commands_focus_text(runs: &[CommandRunSummary], selected_run: usize) -> String {
