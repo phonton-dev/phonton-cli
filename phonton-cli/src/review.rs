@@ -497,6 +497,7 @@ fn print_text_report(report: &ReviewReport) {
             handoff.diff_stats.removed_lines
         );
         println!("summary: {}", handoff.headline);
+        println!("brief: {}", deterministic_review_summary(handoff));
         if !handoff.known_gaps.is_empty() {
             println!("known gaps:");
             for gap in handoff.known_gaps.iter().take(5) {
@@ -589,6 +590,8 @@ fn format_markdown_report(report: &ReviewReport) -> String {
     writeln!(out, "## Result").ok();
     if let Some(handoff) = &report.handoff {
         writeln!(out, "{}", handoff.headline).ok();
+        writeln!(out).ok();
+        writeln!(out, "{}", deterministic_review_summary(handoff)).ok();
         writeln!(
             out,
             "Changed {} file(s), +{} -{}.",
@@ -728,6 +731,19 @@ fn format_markdown_report(report: &ReviewReport) -> String {
     }
 
     out
+}
+
+fn deterministic_review_summary(handoff: &HandoffPacket) -> String {
+    format!(
+        "Summary: changed {} file(s) (+{} -{}), checks {} pass/{} finding(s), gaps {}, tokens {}.",
+        handoff.diff_stats.files_changed,
+        handoff.diff_stats.added_lines,
+        handoff.diff_stats.removed_lines,
+        handoff.verification.passed.len(),
+        handoff.verification.findings.len(),
+        handoff.known_gaps.len(),
+        handoff.token_usage.budget_tokens()
+    )
 }
 
 fn append_review_item_files(out: &mut String, report: &ReviewReport) {
@@ -1017,6 +1033,9 @@ mod tests {
         let markdown = format_markdown_report(&report);
 
         assert!(markdown.contains("# Phonton Review Receipt"));
+        assert!(markdown.contains(
+            "Summary: changed 1 file(s) (+4 -0), checks 1 pass/0 finding(s), gaps 1, tokens 12."
+        ));
         assert!(markdown.contains("## Changed Files"));
         assert!(markdown.contains("`src/config.rs`"));
         assert!(markdown.contains("## Verification"));

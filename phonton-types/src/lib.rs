@@ -473,6 +473,87 @@ impl From<&CodeSlice> for ContextAttribution {
     }
 }
 
+/// A planned context source category for one provider call.
+///
+/// This is different from [`ContextSource`]: `ContextPlanItem` is built before
+/// the model call and records what Phonton intended to include, omit, or cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextPlanKind {
+    /// The current user goal or subtask.
+    Goal,
+    /// Contract or quality-floor text.
+    Contract,
+    /// Compact file/symbol orientation for the repository.
+    RepoMap,
+    /// Concrete symbol or file slice selected for the worker.
+    CodeSlice,
+    /// Persistent memory selected for this task.
+    Memory,
+    /// User-pasted text, images, or mentioned files.
+    Attachment,
+    /// Compact verifier/provider diagnostics for a repair attempt.
+    RetryDiagnostic,
+    /// MCP/tool instructions or tool result context.
+    Tool,
+}
+
+/// One planned context item, included or omitted, for a provider call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPlanItem {
+    /// Source category.
+    pub kind: ContextPlanKind,
+    /// Stable source id, usually a path, symbol name, or synthetic bucket id.
+    pub id: String,
+    /// Review-safe summary of why this item matters.
+    pub summary: String,
+    /// Estimated token cost for this item.
+    pub estimated_tokens: u64,
+    /// True when the item is included in the provider prompt.
+    pub included: bool,
+    /// Short reason for inclusion or omission.
+    pub reason: String,
+}
+
+/// Bounded context plan for a single worker/provider call.
+///
+/// `PromptContextManifest` records the final token buckets after rendering.
+/// `ContextPlan` records the budget decision that led to those buckets. This
+/// makes token efficiency inspectable instead of relying on hidden heuristics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPlan {
+    /// Hard context limit when known.
+    #[serde(default)]
+    pub budget_limit: Option<u64>,
+    /// Target prompt budget chosen by Phonton's context compiler.
+    #[serde(default)]
+    pub target_tokens: u64,
+    /// Estimated tokens from fixed prompt sections before code context.
+    #[serde(default)]
+    pub fixed_tokens: u64,
+    /// Estimated tokens spent on compact repository map lines.
+    #[serde(default)]
+    pub repo_map_tokens: u64,
+    /// Estimated tokens spent on selected code context.
+    #[serde(default)]
+    pub selected_code_tokens: u64,
+    /// Estimated candidate code tokens intentionally omitted.
+    #[serde(default)]
+    pub omitted_code_tokens: u64,
+    /// Total prompt estimate after the context decision.
+    #[serde(default)]
+    pub estimated_total_tokens: u64,
+    /// True when required context forced the estimate above the selected target.
+    #[serde(default)]
+    pub target_exceeded: bool,
+    /// Estimated tokens above the selected target when [`Self::target_exceeded`] is true.
+    #[serde(default)]
+    pub over_target_tokens: u64,
+    /// Included and omitted context items.
+    #[serde(default)]
+    pub items: Vec<ContextPlanItem>,
+}
+
 /// Provenance of a [`CodeSlice`].
 ///
 /// Recorded so downstream consumers (planner, worker) can reason about
@@ -978,6 +1059,27 @@ pub struct PromptContextManifest {
     /// Tokens attributed to selected repository code context.
     #[serde(default)]
     pub code_context_tokens: u64,
+    /// Tokens attributed to the compact repository map.
+    #[serde(default)]
+    pub repo_map_tokens: u64,
+    /// Candidate code-context tokens intentionally omitted by the compiler.
+    #[serde(default)]
+    pub omitted_code_tokens: u64,
+    /// Target prompt budget selected by the context compiler.
+    #[serde(default)]
+    pub context_target_tokens: u64,
+    /// One-based provider attempt index for this prompt.
+    #[serde(default = "default_prompt_attempt")]
+    pub attempt: u8,
+    /// True when this prompt is a repair/retry attempt.
+    #[serde(default)]
+    pub repair_attempt: bool,
+    /// True when required context forced the prompt estimate above the target.
+    #[serde(default)]
+    pub target_exceeded: bool,
+    /// Estimated tokens above the selected context target.
+    #[serde(default)]
+    pub over_target_tokens: u64,
     /// Tokens attributed to MCP/tool instructions and results.
     #[serde(default)]
     pub mcp_tool_tokens: u64,
@@ -996,6 +1098,10 @@ pub struct PromptContextManifest {
     /// Approximate tokens removed by context deduplication before this prompt.
     #[serde(default)]
     pub deduped_tokens: u64,
+}
+
+fn default_prompt_attempt() -> u8 {
+    1
 }
 
 /// Origin for a workspace trust record.
@@ -1262,6 +1368,10 @@ mod tests {
         assert_eq!(manifest.compacted_tokens, 0);
         assert_eq!(manifest.deduped_tokens, 0);
         assert_eq!(manifest.budget_limit, None);
+        assert_eq!(manifest.attempt, 1);
+        assert!(!manifest.repair_attempt);
+        assert!(!manifest.target_exceeded);
+        assert_eq!(manifest.over_target_tokens, 0);
     }
 
     #[test]

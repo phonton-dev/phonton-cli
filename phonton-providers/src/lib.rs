@@ -872,6 +872,32 @@ emitting a diff that depends on exact symbol shape.
     format!("{banner}\n{base}")
 }
 
+fn max_output_tokens_for_prompt(system: &str, user: &str) -> u64 {
+    let text = format!("{system}\n{user}").to_ascii_lowercase();
+    let repair = text.contains("previous verification failed")
+        || text.contains("verifier")
+        || text.contains("repair");
+    let generated_app = text.contains("playable")
+        || text.contains("game")
+        || text.contains("chess")
+        || text.contains("html")
+        || text.contains("web app")
+        || text.contains("terminal game")
+        || text.contains("full app")
+        || text.contains("create a")
+        || text.contains("build a")
+        || text.contains("make ");
+    if repair && generated_app {
+        3_072
+    } else if repair {
+        1_536
+    } else if generated_app {
+        3_072
+    } else {
+        2_048
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic-routing metrics
 // ---------------------------------------------------------------------------
@@ -1148,13 +1174,10 @@ impl Provider for AnthropicProvider {
         } else {
             json!({ "type": "text", "text": system })
         };
-        // 8192 is the highest `max_tokens` value every current Claude model
-        // accepts (haiku 3.5 caps here; sonnet 4.x/opus go higher). Going
-        // above this would 400 on haiku, going below this throws away
-        // headroom on the bigger models for normal-length completions.
+        let max_tokens = max_output_tokens_for_prompt(&system, user);
         let body = json!({
             "model": self.model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "system": [system_block],
             "messages": [{ "role": "user", "content": anthropic_user_content(user, attachments) }],
         });
@@ -1454,9 +1477,10 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             json!(user)
         };
+        let max_tokens = max_output_tokens_for_prompt(&system, user);
         let mut body = json!({
             "model": self.model,
-            token_key: 4096,
+            token_key: max_tokens,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user_content },
@@ -1712,6 +1736,7 @@ impl Provider for GeminiProvider {
             "generationConfig": {
                 "temperature": 0.1,
                 "topP": 0.95,
+                "maxOutputTokens": max_output_tokens_for_prompt(&system_full, user),
                 "responseMimeType": if is_json { "application/json" } else { "text/plain" },
             }
         });
@@ -1829,6 +1854,9 @@ impl Provider for OllamaProvider {
         let body = json!({
             "model": self.model,
             "stream": false,
+            "options": {
+                "num_predict": max_output_tokens_for_prompt(&system, user),
+            },
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user",   "content": user   },
@@ -1906,6 +1934,29 @@ mod tests {
     fn empty_origins_no_banner() {
         let s = build_system_prompt("base", &[]);
         assert_eq!(s, "base");
+    }
+
+    #[test]
+    fn output_token_ceiling_tracks_prompt_shape() {
+        assert_eq!(
+            max_output_tokens_for_prompt("sys", "repair verifier failure"),
+            1_536
+        );
+        assert_eq!(
+            max_output_tokens_for_prompt("sys", "create a playable game"),
+            3_072
+        );
+        assert_eq!(
+            max_output_tokens_for_prompt(
+                "sys",
+                "make chess in html\nprevious verification failed: missing reset behavior"
+            ),
+            3_072
+        );
+        assert_eq!(
+            max_output_tokens_for_prompt("sys", "rename config field"),
+            2_048
+        );
     }
 
     #[test]

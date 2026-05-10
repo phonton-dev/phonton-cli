@@ -16,15 +16,28 @@ Phonton benchmark claims must be reproducible. This repo should not publish broa
 
 This is useful for checking whether Phonton is producing compact plans and whether the planner's context strategy is moving in the right direction.
 
+`scripts/score-benchmark-runs.ps1` scores end-to-end run folders when they
+exist. The primary score is:
+
+```text
+verified_success_per_10k_tokens = verified_successes / (provider_reported_tokens / 10000)
+```
+
+This is the benchmark direction for v0.11.0 and later: not "fewest tokens"
+alone, and not "looks done", but the least provider-reported tokens per
+verified, reviewable result.
+
 ## What It Does Not Prove Yet
 
 The current harness does not prove end-to-end superiority over Codex, Claude Code, Cursor, or any other tool.
 
 It does not yet measure:
 
-- actual provider billable input/output tokens;
-- cached-token behavior by provider;
-- diff correctness after human review;
+- actual provider billable input/output tokens unless each run writes
+  `token-usage.json`;
+- cached-token behavior by provider unless the provider exposes it;
+- diff correctness after human review unless each run writes
+  `quality-review.json`;
 - time-to-merged-change;
 - quality compared with a competitor on the same task;
 - full autonomous edit success rate.
@@ -55,9 +68,27 @@ Write reports somewhere else:
 .\scripts\benchmark-plan.ps1 -OutDir tmp\benchmarks
 ```
 
+Score completed end-to-end run folders:
+
+```powershell
+.\scripts\score-benchmark-runs.ps1 `
+  -RunsDir benchmarks\runs `
+  -OutJson benchmarks\reports\score.json `
+  -OutMarkdown benchmarks\reports\score.md
+```
+
+Expected per-run files:
+
+```text
+benchmarks/runs/<suite>/<tool>/<task>/<run>/
+  metadata.json        # tool, task_id, status, versions
+  token-usage.json     # total_tokens or input/output token buckets
+  quality-review.json  # verified/success/passed boolean
+```
+
 ## Interpreting Results
 
-The report includes an estimated reduction:
+The plan report includes an estimated reduction:
 
 ```text
 1 - (estimated_total_tokens / naive_baseline_tokens)
@@ -75,6 +106,10 @@ Good release evidence should include:
 - provider/model where live model calls are used;
 - verification command results;
 - failures, not just wins.
+
+The end-to-end score report ranks tools by verified success per 10k tokens.
+A tool that uses fewer tokens but fails verification should score lower than a
+tool that spends more tokens and passes.
 
 ## Public Claim Rules
 

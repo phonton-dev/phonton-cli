@@ -305,12 +305,23 @@ impl EventRecord {
                 subtask_id,
                 manifest,
             } => {
+                let target_note = if manifest.target_exceeded {
+                    format!(" over_target={}", manifest.over_target_tokens)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "prompt {subtask_id}: system={} goal={} memory={} code={} attachments={} mcp={} retry={} compacted={} deduped={} total~{}",
+                    "prompt {subtask_id}: attempt={}{} target={}{} system={} goal={} memory={} map={} code={} omitted={} attachments={} mcp={} retry={} compacted={} deduped={} total~{}",
+                    manifest.attempt,
+                    if manifest.repair_attempt { " repair" } else { "" },
+                    manifest.context_target_tokens,
+                    target_note,
                     manifest.system_tokens,
                     manifest.user_goal_tokens,
                     manifest.memory_tokens,
+                    manifest.repo_map_tokens,
                     manifest.code_context_tokens,
+                    manifest.omitted_code_tokens,
                     manifest.attachment_tokens,
                     manifest.mcp_tool_tokens,
                     manifest.retry_error_tokens,

@@ -52,11 +52,12 @@ impl FocusView {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashAction {
     GoalMode,
     TaskMode,
     AskMode,
+    SubmitAsk(String),
     OpenSettings,
     ToggleLog,
     OpenMemory,
@@ -85,7 +86,7 @@ pub enum SlashAction {
     ManageModel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
@@ -126,8 +127,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/ask",
         aliases: &[],
-        args: "",
-        description: "open the Ask side panel",
+        args: "[question]",
+        description: "open Ask or ask a question directly",
         category: CommandCategory::Loop,
         action: SlashAction::AskMode,
     },
@@ -417,8 +418,16 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
         };
     }
 
+    if head == "/ask" {
+        return if rest.is_empty() {
+            SlashParse::Command(SlashAction::AskMode)
+        } else {
+            SlashParse::Command(SlashAction::SubmitAsk(rest.to_string()))
+        };
+    }
+
     if let Some(spec) = find_command(head) {
-        return SlashParse::Command(spec.action);
+        return SlashParse::Command(spec.action.clone());
     }
 
     SlashParse::Unknown {
@@ -650,6 +659,14 @@ mod tests {
         assert_eq!(
             parse_slash_command("/why-tokens"),
             SlashParse::Command(SlashAction::ShowWhyTokens)
+        );
+        assert_eq!(
+            parse_slash_command("/ask why did verification fail?"),
+            SlashParse::Command(SlashAction::SubmitAsk("why did verification fail?".into()))
+        );
+        assert_eq!(
+            parse_slash_command("/ask"),
+            SlashParse::Command(SlashAction::AskMode)
         );
     }
 
