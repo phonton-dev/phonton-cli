@@ -4,6 +4,28 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.11.0 - Context Engine
+
+### Added
+
+- Added typed `ContextPlan` data so worker prompt context is budgeted and
+  auditable before every provider call.
+- Added a deterministic context compiler in `phonton-context` that keeps
+  ranked repository slices under a target budget and records omitted code
+  tokens.
+- Added benchmark scoring for `verified_success_per_10k_tokens`.
+
+### Changed
+
+- Worker prompts now include compact repo-map orientation plus only the
+  selected context slices.
+- `/context`, `/why-tokens`, and Flight Log prompt manifests now expose
+  context target, repo-map tokens, selected code tokens, and omitted candidate
+  code tokens.
+- Providers now use dynamic output ceilings instead of one large fixed
+  completion limit, reducing runaway generated-code outputs while preserving
+  headroom for broad tasks.
+
 ## 0.10.0 - Verification And Failure QoL
 
 ### Added

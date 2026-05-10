@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use phonton_providers::Provider;
-use phonton_types::{ContextFrame, SliceOrigin};
+use phonton_types::{
+    CodeSlice, ContextFrame, ContextPlan, ContextPlanItem, ContextPlanKind, SliceOrigin,
+};
 use tracing::{debug, warn};
 
 /// Default fraction of the window at which compression fires.
@@ -40,6 +42,13 @@ pub const COMPRESS_MIN: u8 = 1;
 /// Priorities eligible for compression.
 pub const COMPRESS_MAX: u8 = 3;
 
+/// Default target for one worker prompt after context compilation.
+///
+/// This is deliberately far below common model windows. The compiler can
+/// spend more when fixed sections already exceed the target, but the default
+/// posture is "smallest context that can still verify."
+pub const DEFAULT_WORKER_CONTEXT_TARGET_TOKENS: u64 = 3_500;
+
 // ---------------------------------------------------------------------------
 // Token counting
 // ---------------------------------------------------------------------------
@@ -51,6 +60,189 @@ pub const COMPRESS_MAX: u8 = 3;
 pub trait TokenCounter: Send + Sync + 'static {
     /// Estimated token count for `s`.
     fn count(&self, s: &str) -> usize;
+}
+
+// ---------------------------------------------------------------------------
+// Context compiler
+// ---------------------------------------------------------------------------
+
+/// Request for compiling one worker prompt context.
+#[derive(Debug, Clone)]
+pub struct ContextPlanRequest<'a> {
+    /// Current subtask or goal text.
+    pub goal: &'a str,
+    /// Candidate repository slices, already ranked by semantic relevance.
+    pub candidate_slices: &'a [CodeSlice],
+    /// Estimated system-prompt tokens.
+    pub system_tokens: u64,
+    /// Estimated retained memory/context tokens.
+    pub memory_tokens: u64,
+    /// Estimated attachment/artifact tokens.
+    pub attachment_tokens: u64,
+    /// Estimated retry-diagnostic tokens.
+    pub retry_error_tokens: u64,
+    /// Estimated MCP/tool tokens.
+    pub mcp_tool_tokens: u64,
+    /// Hard provider/model context limit when known.
+    pub budget_limit: Option<u64>,
+    /// Desired prompt target. Defaults to
+    /// [`DEFAULT_WORKER_CONTEXT_TARGET_TOKENS`].
+    pub target_tokens: Option<u64>,
+}
+
+/// Result of context compilation: a typed plan plus the selected slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledContextPlan {
+    /// Auditable token/context decision.
+    pub plan: ContextPlan,
+    /// Candidate slices allowed into the provider prompt.
+    pub selected_slices: Vec<CodeSlice>,
+}
+
+/// Deterministic context budgeter for worker prompts.
+///
+/// It does not call a model. It turns ranked candidate slices into a bounded
+/// worker packet and records every inclusion/omission as a [`ContextPlan`].
+pub struct ContextCompiler {
+    counter: Arc<dyn TokenCounter>,
+}
+
+impl ContextCompiler {
+    /// Build a compiler using the cheap character heuristic.
+    pub fn new() -> Self {
+        Self {
+            counter: Arc::new(CharHeuristic),
+        }
+    }
+
+    /// Build a compiler with a caller-provided tokenizer.
+    pub fn with_counter(counter: Arc<dyn TokenCounter>) -> Self {
+        Self { counter }
+    }
+
+    /// Compile one prompt context plan from ranked candidates.
+    pub fn compile(&self, request: ContextPlanRequest<'_>) -> CompiledContextPlan {
+        let target = request
+            .target_tokens
+            .unwrap_or(DEFAULT_WORKER_CONTEXT_TARGET_TOKENS)
+            .min(request.budget_limit.unwrap_or(u64::MAX))
+            .max(512);
+        let goal_tokens = self.count(request.goal);
+        let fixed_tokens = request
+            .system_tokens
+            .saturating_add(goal_tokens)
+            .saturating_add(request.memory_tokens)
+            .saturating_add(request.attachment_tokens)
+            .saturating_add(request.retry_error_tokens)
+            .saturating_add(request.mcp_tool_tokens);
+
+        let repo_map_items = self.repo_map_items(request.candidate_slices, 12);
+        let repo_map_tokens = repo_map_items
+            .iter()
+            .filter(|item| item.included)
+            .map(|item| item.estimated_tokens)
+            .sum::<u64>();
+        let mut remaining = target.saturating_sub(fixed_tokens.saturating_add(repo_map_tokens));
+
+        let mut selected_slices = Vec::new();
+        let mut selected_code_tokens = 0u64;
+        let mut omitted_code_tokens = 0u64;
+        let mut items = Vec::new();
+        items.push(ContextPlanItem {
+            kind: ContextPlanKind::Goal,
+            id: "goal".into(),
+            summary: truncate_for_summary(request.goal, 120),
+            estimated_tokens: goal_tokens,
+            included: true,
+            reason: "current task is always included".into(),
+        });
+        items.extend(repo_map_items);
+
+        for slice in request.candidate_slices {
+            let estimated = self.slice_tokens(slice);
+            let id = format!("{}#{}", slice.file_path.display(), slice.symbol_name);
+            let summary = format!("{} {}", slice.symbol_name, slice.signature);
+            if estimated <= remaining || selected_slices.is_empty() {
+                remaining = remaining.saturating_sub(estimated);
+                selected_code_tokens = selected_code_tokens.saturating_add(estimated);
+                selected_slices.push(slice.clone());
+                items.push(ContextPlanItem {
+                    kind: ContextPlanKind::CodeSlice,
+                    id,
+                    summary: truncate_for_summary(&summary, 180),
+                    estimated_tokens: estimated,
+                    included: true,
+                    reason: "ranked relevant slice fits the context budget".into(),
+                });
+            } else {
+                omitted_code_tokens = omitted_code_tokens.saturating_add(estimated);
+                items.push(ContextPlanItem {
+                    kind: ContextPlanKind::CodeSlice,
+                    id,
+                    summary: truncate_for_summary(&summary, 180),
+                    estimated_tokens: estimated,
+                    included: false,
+                    reason: "omitted to stay within the worker context target".into(),
+                });
+            }
+        }
+
+        let estimated_total_tokens = fixed_tokens
+            .saturating_add(repo_map_tokens)
+            .saturating_add(selected_code_tokens);
+
+        CompiledContextPlan {
+            plan: ContextPlan {
+                budget_limit: request.budget_limit,
+                target_tokens: target,
+                fixed_tokens,
+                repo_map_tokens,
+                selected_code_tokens,
+                omitted_code_tokens,
+                estimated_total_tokens,
+                items,
+            },
+            selected_slices,
+        }
+    }
+
+    fn repo_map_items(&self, slices: &[CodeSlice], max_items: usize) -> Vec<ContextPlanItem> {
+        slices
+            .iter()
+            .take(max_items)
+            .map(|slice| {
+                let summary = format!("{}: {}", slice.file_path.display(), slice.symbol_name);
+                ContextPlanItem {
+                    kind: ContextPlanKind::RepoMap,
+                    id: slice.file_path.display().to_string(),
+                    estimated_tokens: self.count(&summary),
+                    summary,
+                    included: true,
+                    reason: "compact orientation for ranked candidate context".into(),
+                }
+            })
+            .collect()
+    }
+
+    fn slice_tokens(&self, slice: &CodeSlice) -> u64 {
+        let fallback = self.count(&format!(
+            "{} {} {}",
+            slice.file_path.display(),
+            slice.symbol_name,
+            slice.signature
+        ));
+        (slice.token_count as u64).max(fallback).max(1)
+    }
+
+    fn count(&self, text: &str) -> u64 {
+        self.counter.count(text) as u64
+    }
+}
+
+impl Default for ContextCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Four-chars-per-token heuristic. Cheap, provider-agnostic, and good
@@ -295,6 +487,15 @@ fn frame_content(f: &ContextFrame) -> &str {
     }
 }
 
+fn truncate_for_summary(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -302,9 +503,11 @@ fn frame_content(f: &ContextFrame) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
     use async_trait::async_trait;
     use phonton_types::{LLMResponse, ProviderKind};
-    use std::sync::Mutex;
 
     /// Test provider: returns a fixed summary and records every call.
     #[derive(Clone)]
@@ -521,5 +724,74 @@ mod tests {
         assert!(c.count("hello world") > 0);
         // And a much longer string must cost more.
         assert!(c.count(&"hello world ".repeat(50)) > c.count("hello world"));
+    }
+
+    #[test]
+    fn context_compiler_keeps_ranked_slices_under_budget() {
+        let slices = vec![
+            code_slice("src/a.rs", "alpha", 100),
+            code_slice("src/b.rs", "beta", 900),
+            code_slice("src/c.rs", "gamma", 100),
+        ];
+        let compiled = ContextCompiler::default().compile(ContextPlanRequest {
+            goal: "change alpha",
+            candidate_slices: &slices,
+            system_tokens: 100,
+            memory_tokens: 0,
+            attachment_tokens: 0,
+            retry_error_tokens: 0,
+            mcp_tool_tokens: 0,
+            budget_limit: Some(450),
+            target_tokens: Some(450),
+        });
+
+        assert_eq!(compiled.selected_slices.len(), 2);
+        assert!(compiled
+            .selected_slices
+            .iter()
+            .any(|slice| slice.symbol_name == "alpha"));
+        assert!(compiled.plan.omitted_code_tokens > 0);
+        assert!(compiled.plan.estimated_total_tokens <= compiled.plan.target_tokens);
+        assert!(compiled
+            .plan
+            .items
+            .iter()
+            .any(|item| item.kind == ContextPlanKind::RepoMap && item.included));
+        assert!(compiled
+            .plan
+            .items
+            .iter()
+            .any(|item| item.kind == ContextPlanKind::CodeSlice && !item.included));
+    }
+
+    #[test]
+    fn context_compiler_selects_at_least_one_slice_when_fixed_budget_is_full() {
+        let slices = vec![code_slice("src/large.rs", "large", 700)];
+        let compiled = ContextCompiler::default().compile(ContextPlanRequest {
+            goal: "fix large",
+            candidate_slices: &slices,
+            system_tokens: 900,
+            memory_tokens: 0,
+            attachment_tokens: 0,
+            retry_error_tokens: 0,
+            mcp_tool_tokens: 0,
+            budget_limit: Some(1_000),
+            target_tokens: Some(1_000),
+        });
+
+        assert_eq!(compiled.selected_slices.len(), 1);
+        assert!(compiled.plan.estimated_total_tokens > compiled.plan.target_tokens);
+    }
+
+    fn code_slice(path: &str, symbol: &str, token_count: usize) -> CodeSlice {
+        CodeSlice {
+            file_path: PathBuf::from(path),
+            symbol_name: symbol.into(),
+            signature: format!("fn {symbol}()"),
+            docstring: None,
+            callsites: Vec::new(),
+            token_count,
+            origin: SliceOrigin::Semantic,
+        }
     }
 }

@@ -306,11 +306,14 @@ impl EventRecord {
                 manifest,
             } => {
                 format!(
-                    "prompt {subtask_id}: system={} goal={} memory={} code={} attachments={} mcp={} retry={} compacted={} deduped={} total~{}",
+                    "prompt {subtask_id}: target={} system={} goal={} memory={} map={} code={} omitted={} attachments={} mcp={} retry={} compacted={} deduped={} total~{}",
+                    manifest.context_target_tokens,
                     manifest.system_tokens,
                     manifest.user_goal_tokens,
                     manifest.memory_tokens,
+                    manifest.repo_map_tokens,
                     manifest.code_context_tokens,
+                    manifest.omitted_code_tokens,
                     manifest.attachment_tokens,
                     manifest.mcp_tool_tokens,
                     manifest.retry_error_tokens,

@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.10.0</h1>
+<h1 align="center">Phonton CLI · v0.11.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.10.0-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.11.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -73,6 +73,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - Static syntax verification now covers Rust, Python, JavaScript, TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before review-ready status. Generated code that cannot parse stays failed/unverified instead of becoming a receipt.
 - Failed goals default to a Problems focus view with grouped verifier/provider/quality diagnostics, compact repair hints, and `p` / `r` keyboard shortcuts for inspection and repair.
 - `/why-tokens` explains the latest prompt manifest in plain language, including system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, and dedupe buckets.
+- v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, and exposes omitted code tokens so token waste is visible before it becomes benchmark noise.
 - Faster multi-goal navigation: the sidebar shows stable goal indexes, `Alt+Up` / `Alt+Down` switches goals even while drafting text, `Alt+1` through `Alt+9` jumps directly, and `/goals` opens a searchable switcher.
 - Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Problems, Code, Commands, and Log tabs in the Active panel plus `p` / `r` / `f` / `[` / `]` keyboard navigation.
 - Command run receipts stay collapsed by default; the Commands focus view shows status, exit code, duration, and short stdout/stderr previews. `/rerun` repeats the latest command through the same sandbox path and `/copy` copies the current focus view to the Windows clipboard.
@@ -138,7 +139,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.10.0 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.11.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -154,7 +155,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.10.0 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.11.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |

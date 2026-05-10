@@ -29,15 +29,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use phonton_context::{ContextManager, TiktokenCounter};
+use phonton_context::{ContextCompiler, ContextManager, ContextPlanRequest, TiktokenCounter};
 use phonton_mcp::{McpCallResult, McpRuntime, McpTool};
 use phonton_providers::Provider;
 use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
-    CodeSlice, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord, ModelTier, Permission,
-    PromptContextManifest, SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
-    TokenUsage, VerifyLayer, VerifyResult,
+    CodeSlice, ContextFrame, ContextPlan, ContextPlanKind, DiffHunk, DiffLine, ExtensionId,
+    MemoryRecord, ModelTier, Permission, PromptContextManifest, SliceOrigin, Subtask, SubtaskId,
+    SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer, VerifyResult,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -260,7 +260,6 @@ impl Worker {
             None => Vec::new(),
         };
         let repo_context = dedupe_code_slices(&context_slices, &relevant_slices);
-        let origins: Vec<SliceOrigin> = repo_context.slices.iter().map(|s| s.origin).collect();
 
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
@@ -269,16 +268,10 @@ impl Worker {
         let mut last_model_name = String::new();
         let mut mcp_results: Vec<McpResultContext> = Vec::new();
         let mut mcp_calls = 0usize;
+        let context_compiler = ContextCompiler::default();
 
         for attempt in 1..=MAX_ATTEMPTS {
             let system_prompt = system_prompt_for_attempt(&last_errors, self.mcp.is_some());
-            let user_prompt = render_user_prompt(
-                &subtask,
-                &repo_context.slices,
-                &last_errors,
-                self.mcp.as_deref(),
-                &mcp_results,
-            );
 
             if let Some(tx) = &self.msg_tx {
                 let _ = tx.try_send(
@@ -293,7 +286,7 @@ impl Worker {
             // user prompt into the manager until we get a successful
             // response, to avoid polluting the history with failed attempts
             // that will be superseded by the error-retry prompt.
-            let (rendered_context, full_prompt, compacted_tokens, budget_limit) = {
+            let (rendered_context, compacted_tokens, budget_limit) = {
                 let mut ctx = self.context.lock().await;
                 let budget_limit = Some(ctx.limit_tokens() as u64);
                 let before_tokens = ctx.total_tokens();
@@ -310,20 +303,52 @@ impl Worker {
                     0
                 };
                 let rendered_context = ctx.render();
-                let full_prompt = render_full_prompt(&rendered_context, &user_prompt);
-                (
-                    rendered_context,
-                    full_prompt,
-                    compacted_tokens,
-                    budget_limit,
-                )
+                (rendered_context, compacted_tokens, budget_limit)
             };
+            let fixed_tokens = PromptFixedTokens {
+                system: estimate_prompt_tokens(&system_prompt),
+                memory: estimate_prompt_tokens(&rendered_context),
+                attachments: estimate_prompt_tokens(&phonton_types::render_prompt_attachments(
+                    &subtask.attachments,
+                )),
+                retry: estimate_prompt_tokens(&last_errors.join("\n")),
+                mcp: estimate_prompt_tokens(&render_mcp_budget_text(
+                    self.mcp.as_deref(),
+                    &mcp_results,
+                )),
+            };
+            let compiled_context = context_compiler.compile(ContextPlanRequest {
+                goal: &subtask.description,
+                candidate_slices: &repo_context.slices,
+                system_tokens: fixed_tokens.system,
+                memory_tokens: fixed_tokens.memory,
+                attachment_tokens: fixed_tokens.attachments,
+                retry_error_tokens: fixed_tokens.retry,
+                mcp_tool_tokens: fixed_tokens.mcp,
+                budget_limit,
+                target_tokens: Some(dynamic_worker_context_target(&subtask, &last_errors)),
+            });
+            let user_prompt = render_user_prompt(
+                &subtask,
+                &compiled_context.selected_slices,
+                Some(&compiled_context.plan),
+                &last_errors,
+                self.mcp.as_deref(),
+                &mcp_results,
+            );
+            let full_prompt = render_full_prompt(&rendered_context, &user_prompt);
+            let origins: Vec<SliceOrigin> = compiled_context
+                .selected_slices
+                .iter()
+                .map(|s| s.origin)
+                .collect();
             if let Some(tx) = &self.msg_tx {
                 let manifest = prompt_context_manifest(PromptManifestInput {
                     system_prompt: &system_prompt,
                     subtask: &subtask,
                     rendered_context: &rendered_context,
-                    repo_context: &repo_context.slices,
+                    repo_context: &compiled_context.selected_slices,
+                    context_plan: Some(&compiled_context.plan),
                     prior_errors: last_errors.as_slice(),
                     mcp_results: mcp_results.as_slice(),
                     mcp: self.mcp.as_deref(),
@@ -874,6 +899,15 @@ struct DedupeCodeContext {
     deduped_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PromptFixedTokens {
+    system: u64,
+    memory: u64,
+    attachments: u64,
+    retry: u64,
+    mcp: u64,
+}
+
 fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeCodeContext {
     let mut seen = HashSet::new();
     let mut slices = Vec::with_capacity(primary.len().saturating_add(secondary.len()));
@@ -895,6 +929,29 @@ fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeC
     DedupeCodeContext {
         slices,
         deduped_tokens,
+    }
+}
+
+fn dynamic_worker_context_target(subtask: &Subtask, prior_errors: &[String]) -> u64 {
+    let desc = subtask.description.to_ascii_lowercase();
+    let broad_generated_goal = [
+        "make ",
+        "create ",
+        "build ",
+        "implement ",
+        "generate ",
+        "playable",
+        "game",
+        "app",
+    ]
+    .iter()
+    .any(|needle| desc.contains(needle));
+    let repair_attempt = !prior_errors.is_empty();
+
+    match (broad_generated_goal, repair_attempt) {
+        (_, true) => 1_800,
+        (true, false) => 2_800,
+        (false, false) => 2_200,
     }
 }
 
@@ -926,6 +983,11 @@ fn render_system_prompt(include_diff_example: bool, mcp_enabled: bool) -> String
          No prose, no markdown fences, no commentary, no explanations.\n\
          Start with `--- a/` or `--- /dev/null`; output empty text only when there is nothing to change.\n",
     );
+    out.push_str(
+        "Minimize tokens: produce the smallest runnable diff that satisfies the acceptance criteria. \
+         Avoid decorative comments, large rewrites, duplicated helpers, and unrelated files. \
+         For generated examples, prefer concise implementations over exhaustive frameworks.\n",
+    );
     if mcp_enabled {
         out.push_str(
             "If the user prompt lists MCP servers, you may output exactly one MCP_TOOL_CALL JSON marker instead of a diff. After MCP results are provided, return to unified-diff output.\n",
@@ -947,6 +1009,7 @@ fn render_system_prompt(include_diff_example: bool, mcp_enabled: bool) -> String
 fn render_user_prompt(
     subtask: &Subtask,
     repo_context: &[CodeSlice],
+    context_plan: Option<&ContextPlan>,
     prior_errors: &[String],
     mcp: Option<&McpRuntime>,
     mcp_results: &[McpResultContext],
@@ -959,6 +1022,27 @@ fn render_user_prompt(
     }
     out.push_str("# Subtask\n");
     out.push_str(&subtask.description);
+    if let Some(plan) = context_plan {
+        let repo_map: Vec<&str> = plan
+            .items
+            .iter()
+            .filter(|item| item.included && item.kind == ContextPlanKind::RepoMap)
+            .map(|item| item.summary.as_str())
+            .collect();
+        if !repo_map.is_empty() {
+            out.push_str("\n\n# Repo map (compact)");
+            for item in repo_map.iter().take(12) {
+                out.push_str("\n- ");
+                out.push_str(item);
+            }
+        }
+        if plan.omitted_code_tokens > 0 {
+            out.push_str(&format!(
+                "\n\n# Context budget\nOmitted ~{} candidate code token(s); use the selected context and keep the diff minimal.",
+                plan.omitted_code_tokens
+            ));
+        }
+    }
     if !repo_context.is_empty() {
         out.push_str("\n\n# Repo context\n");
         for s in repo_context {
@@ -1043,6 +1127,7 @@ struct PromptManifestInput<'a> {
     subtask: &'a Subtask,
     rendered_context: &'a str,
     repo_context: &'a [CodeSlice],
+    context_plan: Option<&'a ContextPlan>,
     prior_errors: &'a [String],
     mcp_results: &'a [McpResultContext],
     mcp: Option<&'a McpRuntime>,
@@ -1057,6 +1142,7 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
         subtask,
         rendered_context,
         repo_context,
+        context_plan,
         prior_errors,
         mcp_results,
         mcp,
@@ -1070,33 +1156,29 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
     let attachment_tokens = estimate_prompt_tokens(&phonton_types::render_prompt_attachments(
         &subtask.attachments,
     ));
-    let code_context_tokens = repo_context
-        .iter()
-        .map(|slice| slice.token_count as u64)
-        .sum();
+    let repo_map_tokens = context_plan.map(|plan| plan.repo_map_tokens).unwrap_or(0);
+    let code_context_tokens = context_plan
+        .map(|plan| plan.selected_code_tokens)
+        .unwrap_or_else(|| {
+            repo_context
+                .iter()
+                .map(|slice| slice.token_count as u64)
+                .sum()
+        });
+    let omitted_code_tokens = context_plan
+        .map(|plan| plan.omitted_code_tokens)
+        .unwrap_or(0);
+    let context_target_tokens = context_plan
+        .map(|plan| plan.target_tokens)
+        .unwrap_or_default();
     let retry_error_tokens = estimate_prompt_tokens(&prior_errors.join("\n"));
-    let mut mcp_text = String::new();
-    if let Some(runtime) = mcp {
-        for server in runtime.servers() {
-            mcp_text.push_str(server.id.as_str());
-            mcp_text.push(' ');
-            mcp_text.push_str(&server.name);
-            mcp_text.push('\n');
-        }
-    }
-    for result in mcp_results {
-        mcp_text.push_str(&result.server_id.to_string());
-        mcp_text.push(' ');
-        mcp_text.push_str(&result.tool_name);
-        mcp_text.push(' ');
-        mcp_text.push_str(&result.content);
-        mcp_text.push('\n');
-    }
+    let mcp_text = render_mcp_budget_text(mcp, mcp_results);
     let mcp_tool_tokens = estimate_prompt_tokens(&mcp_text);
     let total_estimated_tokens = system_tokens
         .saturating_add(user_goal_tokens)
         .saturating_add(memory_tokens)
         .saturating_add(attachment_tokens)
+        .saturating_add(repo_map_tokens)
         .saturating_add(code_context_tokens)
         .saturating_add(mcp_tool_tokens)
         .saturating_add(retry_error_tokens);
@@ -1107,6 +1189,9 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
         memory_tokens,
         attachment_tokens,
         code_context_tokens,
+        repo_map_tokens,
+        omitted_code_tokens,
+        context_target_tokens,
         mcp_tool_tokens,
         retry_error_tokens,
         total_estimated_tokens,
@@ -1121,6 +1206,27 @@ fn estimate_prompt_tokens(text: &str) -> u64 {
         return 0;
     }
     ((text.chars().count() as u64).saturating_add(3)) / 4
+}
+
+fn render_mcp_budget_text(mcp: Option<&McpRuntime>, mcp_results: &[McpResultContext]) -> String {
+    let mut text = String::new();
+    if let Some(runtime) = mcp {
+        for server in runtime.servers() {
+            text.push_str(server.id.as_str());
+            text.push(' ');
+            text.push_str(&server.name);
+            text.push('\n');
+        }
+    }
+    for result in mcp_results {
+        text.push_str(&result.server_id.to_string());
+        text.push(' ');
+        text.push_str(&result.tool_name);
+        text.push(' ');
+        text.push_str(&result.content);
+        text.push('\n');
+    }
+    text
 }
 
 fn compact_verify_retry_errors(layer: VerifyLayer, errors: &[String]) -> Vec<String> {
@@ -1725,6 +1831,7 @@ mod tests {
             subtask: &subtask,
             rendered_context: "prior decision context",
             repo_context: &[],
+            context_plan: None,
             prior_errors: &errors,
             mcp_results: &[],
             mcp: None,
@@ -1743,6 +1850,7 @@ mod tests {
                 .saturating_add(manifest.user_goal_tokens)
                 .saturating_add(manifest.memory_tokens)
                 .saturating_add(manifest.attachment_tokens)
+                .saturating_add(manifest.repo_map_tokens)
                 .saturating_add(manifest.code_context_tokens)
                 .saturating_add(manifest.mcp_tool_tokens)
                 .saturating_add(manifest.retry_error_tokens)
@@ -1894,7 +2002,7 @@ mod tests {
             success: true,
             content: "- read_file".into(),
         }];
-        let prompt = render_user_prompt(&subtask, &[], &[], Some(&runtime), &results);
+        let prompt = render_user_prompt(&subtask, &[], None, &[], Some(&runtime), &results);
         assert!(prompt.contains("# MCP servers"));
         assert!(prompt.contains("docs (Docs)"));
         assert!(prompt.contains("# MCP results"));

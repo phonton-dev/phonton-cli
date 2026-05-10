@@ -961,12 +961,19 @@ impl App {
             );
         };
         format!(
-            "Context\nlatest prompt total: {}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo code: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
+            "Context\nlatest prompt total: {}\ncontext target: {}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo map: {}\nrepo code: {}\nomitted code: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
             m.total_estimated_tokens,
+            if m.context_target_tokens == 0 {
+                "unknown".into()
+            } else {
+                m.context_target_tokens.to_string()
+            },
             m.system_tokens,
             m.user_goal_tokens,
             m.memory_tokens,
+            m.repo_map_tokens,
             m.code_context_tokens,
+            m.omitted_code_tokens,
             m.attachment_tokens,
             m.mcp_tool_tokens,
             m.retry_error_tokens,
@@ -990,13 +997,20 @@ impl App {
             .map(|goal| goal.description.as_str())
             .unwrap_or("none");
         format!(
-            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- code: {} selected repository context tokens\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\nprovider-reported completion tokens remain the billing source of truth.",
+            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\ncontext target: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- repo map: {} compact orientation tokens\n- code: {} selected repository context tokens\n- omitted code: {} candidate tokens skipped by the context compiler\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\nprovider-reported completion tokens remain the billing source of truth.",
             active_goal,
             m.total_estimated_tokens,
+            if m.context_target_tokens == 0 {
+                "unknown".into()
+            } else {
+                m.context_target_tokens.to_string()
+            },
             m.system_tokens,
             m.user_goal_tokens,
             m.memory_tokens,
+            m.repo_map_tokens,
             m.code_context_tokens,
+            m.omitted_code_tokens,
             m.attachment_tokens,
             m.mcp_tool_tokens,
             m.retry_error_tokens,
@@ -8142,6 +8156,9 @@ fn extract_id(line: &str) -> Option<String> {
             memory_tokens: 3,
             attachment_tokens: 2,
             code_context_tokens: 0,
+            repo_map_tokens: 0,
+            omitted_code_tokens: 0,
+            context_target_tokens: 3_500,
             mcp_tool_tokens: 1,
             retry_error_tokens: 0,
             total_estimated_tokens: 21,
