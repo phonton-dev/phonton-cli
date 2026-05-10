@@ -69,11 +69,12 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 ## What Works Today
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
-- Unified slash commands in the TUI: `/settings`, `/config`, `/status`, `/context`, `/compact`, `/compress`, `/problems`, `/diagnostics`, `/retry`, `/repair`, `/why-tokens`, `/goals`, `/switch`, `/focus`, `/copy`, `/rerun`, `/stats`, `/stop`, `/review`, `/memory`, `/permissions`, `/trust`, `/model`, `/commands`, `/run`, and `!` all route through the same command registry and prompt drawer.
+- Unified slash commands in the TUI: `/settings`, `/config`, `/status`, `/context`, `/compact`, `/compress`, `/problems`, `/diagnostics`, `/retry`, `/repair`, `/why-tokens`, `/ask`, `/goals`, `/switch`, `/focus`, `/copy`, `/rerun`, `/stats`, `/stop`, `/review`, `/memory`, `/permissions`, `/trust`, `/model`, `/commands`, `/run`, and `!` all route through the same command registry and prompt drawer.
 - Static syntax verification now covers Rust, Python, JavaScript, TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before review-ready status. Generated code that cannot parse stays failed/unverified instead of becoming a receipt.
 - Failed goals default to a Problems focus view with grouped verifier/provider/quality diagnostics, compact repair hints, and `p` / `r` keyboard shortcuts for inspection and repair.
-- `/why-tokens` explains the latest prompt manifest in plain language, including system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, and dedupe buckets.
-- v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, and exposes omitted code tokens so token waste is visible before it becomes benchmark noise.
+- `/why-tokens` explains the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, and dedupe buckets.
+- v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
+- Ask mode supports `/ask <question>`, scrollable answers, and lightweight markdown-style rendering without mixing Ask into goal memory.
 - Faster multi-goal navigation: the sidebar shows stable goal indexes, `Alt+Up` / `Alt+Down` switches goals even while drafting text, `Alt+1` through `Alt+9` jumps directly, and `/goals` opens a searchable switcher.
 - Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Problems, Code, Commands, and Log tabs in the Active panel plus `p` / `r` / `f` / `[` / `]` keyboard navigation.
 - Command run receipts stay collapsed by default; the Commands focus view shows status, exit code, duration, and short stdout/stderr previews. `/rerun` repeats the latest command through the same sandbox path and `/copy` copies the current focus view to the Windows clipboard.
@@ -258,6 +259,7 @@ Inside the TUI prompt bar:
 /settings, /config      Open provider/model/budget settings
 /status                 Show version, provider, model, workspace, and token state
 /review                 Show review receipt guidance for the selected goal
+/ask <question>         Ask a stateless question without queueing a goal
 /memory                 Inspect local decision memory
 /permissions            Show sandbox, trust, and approval status
 /trust                  Show or revoke workspace trust records
@@ -268,7 +270,7 @@ Inside the TUI prompt bar:
 Ctrl+V                  Paste from the Windows clipboard
 Ctrl+U / Ctrl+K         Clear before / after cursor
 PgUp / PgDn             Scroll the Active receipt/code surface
-Mouse wheel             Scroll the visible Active or Flight Log surface
+Mouse wheel             Scroll the visible Active, Ask, or Flight Log surface
 Tab                     Complete slash commands
 ```
 

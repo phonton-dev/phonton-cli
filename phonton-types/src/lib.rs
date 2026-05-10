@@ -543,6 +543,12 @@ pub struct ContextPlan {
     /// Total prompt estimate after the context decision.
     #[serde(default)]
     pub estimated_total_tokens: u64,
+    /// True when required context forced the estimate above the selected target.
+    #[serde(default)]
+    pub target_exceeded: bool,
+    /// Estimated tokens above the selected target when [`Self::target_exceeded`] is true.
+    #[serde(default)]
+    pub over_target_tokens: u64,
     /// Included and omitted context items.
     #[serde(default)]
     pub items: Vec<ContextPlanItem>,
@@ -1062,6 +1068,18 @@ pub struct PromptContextManifest {
     /// Target prompt budget selected by the context compiler.
     #[serde(default)]
     pub context_target_tokens: u64,
+    /// One-based provider attempt index for this prompt.
+    #[serde(default = "default_prompt_attempt")]
+    pub attempt: u8,
+    /// True when this prompt is a repair/retry attempt.
+    #[serde(default)]
+    pub repair_attempt: bool,
+    /// True when required context forced the prompt estimate above the target.
+    #[serde(default)]
+    pub target_exceeded: bool,
+    /// Estimated tokens above the selected context target.
+    #[serde(default)]
+    pub over_target_tokens: u64,
     /// Tokens attributed to MCP/tool instructions and results.
     #[serde(default)]
     pub mcp_tool_tokens: u64,
@@ -1080,6 +1098,10 @@ pub struct PromptContextManifest {
     /// Approximate tokens removed by context deduplication before this prompt.
     #[serde(default)]
     pub deduped_tokens: u64,
+}
+
+fn default_prompt_attempt() -> u8 {
+    1
 }
 
 /// Origin for a workspace trust record.
@@ -1346,6 +1368,10 @@ mod tests {
         assert_eq!(manifest.compacted_tokens, 0);
         assert_eq!(manifest.deduped_tokens, 0);
         assert_eq!(manifest.budget_limit, None);
+        assert_eq!(manifest.attempt, 1);
+        assert!(!manifest.repair_attempt);
+        assert!(!manifest.target_exceeded);
+        assert_eq!(manifest.over_target_tokens, 0);
     }
 
     #[test]

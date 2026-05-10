@@ -608,6 +608,8 @@ pub struct App {
     pub ask_prompt: PromptBuffer,
     /// Most recent ask-mode answer, for display in the side panel.
     pub ask_answer: Option<String>,
+    /// Vertical scroll offset for the Ask answer panel.
+    pub ask_scroll: usize,
     /// True while an ask-mode provider call is in flight; drives the
     /// thinking spinner in the Ask panel.
     pub ask_pending: bool,
@@ -692,6 +694,7 @@ impl App {
             goal_prompt: PromptBuffer::new(),
             ask_prompt: PromptBuffer::new(),
             ask_answer: None,
+            ask_scroll: 0,
             ask_pending: false,
             should_quit: false,
             quit_confirmation_open: false,
@@ -754,7 +757,16 @@ impl App {
             }
             SlashAction::AskMode => {
                 self.mode = Mode::Ask;
+                self.ask_scroll = 0;
                 None
+            }
+            SlashAction::SubmitAsk(question) => {
+                self.mode = Mode::Ask;
+                self.ask_prompt.set_text("");
+                self.ask_answer = None;
+                self.ask_scroll = 0;
+                self.ask_pending = true;
+                Some(Intent::Ask(question))
             }
             SlashAction::OpenSettings | SlashAction::ManageModel => {
                 self.mode = Mode::Settings;
@@ -961,13 +973,20 @@ impl App {
             );
         };
         format!(
-            "Context\nlatest prompt total: {}\ncontext target: {}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo map: {}\nrepo code: {}\nomitted code: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
+            "Context\nlatest prompt total: {}\ncontext target: {}{}\nattempt: {}{}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo map: {}\nrepo code: {}\nomitted code: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
             m.total_estimated_tokens,
             if m.context_target_tokens == 0 {
                 "unknown".into()
             } else {
                 m.context_target_tokens.to_string()
             },
+            if m.target_exceeded {
+                format!(" (target exceeded by {})", m.over_target_tokens)
+            } else {
+                String::new()
+            },
+            m.attempt,
+            if m.repair_attempt { " repair" } else { "" },
             m.system_tokens,
             m.user_goal_tokens,
             m.memory_tokens,
@@ -996,8 +1015,11 @@ impl App {
             .get(self.selected)
             .map(|goal| goal.description.as_str())
             .unwrap_or("none");
+        let (first_attempt, repair_attempts, context_artifacts, retry_tokens) =
+            self.prompt_attempt_buckets();
+        let routing_note = self.routing_note_for_goal(active_goal);
         format!(
-            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\ncontext target: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- repo map: {} compact orientation tokens\n- code: {} selected repository context tokens\n- omitted code: {} candidate tokens skipped by the context compiler\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\nprovider-reported completion tokens remain the billing source of truth.",
+            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\ncontext target: {}{}\nattempt buckets:\n- first attempt: {}\n- repair attempts: {}\n- context/artifacts: {}\n- verifier retry diagnostics: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- repo map: {} compact orientation tokens\n- code: {} selected repository context tokens\n- omitted code: {} candidate tokens skipped by the context compiler\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\n{}provider-reported completion tokens remain the billing source of truth.",
             active_goal,
             m.total_estimated_tokens,
             if m.context_target_tokens == 0 {
@@ -1005,6 +1027,15 @@ impl App {
             } else {
                 m.context_target_tokens.to_string()
             },
+            if m.target_exceeded {
+                format!(" (target exceeded by {})", m.over_target_tokens)
+            } else {
+                String::new()
+            },
+            first_attempt,
+            repair_attempts,
+            context_artifacts,
+            retry_tokens,
             m.system_tokens,
             m.user_goal_tokens,
             m.memory_tokens,
@@ -1015,8 +1046,74 @@ impl App {
             m.mcp_tool_tokens,
             m.retry_error_tokens,
             m.compacted_tokens,
-            m.deduped_tokens
+            m.deduped_tokens,
+            routing_note
         )
+    }
+
+    fn prompt_attempt_buckets(&self) -> (u64, u64, u64, u64) {
+        let mut first_attempt = 0_u64;
+        let mut repair_attempts = 0_u64;
+        let mut context_artifacts = 0_u64;
+        let mut retry_tokens = 0_u64;
+        let mut saw_manifest = false;
+        if let Some(goal) = self.goals.get(self.selected) {
+            for record in &goal.flight_log {
+                if let OrchestratorEvent::PromptManifest { manifest, .. } = &record.event {
+                    saw_manifest = true;
+                    if manifest.repair_attempt || manifest.attempt > 1 {
+                        repair_attempts =
+                            repair_attempts.saturating_add(manifest.total_estimated_tokens);
+                    } else {
+                        first_attempt =
+                            first_attempt.saturating_add(manifest.total_estimated_tokens);
+                    }
+                    context_artifacts = context_artifacts
+                        .saturating_add(manifest.memory_tokens)
+                        .saturating_add(manifest.repo_map_tokens)
+                        .saturating_add(manifest.code_context_tokens)
+                        .saturating_add(manifest.attachment_tokens);
+                    retry_tokens = retry_tokens.saturating_add(manifest.retry_error_tokens);
+                }
+            }
+        }
+        if !saw_manifest {
+            if let Some(manifest) = &self.last_prompt_manifest {
+                if manifest.repair_attempt || manifest.attempt > 1 {
+                    repair_attempts = manifest.total_estimated_tokens;
+                } else {
+                    first_attempt = manifest.total_estimated_tokens;
+                }
+                context_artifacts = manifest
+                    .memory_tokens
+                    .saturating_add(manifest.repo_map_tokens)
+                    .saturating_add(manifest.code_context_tokens)
+                    .saturating_add(manifest.attachment_tokens);
+                retry_tokens = manifest.retry_error_tokens;
+            }
+        }
+        (
+            first_attempt,
+            repair_attempts,
+            context_artifacts,
+            retry_tokens,
+        )
+    }
+
+    fn routing_note_for_goal(&self, goal: &str) -> String {
+        let provider = self.settings.provider.to_ascii_lowercase();
+        let model = self.settings.model.to_ascii_lowercase();
+        let goal = goal.to_ascii_lowercase();
+        let broad_generated = goal.contains("chess")
+            || goal.contains("game")
+            || goal.contains("app")
+            || goal.contains("html")
+            || goal.contains("web");
+        if provider.contains("cloudflare") && model.contains("kimi") && broad_generated {
+            "routing note: Cloudflare Kimi is high-risk for broad generated-code tasks in current evidence; if quality gates repeat, use a stronger code model or narrower prompt.\n".into()
+        } else {
+            String::new()
+        }
     }
 
     fn stats_command_summary(&self) -> String {
@@ -1215,6 +1312,7 @@ impl App {
         self.goal_prompt = PromptBuffer::from_text(snapshot.goal_input);
         self.ask_prompt = PromptBuffer::from_text(snapshot.ask_input);
         self.ask_answer = snapshot.ask_answer;
+        self.ask_scroll = 0;
         self.prompt_history = bounded_prompt_history(&snapshot.prompt_history, 100);
         self.prompt_history_cursor = None;
         self.ask_pending = false;
@@ -1610,6 +1708,15 @@ impl App {
             return;
         }
 
+        if self.mode == Mode::Ask {
+            if delta < 0 {
+                self.ask_scroll = self.ask_scroll.saturating_sub(delta.unsigned_abs());
+            } else {
+                self.ask_scroll = self.ask_scroll.saturating_add(delta as usize);
+            }
+            return;
+        }
+
         if matches!(self.mode, Mode::Goal | Mode::Task) {
             if delta < 0 {
                 self.focus_scroll = self.focus_scroll.saturating_sub(delta.unsigned_abs());
@@ -1832,6 +1939,35 @@ impl App {
                 _ => {}
             }
         }
+        if self.mode == Mode::Ask && self.ask_prompt.is_empty() {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.ask_scroll = self.ask_scroll.saturating_sub(12);
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    self.ask_scroll = self.ask_scroll.saturating_add(12);
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.ask_scroll = self.ask_scroll.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.ask_scroll = self.ask_scroll.saturating_add(1);
+                    return None;
+                }
+                KeyCode::Home => {
+                    self.ask_scroll = 0;
+                    return None;
+                }
+                KeyCode::End => {
+                    self.ask_scroll = usize::MAX;
+                    return None;
+                }
+                _ => {}
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -2034,7 +2170,7 @@ impl App {
                 }
                 let selected = filtered_options[self.palette_selected % filtered_options.len()];
                 self.mode = self.prev_mode;
-                self.apply_slash_action(selected.action)
+                self.apply_slash_action(selected.action.clone())
             }
             KeyCode::Up => {
                 self.palette_selected = self.palette_selected.saturating_sub(1);
@@ -2322,6 +2458,9 @@ impl App {
                 let submission = self.ask_prompt.take_submission()?;
                 self.prompt_history.push(submission.display_text);
                 self.prompt_history_cursor = None;
+                self.ask_answer = None;
+                self.ask_scroll = 0;
+                self.ask_pending = true;
                 Some(Intent::Ask(submission.model_text))
             }
             KeyCode::Backspace => {
@@ -2873,6 +3012,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("/problems", "inspect verifier failures and repair hints"),
         ("/retry", "repair the selected failed goal with diagnostics"),
         ("/why-tokens", "explain latest prompt token buckets"),
+        ("/ask", "ask a stateless question without queueing a goal"),
         ("/commands", "show command and keyboard help"),
         ("/run", "run a command through the sandbox"),
         ("!", "run command shorthand, e.g. !npm test"),
@@ -4597,26 +4737,87 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
             "A:",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
-        for l in ans.lines() {
-            lines.push(Line::raw(l.to_string()));
-        }
+        lines.extend(render_rich_text_lines(ans));
     } else {
         lines.push(Line::from(Span::styled(
             "(no answer yet)",
             Style::default().fg(MUTED),
         )));
     }
-    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-        Block::default()
-            .title(Span::styled(
-                " Ask ",
-                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(VIOLET)),
-    );
+    let viewport = area.height.saturating_sub(2) as usize;
+    let max_scroll = lines.len().saturating_sub(viewport);
+    let scroll = app.ask_scroll.min(max_scroll);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" Ask  {scroll}/{max_scroll}  PgUp/PgDn "),
+                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(Style::default().fg(VIOLET)),
+        )
+        .scroll((scroll as u16, 0));
     frame.render_widget(p, area);
+}
+
+fn render_rich_text_lines(text: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code = false;
+    for raw in text.lines() {
+        let line = raw.to_string();
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(ACCENT_HI),
+            )));
+            continue;
+        }
+        let style = if in_code {
+            Style::default().fg(ACCENT_HI)
+        } else if trimmed.starts_with('#') {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || numbered_list_prefix(trimmed)
+        {
+            Style::default().fg(Color::White)
+        } else if status_line_prefix(trimmed) == Some(DANGER) {
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+        } else if status_line_prefix(trimmed) == Some(WARN) {
+            Style::default().fg(WARN)
+        } else if status_line_prefix(trimmed) == Some(SUCCESS) {
+            Style::default().fg(SUCCESS)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line, style)));
+    }
+    lines
+}
+
+fn numbered_list_prefix(line: &str) -> bool {
+    let Some((digits, rest)) = line.split_once('.') else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) && rest.starts_with(' ')
+}
+
+fn status_line_prefix(line: &str) -> Option<Color> {
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("error") || lower.starts_with("fail") || lower.starts_with("failed") {
+        Some(DANGER)
+    } else if lower.starts_with("warn") || lower.starts_with("warning") {
+        Some(WARN)
+    } else if lower.starts_with("pass") || lower.starts_with("success") {
+        Some(SUCCESS)
+    } else {
+        None
+    }
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
@@ -5740,7 +5941,7 @@ fn print_help() {
          \n\
          TUI SLASH COMMANDS:\n  \
          /settings, /config, /status, /context, /compact, /compress,\n  \
-         /problems, /diagnostics, /retry, /repair, /why-tokens,\n  \
+         /problems, /diagnostics, /retry, /repair, /why-tokens, /ask <question>,\n  \
          /goals, /switch, /focus <view>, /copy, /rerun, /stats, /stop,\n  \
          /review, /memory, /permissions set <mode>, /trust, /model set <name>,\n  \
          /commands, /run <cmd>, and !<cmd>\n\
@@ -6836,6 +7037,7 @@ async fn run_app<B: Backend>(
                             let provider = ask_provider.clone();
                             app.ask_pending = true;
                             app.ask_answer = None;
+                            app.ask_scroll = 0;
                             tokio::spawn(async move {
                                 let a = match provider {
                                     Some(p) => match p
@@ -6860,6 +7062,7 @@ async fn run_app<B: Backend>(
             LoopEvent::AskAnswer(a) => {
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
+                app.ask_scroll = 0;
             }
             LoopEvent::CommandFinished(summary) => {
                 app.push_command_run(summary);
@@ -8159,6 +8362,10 @@ fn extract_id(line: &str) -> Option<String> {
             repo_map_tokens: 0,
             omitted_code_tokens: 0,
             context_target_tokens: 3_500,
+            attempt: 1,
+            repair_attempt: false,
+            target_exceeded: false,
+            over_target_tokens: 0,
             mcp_tool_tokens: 1,
             retry_error_tokens: 0,
             total_estimated_tokens: 21,
@@ -8648,6 +8855,50 @@ fn extract_id(line: &str) -> Option<String> {
         // Ask must not pollute the existing goal list.
         assert_eq!(app.goals.len(), 1);
         assert_eq!(app.goals[0].description, "parent goal");
+    }
+
+    #[test]
+    fn slash_ask_question_emits_ask_intent_without_queueing_goal() {
+        let mut app = App::default();
+        for c in "/ask why tokens?".chars() {
+            app.handle_key(key(c));
+        }
+
+        let intent = app.handle_key(enter());
+
+        assert_eq!(intent, Some(Intent::Ask("why tokens?".into())));
+        assert_eq!(app.mode, Mode::Ask);
+        assert!(app.ask_pending);
+        assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn ask_answer_scrolls_when_prompt_is_empty() {
+        let mut app = App {
+            mode: Mode::Ask,
+            ask_answer: Some(
+                (0..40)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ..App::default()
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.ask_scroll, 12);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.ask_scroll, 0);
+    }
+
+    #[test]
+    fn ask_rich_text_renderer_keeps_markdown_shape() {
+        let lines = render_rich_text_lines("# Head\n- item\n```rust\nfn main() {}\n```");
+
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0].spans[0].content, "# Head");
+        assert_eq!(lines[1].spans[0].content, "- item");
+        assert_eq!(lines[3].spans[0].content, "fn main() {}");
     }
 
     #[test]

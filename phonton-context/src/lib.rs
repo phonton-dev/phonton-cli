@@ -190,6 +190,7 @@ impl ContextCompiler {
         let estimated_total_tokens = fixed_tokens
             .saturating_add(repo_map_tokens)
             .saturating_add(selected_code_tokens);
+        let over_target_tokens = estimated_total_tokens.saturating_sub(target);
 
         CompiledContextPlan {
             plan: ContextPlan {
@@ -200,6 +201,8 @@ impl ContextCompiler {
                 selected_code_tokens,
                 omitted_code_tokens,
                 estimated_total_tokens,
+                target_exceeded: over_target_tokens > 0,
+                over_target_tokens,
                 items,
             },
             selected_slices,
@@ -781,6 +784,14 @@ mod tests {
 
         assert_eq!(compiled.selected_slices.len(), 1);
         assert!(compiled.plan.estimated_total_tokens > compiled.plan.target_tokens);
+        assert!(compiled.plan.target_exceeded);
+        assert_eq!(
+            compiled.plan.over_target_tokens,
+            compiled
+                .plan
+                .estimated_total_tokens
+                .saturating_sub(compiled.plan.target_tokens)
+        );
     }
 
     fn code_slice(path: &str, symbol: &str, token_count: usize) -> CodeSlice {

@@ -27,7 +27,7 @@ pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusVie
         "Focus ",
         Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
     )];
-    for view in tabs {
+    for (idx, view) in tabs.iter().copied().enumerate() {
         let selected = view == active;
         let style = if selected {
             Style::default()
@@ -38,12 +38,20 @@ pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusVie
             Style::default().fg(MUTED)
         };
         spans.push(Span::styled(format!(" {} ", view.as_str()), style));
-        spans.push(Span::raw(" "));
+        if idx + 1 < tabs.len() {
+            spans.push(Span::styled(" | ", Style::default().fg(MUTED)));
+        } else {
+            spans.push(Span::raw("  "));
+        }
     }
-    spans.push(Span::styled(
-        " p problems  r retry  f cycle  [ ] item",
-        Style::default().fg(MUTED),
-    ));
+    let hint = match active {
+        FocusView::Receipt => "f cycle",
+        FocusView::Problems => "p problems  r retry",
+        FocusView::Code => "[ ] file  PgUp/PgDn",
+        FocusView::Commands => "[ ] command  /rerun",
+        FocusView::Log => "PgUp/PgDn  End tail",
+    };
+    spans.push(Span::styled(hint, Style::default().fg(MUTED)));
     lines.push(Line::from(spans));
 }
 
@@ -84,17 +92,51 @@ pub(crate) fn append_code_focus_lines(
     selected_file: usize,
 ) {
     for line in code_focus_text(goal, selected_file).lines() {
-        let style = if line.starts_with('+') {
-            Style::default().fg(SUCCESS)
-        } else if line.starts_with('-') {
-            Style::default().fg(DANGER)
-        } else if line.starts_with("@@") {
-            Style::default().fg(ACCENT_HI)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(Span::styled(line.to_string(), style)));
+        lines.push(Line::from(Span::styled(
+            line.to_string(),
+            code_focus_line_style(line),
+        )));
     }
+}
+
+fn code_focus_line_style(line: &str) -> Style {
+    if line.starts_with("@@") {
+        return Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD);
+    }
+    if line.starts_with("Code ") || line.starts_with("file:") {
+        return Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    }
+    if line.starts_with('-') {
+        return Style::default().fg(DANGER);
+    }
+    if let Some(rest) = line.strip_prefix('+') {
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            return Style::default().fg(MUTED);
+        }
+        if trimmed.starts_with('"') || trimmed.starts_with('\'') || trimmed.contains(" = \"") {
+            return Style::default().fg(WARN);
+        }
+        if trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("def ")
+            || trimmed.starts_with("function ")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("var ")
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("use ")
+        {
+            return Style::default().fg(ACCENT_HI);
+        }
+        return Style::default().fg(SUCCESS);
+    }
+    if line.starts_with(' ') {
+        return Style::default().fg(MUTED);
+    }
+    Style::default().fg(Color::White)
 }
 
 pub(crate) fn code_focus_text(goal: &GoalEntry, selected_file: usize) -> String {
@@ -200,6 +242,9 @@ pub(crate) fn problems_focus_text(goal: &GoalEntry, selected_file: usize) -> Str
             "... {} more diagnostic(s)\n",
             diagnostics.len() - 10
         ));
+    }
+    if let Some(note) = token_note(goal) {
+        out.push_str(&format!("\nTokens\n{note}\n"));
     }
     out.push_str("\nRepair\n- Press r or run /retry to queue a repair with compact diagnostics.\n- Use /why-tokens to inspect retry/context token buckets.\n");
 
@@ -360,7 +405,11 @@ pub(crate) fn receipt_focus_text(goal: &GoalEntry) -> String {
             goal.description
         );
     };
-    let mut out = format!("Receipt\n{}\n", handoff.headline);
+    let mut out = format!(
+        "Receipt\n{}\n{}\n",
+        handoff.headline,
+        deterministic_summary(handoff)
+    );
     out.push_str(&format!(
         "files: {} +{} -{}\n",
         handoff.diff_stats.files_changed,
@@ -374,6 +423,51 @@ pub(crate) fn receipt_focus_text(goal: &GoalEntry) -> String {
         out.push_str(&format!("gap: {gap}\n"));
     }
     out
+}
+
+fn deterministic_summary(handoff: &phonton_types::HandoffPacket) -> String {
+    let checks = handoff.verification.passed.len();
+    let findings = handoff.verification.findings.len();
+    let gaps = handoff.known_gaps.len();
+    let tokens = handoff.token_usage.budget_tokens();
+    format!(
+        "Summary: changed {} file(s) (+{} -{}), checks {} pass/{} finding(s), gaps {}, tokens {}.",
+        handoff.diff_stats.files_changed,
+        handoff.diff_stats.added_lines,
+        handoff.diff_stats.removed_lines,
+        checks,
+        findings,
+        gaps,
+        tokens
+    )
+}
+
+fn token_note(goal: &GoalEntry) -> Option<String> {
+    let mut total = 0_u64;
+    let mut repair = 0_u64;
+    let mut target_exceeded = None;
+    for record in &goal.flight_log {
+        if let OrchestratorEvent::PromptManifest { manifest, .. } = &record.event {
+            total = total.saturating_add(manifest.total_estimated_tokens);
+            if manifest.repair_attempt || manifest.attempt > 1 {
+                repair = repair.saturating_add(manifest.total_estimated_tokens);
+            }
+            if manifest.target_exceeded {
+                target_exceeded = Some(manifest.over_target_tokens);
+            }
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    let mut note = format!("estimated prompt tokens: {total}");
+    if repair > 0 {
+        note.push_str(&format!("; repair attempts: {repair}"));
+    }
+    if let Some(over) = target_exceeded {
+        note.push_str(&format!("; context target exceeded by {over}"));
+    }
+    Some(note)
 }
 
 pub(crate) fn commands_focus_text(runs: &[CommandRunSummary], selected_run: usize) -> String {

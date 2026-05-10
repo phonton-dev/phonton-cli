@@ -21,14 +21,18 @@ function Token-Total($Usage) {
     if ($null -ne $totalTokens) {
         return [int64]$totalTokens.Value
     }
-    $total = 0L
-    foreach ($name in @("input_tokens", "prompt_tokens", "output_tokens", "completion_tokens", "cached_tokens", "cache_creation_tokens")) {
-        $property = $Usage.PSObject.Properties[$name]
-        if ($null -ne $property) {
-            $total += [int64]$property.Value
-        }
+    $input = $Usage.PSObject.Properties["input_tokens"]
+    if ($null -eq $input) {
+        $input = $Usage.PSObject.Properties["prompt_tokens"]
     }
-    $total
+    $output = $Usage.PSObject.Properties["output_tokens"]
+    if ($null -eq $output) {
+        $output = $Usage.PSObject.Properties["completion_tokens"]
+    }
+
+    $inputValue = if ($null -ne $input) { [int64]$input.Value } else { 0L }
+    $outputValue = if ($null -ne $output) { [int64]$output.Value } else { 0L }
+    $inputValue + $outputValue
 }
 
 function Is-Verified($Review, $Metadata) {

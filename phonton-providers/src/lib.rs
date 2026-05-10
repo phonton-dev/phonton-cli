@@ -879,10 +879,17 @@ fn max_output_tokens_for_prompt(system: &str, user: &str) -> u64 {
         || text.contains("repair");
     let generated_app = text.contains("playable")
         || text.contains("game")
+        || text.contains("chess")
+        || text.contains("html")
+        || text.contains("web app")
+        || text.contains("terminal game")
         || text.contains("full app")
         || text.contains("create a")
-        || text.contains("build a");
-    if repair {
+        || text.contains("build a")
+        || text.contains("make ");
+    if repair && generated_app {
+        3_072
+    } else if repair {
         1_536
     } else if generated_app {
         3_072
@@ -1937,6 +1944,13 @@ mod tests {
         );
         assert_eq!(
             max_output_tokens_for_prompt("sys", "create a playable game"),
+            3_072
+        );
+        assert_eq!(
+            max_output_tokens_for_prompt(
+                "sys",
+                "make chess in html\nprevious verification failed: missing reset behavior"
+            ),
             3_072
         );
         assert_eq!(

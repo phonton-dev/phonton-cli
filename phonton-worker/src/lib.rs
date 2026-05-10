@@ -355,6 +355,8 @@ impl Worker {
                     deduped_tokens: repo_context.deduped_tokens,
                     compacted_tokens,
                     budget_limit,
+                    attempt,
+                    repair_attempt: !last_errors.is_empty(),
                 });
                 let _ = tx.try_send(
                     phonton_types::messages::OrchestratorMessage::PromptManifest {
@@ -1134,6 +1136,8 @@ struct PromptManifestInput<'a> {
     deduped_tokens: u64,
     compacted_tokens: u64,
     budget_limit: Option<u64>,
+    attempt: u8,
+    repair_attempt: bool,
 }
 
 fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManifest {
@@ -1149,6 +1153,8 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
         deduped_tokens,
         compacted_tokens,
         budget_limit,
+        attempt,
+        repair_attempt,
     } = input;
     let system_tokens = estimate_prompt_tokens(system_prompt);
     let user_goal_tokens = estimate_prompt_tokens(&subtask.description);
@@ -1171,6 +1177,12 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
     let context_target_tokens = context_plan
         .map(|plan| plan.target_tokens)
         .unwrap_or_default();
+    let target_exceeded = context_plan
+        .map(|plan| plan.target_exceeded)
+        .unwrap_or_default();
+    let over_target_tokens = context_plan
+        .map(|plan| plan.over_target_tokens)
+        .unwrap_or_default();
     let retry_error_tokens = estimate_prompt_tokens(&prior_errors.join("\n"));
     let mcp_text = render_mcp_budget_text(mcp, mcp_results);
     let mcp_tool_tokens = estimate_prompt_tokens(&mcp_text);
@@ -1192,6 +1204,10 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
         repo_map_tokens,
         omitted_code_tokens,
         context_target_tokens,
+        attempt,
+        repair_attempt,
+        target_exceeded,
+        over_target_tokens,
         mcp_tool_tokens,
         retry_error_tokens,
         total_estimated_tokens,
@@ -1838,11 +1854,15 @@ mod tests {
             deduped_tokens: 0,
             compacted_tokens: 0,
             budget_limit: Some(DEFAULT_WINDOW_LIMIT as u64),
+            attempt: 2,
+            repair_attempt: true,
         });
         assert!(manifest.system_tokens > 0);
         assert!(manifest.user_goal_tokens > 0);
         assert!(manifest.memory_tokens > 0);
         assert!(manifest.retry_error_tokens > 0);
+        assert_eq!(manifest.attempt, 2);
+        assert!(manifest.repair_attempt);
         assert_eq!(
             manifest.total_estimated_tokens,
             manifest

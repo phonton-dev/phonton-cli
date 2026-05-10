@@ -14,17 +14,32 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   ranked repository slices under a target budget and records omitted code
   tokens.
 - Added benchmark scoring for `verified_success_per_10k_tokens`.
+- Added attempt-level prompt accounting for first attempts, repair attempts,
+  context/artifact buckets, and verifier retry diagnostics.
+- Added `/ask <question>` plus scrollable Ask answers with lightweight
+  markdown-style rendering.
 
 ### Changed
 
 - Worker prompts now include compact repo-map orientation plus only the
   selected context slices.
 - `/context`, `/why-tokens`, and Flight Log prompt manifests now expose
-  context target, repo-map tokens, selected code tokens, and omitted candidate
-  code tokens.
+  context target, target-exceeded status, repo-map tokens, selected code
+  tokens, omitted candidate code tokens, and attempt buckets.
 - Providers now use dynamic output ceilings instead of one large fixed
   completion limit, reducing runaway generated-code outputs while preserving
   headroom for broad tasks.
+- Broad generated-code repair attempts now keep adequate output headroom
+  instead of collapsing to the smallest repair budget.
+- Receipt and Markdown review output now include a deterministic brief summary
+  without spending another model call.
+
+### Fixed
+
+- Benchmark token scoring no longer double-counts provider aliases such as
+  `input_tokens`/`prompt_tokens` or `output_tokens`/`completion_tokens`.
+- Context manifests now state when the target was exceeded because at least one
+  required slice had to be included.
 
 ## 0.10.0 - Verification And Failure QoL
 
