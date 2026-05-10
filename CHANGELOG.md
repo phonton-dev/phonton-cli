@@ -4,6 +4,17 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.9.3 - Python Verification Hotfix
+
+### Fixed
+
+- Generated whole-file Python diffs are now parsed by the syntax verifier
+  before review-ready status, preventing invalid files such as an
+  unterminated `chess.py` from being reported as verified.
+- Empty or non-Cargo workspaces no longer allow Python generation to fall
+  through to a misleading `VerifyLayer::Test` pass when no Python syntax check
+  has run.
+
 ## 0.9.2 - Quality Gate Repair Hotfix
 
 ### Fixed

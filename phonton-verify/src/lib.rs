@@ -52,6 +52,10 @@ pub async fn verify_diff_with_memory(
         return Ok(fail);
     }
 
+    if let Some(fail) = verify_python_syntax(hunks) {
+        return Ok(fail);
+    }
+
     if let Some(mem) = memory {
         if let Some(fail) = verify_decisions(hunks, mem).await? {
             return Ok(fail);
@@ -105,6 +109,59 @@ pub fn verify_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
                 hunk.file_path.display(),
                 hunk.new_start,
                 hunk.new_start + hunk.new_count
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        None
+    } else {
+        Some(VerifyResult::Fail {
+            layer: VerifyLayer::Syntax,
+            errors,
+            attempt: 1,
+        })
+    }
+}
+
+/// Layer 1b: tree-sitter parse for whole-file generated Python hunks.
+///
+/// The Rust syntax verifier above intentionally ignores non-Rust files, and
+/// cargo layers are skipped outside a Rust workspace. That combination let a
+/// generated `chess.py` with an unterminated string reach review-ready status.
+///
+/// We only parse whole-file Python hunks here. Partial hunks usually do not
+/// contain enough context to parse as a complete module, so failing them would
+/// create false negatives for normal edits.
+pub fn verify_python_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::language())
+        .is_err()
+    {
+        return Some(VerifyResult::Escalate {
+            reason: "failed to load tree-sitter-python grammar".into(),
+        });
+    }
+
+    let mut errors = Vec::new();
+    for hunk in hunks {
+        if !is_python_path(&hunk.file_path) || !is_whole_file_hunk(hunk) {
+            continue;
+        }
+
+        let source = reconstruct_new_side(hunk);
+        let Some(tree) = parser.parse(&source, None) else {
+            errors.push(format!(
+                "tree-sitter could not parse generated Python file {}",
+                hunk.file_path.display()
+            ));
+            continue;
+        };
+        if tree.root_node().has_error() || contains_error_node(tree.root_node()) {
+            errors.push(format!(
+                "python syntax error in generated file {}",
+                hunk.file_path.display()
             ));
         }
     }
@@ -501,6 +558,17 @@ fn is_rust_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_python_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("py") || e.eq_ignore_ascii_case("pyw"))
+        .unwrap_or(false)
+}
+
+fn is_whole_file_hunk(hunk: &DiffHunk) -> bool {
+    hunk.old_start <= 1 && hunk.old_count == 0 && hunk.new_start <= 1
+}
+
 fn reconstruct_new_side(hunk: &DiffHunk) -> String {
     let mut out = String::new();
     for line in &hunk.lines {
@@ -671,6 +739,85 @@ mod tests {
                 ..
             }) => {}
             other => panic!("expected syntax fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn python_syntax_fail_on_broken_generated_file() {
+        let h = hunk(
+            "chess.py",
+            vec![
+                DiffLine::Added("def broken():".into()),
+                DiffLine::Added("    return \"unterminated".into()),
+            ],
+        );
+        match verify_python_syntax(&[h]) {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::Syntax,
+                errors,
+                ..
+            }) => {
+                let joined = errors.join("\n");
+                assert!(
+                    joined.contains("chess.py"),
+                    "error should identify the Python file: {joined}"
+                );
+            }
+            other => panic!("expected python syntax fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn python_syntax_pass_on_valid_generated_file() {
+        let h = hunk(
+            "chess.py",
+            vec![
+                DiffLine::Added("def ok():".into()),
+                DiffLine::Added("    return \"chess\"".into()),
+            ],
+        );
+        assert!(verify_python_syntax(&[h]).is_none());
+    }
+
+    #[test]
+    fn python_syntax_skips_partial_hunks() {
+        let h = DiffHunk {
+            file_path: PathBuf::from("chess.py"),
+            old_start: 20,
+            old_count: 2,
+            new_start: 20,
+            new_count: 2,
+            lines: vec![
+                DiffLine::Removed("    return old".into()),
+                DiffLine::Added("    return \"unterminated".into()),
+            ],
+        };
+        assert!(verify_python_syntax(&[h]).is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_diff_rejects_broken_generated_python() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = hunk(
+            "chess.py",
+            vec![
+                DiffLine::Added("def broken():".into()),
+                DiffLine::Added("    return \"unterminated".into()),
+            ],
+        );
+
+        match verify_diff(&[h], tmp.path()).await.unwrap() {
+            VerifyResult::Fail {
+                layer: VerifyLayer::Syntax,
+                errors,
+                ..
+            } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("chess.py")),
+                    "syntax failure should name the generated file: {errors:?}"
+                );
+            }
+            other => panic!("expected syntax failure, got {other:?}"),
         }
     }
 
