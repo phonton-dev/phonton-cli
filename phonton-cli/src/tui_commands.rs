@@ -13,6 +13,7 @@ pub enum CommandCategory {
 pub enum FocusView {
     #[default]
     Receipt,
+    Problems,
     Code,
     Commands,
     Log,
@@ -22,6 +23,7 @@ impl FocusView {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
             "receipt" | "review" => Some(Self::Receipt),
+            "problems" | "problem" | "diagnostics" | "diagnostic" | "diag" => Some(Self::Problems),
             "code" | "diff" => Some(Self::Code),
             "commands" | "command" | "cmd" | "run" => Some(Self::Commands),
             "log" | "flight-log" | "flight" => Some(Self::Log),
@@ -32,6 +34,7 @@ impl FocusView {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Receipt => "Receipt",
+            Self::Problems => "Problems",
             Self::Code => "Code",
             Self::Commands => "Commands",
             Self::Log => "Log",
@@ -40,7 +43,8 @@ impl FocusView {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Receipt => Self::Code,
+            Self::Receipt => Self::Problems,
+            Self::Problems => Self::Code,
             Self::Code => Self::Commands,
             Self::Commands => Self::Log,
             Self::Log => Self::Receipt,
@@ -68,6 +72,9 @@ pub enum SlashAction {
     SetPermissionMode(PermissionMode),
     ShowContext,
     CompactContext,
+    ShowProblems,
+    RetryGoal,
+    ShowWhyTokens,
     StopGoal,
     OpenGoals,
     SetFocus(FocusView),
@@ -181,6 +188,30 @@ pub const COMMANDS: &[CommandSpec] = &[
         action: SlashAction::CompactContext,
     },
     CommandSpec {
+        name: "/problems",
+        aliases: &["/diagnostics"],
+        args: "",
+        description: "open verifier and failure diagnostics",
+        category: CommandCategory::Trust,
+        action: SlashAction::ShowProblems,
+    },
+    CommandSpec {
+        name: "/retry",
+        aliases: &["/repair"],
+        args: "",
+        description: "retry the selected failed goal with compact diagnostics",
+        category: CommandCategory::Loop,
+        action: SlashAction::RetryGoal,
+    },
+    CommandSpec {
+        name: "/why-tokens",
+        aliases: &[],
+        args: "",
+        description: "explain the latest prompt token buckets",
+        category: CommandCategory::Trust,
+        action: SlashAction::ShowWhyTokens,
+    },
+    CommandSpec {
         name: "/goals",
         aliases: &["/switch"],
         args: "",
@@ -191,7 +222,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/focus",
         aliases: &[],
-        args: "code|commands|receipt|log",
+        args: "receipt|problems|code|commands|log",
         description: "switch the Active panel focus view",
         category: CommandCategory::Loop,
         action: SlashAction::SetFocus(FocusView::Receipt),
@@ -381,7 +412,7 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
         } else {
             SlashParse::Unknown {
                 command: "/focus".into(),
-                suggestion: Some("/focus code|commands|receipt|log".into()),
+                suggestion: Some("/focus receipt|problems|code|commands|log".into()),
             }
         };
     }
@@ -581,6 +612,10 @@ mod tests {
             SlashParse::Command(SlashAction::SetFocus(FocusView::Commands))
         );
         assert_eq!(
+            parse_slash_command("/focus problems"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Problems))
+        );
+        assert_eq!(
             parse_slash_command("/copy"),
             SlashParse::Command(SlashAction::CopyFocus)
         );
@@ -595,6 +630,26 @@ mod tests {
         assert_eq!(
             parse_slash_command("/compress"),
             SlashParse::Command(SlashAction::CompactContext)
+        );
+        assert_eq!(
+            parse_slash_command("/problems"),
+            SlashParse::Command(SlashAction::ShowProblems)
+        );
+        assert_eq!(
+            parse_slash_command("/diagnostics"),
+            SlashParse::Command(SlashAction::ShowProblems)
+        );
+        assert_eq!(
+            parse_slash_command("/retry"),
+            SlashParse::Command(SlashAction::RetryGoal)
+        );
+        assert_eq!(
+            parse_slash_command("/repair"),
+            SlashParse::Command(SlashAction::RetryGoal)
+        );
+        assert_eq!(
+            parse_slash_command("/why-tokens"),
+            SlashParse::Command(SlashAction::ShowWhyTokens)
         );
     }
 

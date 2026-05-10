@@ -11,14 +11,15 @@
 //! * Layer 3 — `WorkspaceCheck`: `cargo check --workspace`.
 //! * Layer 4 — `Test`: `cargo test --package <crate>`, 120s timeout.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use phonton_memory::MemoryStore;
 use phonton_types::{DiffHunk, DiffLine, MemoryRecord, VerifyLayer, VerifyResult};
 use tokio::process::Command;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Language, Node, Parser};
 
 /// Run layered verification against `hunks`, with cargo commands executed
 /// in `working_dir`.
@@ -48,11 +49,7 @@ pub async fn verify_diff_with_memory(
     working_dir: &Path,
     memory: Option<&MemoryStore>,
 ) -> Result<VerifyResult> {
-    if let Some(fail) = verify_syntax(hunks) {
-        return Ok(fail);
-    }
-
-    if let Some(fail) = verify_python_syntax(hunks) {
+    if let Some(fail) = verify_syntax_in_workspace(hunks, working_dir) {
         return Ok(fail);
     }
 
@@ -81,47 +78,61 @@ pub async fn verify_diff_with_memory(
     })
 }
 
-/// Layer 1: tree-sitter parse of each hunk's post-diff view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyntaxLanguage {
+    Rust,
+    Python,
+    JavaScript,
+    Jsx,
+    TypeScript,
+    Tsx,
+    Json,
+    Toml,
+    Yaml,
+    Html,
+    Css,
+}
+
+impl SyntaxLanguage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript | Self::Jsx => "javascript",
+            Self::TypeScript | Self::Tsx => "typescript",
+            Self::Json => "json",
+            Self::Toml => "toml",
+            Self::Yaml => "yaml",
+            Self::Html => "html",
+            Self::Css => "css",
+        }
+    }
+
+    fn tree_sitter_language(self) -> Option<Language> {
+        match self {
+            Self::Rust => Some(tree_sitter_rust::language()),
+            Self::Python => Some(tree_sitter_python::language()),
+            Self::JavaScript => Some(tree_sitter_typescript::language_typescript()),
+            Self::Jsx => Some(tree_sitter_typescript::language_tsx()),
+            Self::TypeScript => Some(tree_sitter_typescript::language_typescript()),
+            Self::Tsx => Some(tree_sitter_typescript::language_tsx()),
+            Self::Html => Some(tree_sitter_html::language()),
+            Self::Json | Self::Toml | Self::Yaml | Self::Css => None,
+        }
+    }
+}
+
+/// Layer 1: syntax parse of each supported hunk's post-diff view.
 pub fn verify_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
-    let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_rust::language()).is_err() {
-        return Some(VerifyResult::Escalate {
-            reason: "failed to load tree-sitter-rust grammar".into(),
-        });
-    }
+    verify_syntax_for_sources(hunks, None, None)
+}
 
-    let mut errors = Vec::new();
-    for hunk in hunks {
-        if !is_rust_path(&hunk.file_path) {
-            continue;
-        }
-        let snippet = reconstruct_new_side(hunk);
-        let Some(tree) = parser.parse(&snippet, None) else {
-            errors.push(format!(
-                "tree-sitter could not parse hunk in {}",
-                hunk.file_path.display()
-            ));
-            continue;
-        };
-        if tree.root_node().has_error() || contains_error_node(tree.root_node()) {
-            errors.push(format!(
-                "syntax error in hunk targeting {} (lines {}..{})",
-                hunk.file_path.display(),
-                hunk.new_start,
-                hunk.new_start + hunk.new_count
-            ));
-        }
-    }
-
-    if errors.is_empty() {
-        None
-    } else {
-        Some(VerifyResult::Fail {
-            layer: VerifyLayer::Syntax,
-            errors,
-            attempt: 1,
-        })
-    }
+/// Layer 1 with workspace-aware post-diff reconstruction.
+///
+/// Generated files are parsed as full files. Existing files are rebuilt from
+/// the current workspace content plus the proposed hunks before parsing.
+pub fn verify_syntax_in_workspace(hunks: &[DiffHunk], working_dir: &Path) -> Option<VerifyResult> {
+    verify_syntax_for_sources(hunks, Some(working_dir), None)
 }
 
 /// Layer 1b: tree-sitter parse for whole-file generated Python hunks.
@@ -134,38 +145,41 @@ pub fn verify_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
 /// contain enough context to parse as a complete module, so failing them would
 /// create false negatives for normal edits.
 pub fn verify_python_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_python::language())
-        .is_err()
-    {
-        return Some(VerifyResult::Escalate {
-            reason: "failed to load tree-sitter-python grammar".into(),
-        });
-    }
+    verify_syntax_for_sources(hunks, None, Some(SyntaxLanguage::Python))
+}
 
+fn verify_syntax_for_sources(
+    hunks: &[DiffHunk],
+    working_dir: Option<&Path>,
+    only_language: Option<SyntaxLanguage>,
+) -> Option<VerifyResult> {
     let mut errors = Vec::new();
-    for hunk in hunks {
-        if !is_python_path(&hunk.file_path) || !is_whole_file_hunk(hunk) {
-            continue;
-        }
-
-        let source = reconstruct_new_side(hunk);
-        let Some(tree) = parser.parse(&source, None) else {
-            errors.push(format!(
-                "tree-sitter could not parse generated Python file {}",
-                hunk.file_path.display()
-            ));
+    for (path, grouped_hunks) in group_supported_hunks(hunks, only_language) {
+        let Some(language) = syntax_language_for_path(&path) else {
             continue;
         };
-        if tree.root_node().has_error() || contains_error_node(tree.root_node()) {
-            errors.push(format!(
-                "python syntax error in generated file {}",
-                hunk.file_path.display()
-            ));
+        if only_language.is_some_and(|only| only != language) {
+            continue;
+        }
+        if working_dir.is_none() && !grouped_hunks.iter().any(is_new_file_hunk) {
+            continue;
+        }
+        let source = match reconstruct_post_diff_source(&path, &grouped_hunks, working_dir) {
+            Ok(source) => source,
+            Err(reason) => {
+                errors.push(format!(
+                    "[{} syntax] {}: could not reconstruct post-diff file: {}",
+                    language.label(),
+                    path.display(),
+                    reason
+                ));
+                continue;
+            }
+        };
+        if let Some(error) = parse_source(language, &path, &source) {
+            errors.push(error);
         }
     }
-
     if errors.is_empty() {
         None
     } else {
@@ -175,6 +189,296 @@ pub fn verify_python_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
             attempt: 1,
         })
     }
+}
+
+fn group_supported_hunks(
+    hunks: &[DiffHunk],
+    only_language: Option<SyntaxLanguage>,
+) -> BTreeMap<PathBuf, Vec<DiffHunk>> {
+    let mut grouped = BTreeMap::new();
+    for hunk in hunks {
+        let Some(language) = syntax_language_for_path(&hunk.file_path) else {
+            continue;
+        };
+        if only_language.is_some_and(|only| only != language) {
+            continue;
+        }
+        grouped
+            .entry(hunk.file_path.clone())
+            .or_insert_with(Vec::new)
+            .push(hunk.clone());
+    }
+    grouped
+}
+
+fn parse_source(language: SyntaxLanguage, path: &Path, source: &str) -> Option<String> {
+    match language {
+        SyntaxLanguage::Json => parse_json(path, source),
+        SyntaxLanguage::Toml => parse_toml(path, source),
+        SyntaxLanguage::Yaml => parse_yaml(path, source),
+        SyntaxLanguage::Css => parse_css(path, source),
+        _ => parse_tree_sitter(language, path, source),
+    }
+}
+
+fn parse_tree_sitter(language: SyntaxLanguage, path: &Path, source: &str) -> Option<String> {
+    let mut parser = Parser::new();
+    let grammar = language.tree_sitter_language()?;
+    if parser.set_language(&grammar).is_err() {
+        return Some(format!(
+            "[{} syntax] {}: failed to load parser grammar",
+            language.label(),
+            path.display()
+        ));
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Some(format!(
+            "[{} syntax] {}: parser could not parse source",
+            language.label(),
+            path.display()
+        ));
+    };
+    let root = tree.root_node();
+    if root.has_error() || contains_error_node(root) {
+        let location = first_error_position(root)
+            .map(|(line, col)| format!(":{line}:{col}"))
+            .unwrap_or_default();
+        return Some(format!(
+            "[{} syntax] {}{}: invalid syntax",
+            language.label(),
+            path.display(),
+            location
+        ));
+    }
+    None
+}
+
+fn parse_json(path: &Path, source: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(source)
+        .err()
+        .map(|e| {
+            format!(
+                "[json syntax] {}:{}:{}: {}",
+                path.display(),
+                e.line(),
+                e.column(),
+                e
+            )
+        })
+}
+
+fn parse_toml(path: &Path, source: &str) -> Option<String> {
+    source.parse::<toml::Value>().err().map(|e| {
+        let location = e
+            .span()
+            .map(|span| offset_to_line_col(source, span.start))
+            .map(|(line, col)| format!(":{line}:{col}"))
+            .unwrap_or_default();
+        format!("[toml syntax] {}{}: {}", path.display(), location, e)
+    })
+}
+
+fn parse_yaml(path: &Path, source: &str) -> Option<String> {
+    serde_yaml::from_str::<serde_yaml::Value>(source)
+        .err()
+        .map(|e| {
+            if let Some(location) = e.location() {
+                format!(
+                    "[yaml syntax] {}:{}:{}: {}",
+                    path.display(),
+                    location.line(),
+                    location.column(),
+                    e
+                )
+            } else {
+                format!("[yaml syntax] {}: {}", path.display(), e)
+            }
+        })
+}
+
+fn parse_css(path: &Path, source: &str) -> Option<String> {
+    let mut depth = 0usize;
+    for (idx, ch) in source.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    let (line, col) = offset_to_line_col(source, idx);
+                    return Some(format!(
+                        "[css syntax] {}:{line}:{col}: unmatched closing brace",
+                        path.display()
+                    ));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Some(format!(
+            "[css syntax] {}: unmatched opening brace",
+            path.display()
+        ));
+    }
+
+    for block in source.split('{').skip(1) {
+        let body = block.split('}').next().unwrap_or(block);
+        for declaration in body.split(';') {
+            let Some((name, value)) = declaration.split_once(':') else {
+                continue;
+            };
+            if !name.trim().is_empty() && value.trim().is_empty() {
+                return Some(format!(
+                    "[css syntax] {}: empty value for `{}`",
+                    path.display(),
+                    name.trim()
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn reconstruct_post_diff_source(
+    path: &Path,
+    hunks: &[DiffHunk],
+    working_dir: Option<&Path>,
+) -> std::result::Result<String, String> {
+    if working_dir.is_none() || hunks.iter().all(is_new_file_hunk) {
+        return Ok(reconstruct_new_side_from_hunks(hunks));
+    }
+
+    let root = working_dir.expect("checked above");
+    let full_path = root.join(path);
+    let current = std::fs::read_to_string(&full_path)
+        .map_err(|e| format!("could not read {}: {e}", full_path.display()))?;
+    let mut original_lines = split_source_lines(&current);
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    let mut ordered = hunks.to_vec();
+    ordered.sort_by_key(|hunk| hunk.old_start);
+
+    for hunk in ordered {
+        let start = hunk.old_start.saturating_sub(1) as usize;
+        if start < cursor {
+            return Err(format!(
+                "overlapping hunk at old line {} after cursor {}",
+                hunk.old_start,
+                cursor + 1
+            ));
+        }
+        if start > original_lines.len() {
+            return Err(format!(
+                "hunk starts at old line {}, beyond {} line(s)",
+                hunk.old_start,
+                original_lines.len()
+            ));
+        }
+        output.extend(original_lines[cursor..start].iter().cloned());
+        cursor = start;
+
+        for line in hunk.lines {
+            match line {
+                DiffLine::Context(text) => {
+                    let Some(existing) = original_lines.get(cursor) else {
+                        return Err(format!(
+                            "context line `{}` expected after end of file",
+                            trim_for_error(&text)
+                        ));
+                    };
+                    if normalize_line(existing) != normalize_line(&text) {
+                        return Err(format!(
+                            "context mismatch at line {}: expected `{}`, got `{}`",
+                            cursor + 1,
+                            trim_for_error(&text),
+                            trim_for_error(existing)
+                        ));
+                    }
+                    output.push(existing.clone());
+                    cursor += 1;
+                }
+                DiffLine::Removed(text) => {
+                    let Some(existing) = original_lines.get(cursor) else {
+                        return Err(format!(
+                            "removed line `{}` expected after end of file",
+                            trim_for_error(&text)
+                        ));
+                    };
+                    if normalize_line(existing) != normalize_line(&text) {
+                        return Err(format!(
+                            "removed-line mismatch at line {}: expected `{}`, got `{}`",
+                            cursor + 1,
+                            trim_for_error(&text),
+                            trim_for_error(existing)
+                        ));
+                    }
+                    cursor += 1;
+                }
+                DiffLine::Added(text) => output.push(text),
+            }
+        }
+    }
+
+    output.extend(original_lines.drain(cursor..));
+    Ok(join_source_lines(&output))
+}
+
+fn reconstruct_new_side_from_hunks(hunks: &[DiffHunk]) -> String {
+    let mut ordered = hunks.to_vec();
+    ordered.sort_by_key(|hunk| hunk.new_start);
+    let mut out = String::new();
+    for hunk in &ordered {
+        out.push_str(&reconstruct_new_side(hunk));
+    }
+    out
+}
+
+fn split_source_lines(source: &str) -> Vec<String> {
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = normalized
+        .split('\n')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if normalized.ends_with('\n') && lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+fn join_source_lines(lines: &[String]) -> String {
+    let mut source = lines.join("\n");
+    source.push('\n');
+    source
+}
+
+fn normalize_line(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+fn trim_for_error(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() > 80 {
+        format!("{}...", text.chars().take(77).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (idx, ch) in source.char_indices() {
+        if idx >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 /// Layer 1.5 — Decision Check.
@@ -551,21 +855,25 @@ fn record_quote(r: &MemoryRecord) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn is_rust_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("rs"))
-        .unwrap_or(false)
+fn syntax_language_for_path(path: &Path) -> Option<SyntaxLanguage> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => Some(SyntaxLanguage::Rust),
+        "py" | "pyw" => Some(SyntaxLanguage::Python),
+        "js" => Some(SyntaxLanguage::JavaScript),
+        "jsx" => Some(SyntaxLanguage::Jsx),
+        "ts" => Some(SyntaxLanguage::TypeScript),
+        "tsx" => Some(SyntaxLanguage::Tsx),
+        "json" => Some(SyntaxLanguage::Json),
+        "toml" => Some(SyntaxLanguage::Toml),
+        "yml" | "yaml" => Some(SyntaxLanguage::Yaml),
+        "html" | "htm" => Some(SyntaxLanguage::Html),
+        "css" => Some(SyntaxLanguage::Css),
+        _ => None,
+    }
 }
 
-fn is_python_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("py") || e.eq_ignore_ascii_case("pyw"))
-        .unwrap_or(false)
-}
-
-fn is_whole_file_hunk(hunk: &DiffHunk) -> bool {
+fn is_new_file_hunk(hunk: &DiffHunk) -> bool {
     hunk.old_start <= 1 && hunk.old_count == 0 && hunk.new_start <= 1
 }
 
@@ -596,6 +904,20 @@ fn contains_error_node(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+fn first_error_position(node: Node<'_>) -> Option<(usize, usize)> {
+    if node.is_error() || node.is_missing() {
+        let pos = node.start_position();
+        return Some((pos.row + 1, pos.column + 1));
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(pos) = first_error_position(child) {
+            return Some(pos);
+        }
+    }
+    None
 }
 
 /// Infer the cargo package name for a path inside the workspace.
@@ -718,6 +1040,14 @@ mod tests {
         }
     }
 
+    fn generated_file(path: &str, source: &str) -> DiffHunk {
+        let lines = source
+            .lines()
+            .map(|line| DiffLine::Added(line.to_string()))
+            .collect::<Vec<_>>();
+        hunk(path, lines)
+    }
+
     #[test]
     fn syntax_pass_on_valid_rust() {
         let h = hunk(
@@ -818,6 +1148,137 @@ mod tests {
                 );
             }
             other => panic!("expected syntax failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_registry_fails_broken_generated_supported_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("app.js", "function broken( {"),
+            ("app.jsx", "export default function App(){ return <div>; }"),
+            ("app.ts", "const value: = 1;"),
+            ("app.tsx", "export function App(){ return <div>; }"),
+            ("package.json", r#"{ "scripts": }"#),
+            ("config.toml", "name ="),
+            ("workflow.yaml", "jobs: ["),
+            ("index.html", "<div <span>broken</span>"),
+            ("style.css", ".board { color: ; }"),
+        ];
+
+        for (path, source) in cases {
+            let h = generated_file(path, source);
+            match verify_syntax_in_workspace(&[h], tmp.path()) {
+                Some(VerifyResult::Fail {
+                    layer: VerifyLayer::Syntax,
+                    errors,
+                    ..
+                }) => {
+                    let joined = errors.join("\n");
+                    assert!(
+                        joined.contains(path),
+                        "syntax error should mention {path}: {joined}"
+                    );
+                }
+                other => panic!("expected syntax failure for {path}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_registry_passes_valid_generated_supported_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("app.js", "function ok() { return 1; }\n"),
+            (
+                "app.jsx",
+                "export default function App(){ return <div>ok</div>; }\n",
+            ),
+            ("app.ts", "const value: number = 1;\n"),
+            (
+                "app.tsx",
+                "export function App(){ return <div>ok</div>; }\n",
+            ),
+            ("package.json", r#"{ "scripts": { "test": "echo ok" } }"#),
+            ("config.toml", "name = \"phonton\"\n"),
+            (
+                "workflow.yaml",
+                "jobs:\n  test:\n    runs-on: ubuntu-latest\n",
+            ),
+            (
+                "index.html",
+                "<!doctype html><html><body>ok</body></html>\n",
+            ),
+            ("style.css", ".board { color: white; }\n"),
+        ];
+
+        for (path, source) in cases {
+            let h = generated_file(path, source);
+            assert!(
+                verify_syntax_in_workspace(&[h], tmp.path()).is_none(),
+                "valid generated file should pass syntax: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_registry_reconstructs_existing_file_before_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("app.js"),
+            "function ok() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+        let h = DiffHunk {
+            file_path: PathBuf::from("app.js"),
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("  return 1;".into()),
+                DiffLine::Added("  return ; }".into()),
+            ],
+        };
+
+        match verify_syntax_in_workspace(&[h], tmp.path()) {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::Syntax,
+                errors,
+                ..
+            }) => assert!(
+                errors.iter().any(|error| error.contains("app.js")),
+                "reconstructed-file syntax error should mention app.js: {errors:?}"
+            ),
+            other => panic!("expected reconstructed syntax failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_registry_fails_when_existing_file_reconstruction_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("app.js"), "function ok() { return 1; }\n").unwrap();
+        let h = DiffHunk {
+            file_path: PathBuf::from("app.js"),
+            old_start: 20,
+            old_count: 1,
+            new_start: 20,
+            new_count: 1,
+            lines: vec![DiffLine::Added("function later() {}".into())],
+        };
+
+        match verify_syntax_in_workspace(&[h], tmp.path()) {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::Syntax,
+                errors,
+                ..
+            }) => assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("could not reconstruct")),
+                "reconstruction failure should be explicit: {errors:?}"
+            ),
+            other => panic!("expected reconstruction failure, got {other:?}"),
         }
     }
 

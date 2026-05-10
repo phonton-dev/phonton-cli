@@ -514,7 +514,7 @@ impl Worker {
                         n = errors.len(),
                         "verify failed; will retry"
                     );
-                    last_errors = errors;
+                    last_errors = compact_verify_retry_errors(layer, &errors);
                 }
                 VerifyResult::Escalate { reason } => {
                     return Ok(failed_result(
@@ -1123,6 +1123,26 @@ fn estimate_prompt_tokens(text: &str) -> u64 {
     ((text.chars().count() as u64).saturating_add(3)) / 4
 }
 
+fn compact_verify_retry_errors(layer: VerifyLayer, errors: &[String]) -> Vec<String> {
+    if errors.is_empty() {
+        return vec![format!(
+            "Verifier {layer:?} failed without a detailed diagnostic. Repair the diff and keep the next response as a unified diff only."
+        )];
+    }
+    let mut compact: Vec<String> = errors
+        .iter()
+        .take(6)
+        .map(|error| format!("Verifier {layer:?}: {}", truncate_chars(error.trim(), 500)))
+        .collect();
+    if errors.len() > compact.len() {
+        compact.push(format!(
+            "{} additional verifier error(s) omitted.",
+            errors.len() - compact.len()
+        ));
+    }
+    compact
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct McpToolRequest {
     server_id: ExtensionId,
@@ -1727,6 +1747,22 @@ mod tests {
                 .saturating_add(manifest.mcp_tool_tokens)
                 .saturating_add(manifest.retry_error_tokens)
         );
+    }
+
+    #[test]
+    fn compact_verify_retry_errors_caps_diagnostic_context() {
+        let errors: Vec<String> = (0..8)
+            .map(|i| format!("[python syntax] chess.py:{}: {}", i + 1, "x".repeat(700)))
+            .collect();
+        let compact = compact_verify_retry_errors(VerifyLayer::Syntax, &errors);
+
+        assert_eq!(compact.len(), 7);
+        assert!(compact[0].starts_with("Verifier Syntax: [python syntax] chess.py:1"));
+        assert!(compact[0].chars().count() < 540);
+        assert!(compact
+            .last()
+            .unwrap()
+            .contains("additional verifier error"));
     }
 
     #[test]

@@ -4,6 +4,25 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.10.0 - Verification And Failure QoL
+
+### Added
+
+- Added a multi-language syntax verifier registry covering Rust, Python,
+  JavaScript/TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before
+  review-ready status.
+- Added the TUI Problems focus view, `/problems`, `/diagnostics`, `/retry`,
+  `/repair`, and `/why-tokens` commands.
+- Added failed/unverified Markdown review receipts that include verifier and
+  subtask diagnostics.
+
+### Changed
+
+- Worker verifier retry prompts now use compact diagnostics instead of feeding
+  back large previous error/output blobs.
+- Failed selected goals default to Problems focus and expose a short failure
+  type such as `syntax`, `quality`, `provider`, or `command` in goal lists.
+
 ## 0.9.3 - Python Verification Hotfix
 
 ### Fixed

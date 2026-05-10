@@ -821,6 +821,18 @@ impl App {
                 self.ask_answer = Some(self.compact_command_summary(intent.is_some()));
                 intent
             }
+            SlashAction::ShowProblems => {
+                self.focus_view = FocusView::Problems;
+                self.focus_scroll = 0;
+                self.command_notice = Some("Active focus: Problems".into());
+                None
+            }
+            SlashAction::RetryGoal => self.retry_selected_goal_intent(),
+            SlashAction::ShowWhyTokens => {
+                self.mode = Mode::Ask;
+                self.ask_answer = Some(self.why_tokens_command_summary());
+                None
+            }
             SlashAction::StopGoal => self.stop_selected_goal_intent(),
             SlashAction::OpenGoals => {
                 self.goal_switcher.open = true;
@@ -961,6 +973,31 @@ impl App {
         )
     }
 
+    fn why_tokens_command_summary(&self) -> String {
+        let Some(m) = &self.last_prompt_manifest else {
+            return "Why tokens?\nNo provider prompt manifest has been recorded yet. Run a goal first, then use /why-tokens again.".into();
+        };
+        let active_goal = self
+            .goals
+            .get(self.selected)
+            .map(|goal| goal.description.as_str())
+            .unwrap_or("none");
+        format!(
+            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- code: {} selected repository context tokens\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\nprovider-reported completion tokens remain the billing source of truth.",
+            active_goal,
+            m.total_estimated_tokens,
+            m.system_tokens,
+            m.user_goal_tokens,
+            m.memory_tokens,
+            m.code_context_tokens,
+            m.attachment_tokens,
+            m.mcp_tool_tokens,
+            m.retry_error_tokens,
+            m.compacted_tokens,
+            m.deduped_tokens
+        )
+    }
+
     fn stats_command_summary(&self) -> String {
         let totals = self.session_totals();
         let active = self
@@ -1031,6 +1068,26 @@ impl App {
             self.command_notice = Some("No running goal is selected.".into());
             None
         }
+    }
+
+    fn retry_selected_goal_intent(&mut self) -> Option<Intent> {
+        let Some(goal) = self.goals.get(self.selected) else {
+            self.command_notice = Some("No selected goal to retry.".into());
+            return None;
+        };
+        if !matches!(goal.status, TaskStatus::Failed { .. }) && problem_diagnostics(goal).is_empty()
+        {
+            self.command_notice = Some("Selected goal has no verifier failure to repair.".into());
+            return None;
+        }
+        let diagnostics = compact_problem_diagnostics(goal, 6);
+        let prompt = format!(
+            "Repair the previous failed Phonton goal.\n\nOriginal goal:\n{}\n\nVerifier diagnostics:\n{}\n\nInstructions:\n- Fix the reported failure with the smallest reviewable diff.\n- Keep output runnable and concise.\n- Run static syntax/build verification before review.\n- Do not claim success unless the verifier passes.",
+            goal.description,
+            diagnostics
+        );
+        self.command_notice = Some("Retry queued with compact diagnostics.".into());
+        Some(Intent::QueueGoal(prompt))
     }
 
     fn selected_goal_can_be_controlled(&self) -> bool {
@@ -1335,6 +1392,15 @@ impl App {
             g.status = state.task_status.clone();
             g.state = Some(state);
         }
+        if index == self.selected
+            && matches!(
+                self.goals.get(index).map(|g| &g.status),
+                Some(TaskStatus::Failed { .. })
+            )
+        {
+            self.focus_view = FocusView::Problems;
+            self.focus_scroll = 0;
+        }
     }
 
     /// Append a flight-log event to the goal at `index`.
@@ -1344,11 +1410,21 @@ impl App {
                 &event.event,
                 OrchestratorEvent::SubtaskReviewReady { diff_hunks, .. } if !diff_hunks.is_empty()
             );
+        let should_default_problems_focus = index == self.selected
+            && matches!(
+                &event.event,
+                OrchestratorEvent::VerifyFail { .. } | OrchestratorEvent::SubtaskFailed { .. }
+            );
         if let OrchestratorEvent::PromptManifest { manifest, .. } = &event.event {
             self.record_prompt_manifest(manifest.clone());
         }
         if let Some(g) = self.goals.get_mut(index) {
             g.flight_log.push(event);
+        }
+        if should_default_problems_focus {
+            self.focus_view = FocusView::Problems;
+            self.focus_scroll = 0;
+            return;
         }
         if should_default_code_focus && self.focus_view == FocusView::Receipt {
             self.focus_view = FocusView::Code;
@@ -1372,6 +1448,7 @@ impl App {
         };
         match self.active_focus_view_for_current_goal() {
             FocusView::Receipt => receipt_focus_text(goal),
+            FocusView::Problems => problems_focus_text(goal, self.focused_changed_file),
             FocusView::Code => code_focus_text(goal, self.focused_changed_file),
             FocusView::Commands => {
                 commands_focus_text(&self.command_runs, self.focused_command_run)
@@ -1419,6 +1496,14 @@ impl App {
     }
 
     fn default_to_code_focus_for_reviewable_goal(&mut self) {
+        if self
+            .current_goal()
+            .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
+        {
+            self.focus_view = FocusView::Problems;
+            self.focus_scroll = 0;
+            return;
+        }
         if self.focus_view == FocusView::Receipt
             && self.current_goal().map(focused_file_count).unwrap_or(0) > 0
         {
@@ -2122,6 +2207,12 @@ impl App {
                 None
             }
             KeyCode::Char('r') if self.goal_prompt.is_empty() => {
+                if self
+                    .current_goal()
+                    .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
+                {
+                    return self.retry_selected_goal_intent();
+                }
                 // Rollback shortcut — only when the goal bar is empty so the
                 // user can still type words starting with 'r' normally.
                 let goal_index = self.selected;
@@ -2136,6 +2227,11 @@ impl App {
                     }
                 }
                 self.goal_prompt.insert_char('r');
+                None
+            }
+            KeyCode::Char('p') if self.goal_prompt.is_empty() => {
+                self.focus_view = FocusView::Problems;
+                self.focus_scroll = 0;
                 None
             }
             KeyCode::Char('f') if self.goal_prompt.is_empty() => {
@@ -2753,6 +2849,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
             "inspect memories that can influence future tasks",
         ),
         ("/review", "use `phonton review latest` outside the TUI"),
+        ("/problems", "inspect verifier failures and repair hints"),
+        ("/retry", "repair the selected failed goal with diagnostics"),
+        ("/why-tokens", "explain latest prompt token buckets"),
         ("/commands", "show command and keyboard help"),
         ("/run", "run a command through the sandbox"),
         ("!", "run command shorthand, e.g. !npm test"),
@@ -2769,7 +2868,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("← / →", "move caret in the input bar"),
         ("Home / End", "jump to start/end of the input"),
         ("Ctrl+↑↓", "move the checkpoint cursor"),
-        ("r", "rollback to the highlighted checkpoint (input empty)"),
+        ("p", "open Problems focus (input empty)"),
+        (
+            "r",
+            "retry failed goal or rollback checkpoint (input empty)",
+        ),
         ("Ctrl+C", "ask to save and quit"),
         ("Esc", "close overlay / cancel / ask to quit"),
     ];
@@ -3327,10 +3430,15 @@ fn render_goal_switcher(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default().fg(MUTED)
             };
+            let status = if matches!(goal.status, TaskStatus::Failed { .. }) {
+                goal_failure_kind(goal)
+            } else {
+                goal_status_label(&goal.status)
+            };
             ListItem::new(Line::from(format!(
                 "{:>2}. {:<7} {}",
                 goal_idx + 1,
-                goal_status_label(&goal.status),
+                status,
                 short(&goal.description, inner.width.saturating_sub(14) as usize)
             )))
             .style(style)
@@ -3371,6 +3479,13 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(if selected { ACCENT_HI } else { MUTED }),
             ));
             spans.extend(status_tag_spans(&g.status, app.spinner_frame));
+            if matches!(g.status, TaskStatus::Failed { .. }) {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    goal_failure_kind(g),
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                ));
+            }
             // Parallel-worker indicator: one spinner glyph per concurrently
             // active subtask, capped at 5 so the sidebar stays readable.
             // Each glyph is drawn at a different phase of the spinner so
@@ -3777,6 +3892,9 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                     )));
                 }
             }
+            FocusView::Problems => {
+                append_problems_focus_lines(&mut lines, g, app.focused_changed_file)
+            }
             FocusView::Code => append_code_focus_lines(&mut lines, g, app.focused_changed_file),
             FocusView::Commands => {
                 append_command_run_lines(&mut lines, &app.command_runs, app.focused_command_run)
@@ -3851,6 +3969,7 @@ fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusView) {
     lines.push(Line::raw(""));
     let tabs = [
         FocusView::Receipt,
+        FocusView::Problems,
         FocusView::Code,
         FocusView::Commands,
         FocusView::Log,
@@ -3873,7 +3992,7 @@ fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusView) {
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(
-        " f cycle  [ ] item",
+        " p problems  r retry  f cycle  [ ] item",
         Style::default().fg(MUTED),
     ));
     lines.push(Line::from(spans));
@@ -3989,6 +4108,181 @@ fn code_focus_text(goal: &GoalEntry, selected_file: usize) -> String {
     }
 
     "Code\nNo diff hunks recorded yet.".into()
+}
+
+fn append_problems_focus_lines(
+    lines: &mut Vec<Line<'static>>,
+    goal: &GoalEntry,
+    selected_file: usize,
+) {
+    for line in problems_focus_text(goal, selected_file).lines() {
+        let style = if line.starts_with("fail") || line.starts_with("error") {
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+        } else if line.starts_with("- [") || line.starts_with("- layer") {
+            Style::default().fg(WARN)
+        } else if line.starts_with('+') {
+            Style::default().fg(SUCCESS)
+        } else if line.starts_with("@@") || line.starts_with("file:") {
+            Style::default().fg(ACCENT_HI)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line.to_string(), style)));
+    }
+}
+
+fn problems_focus_text(goal: &GoalEntry, selected_file: usize) -> String {
+    let mut out = String::from("Problems\n");
+    let diagnostics = problem_diagnostics(goal);
+    if diagnostics.is_empty() {
+        out.push_str("No verifier problems recorded for this goal.");
+        return out;
+    }
+    out.push_str(&format!("failure type: {}\n", goal_failure_kind(goal)));
+    for item in diagnostics.iter().take(10) {
+        out.push_str(&format!("- {item}\n"));
+    }
+    if diagnostics.len() > 10 {
+        out.push_str(&format!(
+            "... {} more diagnostic(s)\n",
+            diagnostics.len() - 10
+        ));
+    }
+    out.push_str("\nRepair\n- Press r or run /retry to queue a repair with compact diagnostics.\n- Use /why-tokens to inspect retry/context token buckets.\n");
+
+    let groups = diff_hunks_by_file(goal);
+    if let Some((path, hunks)) = groups.get(selected_file.min(groups.len().saturating_sub(1))) {
+        out.push_str(&format!(
+            "\nChanged excerpt {}/{}\nfile: {}\n",
+            selected_file.min(groups.len().saturating_sub(1)) + 1,
+            groups.len(),
+            path.display()
+        ));
+        for hunk in hunks.iter().take(1) {
+            out.push_str(&format!(
+                "@@ -{},{} +{},{} @@\n",
+                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+            ));
+            for line in hunk.lines.iter().take(12) {
+                match line {
+                    DiffLine::Context(text) => {
+                        out.push(' ');
+                        out.push_str(text);
+                    }
+                    DiffLine::Added(text) => {
+                        out.push('+');
+                        out.push_str(text);
+                    }
+                    DiffLine::Removed(text) => {
+                        out.push('-');
+                        out.push_str(text);
+                    }
+                }
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn problem_diagnostics(goal: &GoalEntry) -> Vec<String> {
+    let mut items = Vec::new();
+    for record in &goal.flight_log {
+        match &record.event {
+            OrchestratorEvent::VerifyFail {
+                layer,
+                errors,
+                attempt,
+                ..
+            } => {
+                if errors.is_empty() {
+                    items.push(format!("layer {layer:?} failed on attempt {attempt}"));
+                } else {
+                    for error in errors {
+                        items.push(format!(
+                            "[{}] {}",
+                            format!("{layer:?}").to_ascii_lowercase(),
+                            short(error, 220)
+                        ));
+                    }
+                }
+            }
+            OrchestratorEvent::SubtaskFailed {
+                reason, attempt, ..
+            } => items.push(format!(
+                "subtask failed on attempt {attempt}: {}",
+                short(reason, 220)
+            )),
+            _ => {}
+        }
+    }
+    if let TaskStatus::Failed { reason, .. } = &goal.status {
+        if !items.iter().any(|item| item.contains(reason)) {
+            items.push(format!("task failed: {}", short(reason, 220)));
+        }
+    }
+    items
+}
+
+fn compact_problem_diagnostics(goal: &GoalEntry, max_items: usize) -> String {
+    let diagnostics = problem_diagnostics(goal);
+    if diagnostics.is_empty() {
+        return "- no explicit verifier diagnostic was recorded".into();
+    }
+    diagnostics
+        .iter()
+        .take(max_items)
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn goal_failure_kind(goal: &GoalEntry) -> &'static str {
+    for record in goal.flight_log.iter().rev() {
+        match &record.event {
+            OrchestratorEvent::VerifyFail { layer, errors, .. } => {
+                if matches!(layer, VerifyLayer::Syntax) {
+                    return "syntax";
+                }
+                if errors.iter().any(|error| {
+                    let lower = error.to_ascii_lowercase();
+                    lower.contains("quality") || lower.contains("gate")
+                }) {
+                    return "quality";
+                }
+                return "verify";
+            }
+            OrchestratorEvent::SubtaskFailed { reason, .. } => {
+                let lower = reason.to_ascii_lowercase();
+                if lower.contains("provider") || lower.contains("dispatch") {
+                    return "provider";
+                }
+                if lower.contains("command") || lower.contains("exit") {
+                    return "command";
+                }
+                if lower.contains("quality") || lower.contains("gate") {
+                    return "quality";
+                }
+            }
+            _ => {}
+        }
+    }
+    if let TaskStatus::Failed { reason, .. } = &goal.status {
+        let lower = reason.to_ascii_lowercase();
+        if lower.contains("syntax") {
+            "syntax"
+        } else if lower.contains("quality") || lower.contains("gate") {
+            "quality"
+        } else if lower.contains("provider") || lower.contains("dispatch") {
+            "provider"
+        } else if lower.contains("command") || lower.contains("exit") {
+            "command"
+        } else {
+            "failed"
+        }
+    } else {
+        "none"
+    }
 }
 
 fn append_log_focus_lines(lines: &mut Vec<Line<'static>>, goal: &GoalEntry) {
@@ -5875,6 +6169,7 @@ fn print_help() {
          \n\
          TUI SLASH COMMANDS:\n  \
          /settings, /config, /status, /context, /compact, /compress,\n  \
+         /problems, /diagnostics, /retry, /repair, /why-tokens,\n  \
          /goals, /switch, /focus <view>, /copy, /rerun, /stats, /stop,\n  \
          /review, /memory, /permissions set <mode>, /trust, /model set <name>,\n  \
          /commands, /run <cmd>, and !<cmd>\n\
@@ -7818,6 +8113,37 @@ mod tests {
         }
     }
 
+    fn verify_fail_event(path: &str) -> EventRecord {
+        EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 1,
+            event: OrchestratorEvent::VerifyFail {
+                subtask_id: SubtaskId::new(),
+                layer: VerifyLayer::Syntax,
+                errors: vec![format!(
+                    "[python syntax] {path}:398: unterminated or invalid string"
+                )],
+                attempt: 1,
+            },
+        }
+    }
+
+    fn failed_state(reason: &str) -> GlobalState {
+        GlobalState {
+            task_status: TaskStatus::Failed {
+                reason: reason.into(),
+                failed_subtask: Some(SubtaskId::new()),
+            },
+            goal_contract: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 123,
+            tokens_budget: None,
+            estimated_naive_tokens: 1000,
+            checkpoints: Vec::new(),
+        }
+    }
+
     #[derive(Clone, Default)]
     struct McpE2eProvider {
         calls: Arc<AtomicU64>,
@@ -8891,6 +9217,40 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn failed_goal_defaults_to_problems_focus() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, verify_fail_event("chess.py"));
+        app.apply_state(0, failed_state("syntax verification failed"));
+
+        assert_eq!(
+            app.active_focus_view_for_current_goal(),
+            FocusView::Problems
+        );
+        assert!(app.focus_text().contains("[python syntax] chess.py"));
+    }
+
+    #[test]
+    fn problems_shortcuts_open_and_retry_failed_goal() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, verify_fail_event("chess.py"));
+        app.apply_state(0, failed_state("syntax verification failed"));
+        app.focus_view = FocusView::Receipt;
+
+        assert_eq!(app.handle_key(key('p')), None);
+        assert_eq!(app.focus_view, FocusView::Problems);
+
+        match app.handle_key(key('r')) {
+            Some(Intent::QueueGoal(prompt)) => {
+                assert!(prompt.contains("Repair the previous failed Phonton goal"));
+                assert!(prompt.contains("[python syntax] chess.py"));
+            }
+            other => panic!("expected retry repair goal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn code_focus_text_preserves_diff_markers() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
@@ -9014,6 +9374,9 @@ fn extract_id(line: &str) -> Option<String> {
 
         app.focus_view = FocusView::Receipt;
         assert!(app.focus_text().contains("Receipt"));
+
+        app.focus_view = FocusView::Problems;
+        assert!(app.focus_text().contains("Problems"));
 
         app.focus_view = FocusView::Code;
         assert!(app.focus_text().contains("chess.py"));

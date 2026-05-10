@@ -48,6 +48,7 @@ struct ReviewReport {
     handoff: Option<HandoffPacket>,
     checkpoints: Vec<CheckpointItem>,
     review_items: Vec<ReviewItem>,
+    diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,7 +232,13 @@ pub async fn run(args: &[String]) -> Result<i32> {
         print_text_report(&report);
     }
 
-    Ok(if report.review_items.is_empty() { 1 } else { 0 })
+    Ok(
+        if report.review_items.is_empty() && report.diagnostics.is_empty() {
+            1
+        } else {
+            0
+        },
+    )
 }
 
 async fn resolve_task(
@@ -399,6 +406,7 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
 
     let mut checkpoints = Vec::new();
     let mut review_items = Vec::new();
+    let mut diagnostics = Vec::new();
     for event in events {
         match event.event {
             OrchestratorEvent::CheckpointCreated {
@@ -441,6 +449,23 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
                     diff_hunks,
                 });
             }
+            OrchestratorEvent::VerifyFail {
+                layer,
+                errors,
+                attempt,
+                ..
+            } => {
+                if errors.is_empty() {
+                    diagnostics.push(format!("verify {layer:?} failed on attempt {attempt}"));
+                } else {
+                    for error in errors {
+                        diagnostics.push(format!("verify {layer:?} attempt {attempt}: {error}"));
+                    }
+                }
+            }
+            OrchestratorEvent::SubtaskFailed {
+                reason, attempt, ..
+            } => diagnostics.push(format!("subtask failed on attempt {attempt}: {reason}")),
             _ => {}
         }
     }
@@ -453,6 +478,7 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
         handoff: task.outcome_ledger.and_then(|ledger| ledger.handoff),
         checkpoints,
         review_items,
+        diagnostics,
     }
 }
 
@@ -481,8 +507,16 @@ fn print_text_report(report: &ReviewReport) {
     println!();
 
     if report.review_items.is_empty() {
-        println!("No verified review payloads found for this task.");
-        println!("Run a task to Reviewing/Done first; failed or pre-verification output is not review-ready.");
+        if report.diagnostics.is_empty() {
+            println!("No verified review payloads found for this task.");
+            println!("Run a task to Reviewing/Done first; failed or pre-verification output is not review-ready.");
+        } else {
+            println!("No verified review payloads found; this task is failed/unverified.");
+            println!("Diagnostics:");
+            for diagnostic in report.diagnostics.iter().take(10) {
+                println!("  - {diagnostic}");
+            }
+        }
         return;
     }
 
@@ -596,7 +630,11 @@ fn format_markdown_report(report: &ReviewReport) -> String {
         append_markdown_list(&mut out, "Findings", &handoff.verification.findings);
         append_markdown_list(&mut out, "Skipped", &handoff.verification.skipped);
     } else if report.review_items.is_empty() {
-        writeln!(out, "- No verified review payloads found.").ok();
+        writeln!(
+            out,
+            "- Failed/unverified: no verified review payloads found."
+        )
+        .ok();
     } else {
         for item in &report.review_items {
             writeln!(
@@ -606,6 +644,14 @@ fn format_markdown_report(report: &ReviewReport) -> String {
             )
             .ok();
         }
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Diagnostics").ok();
+    if report.diagnostics.is_empty() {
+        writeln!(out, "- None recorded.").ok();
+    } else {
+        append_markdown_items(&mut out, &report.diagnostics);
     }
 
     writeln!(out).ok();
