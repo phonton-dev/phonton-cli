@@ -4,6 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.11.1 - Benchmark Hotfix
+
+### Fixed
+
+- Fixed chess quality gates so symbol/abbreviation piece maps such as
+  `K/Q/R/B/N/P` and Unicode chess glyphs count as valid piece evidence instead
+  of falsely failing `named chess pieces`.
+- Prevented automatic broad chess quality repair after an already-expensive
+  attempt crosses 8k provider tokens; Phonton now fails honestly and tells the
+  user to run `/retry` for an explicit compact repair.
+- Honored explicit empty-workspace HTML chess goals by targeting a static
+  `index.html` artifact instead of silently defaulting to Python terminal
+  chess.
+
 ## 0.11.0 - Context Engine
 
 ### Added

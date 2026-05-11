@@ -54,6 +54,11 @@ pub const MAX_ESCALATIONS: u8 = 3;
 /// ordinary syntax/build/test verification has passed.
 pub const MAX_QUALITY_REPAIR_ATTEMPTS: u8 = 1;
 
+/// Provider tokens above which broad post-verification quality repair must be
+/// explicit. This prevents an already-expensive generated-code attempt from
+/// silently doubling cost after syntax/build checks have passed.
+pub const QUALITY_AUTO_REPAIR_TOKEN_CEILING: u64 = 8_000;
+
 /// Deprecated — budget pauses now produce `TaskStatus::Paused` directly.
 /// Kept for any downstream code that may still substring-match the old sentinel.
 #[deprecated(note = "budget pauses now emit TaskStatus::Paused; remove this check")]
@@ -508,6 +513,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     let quality_failures = self.quality_gate_failures(&plan, &runtimes);
                     if !quality_failures.is_empty()
                         && quality_repair_attempts < MAX_QUALITY_REPAIR_ATTEMPTS
+                        && should_auto_repair_quality(&plan, tokens_used)
                         && self.redispatch_quality_gate_repair(
                             &plan,
                             &quality_failures,
@@ -803,11 +809,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // 5. Final task status. Paused takes priority over a simultaneous
         //    failure (the pause aborted the joinset so any failure that
         //    raced in is noise). Real failures take priority over nothing.
-        let quality_failures = if failure.is_none() && paused.is_none() && !cancelled {
+        let mut quality_failures = if failure.is_none() && paused.is_none() && !cancelled {
             self.quality_gate_failures(&plan, &runtimes)
         } else {
             Vec::new()
         };
+        if !quality_failures.is_empty() {
+            if let Some(reason) = quality_auto_repair_skip_reason(&plan, tokens_used) {
+                quality_failures.push(reason);
+            }
+        }
 
         let terminal = if cancelled {
             self.emit(OrchestratorEvent::TaskFailed {
@@ -1354,10 +1365,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 "playable chess requires substantial implementation; only {added_lines} added line(s) were produced"
             ));
         }
-        let piece_hits = ["king", "queen", "rook", "bishop", "knight", "pawn"]
-            .iter()
-            .filter(|piece| lower.contains(**piece))
-            .count();
+        let piece_hits = chess_piece_evidence_count(&added_text);
         if piece_hits < 4 {
             failures.push("playable chess must represent named chess pieces".into());
         }
@@ -1639,6 +1647,42 @@ fn is_chess_goal_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("chess")
         && (lower.contains("make") || lower.contains("build") || lower.contains("create"))
+}
+
+fn should_auto_repair_quality(plan: &PlannerOutput, tokens_used: u64) -> bool {
+    quality_auto_repair_skip_reason(plan, tokens_used).is_none()
+}
+
+fn quality_auto_repair_skip_reason(plan: &PlannerOutput, tokens_used: u64) -> Option<String> {
+    let broad_chess = plan
+        .goal_contract
+        .as_ref()
+        .is_some_and(|contract| is_chess_goal_text(&contract.goal));
+    if broad_chess && tokens_used >= QUALITY_AUTO_REPAIR_TOKEN_CEILING {
+        return Some(format!(
+            "automatic quality repair skipped after {tokens_used} tokens to protect budget; use /retry to repair with compact diagnostics"
+        ));
+    }
+    None
+}
+
+fn chess_piece_evidence_count(text: &str) -> usize {
+    let lower = text.to_ascii_lowercase();
+    [
+        ("king", ["'k'", "\"k\"", "`k`"], ['♔', '♚']),
+        ("queen", ["'q'", "\"q\"", "`q`"], ['♕', '♛']),
+        ("rook", ["'r'", "\"r\"", "`r`"], ['♖', '♜']),
+        ("bishop", ["'b'", "\"b\"", "`b`"], ['♗', '♝']),
+        ("knight", ["'n'", "\"n\"", "`n`"], ['♘', '♞']),
+        ("pawn", ["'p'", "\"p\"", "`p`"], ['♙', '♟']),
+    ]
+    .iter()
+    .filter(|(name, aliases, glyphs)| {
+        lower.contains(*name)
+            || aliases.iter().any(|alias| lower.contains(alias))
+            || glyphs.iter().any(|glyph| text.contains(*glyph))
+    })
+    .count()
 }
 
 fn short_text(text: &str, max_chars: usize) -> String {
@@ -2307,6 +2351,46 @@ mod tests {
         }
     }
 
+    fn chess_symbol_piece_hunk() -> DiffHunk {
+        let mut hunk = chess_hunk(true);
+        hunk.lines[1] = DiffLine::Added(
+            "PIECES = {'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙', 'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'}"
+                .into(),
+        );
+        hunk
+    }
+
+    #[test]
+    fn chess_quality_gate_accepts_symbol_piece_maps() {
+        let a = subtask("make chess", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(chess_contract("make chess")),
+        };
+        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
+        runtime.status = SubtaskStatus::Done {
+            tokens_used: 100,
+            diff_hunk_count: 1,
+        };
+        runtime.diff_hunks = vec![chess_symbol_piece_hunk()];
+        let mut runtimes = HashMap::new();
+        runtimes.insert(a.id, runtime);
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let orch = Orchestrator::new(dispatcher);
+
+        let failures = orch.quality_gate_failures(&plan, &runtimes);
+
+        assert!(
+            !failures
+                .iter()
+                .any(|failure| failure.contains("named chess pieces")),
+            "unexpected failures: {failures:?}"
+        );
+    }
+
     #[tokio::test]
     async fn quality_gate_failure_redispatches_repair_once() {
         struct ChessRepairDispatcher {
@@ -2371,6 +2455,68 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls[0].is_empty());
         assert!(calls[1].iter().any(|error| error.contains("reset")));
+    }
+
+    #[tokio::test]
+    async fn expensive_quality_gate_failure_does_not_auto_repair() {
+        struct ExpensiveFailingDispatcher {
+            calls: Mutex<u8>,
+        }
+
+        #[async_trait]
+        impl WorkerDispatcher for ExpensiveFailingDispatcher {
+            async fn dispatch(
+                &self,
+                subtask: Subtask,
+                _prior_errors: Vec<String>,
+                _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
+            ) -> Result<SubtaskResult> {
+                *self.calls.lock().unwrap() += 1;
+                let hunks = vec![chess_hunk(false)];
+                Ok(SubtaskResult {
+                    id: subtask.id,
+                    status: SubtaskStatus::Done {
+                        tokens_used: 9_500,
+                        diff_hunk_count: hunks.len(),
+                    },
+                    diff_hunks: hunks,
+                    model_tier: subtask.model_tier,
+                    verify_result: VerifyResult::Pass {
+                        layer: VerifyLayer::Syntax,
+                    },
+                    provider: ProviderKind::Cloudflare,
+                    model_name: "@cf/moonshotai/kimi-k2.6".into(),
+                    token_usage: TokenUsage {
+                        input_tokens: 3_000,
+                        output_tokens: 6_500,
+                        ..TokenUsage::default()
+                    },
+                })
+            }
+        }
+
+        let a = subtask("make chess", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(chess_contract("make chess")),
+        };
+        let dispatcher = Arc::new(ExpensiveFailingDispatcher {
+            calls: Mutex::new(0),
+        });
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+
+        let status = orch.run_task(plan, empty_state()).await.unwrap();
+
+        let TaskStatus::Failed { reason, .. } = status else {
+            panic!("unexpected status: {status:?}");
+        };
+        assert!(reason.contains("automatic quality repair skipped"));
+        assert_eq!(*dispatcher.calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]

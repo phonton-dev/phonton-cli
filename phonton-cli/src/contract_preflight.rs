@@ -16,6 +16,7 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
         && (lower_goal.contains("make")
             || lower_goal.contains("build")
             || lower_goal.contains("create"));
+    let wants_static_html = is_chess && (lower_goal.contains("html") || lower_goal.contains("web"));
     let mut stack_detected = false;
 
     let package_json = working_dir.join("package.json");
@@ -80,44 +81,91 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
                 !question.contains("No project stack was detected")
                     && !question.contains("What exact behavior or artifact")
             });
-            contract.assumptions.push(
-                "No project stack was detected; defaulting to a self-contained Python terminal chess game."
-                    .into(),
-            );
-            contract.acceptance_criteria.push(
-                "In an empty workspace, create a self-contained terminal chess game in chess.py."
-                    .into(),
-            );
-            push_expected_artifact(
-                contract,
-                "Terminal chess game",
-                Some(PathBuf::from("chess.py")),
-            );
-            push_likely_file(contract, PathBuf::from("chess.py"));
-            push_verify_step(
-                contract,
-                "python syntax check",
-                vec![
-                    "python".into(),
-                    "-m".into(),
-                    "py_compile".into(),
-                    "chess.py".into(),
-                ],
-            );
-            push_run_command(
-                contract,
-                "Run terminal chess",
-                vec!["python".into(), "chess.py".into()],
-            );
-            for subtask in &mut plan.subtasks {
-                if subtask
-                    .description
-                    .trim()
-                    .eq_ignore_ascii_case(goal_text.trim())
-                {
-                    subtask.description = format!(
-                        "{goal_text}\n\nDefault empty-workspace target: create a self-contained Python terminal chess game in chess.py. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python chess.py`."
-                    );
+            if wants_static_html {
+                contract.assumptions.push(
+                    "No project stack was detected; defaulting to a self-contained static HTML chess page."
+                        .into(),
+                );
+                contract.acceptance_criteria.push(
+                    "In an empty workspace, create a self-contained playable chess page in index.html."
+                        .into(),
+                );
+                push_expected_artifact(
+                    contract,
+                    "Static browser chess page",
+                    Some(PathBuf::from("index.html")),
+                );
+                push_likely_file(contract, PathBuf::from("index.html"));
+                push_verify_step(
+                    contract,
+                    "index.html exists",
+                    vec![
+                        "python".into(),
+                        "-c".into(),
+                        "from pathlib import Path; p=Path('index.html'); assert p.is_file() and p.read_text(encoding='utf-8').strip()".into(),
+                    ],
+                );
+                push_run_command(
+                    contract,
+                    "Serve static chess page",
+                    vec![
+                        "python".into(),
+                        "-m".into(),
+                        "http.server".into(),
+                        "8000".into(),
+                    ],
+                );
+                for subtask in &mut plan.subtasks {
+                    if subtask
+                        .description
+                        .trim()
+                        .eq_ignore_ascii_case(goal_text.trim())
+                    {
+                        subtask.description = format!(
+                            "{goal_text}\n\nDefault empty-workspace target: create a self-contained playable chess page in index.html with embedded CSS and JavaScript. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python -m http.server 8000`."
+                        );
+                    }
+                }
+            } else {
+                contract.assumptions.push(
+                    "No project stack was detected; defaulting to a self-contained Python terminal chess game."
+                        .into(),
+                );
+                contract.acceptance_criteria.push(
+                    "In an empty workspace, create a self-contained terminal chess game in chess.py."
+                        .into(),
+                );
+                push_expected_artifact(
+                    contract,
+                    "Terminal chess game",
+                    Some(PathBuf::from("chess.py")),
+                );
+                push_likely_file(contract, PathBuf::from("chess.py"));
+                push_verify_step(
+                    contract,
+                    "python syntax check",
+                    vec![
+                        "python".into(),
+                        "-m".into(),
+                        "py_compile".into(),
+                        "chess.py".into(),
+                    ],
+                );
+                push_run_command(
+                    contract,
+                    "Run terminal chess",
+                    vec!["python".into(), "chess.py".into()],
+                );
+                for subtask in &mut plan.subtasks {
+                    if subtask
+                        .description
+                        .trim()
+                        .eq_ignore_ascii_case(goal_text.trim())
+                    {
+                        subtask.description = format!(
+                            "{goal_text}\n\nDefault empty-workspace target: create a self-contained Python terminal chess game in chess.py. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python chess.py`."
+                        );
+                    }
                 }
             }
         }
@@ -260,5 +308,34 @@ mod tests {
             .subtasks
             .iter()
             .any(|subtask| subtask.description.contains("python chess.py")));
+    }
+
+    #[test]
+    fn empty_chess_html_goal_defaults_to_static_index_html() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = plan_for("make chess in html");
+
+        apply_workspace_preflight(&mut plan, temp.path(), "make chess in html");
+
+        let contract = plan.goal_contract.as_ref().unwrap();
+        assert!(contract
+            .likely_files
+            .iter()
+            .any(|path| path == &PathBuf::from("index.html")));
+        assert!(!contract
+            .likely_files
+            .iter()
+            .any(|path| path == &PathBuf::from("chess.py")));
+        assert!(contract.run_plan.iter().any(|cmd| cmd.command
+            == vec![
+                "python".to_string(),
+                "-m".to_string(),
+                "http.server".to_string(),
+                "8000".to_string()
+            ]));
+        assert!(plan
+            .subtasks
+            .iter()
+            .any(|subtask| subtask.description.contains("index.html")));
     }
 }
