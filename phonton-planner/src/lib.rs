@@ -15,6 +15,7 @@
 //! When the LLM-backed decomposer lands it must produce the same
 //! [`PlannerOutput`] shape, including a populated [`CoverageSummary`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -22,8 +23,9 @@ use phonton_memory::MemoryStore;
 use phonton_providers::Provider;
 use phonton_store::{MemoryKind, Store};
 use phonton_types::{
-    CoverageSummary, ExpectedArtifact, GoalContract, MemoryRecord, ModelTier, PlannerOutput,
-    PromptAttachment, QualityFloor, RunCommand, Subtask, SubtaskId, SubtaskStatus, VerifyStepSpec,
+    AcceptanceSlice, CoverageSummary, ExpectedArtifact, GoalContract, MemoryRecord, ModelTier,
+    PlannerOutput, PromptAttachment, QualityFloor, RunCommand, Subtask, SubtaskId, SubtaskStatus,
+    TaskClass, TokenPolicy, VerifyLayer, VerifyStepSpec,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -80,8 +82,12 @@ impl Goal {
 
     /// Build a conservative first-pass contract for the goal.
     pub fn contract(&self) -> GoalContract {
-        let task_class = phonton_types::classify_task(&self.description);
+        let intent = phonton_types::classify_intent(&self.description);
+        let task_class = intent.task_class;
         let chess_goal = is_chess_goal(&self.description);
+        let html_chess_goal = is_html_chess_goal(&self.description);
+        let generated_app_goal = matches!(task_class, TaskClass::GeneratedAppGame);
+        let web_artifact_goal = is_web_artifact_goal(&self.description);
         let mut assumptions = Vec::new();
         if !self.attachments.is_empty() {
             assumptions.push(format!(
@@ -98,6 +104,16 @@ impl Goal {
             "Diff is parseable and reviewable.".into(),
             "Verification outcome is surfaced honestly.".into(),
         ];
+        let mut acceptance_slices = Vec::new();
+        let mut likely_files: Vec<PathBuf> =
+            self.attachments.iter().map(|a| a.path.clone()).collect();
+        let mut verify_plan = vec![VerifyStepSpec {
+            name: "Run configured Phonton verification layers".into(),
+            layer: None,
+            command: None,
+        }];
+        let mut run_plan = Vec::<RunCommand>::new();
+        let mut token_policy = TokenPolicy::default();
         let mut expected_artifacts: Vec<ExpectedArtifact> = self
             .attachments
             .iter()
@@ -118,26 +134,100 @@ impl Goal {
             ]);
             expected_artifacts.push(ExpectedArtifact {
                 description: "Playable chess implementation".into(),
-                path: None,
+                path: if html_chess_goal {
+                    Some(PathBuf::from("index.html"))
+                } else {
+                    None
+                },
             });
+            if html_chess_goal {
+                likely_files.push(PathBuf::from("index.html"));
+                verify_plan.extend(runtime_web_verify_plan());
+                run_plan.push(RunCommand {
+                    label: "Serve static chess page".into(),
+                    command: vec![
+                        "python".into(),
+                        "-m".into(),
+                        "http.server".into(),
+                        "8000".into(),
+                    ],
+                    cwd: None,
+                });
+            }
+            let artifact_path = html_chess_goal.then(|| PathBuf::from("index.html"));
+            let slice_verify_plan = if html_chess_goal {
+                runtime_web_verify_plan()
+            } else {
+                verify_plan.clone()
+            };
+            acceptance_slices = chess_acceptance_slices(artifact_path, slice_verify_plan);
+            token_policy = TokenPolicy {
+                first_attempt_cap_tokens: Some(8_000),
+                allow_broad_repair: false,
+                repair_only_missing_criteria: true,
+                notes: vec![
+                    "Use contract preflight before implementation.".into(),
+                    "Repair only missing acceptance criteria after verifier evidence.".into(),
+                ],
+            };
+        } else if generated_app_goal {
+            acceptance_criteria.extend([
+                "Produce the requested app/game artifact in bounded acceptance slices.".into(),
+                "Each slice must preserve previously accepted behavior and avoid broad rewrites."
+                    .into(),
+                "Provide concrete runtime instructions when the artifact is runnable.".into(),
+            ]);
+            quality_criteria.extend([
+                "Placeholder-only output is below the quality floor.".into(),
+                "Primary user interaction must mutate visible state or behavior.".into(),
+            ]);
+            let artifact_path = web_artifact_goal.then(|| PathBuf::from("index.html"));
+            if let Some(path) = &artifact_path {
+                likely_files.push(path.clone());
+                expected_artifacts.push(ExpectedArtifact {
+                    description: "Runnable generated web artifact".into(),
+                    path: Some(path.clone()),
+                });
+                verify_plan.extend(runtime_web_verify_plan());
+                run_plan.push(RunCommand {
+                    label: "Serve generated web artifact".into(),
+                    command: vec![
+                        "python".into(),
+                        "-m".into(),
+                        "http.server".into(),
+                        "8000".into(),
+                    ],
+                    cwd: None,
+                });
+            }
+            let slice_verify_plan = if web_artifact_goal {
+                runtime_web_verify_plan()
+            } else {
+                verify_plan.clone()
+            };
+            acceptance_slices =
+                generated_app_acceptance_slices(artifact_path.clone(), slice_verify_plan);
+            token_policy = TokenPolicy {
+                first_attempt_cap_tokens: Some(6_000),
+                allow_broad_repair: false,
+                repair_only_missing_criteria: true,
+                notes: vec![
+                    "Dispatch generated-app work as bounded acceptance slices.".into(),
+                    "Fail with replan instead of broad auto-repair when multiple criteria are missing.".into(),
+                ],
+            };
         }
         GoalContract {
             goal: self.description.clone(),
             task_class,
-            confidence_percent: if self.description.split_whitespace().count() <= 3 {
-                60
-            } else {
-                75
-            },
+            intent: Some(intent.clone()),
+            confidence_percent: intent.confidence_percent,
             acceptance_criteria,
+            acceptance_slices,
             expected_artifacts,
-            likely_files: self.attachments.iter().map(|a| a.path.clone()).collect(),
-            verify_plan: vec![VerifyStepSpec {
-                name: "Run configured Phonton verification layers".into(),
-                layer: None,
-                command: None,
-            }],
-            run_plan: Vec::<RunCommand>::new(),
+            likely_files,
+            verify_plan,
+            run_plan,
             quality_floor: QualityFloor {
                 criteria: quality_criteria,
             },
@@ -149,6 +239,7 @@ impl Goal {
                 Vec::new()
             },
             assumptions,
+            token_policy,
         }
     }
 }
@@ -157,6 +248,99 @@ fn is_chess_goal(description: &str) -> bool {
     let lower = description.to_ascii_lowercase();
     (lower.contains("make") || lower.contains("build") || lower.contains("create"))
         && lower.contains("chess")
+}
+
+fn is_html_chess_goal(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    is_chess_goal(description) && (lower.contains("html") || lower.contains("web"))
+}
+
+fn is_web_artifact_goal(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    lower.contains("html")
+        || lower.contains("web")
+        || lower.contains("website")
+        || lower.contains("single page")
+}
+
+fn runtime_web_verify_plan() -> Vec<VerifyStepSpec> {
+    vec![
+        VerifyStepSpec {
+            name: "browser runtime smoke".into(),
+            layer: Some(VerifyLayer::RuntimeSmoke),
+            command: None,
+        },
+        VerifyStepSpec {
+            name: "browser DOM check".into(),
+            layer: Some(VerifyLayer::BrowserDomCheck),
+            command: None,
+        },
+        VerifyStepSpec {
+            name: "browser interaction check".into(),
+            layer: Some(VerifyLayer::InteractionCheck),
+            command: None,
+        },
+    ]
+}
+
+fn chess_acceptance_slices(
+    path: Option<PathBuf>,
+    verify_plan: Vec<VerifyStepSpec>,
+) -> Vec<AcceptanceSlice> {
+    [
+        ("board", "render an 8x8 board"),
+        ("pieces", "show named or symbolic chess pieces"),
+        ("select_move", "select and move pieces"),
+        ("turns", "enforce turn handling"),
+        ("illegal_moves", "reject illegal or invalid moves"),
+        ("reset", "expose reset or new game"),
+        ("run", "provide a concrete run command"),
+    ]
+    .into_iter()
+    .map(|(id, criterion)| AcceptanceSlice {
+        id: id.into(),
+        criterion: criterion.into(),
+        artifact_path: path.clone(),
+        verify_plan: verify_plan.clone(),
+    })
+    .collect()
+}
+
+fn generated_app_acceptance_slices(
+    path: Option<PathBuf>,
+    verify_plan: Vec<VerifyStepSpec>,
+) -> Vec<AcceptanceSlice> {
+    [
+        (
+            "artifact_shell",
+            "create the smallest runnable artifact for the requested app or game",
+        ),
+        (
+            "domain_elements",
+            "render the domain-specific elements named in the goal",
+        ),
+        (
+            "primary_interaction",
+            "wire the primary user interaction so it changes visible state",
+        ),
+        (
+            "invalid_state",
+            "handle invalid or no-op actions without crashing",
+        ),
+        (
+            "reset_or_restart",
+            "provide reset, restart, clear, or equivalent recovery behavior when applicable",
+        ),
+        ("run", "provide a concrete run command"),
+    ]
+    .into_iter()
+    .map(|(id, criterion)| AcceptanceSlice {
+        id: id.into(),
+        criterion: criterion.into(),
+        artifact_path: path.clone(),
+        verify_plan: verify_plan.clone(),
+    })
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +364,21 @@ fn is_chess_goal(description: &str) -> bool {
 /// * Populates [`CoverageSummary`] with the count of detected symbols and
 ///   the number of paired test subtasks.
 pub fn decompose(goal: &Goal) -> PlannerOutput {
+    let contract = goal.contract();
+    if !contract.acceptance_slices.is_empty() {
+        let subtasks = acceptance_slice_subtasks(goal, &contract);
+        return PlannerOutput {
+            estimated_total_tokens: estimate_acceptance_slice_tokens(subtasks.len()),
+            naive_baseline_tokens: estimate_acceptance_slice_naive_tokens(subtasks.len()),
+            coverage_summary: CoverageSummary {
+                new_functions: 0,
+                tests_planned: 0,
+            },
+            goal_contract: Some(contract),
+            subtasks,
+        };
+    }
+
     let detections = detect_new_symbols(&goal.description);
 
     let mut subtasks: Vec<Subtask> = Vec::new();
@@ -231,7 +430,48 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
             new_functions,
             tests_planned,
         },
-        goal_contract: Some(goal.contract()),
+        goal_contract: Some(contract),
+    }
+}
+
+fn acceptance_slice_subtasks(goal: &Goal, contract: &GoalContract) -> Vec<Subtask> {
+    let total = contract.acceptance_slices.len();
+    let mut subtasks = Vec::with_capacity(total);
+    let mut previous = None;
+
+    for (idx, slice) in contract.acceptance_slices.iter().enumerate() {
+        let id = SubtaskId::new();
+        let artifact = slice
+            .artifact_path
+            .as_ref()
+            .map(|path| format!(" Artifact: {}.", path.display()))
+            .unwrap_or_default();
+        let description = format!(
+            "Acceptance slice {}/{} for `{}`: {}.{} Keep the diff minimal; satisfy only this slice and preserve earlier slices.",
+            idx + 1,
+            total,
+            goal.description,
+            slice.criterion,
+            artifact
+        );
+        subtasks.push(Subtask {
+            id,
+            description,
+            model_tier: generated_slice_tier(goal.default_tier),
+            dependencies: previous.into_iter().collect(),
+            attachments: goal.attachments.clone(),
+            status: SubtaskStatus::Queued,
+        });
+        previous = Some(id);
+    }
+
+    subtasks
+}
+
+fn generated_slice_tier(default_tier: ModelTier) -> ModelTier {
+    match default_tier {
+        ModelTier::Frontier => ModelTier::Standard,
+        other => other,
     }
 }
 
@@ -752,6 +992,10 @@ fn estimate_tokens(detections: &[Detection], goal: &Goal) -> u64 {
     base + per_impl * impls + per_test * tests
 }
 
+fn estimate_acceptance_slice_tokens(slice_count: usize) -> u64 {
+    900 + (slice_count as u64).saturating_mul(1_350)
+}
+
 /// Crude naive baseline estimate. Assumes a stateless agent would load
 /// the entire relevant file set for every turn.
 fn estimate_naive_tokens(detections: &[Detection], goal: &Goal) -> u64 {
@@ -766,6 +1010,12 @@ fn estimate_naive_tokens(detections: &[Detection], goal: &Goal) -> u64 {
         detections.len() as u64
     };
     (turns + tests) * per_turn
+}
+
+fn estimate_acceptance_slice_naive_tokens(slice_count: usize) -> u64 {
+    // A broad generated app/game attempt tends to reload the whole artifact
+    // and verifier feedback per turn; keep the baseline per acceptance slice.
+    (slice_count.max(1) as u64).saturating_mul(35_000)
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +1193,57 @@ mod tests {
     }
 
     #[test]
+    fn html_chess_contract_is_sliced_and_runtime_verified() {
+        let contract = Goal::new("make chess in html").contract();
+
+        assert_eq!(contract.task_class, TaskClass::GeneratedAppGame);
+        assert!(contract
+            .expected_artifacts
+            .iter()
+            .any(|artifact| artifact.path.as_deref() == Some(std::path::Path::new("index.html"))));
+        assert!(contract.acceptance_slices.len() >= 7);
+        assert!(contract
+            .acceptance_slices
+            .iter()
+            .any(|slice| slice.criterion.contains("render an 8x8 board")));
+        assert!(contract
+            .verify_plan
+            .iter()
+            .any(|step| step.layer == Some(phonton_types::VerifyLayer::RuntimeSmoke)));
+        assert!(!contract.token_policy.allow_broad_repair);
+        assert!(contract.token_policy.repair_only_missing_criteria);
+    }
+
+    #[test]
+    fn generated_app_decomposes_into_sequential_acceptance_slices() {
+        let plan = decompose(&Goal::new("make chess in html"));
+        let contract = plan.goal_contract.as_ref().unwrap();
+
+        assert_eq!(plan.subtasks.len(), contract.acceptance_slices.len());
+        assert_eq!(plan.subtasks[0].dependencies.len(), 0);
+        for pair in plan.subtasks.windows(2) {
+            assert_eq!(pair[1].dependencies, vec![pair[0].id]);
+        }
+        assert!(plan
+            .subtasks
+            .iter()
+            .all(|subtask| subtask.description.contains("Keep the diff minimal")));
+        assert!(plan.estimated_total_tokens < plan.naive_baseline_tokens);
+    }
+
+    #[test]
+    fn generic_web_app_contract_uses_sliced_runtime_plan() {
+        let contract = Goal::new("create a todo web app").contract();
+
+        assert_eq!(contract.task_class, TaskClass::GeneratedAppGame);
+        assert!(contract.acceptance_slices.len() >= 4);
+        assert!(contract.acceptance_slices.iter().all(
+            |slice| slice.artifact_path.as_deref() == Some(std::path::Path::new("index.html"))
+        ));
+        assert!(!contract.token_policy.allow_broad_repair);
+    }
+
+    #[test]
     fn coverage_summary_renders_honest_signal() {
         let plan = decompose(&Goal::new("add function a and add function b"));
         assert_eq!(
@@ -1031,11 +1332,11 @@ mod tests {
     fn classify_task_identifies_tests() {
         assert_eq!(
             classify_task("Write integration tests for parse_callsites"),
-            TaskClass::Tests
+            TaskClass::TestGeneration
         );
         assert_eq!(
             classify_task("add unit-test for Provider"),
-            TaskClass::Tests
+            TaskClass::TestGeneration
         );
     }
 
@@ -1072,6 +1373,10 @@ mod tests {
         assert!(matches!(
             effective_tier(ModelTier::Frontier, TaskClass::CoreLogic),
             ModelTier::Frontier
+        ));
+        assert!(matches!(
+            effective_tier(ModelTier::Frontier, TaskClass::GeneratedAppGame),
+            ModelTier::Standard
         ));
         // Never upgrades past the planner's own floor.
         assert!(matches!(

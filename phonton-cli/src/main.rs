@@ -34,8 +34,10 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod benchmark_cli;
 mod command_runner;
 mod config;
+mod context_cli;
 mod contract_preflight;
 mod demo;
 mod doctor;
@@ -45,8 +47,10 @@ mod mcp_cli;
 mod memory_cli;
 mod plan_preview;
 mod prompt_buffer;
+mod proof_cli;
 mod review;
 mod run_command;
+mod tokens_cli;
 mod trust;
 mod tui_commands;
 
@@ -1199,10 +1203,12 @@ impl App {
             return None;
         }
         let diagnostics = compact_problem_diagnostics(goal, 6);
+        let acceptance_context = repair_acceptance_context(goal);
         let prompt = format!(
-            "Repair the previous failed Phonton goal.\n\nOriginal goal:\n{}\n\nVerifier diagnostics:\n{}\n\nInstructions:\n- Fix the reported failure with the smallest reviewable diff.\n- Keep output runnable and concise.\n- Run static syntax/build verification before review.\n- Do not claim success unless the verifier passes.",
+            "Repair the previous failed Phonton goal.\n\nOriginal goal:\n{}\n\nVerifier diagnostics:\n{}\n\n{}\nInstructions:\n- Fix only the missing or failed acceptance criteria above when listed.\n- Use the smallest reviewable diff and avoid broad rewrites.\n- Keep output runnable and concise.\n- Run static syntax/build verification before review.\n- Do not claim success unless the verifier passes.",
             goal.description,
-            diagnostics
+            diagnostics,
+            acceptance_context
         );
         self.command_notice = Some("Retry queued with compact diagnostics.".into());
         Some(Intent::QueueGoal(prompt))
@@ -1378,6 +1384,41 @@ fn session_goal_baseline(goal: &GoalEntry) -> u64 {
             } => tokens_used.saturating_add(estimated_savings_tokens),
             _ => 0,
         })
+}
+
+fn repair_acceptance_context(goal: &GoalEntry) -> String {
+    let Some(contract) = goal
+        .state
+        .as_ref()
+        .and_then(|state| state.goal_contract.as_ref())
+    else {
+        return "Missing acceptance criteria:\n- none recorded; use verifier diagnostics only.\n"
+            .into();
+    };
+
+    if !contract.acceptance_slices.is_empty() {
+        let items = contract
+            .acceptance_slices
+            .iter()
+            .take(6)
+            .map(|slice| format!("- {}: {}", slice.id, slice.criterion))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("Missing or unverified acceptance slices:\n{items}\n");
+    }
+
+    if !contract.acceptance_criteria.is_empty() {
+        let items = contract
+            .acceptance_criteria
+            .iter()
+            .take(4)
+            .map(|criterion| format!("- {criterion}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("Missing or unverified acceptance criteria:\n{items}\n");
+    }
+
+    "Missing acceptance criteria:\n- none recorded; use verifier diagnostics only.\n".into()
 }
 
 fn token_delta_vs_naive(naive_baseline_tokens: u64, tokens_used: u64) -> i64 {
@@ -5921,8 +5962,12 @@ fn print_help() {
          steering          Inspect loaded steering rules\n  \
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
+         context           Evaluate deterministic context-selection fixtures\n  \
          review [task-id]  Show verified diff review payloads\n  \
+         proof             Export proof bundles from OutcomeLedger\n  \
          run [task-id]     Run a receipt-suggested command from latest task\n  \
+         benchmark         Export benchmark evidence from OutcomeLedger\n  \
+         why-tokens        Explain latest token buckets by source\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
          config path       Print the resolved config file path\n  \
          config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
@@ -5963,6 +6008,13 @@ fn print_help() {
          \n\
          RUN:\n  \
          phonton run [--json] [--index <n>] [latest|<task-id>]\n\
+         \n\
+         BENCHMARK:\n  \
+         phonton benchmark export --latest --format json\n  \
+         phonton proof export --latest --format json\n  \
+         phonton context eval <fixture.json> [--format json]\n  \
+         phonton context diff --indexed --non-indexed <fixture.json> [--format json]\n  \
+         phonton why-tokens --by-source\n\
          \n\
          MCP:\n  \
          phonton mcp list [--json]\n  \
@@ -6094,6 +6146,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             }
             Ok(None)
         }
+        "benchmark" => {
+            let code = benchmark_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
         "config" => {
             let sub = args.get(1).map(|s| s.as_str()).unwrap_or("path");
             match sub {
@@ -6206,6 +6265,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             }
             Ok(None)
         }
+        "context" => {
+            let code = context_cli::run(&args[1..])?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
         "review" => {
             let code = review::run(&args[1..]).await?;
             if code != 0 {
@@ -6213,8 +6279,22 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             }
             Ok(None)
         }
+        "proof" => {
+            let code = proof_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
         "run" => {
             let code = run_command::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
+        "why-tokens" => {
+            let code = tokens_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }

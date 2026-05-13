@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2282,6 +2282,7 @@ dependencies = [
  "crossterm",
  "dirs 5.0.1",
  "git2",
+ "phonton-context",
  "phonton-diff",
  "phonton-extensions",
  "phonton-index",

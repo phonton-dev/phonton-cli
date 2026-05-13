@@ -320,8 +320,10 @@ mod tests {
         let contract = GoalContract {
             goal: "g".into(),
             task_class: phonton_types::TaskClass::CoreLogic,
+            intent: None,
             confidence_percent: 80,
             acceptance_criteria: Vec::new(),
+            acceptance_slices: Vec::new(),
             expected_artifacts: Vec::new(),
             likely_files: Vec::new(),
             verify_plan: Vec::new(),
@@ -331,6 +333,7 @@ mod tests {
             },
             clarification_questions: Vec::new(),
             assumptions: Vec::new(),
+            token_policy: Default::default(),
         };
         let mut ledger = OutcomeLedger {
             task_id,

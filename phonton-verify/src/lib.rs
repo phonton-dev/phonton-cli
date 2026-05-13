@@ -21,6 +21,107 @@ use phonton_types::{DiffHunk, DiffLine, MemoryRecord, VerifyLayer, VerifyResult}
 use tokio::process::Command;
 use tree_sitter::{Language, Node, Parser};
 
+/// Browser/runtime verification request for a generated web artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserRuntimeSpec {
+    /// HTML artifact path, relative to the verified workspace.
+    pub artifact_path: PathBuf,
+    /// CSS selectors that must exist after the page loads.
+    pub required_selectors: Vec<String>,
+}
+
+/// Run optional Playwright-based browser verification for a generated web artifact.
+///
+/// If Playwright is not installed in the local Node environment, this returns
+/// `Escalate` so generated web work remains explicitly unverified.
+pub async fn verify_browser_runtime(
+    working_dir: &Path,
+    spec: &BrowserRuntimeSpec,
+) -> Result<VerifyResult> {
+    let artifact = working_dir.join(&spec.artifact_path);
+    if !artifact.is_file() {
+        return Ok(VerifyResult::Fail {
+            layer: VerifyLayer::RuntimeSmoke,
+            errors: vec![format!(
+                "runtime artifact not found: {}",
+                spec.artifact_path.display()
+            )],
+            attempt: 1,
+        });
+    }
+
+    if !playwright_available(working_dir).await {
+        return Ok(VerifyResult::Escalate {
+            reason: "browser runtime verification unavailable: install Playwright for this workspace to verify generated web artifacts".into(),
+        });
+    }
+
+    let script = browser_verify_script(&artifact, &spec.required_selectors)?;
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .current_dir(working_dir)
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(VerifyResult::Pass {
+            layer: VerifyLayer::InteractionCheck,
+        });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Ok(VerifyResult::Fail {
+        layer: VerifyLayer::BrowserDomCheck,
+        errors: vec![detail],
+        attempt: 1,
+    })
+}
+
+async fn playwright_available(working_dir: &Path) -> bool {
+    Command::new("node")
+        .arg("-e")
+        .arg("require.resolve('playwright')")
+        .current_dir(working_dir)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+fn browser_verify_script(artifact: &Path, selectors: &[String]) -> Result<String> {
+    let artifact = artifact.canonicalize()?;
+    let artifact_url = format!("file:///{}", artifact.to_string_lossy().replace('\\', "/"));
+    let artifact_json = serde_json::to_string(&artifact_url)?;
+    let selectors_json = serde_json::to_string(selectors)?;
+    Ok(format!(
+        r#"
+const {{ chromium }} = require('playwright');
+const artifactUrl = {artifact_json};
+const selectors = {selectors_json};
+(async () => {{
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  const consoleErrors = [];
+  page.on('console', msg => {{
+    if (msg.type() === 'error') consoleErrors.push(msg.text());
+  }});
+  await page.goto(artifactUrl);
+  for (const selector of selectors) {{
+    await page.waitForSelector(selector, {{ timeout: 1500 }});
+  }}
+  if (consoleErrors.length) {{
+    throw new Error('console errors: ' + consoleErrors.join('; '));
+  }}
+  await browser.close();
+}})().catch(async error => {{
+  console.error(error.message || String(error));
+  process.exit(1);
+}});
+"#
+    ))
+}
+
 /// Run layered verification against `hunks`, with cargo commands executed
 /// in `working_dir`.
 ///
@@ -1458,5 +1559,41 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let found = super::find_cargo_workspace(&nested).expect("should find Cargo.toml");
         assert_eq!(found, root);
+    }
+
+    #[tokio::test]
+    async fn browser_runtime_fails_when_artifact_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = verify_browser_runtime(
+            tmp.path(),
+            &BrowserRuntimeSpec {
+                artifact_path: PathBuf::from("index.html"),
+                required_selectors: vec!["#board".into()],
+            },
+        )
+        .await
+        .unwrap();
+
+        match result {
+            VerifyResult::Fail {
+                layer: VerifyLayer::RuntimeSmoke,
+                errors,
+                ..
+            } => assert!(errors[0].contains("index.html")),
+            other => panic!("expected runtime smoke failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn browser_runtime_script_contains_required_selectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let html = tmp.path().join("index.html");
+        std::fs::write(&html, "<!doctype html><div id='board'></div>").unwrap();
+
+        let script = browser_verify_script(&html, &["#board".into()]).unwrap();
+
+        assert!(script.contains("file:///"));
+        assert!(script.contains("#board"));
+        assert!(script.contains("waitForSelector"));
     }
 }

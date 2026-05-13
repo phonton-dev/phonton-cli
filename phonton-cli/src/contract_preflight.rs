@@ -116,13 +116,10 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
                     ],
                 );
                 for subtask in &mut plan.subtasks {
-                    if subtask
-                        .description
-                        .trim()
-                        .eq_ignore_ascii_case(goal_text.trim())
-                    {
+                    if subtask_matches_goal(subtask, goal_text) {
                         subtask.description = format!(
-                            "{goal_text}\n\nDefault empty-workspace target: create a self-contained playable chess page in index.html with embedded CSS and JavaScript. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python -m http.server 8000`."
+                            "{}\n\nDefault empty-workspace target: create a self-contained playable chess page in index.html with embedded CSS and JavaScript. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python -m http.server 8000`.",
+                            subtask.description
                         );
                     }
                 }
@@ -157,19 +154,26 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
                     vec!["python".into(), "chess.py".into()],
                 );
                 for subtask in &mut plan.subtasks {
-                    if subtask
-                        .description
-                        .trim()
-                        .eq_ignore_ascii_case(goal_text.trim())
-                    {
+                    if subtask_matches_goal(subtask, goal_text) {
                         subtask.description = format!(
-                            "{goal_text}\n\nDefault empty-workspace target: create a self-contained Python terminal chess game in chess.py. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python chess.py`."
+                            "{}\n\nDefault empty-workspace target: create a self-contained Python terminal chess game in chess.py. Include an 8x8 board, named pieces, turn handling, legal/valid move checks, reset or new-game behavior, and a clear way to run it with `python chess.py`.",
+                            subtask.description
                         );
                     }
                 }
             }
         }
     }
+}
+
+fn subtask_matches_goal(subtask: &phonton_types::Subtask, goal_text: &str) -> bool {
+    subtask
+        .description
+        .trim()
+        .eq_ignore_ascii_case(goal_text.trim())
+        || subtask
+            .description
+            .contains(&format!("for `{}`", goal_text.trim()))
 }
 
 fn push_verify_step(contract: &mut phonton_types::GoalContract, label: &str, command: Vec<String>) {

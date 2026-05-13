@@ -77,6 +77,42 @@ Score completed end-to-end run folders:
   -OutMarkdown benchmarks\reports\score.md
 ```
 
+Export the latest real Phonton run from the local OutcomeLedger:
+
+```powershell
+phonton benchmark export --latest --format json
+```
+
+The export refuses estimated-token ledgers. Benchmark exports require
+provider-reported input/output/cache tokens so `verified_success_per_10k_tokens`
+does not mix estimates with billing-source token usage.
+
+Inspect source-attributed prompt/context buckets for the latest run:
+
+```powershell
+phonton why-tokens --by-source
+```
+
+Export the proof bundle attached to the latest run:
+
+```powershell
+phonton proof export --latest --format json
+```
+
+Evaluate context-selection fixtures before a benchmark batch:
+
+```powershell
+phonton context eval fixtures/context.json --format json
+phonton context diff --indexed --non-indexed fixtures/context.json --format json
+```
+
+v0.12 also has pre-call savings controls. Generated app/game goals are split
+into acceptance-slice subtasks before worker dispatch; simple/docs/test work
+uses smaller task-class context targets; generated-app repairs use a sub-1k
+context target; semantic top-k, repo-map entries, MCP result context, and
+provider output ceilings are lower by default. These controls should show up in
+`context_buckets` and provider-reported token usage, not just in estimates.
+
 Expected per-run files:
 
 ```text

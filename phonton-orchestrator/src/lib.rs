@@ -1654,14 +1654,24 @@ fn should_auto_repair_quality(plan: &PlannerOutput, tokens_used: u64) -> bool {
 }
 
 fn quality_auto_repair_skip_reason(plan: &PlannerOutput, tokens_used: u64) -> Option<String> {
-    let broad_chess = plan
-        .goal_contract
-        .as_ref()
-        .is_some_and(|contract| is_chess_goal_text(&contract.goal));
-    if broad_chess && tokens_used >= QUALITY_AUTO_REPAIR_TOKEN_CEILING {
-        return Some(format!(
-            "automatic quality repair skipped after {tokens_used} tokens to protect budget; use /retry to repair with compact diagnostics"
-        ));
+    if let Some(contract) = plan.goal_contract.as_ref() {
+        if !contract.token_policy.allow_broad_repair {
+            return Some(
+                "automatic broad quality repair disabled by token policy; use /retry to repair missing acceptance criteria with compact diagnostics"
+                    .into(),
+            );
+        }
+        if is_chess_goal_text(&contract.goal)
+            && tokens_used
+                >= contract
+                    .token_policy
+                    .first_attempt_cap_tokens
+                    .unwrap_or(QUALITY_AUTO_REPAIR_TOKEN_CEILING)
+        {
+            return Some(format!(
+                "automatic quality repair skipped after {tokens_used} tokens to protect budget; use /retry to repair with compact diagnostics"
+            ));
+        }
     }
     None
 }
@@ -1701,6 +1711,9 @@ fn verify_layer_name(layer: VerifyLayer) -> &'static str {
         VerifyLayer::CrateCheck => "crate check",
         VerifyLayer::WorkspaceCheck => "workspace check",
         VerifyLayer::Test => "test",
+        VerifyLayer::RuntimeSmoke => "runtime smoke",
+        VerifyLayer::BrowserDomCheck => "browser DOM check",
+        VerifyLayer::InteractionCheck => "interaction check",
     }
 }
 
@@ -2203,8 +2216,10 @@ mod tests {
             goal_contract: Some(GoalContract {
                 goal: "make chess".into(),
                 task_class: TaskClass::CoreLogic,
+                intent: None,
                 confidence_percent: 60,
                 acceptance_criteria: vec!["Produce playable chess.".into()],
+                acceptance_slices: Vec::new(),
                 expected_artifacts: Vec::new(),
                 likely_files: Vec::new(),
                 verify_plan: vec![VerifyStepSpec {
@@ -2226,6 +2241,7 @@ mod tests {
                 },
                 clarification_questions: Vec::new(),
                 assumptions: Vec::new(),
+                token_policy: Default::default(),
             }),
         };
         let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
@@ -2267,8 +2283,10 @@ mod tests {
         GoalContract {
             goal: goal.into(),
             task_class: TaskClass::CoreLogic,
+            intent: None,
             confidence_percent: 60,
             acceptance_criteria: vec!["Produce playable chess.".into()],
+            acceptance_slices: Vec::new(),
             expected_artifacts: Vec::new(),
             likely_files: Vec::new(),
             verify_plan: vec![VerifyStepSpec {
@@ -2295,6 +2313,7 @@ mod tests {
             },
             clarification_questions: Vec::new(),
             assumptions: Vec::new(),
+            token_policy: Default::default(),
         }
     }
 
@@ -2517,6 +2536,24 @@ mod tests {
         };
         assert!(reason.contains("automatic quality repair skipped"));
         assert_eq!(*dispatcher.calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn token_policy_can_disable_broad_quality_repair() {
+        let mut contract = chess_contract("make chess in html");
+        contract.token_policy.allow_broad_repair = false;
+        let plan = PlannerOutput {
+            subtasks: Vec::new(),
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(contract),
+        };
+
+        let reason = quality_auto_repair_skip_reason(&plan, 10)
+            .expect("token policy should disable broad repair");
+
+        assert!(reason.contains("token policy"));
     }
 
     #[tokio::test]

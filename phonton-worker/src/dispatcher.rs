@@ -195,7 +195,7 @@ impl RealDispatcher {
             &semantic.index,
             &semantic.embedder,
             &subtask.description,
-            5,
+            super::semantic_slice_limit(subtask),
         )
         .await
     }

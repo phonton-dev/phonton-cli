@@ -35,9 +35,10 @@ use phonton_providers::Provider;
 use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
-    CodeSlice, ContextFrame, ContextPlan, ContextPlanKind, DiffHunk, DiffLine, ExtensionId,
-    MemoryRecord, ModelTier, Permission, PromptContextManifest, SliceOrigin, Subtask, SubtaskId,
-    SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer, VerifyResult,
+    classify_intent, CodeSlice, ContextFrame, ContextPlan, ContextPlanKind, DiffHunk, DiffLine,
+    ExtensionId, MemoryRecord, ModelTier, Permission, PromptContextManifest, SliceOrigin, Subtask,
+    SubtaskId, SubtaskResult, SubtaskStatus, TaskClass, TaskId, TokenUsage, VerifyLayer,
+    VerifyResult,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -58,7 +59,7 @@ pub const MAX_ATTEMPTS: u8 = 3;
 pub const MAX_MCP_CALLS_PER_SUBTASK: usize = 3;
 
 /// Maximum MCP result characters fed back into the model.
-pub const MCP_RESULT_MAX_CHARS: usize = 4_000;
+pub const MCP_RESULT_MAX_CHARS: usize = 1_500;
 
 /// Default token limit for the context window.
 pub const DEFAULT_WINDOW_LIMIT: usize = 120_000;
@@ -153,8 +154,8 @@ impl Worker {
     }
 
     /// Attach a shared semantic context. When present, the worker
-    /// prepends the top-5 HNSW-retrieved slices to the user prompt under
-    /// a `# Relevant code` section.
+    /// prepends a task-budgeted set of HNSW-retrieved slices to the user
+    /// prompt under a `# Relevant code` section.
     pub fn with_semantic_context(mut self, ctx: Arc<SemanticContext>) -> Self {
         self.semantic = Some(ctx);
         self
@@ -253,7 +254,7 @@ impl Worker {
                     &ctx.index,
                     &ctx.embedder,
                     &subtask.description,
-                    5,
+                    semantic_slice_limit(&subtask),
                 )
                 .await
             }
@@ -271,6 +272,7 @@ impl Worker {
         let context_compiler = ContextCompiler::default();
 
         for attempt in 1..=MAX_ATTEMPTS {
+            let prompt_policy = worker_prompt_policy(&subtask, !last_errors.is_empty());
             let system_prompt = system_prompt_for_attempt(&last_errors, self.mcp.is_some());
 
             if let Some(tx) = &self.msg_tx {
@@ -326,7 +328,8 @@ impl Worker {
                 retry_error_tokens: fixed_tokens.retry,
                 mcp_tool_tokens: fixed_tokens.mcp,
                 budget_limit,
-                target_tokens: Some(dynamic_worker_context_target(&subtask, &last_errors)),
+                target_tokens: Some(prompt_policy.context_target_tokens),
+                max_repo_map_items: prompt_policy.max_repo_map_items,
             });
             let user_prompt = render_user_prompt(
                 &subtask,
@@ -423,7 +426,10 @@ impl Worker {
                                 server_id,
                                 tool_name,
                                 success,
-                                content: truncate_chars(&rendered, MCP_RESULT_MAX_CHARS),
+                                content: truncate_chars(
+                                    &rendered,
+                                    prompt_policy.mcp_result_max_chars,
+                                ),
                             });
                             last_errors.clear();
                         }
@@ -432,7 +438,10 @@ impl Worker {
                                 server_id,
                                 tool_name,
                                 success: false,
-                                content: truncate_chars(e.to_string(), MCP_RESULT_MAX_CHARS),
+                                content: truncate_chars(
+                                    e.to_string(),
+                                    prompt_policy.mcp_result_max_chars,
+                                ),
                             });
                             last_errors = vec![format!(
                                 "The requested MCP tool call failed or was denied: {e}. \
@@ -934,27 +943,61 @@ fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeC
     }
 }
 
-fn dynamic_worker_context_target(subtask: &Subtask, prior_errors: &[String]) -> u64 {
-    let desc = subtask.description.to_ascii_lowercase();
-    let broad_generated_goal = [
-        "make ",
-        "create ",
-        "build ",
-        "implement ",
-        "generate ",
-        "playable",
-        "game",
-        "app",
-    ]
-    .iter()
-    .any(|needle| desc.contains(needle));
-    let repair_attempt = !prior_errors.is_empty();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerPromptPolicy {
+    context_target_tokens: u64,
+    semantic_top_k: usize,
+    max_repo_map_items: usize,
+    mcp_result_max_chars: usize,
+}
 
-    match (broad_generated_goal, repair_attempt) {
-        (_, true) => 1_800,
-        (true, false) => 2_800,
-        (false, false) => 2_200,
+fn worker_prompt_policy(subtask: &Subtask, repair_attempt: bool) -> WorkerPromptPolicy {
+    let class = classify_intent(&subtask.description).task_class;
+    let (context_target_tokens, semantic_top_k, max_repo_map_items, mcp_result_max_chars) =
+        match (class, repair_attempt) {
+            (TaskClass::GeneratedAppGame, true) => (900, 1, 2, 900),
+            (TaskClass::GeneratedAppGame, false) => (1_200, 1, 2, 1_000),
+            (
+                TaskClass::Boilerplate
+                | TaskClass::Tests
+                | TaskClass::Docs
+                | TaskClass::TestGeneration,
+                true,
+            ) => (650, 1, 1, 800),
+            (
+                TaskClass::Boilerplate
+                | TaskClass::Tests
+                | TaskClass::Docs
+                | TaskClass::TestGeneration,
+                false,
+            ) => (800, 2, 2, 1_000),
+            (TaskClass::BugFix, true) => (900, 2, 2, 900),
+            (TaskClass::BugFix, false) => (1_800, 3, 3, 1_200),
+            (TaskClass::ExistingProjectFeature, true) => (1_200, 3, 3, 1_200),
+            (TaskClass::ExistingProjectFeature, false) => (2_200, 4, 4, 1_500),
+            (TaskClass::Refactor, true) => (1_800, 4, 4, 1_200),
+            (TaskClass::Refactor, false) => (3_200, 5, 5, 1_500),
+            (TaskClass::ReleaseCheck, true) => (800, 2, 2, 900),
+            (TaskClass::ReleaseCheck, false) => (1_200, 3, 3, 1_200),
+            (TaskClass::CoreLogic, true) => (1_200, 3, 3, 1_200),
+            (TaskClass::CoreLogic, false) => (2_200, 5, 5, 1_500),
+        };
+
+    WorkerPromptPolicy {
+        context_target_tokens,
+        semantic_top_k,
+        max_repo_map_items,
+        mcp_result_max_chars: mcp_result_max_chars.min(MCP_RESULT_MAX_CHARS),
     }
+}
+
+pub(crate) fn semantic_slice_limit(subtask: &Subtask) -> usize {
+    worker_prompt_policy(subtask, false).semantic_top_k
+}
+
+#[cfg(test)]
+fn dynamic_worker_context_target(subtask: &Subtask, prior_errors: &[String]) -> u64 {
+    worker_prompt_policy(subtask, !prior_errors.is_empty()).context_target_tokens
 }
 
 // ---------------------------------------------------------------------------
@@ -1915,6 +1958,29 @@ mod tests {
     }
 
     #[test]
+    fn worker_prompt_policy_sets_low_context_budgets_by_task_class() {
+        let docs = subtask("clean up the readme typos");
+        let bug = subtask("fix failing config parser panic");
+        let generated = subtask("make chess in html");
+
+        assert_eq!(dynamic_worker_context_target(&docs, &[]), 800);
+        assert_eq!(dynamic_worker_context_target(&bug, &[]), 1_800);
+        assert_eq!(dynamic_worker_context_target(&generated, &[]), 1_200);
+        assert_eq!(semantic_slice_limit(&generated), 1);
+    }
+
+    #[test]
+    fn generated_app_repairs_are_sub_1k_input_context() {
+        let generated = subtask("make chess in html");
+        let errors = vec!["missing reset behavior".into()];
+        let policy = worker_prompt_policy(&generated, true);
+
+        assert_eq!(dynamic_worker_context_target(&generated, &errors), 900);
+        assert_eq!(policy.max_repo_map_items, 2);
+        assert!(policy.mcp_result_max_chars <= 900);
+    }
+
+    #[test]
     fn first_attempt_system_prompt_omits_bulky_diff_example() {
         let prompt = system_prompt_for_attempt(&[], false);
 
@@ -2061,6 +2127,17 @@ mod tests {
             status: SubtaskStatus::Queued,
         };
         assert!(detect_decisions(&st, None).is_empty());
+    }
+
+    fn subtask(description: &str) -> Subtask {
+        Subtask {
+            id: SubtaskId::new(),
+            description: description.into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        }
     }
 
     #[test]

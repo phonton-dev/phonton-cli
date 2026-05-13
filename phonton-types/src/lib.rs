@@ -2,6 +2,7 @@
 //!
 //! Rule: if a type crosses a crate boundary, it lives here. Nothing else does.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -113,16 +114,39 @@ pub enum ModelTier {
 /// down to `Cheap`; `CoreLogic` is left alone so frontier models stay
 /// reserved for the work that actually needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskClass {
     /// Generated docs, stubs, type aliases, trivial wiring.
+    #[serde(alias = "Boilerplate")]
     Boilerplate,
     /// Unit/integration tests. Routine output, cheap models suffice.
+    #[serde(alias = "Tests")]
     Tests,
     /// Documentation prose.
+    #[serde(alias = "Docs")]
     Docs,
     /// Novel algorithmic or architectural work — the one tier that still
     /// justifies a frontier model.
+    #[serde(alias = "CoreLogic")]
     CoreLogic,
+    /// A defect fix with an existing expected behavior.
+    #[serde(alias = "BugFix")]
+    BugFix,
+    /// A feature added to an existing project surface.
+    #[serde(alias = "ExistingProjectFeature")]
+    ExistingProjectFeature,
+    /// New tests or test harness work.
+    #[serde(alias = "TestGeneration")]
+    TestGeneration,
+    /// Behavior-preserving code restructuring.
+    #[serde(alias = "Refactor")]
+    Refactor,
+    /// A generated application, game, or broad greenfield artifact.
+    #[serde(alias = "GeneratedAppGame")]
+    GeneratedAppGame,
+    /// Release validation, packaging, tagging, or publishing checks.
+    #[serde(alias = "ReleaseCheck")]
+    ReleaseCheck,
 }
 
 impl fmt::Display for TaskClass {
@@ -132,6 +156,12 @@ impl fmt::Display for TaskClass {
             TaskClass::Tests => "tests",
             TaskClass::Docs => "docs",
             TaskClass::CoreLogic => "core-logic",
+            TaskClass::BugFix => "bug_fix",
+            TaskClass::ExistingProjectFeature => "existing_project_feature",
+            TaskClass::TestGeneration => "test_generation",
+            TaskClass::Refactor => "refactor",
+            TaskClass::GeneratedAppGame => "generated_app_game",
+            TaskClass::ReleaseCheck => "release_check",
         };
         f.write_str(s)
     }
@@ -148,19 +178,197 @@ impl fmt::Display for TaskClass {
 /// so the orchestrator can call it without pulling in the planner crate
 /// and its provider/memory dependencies.
 pub fn classify_task(description: &str) -> TaskClass {
+    classify_intent(description).task_class
+}
+
+/// Coarse ambiguity estimate for a user goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AmbiguityLevel {
+    /// The goal names a clear target and expected behavior.
+    Low,
+    /// The goal is actionable but leaves meaningful choices.
+    Medium,
+    /// The goal is too vague to execute safely without a question.
+    High,
+}
+
+/// Estimated blast radius of a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlastRadius {
+    /// One file or artifact.
+    File,
+    /// One crate/package/module.
+    Crate,
+    /// Multiple crates/packages or workspace-level behavior.
+    Workspace,
+    /// Release, publishing, or repository state outside normal edits.
+    Release,
+}
+
+/// Runtime proof required by the task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RuntimeRisk {
+    /// No runtime proof expected.
+    None,
+    /// Basic command/build execution is enough.
+    Low,
+    /// Runtime behavior should be exercised.
+    Medium,
+    /// Browser/game/app behavior must be checked before verified success.
+    High,
+}
+
+/// Token waste risk before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TokenRisk {
+    /// Small prompt and repair surface.
+    Low,
+    /// Bounded but non-trivial context or repair risk.
+    Medium,
+    /// Broad or ambiguous work that can burn tokens without verified value.
+    High,
+}
+
+/// Planner action selected by intent classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IntentAction {
+    /// Ask the user a question before planning execution.
+    AskClarifyingQuestion,
+    /// Show a plan/contract before dispatch.
+    PreviewPlan,
+    /// Safe to dispatch directly when the user asks to run.
+    ExecuteDirectTask,
+    /// Refuse or block because the request is unsafe or too underspecified.
+    RefuseUnsafeOrUnderspecified,
+}
+
+/// Structured preflight classification for a top-level goal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentClassification {
+    /// Benchmark/workload class.
+    pub task_class: TaskClass,
+    /// Confidence as 0-100 to keep ledgers stable across platforms.
+    pub confidence_percent: u8,
+    /// How much clarification the request still needs.
+    pub ambiguity: AmbiguityLevel,
+    /// Estimated code/release surface touched.
+    pub blast_radius: BlastRadius,
+    /// Runtime proof risk.
+    pub runtime_risk: RuntimeRisk,
+    /// Token waste risk.
+    pub token_risk: TokenRisk,
+    /// Recommended next action before worker dispatch.
+    pub recommended_action: IntentAction,
+}
+
+/// Build a structured intent classification for a goal or subtask.
+pub fn classify_intent(description: &str) -> IntentClassification {
     let d = description.to_ascii_lowercase();
+    let word_count = d.split_whitespace().count();
+
+    if word_count <= 2 && !d.contains("chess") {
+        return IntentClassification {
+            task_class: TaskClass::CoreLogic,
+            confidence_percent: 45,
+            ambiguity: AmbiguityLevel::High,
+            blast_radius: BlastRadius::Workspace,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::High,
+            recommended_action: IntentAction::AskClarifyingQuestion,
+        };
+    }
+
+    if contains_any(&d, &["delete all", "wipe", "exfiltrate", "steal token"]) {
+        return IntentClassification {
+            task_class: TaskClass::CoreLogic,
+            confidence_percent: 70,
+            ambiguity: AmbiguityLevel::High,
+            blast_radius: BlastRadius::Workspace,
+            runtime_risk: RuntimeRisk::High,
+            token_risk: TokenRisk::High,
+            recommended_action: IntentAction::RefuseUnsafeOrUnderspecified,
+        };
+    }
+
+    if is_generated_app_goal(&d) {
+        return IntentClassification {
+            task_class: TaskClass::GeneratedAppGame,
+            confidence_percent: 85,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::File,
+            runtime_risk: RuntimeRisk::High,
+            token_risk: TokenRisk::High,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
+
+    if contains_any(
+        &d,
+        &[
+            "release",
+            "publish",
+            "tag",
+            "npm pack",
+            "cargo publish",
+            "changelog",
+            "release notes",
+        ],
+    ) {
+        return IntentClassification {
+            task_class: TaskClass::ReleaseCheck,
+            confidence_percent: 82,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::Release,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::Medium,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
+
+    if contains_any(
+        &d,
+        &["fix", "bug", "failing", "failure", "regression", "panic"],
+    ) {
+        return IntentClassification {
+            task_class: TaskClass::BugFix,
+            confidence_percent: 80,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::Crate,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::Medium,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
 
     if d.contains("test") || d.contains("unit-test") || d.contains("integration test") {
-        return TaskClass::Tests;
+        return IntentClassification {
+            task_class: TaskClass::TestGeneration,
+            confidence_percent: 86,
+            ambiguity: AmbiguityLevel::Low,
+            blast_radius: BlastRadius::Crate,
+            runtime_risk: RuntimeRisk::Low,
+            token_risk: TokenRisk::Low,
+            recommended_action: IntentAction::ExecuteDirectTask,
+        };
     }
+
     if d.contains("docstring")
         || d.contains("doc comment")
         || d.contains("readme")
         || d.contains("markdown")
         || d.contains("changelog")
     {
-        return TaskClass::Docs;
+        return IntentClassification {
+            task_class: TaskClass::Docs,
+            confidence_percent: 88,
+            ambiguity: AmbiguityLevel::Low,
+            blast_radius: BlastRadius::File,
+            runtime_risk: RuntimeRisk::None,
+            token_risk: TokenRisk::Low,
+            recommended_action: IntentAction::ExecuteDirectTask,
+        };
     }
+
     if d.contains("rename")
         || d.contains("format")
         || d.contains("derive ")
@@ -171,14 +379,90 @@ pub fn classify_task(description: &str) -> TaskClass {
         || d.contains("add field")
         || d.contains("add a field")
     {
-        return TaskClass::Boilerplate;
+        return IntentClassification {
+            task_class: TaskClass::Boilerplate,
+            confidence_percent: 84,
+            ambiguity: AmbiguityLevel::Low,
+            blast_radius: BlastRadius::File,
+            runtime_risk: RuntimeRisk::Low,
+            token_risk: TokenRisk::Low,
+            recommended_action: IntentAction::ExecuteDirectTask,
+        };
     }
-    TaskClass::CoreLogic
+
+    if contains_any(&d, &["refactor", "restructure", "rename module", "extract"]) {
+        return IntentClassification {
+            task_class: TaskClass::Refactor,
+            confidence_percent: 78,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::Workspace,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::Medium,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
+
+    if contains_any(&d, &["dag", "executor", "backpressure", "algorithm"]) {
+        return IntentClassification {
+            task_class: TaskClass::CoreLogic,
+            confidence_percent: 74,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::Workspace,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::Medium,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
+
+    if contains_any(&d, &["add", "implement", "support", "feature", "create"]) {
+        return IntentClassification {
+            task_class: TaskClass::ExistingProjectFeature,
+            confidence_percent: 76,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::Crate,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::Medium,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
+
+    IntentClassification {
+        task_class: TaskClass::CoreLogic,
+        confidence_percent: 70,
+        ambiguity: AmbiguityLevel::Medium,
+        blast_radius: BlastRadius::Workspace,
+        runtime_risk: RuntimeRisk::Medium,
+        token_risk: TokenRisk::Medium,
+        recommended_action: IntentAction::PreviewPlan,
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn is_generated_app_goal(description: &str) -> bool {
+    let has_build_verb = contains_any(description, &["make", "build", "create", "generate"]);
+    let has_generated_target = contains_any(
+        description,
+        &[
+            " app",
+            "game",
+            "chess",
+            "html",
+            "website",
+            "web page",
+            "single page",
+        ],
+    );
+    has_build_verb && has_generated_target
 }
 
 /// The effective tier to dispatch a subtask at, given its planner-assigned
 /// tier and its classified workload. Core logic keeps its tier; boilerplate,
-/// tests, and docs are floored at `Cheap`.
+/// tests, and docs are floored at `Cheap`. Generated app/game work is capped
+/// at `Standard` because it should be decomposed into acceptance slices before
+/// dispatch instead of spending frontier tokens on one broad attempt.
 ///
 /// The cost-aware half of the orchestrator's routing decision. The
 /// latency-aware half (driven by `phonton_providers::ModelMetrics`) lives
@@ -186,11 +470,21 @@ pub fn classify_task(description: &str) -> TaskClass {
 /// existing `escalate` path.
 pub fn effective_tier(planned: ModelTier, class: TaskClass) -> ModelTier {
     match class {
-        TaskClass::CoreLogic => planned,
-        TaskClass::Boilerplate | TaskClass::Tests | TaskClass::Docs => match planned {
-            ModelTier::Local | ModelTier::Cheap => planned,
-            ModelTier::Standard | ModelTier::Frontier => ModelTier::Cheap,
+        TaskClass::CoreLogic
+        | TaskClass::BugFix
+        | TaskClass::ExistingProjectFeature
+        | TaskClass::Refactor
+        | TaskClass::ReleaseCheck => planned,
+        TaskClass::GeneratedAppGame => match planned {
+            ModelTier::Frontier => ModelTier::Standard,
+            other => other,
         },
+        TaskClass::Boilerplate | TaskClass::Tests | TaskClass::Docs | TaskClass::TestGeneration => {
+            match planned {
+                ModelTier::Local | ModelTier::Cheap => planned,
+                ModelTier::Standard | ModelTier::Frontier => ModelTier::Cheap,
+            }
+        }
     }
 }
 
@@ -777,6 +1071,12 @@ pub enum VerifyLayer {
     WorkspaceCheck,
     /// `cargo test` — never automatic; user-triggered.
     Test,
+    /// Launch or execute the generated artifact enough to catch runtime errors.
+    RuntimeSmoke,
+    /// Browser DOM assertion for generated web artifacts.
+    BrowserDomCheck,
+    /// Browser/user interaction assertion for generated web artifacts.
+    InteractionCheck,
 }
 
 /// Outcome of running `phonton-verify` over a worker's diff hunks.
@@ -990,6 +1290,53 @@ pub struct QualityFloor {
     pub criteria: Vec<String>,
 }
 
+/// One independently verifiable slice of a broad goal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceSlice {
+    /// Stable short id such as `board` or `reset`.
+    pub id: String,
+    /// User-facing criterion this slice must satisfy.
+    pub criterion: String,
+    /// Artifact this slice primarily applies to.
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
+    /// Verification steps that can prove this slice.
+    #[serde(default)]
+    pub verify_plan: Vec<VerifyStepSpec>,
+}
+
+/// Token and repair policy selected before dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenPolicy {
+    /// First-attempt provider token cap when Phonton should avoid broad waste.
+    #[serde(default)]
+    pub first_attempt_cap_tokens: Option<u64>,
+    /// Whether a broad semantic repair is allowed after a large failure.
+    #[serde(default = "default_allow_broad_repair")]
+    pub allow_broad_repair: bool,
+    /// Whether repair workers should receive only missing acceptance criteria.
+    #[serde(default)]
+    pub repair_only_missing_criteria: bool,
+    /// Human-readable policy notes surfaced in plan/review views.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl Default for TokenPolicy {
+    fn default() -> Self {
+        Self {
+            first_attempt_cap_tokens: None,
+            allow_broad_repair: true,
+            repair_only_missing_criteria: false,
+            notes: Vec::new(),
+        }
+    }
+}
+
+fn default_allow_broad_repair() -> bool {
+    true
+}
+
 /// Visible definition of done for a top-level goal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalContract {
@@ -997,10 +1344,16 @@ pub struct GoalContract {
     pub goal: String,
     /// Inferred task class.
     pub task_class: TaskClass,
+    /// Structured preflight classification.
+    #[serde(default)]
+    pub intent: Option<IntentClassification>,
     /// Confidence as 0-100 to avoid float drift across serialized records.
     pub confidence_percent: u8,
     /// Concrete acceptance criteria.
     pub acceptance_criteria: Vec<String>,
+    /// Acceptance criteria split into bounded verification slices.
+    #[serde(default)]
+    pub acceptance_slices: Vec<AcceptanceSlice>,
     /// Expected files, commands, docs, or generated artifacts.
     pub expected_artifacts: Vec<ExpectedArtifact>,
     /// Paths the planner expects to touch.
@@ -1015,6 +1368,9 @@ pub struct GoalContract {
     pub clarification_questions: Vec<String>,
     /// Assumptions Phonton is making if it proceeds.
     pub assumptions: Vec<String>,
+    /// Token and repair policy for this goal.
+    #[serde(default)]
+    pub token_policy: TokenPolicy,
 }
 
 /// Summary of a context source that influenced a run.
@@ -1030,11 +1386,71 @@ pub struct ContextSource {
     pub token_count: Option<u64>,
 }
 
+/// Prompt/context token buckets used by `/why-tokens`, review, and benchmarks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBucketSummary {
+    /// Tokens from selected repository code slices.
+    #[serde(default)]
+    pub selected_code_tokens: u64,
+    /// Candidate repository tokens intentionally omitted.
+    #[serde(default)]
+    pub omitted_candidate_tokens: u64,
+    /// Tokens from persistent memory.
+    #[serde(default)]
+    pub memory_tokens: u64,
+    /// Tokens from skills or steering quality modules.
+    #[serde(default)]
+    pub skill_tokens: u64,
+    /// Tokens from user prompt artifacts or attachments.
+    #[serde(default)]
+    pub artifact_tokens: u64,
+    /// Tokens from verifier or retry diagnostics.
+    #[serde(default)]
+    pub retry_diagnostic_tokens: u64,
+    /// Tokens from MCP/tool output.
+    #[serde(default)]
+    pub tool_output_tokens: u64,
+    /// Tokens removed by context deduplication.
+    #[serde(default)]
+    pub deduped_tokens: u64,
+    /// Provider-side cached input tokens.
+    #[serde(default)]
+    pub cached_tokens: u64,
+}
+
+impl ContextBucketSummary {
+    /// Fold one prompt manifest into the durable context bucket summary.
+    pub fn add_prompt_manifest(&mut self, manifest: &PromptContextManifest) {
+        self.selected_code_tokens = self.selected_code_tokens.saturating_add(
+            manifest
+                .code_context_tokens
+                .saturating_add(manifest.repo_map_tokens),
+        );
+        self.omitted_candidate_tokens = self
+            .omitted_candidate_tokens
+            .saturating_add(manifest.omitted_code_tokens);
+        self.memory_tokens = self.memory_tokens.saturating_add(manifest.memory_tokens);
+        self.artifact_tokens = self
+            .artifact_tokens
+            .saturating_add(manifest.attachment_tokens);
+        self.retry_diagnostic_tokens = self
+            .retry_diagnostic_tokens
+            .saturating_add(manifest.retry_error_tokens);
+        self.tool_output_tokens = self
+            .tool_output_tokens
+            .saturating_add(manifest.mcp_tool_tokens);
+        self.deduped_tokens = self.deduped_tokens.saturating_add(manifest.deduped_tokens);
+    }
+}
+
 /// Manifest of what influenced the model during a task.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextManifest {
     /// Review-safe source list.
     pub sources: Vec<ContextSource>,
+    /// Token buckets by source.
+    #[serde(default)]
+    pub buckets: ContextBucketSummary,
 }
 
 /// Estimated token shape of one prompt sent to a provider.
@@ -1321,6 +1737,74 @@ pub struct HandoffPacket {
     pub influence: InfluenceSummary,
 }
 
+/// Final benchmarkable run status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkFinalStatus {
+    /// Task completed and all required verification passed.
+    VerifiedSuccess,
+    /// Task produced partial or reviewable output but not full verification.
+    Partial,
+    /// Task failed.
+    Failed,
+    /// Task cannot be claimed as verified.
+    Unverified,
+}
+
+/// Exportable benchmark evidence for one completed Phonton run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchmarkRunExport {
+    /// Benchmark task class.
+    pub task_class: TaskClass,
+    /// Original user goal.
+    pub goal: String,
+    /// Git commit of the fixture repository when known.
+    pub repo_commit: String,
+    /// Provider that served the final model call.
+    pub provider: String,
+    /// Model that served the final model call.
+    pub model: String,
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    pub output_tokens: u64,
+    /// Provider-reported cached input tokens.
+    pub cached_tokens: u64,
+    /// Estimated USD cost.
+    pub cost_usd: f64,
+    /// Context contribution by source.
+    pub context_buckets: ContextBucketSummary,
+    /// Verification summary keyed by check name.
+    pub verification: BTreeMap<String, String>,
+    /// Quality gate summary keyed by gate name.
+    pub quality_gates: BTreeMap<String, String>,
+    /// Stable id of the handoff packet for this run.
+    pub handoff_packet_id: String,
+    /// Benchmarkable final status.
+    pub final_status: BenchmarkFinalStatus,
+}
+
+/// Exportable proof bundle for one completed Phonton run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofBundleExport {
+    /// Task id.
+    pub task_id: TaskId,
+    /// Original or contracted goal text.
+    pub goal: String,
+    /// Goal contract that governed the run.
+    pub goal_contract: Option<GoalContract>,
+    /// Context that influenced the run.
+    pub context_manifest: ContextManifest,
+    /// Permission/audit evidence for privileged actions.
+    pub permission_ledger: PermissionLedger,
+    /// Verification report attached to the run.
+    pub verify_report: VerifyReport,
+    /// Human-review handoff packet.
+    pub handoff_packet: HandoffPacket,
+    /// Final status suitable for proof/benchmark consumers.
+    pub final_status: BenchmarkFinalStatus,
+}
+
 /// Durable evidence record for one task run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeLedger {
@@ -1389,5 +1873,53 @@ mod tests {
 
         assert_eq!(value["permission_mode"], "workspace-write");
         assert_eq!(value["source"], "json-record");
+    }
+
+    #[test]
+    fn intent_classifier_marks_generated_web_games_as_high_risk_previews() {
+        let intent = classify_intent("make chess in html");
+
+        assert_eq!(intent.task_class, TaskClass::GeneratedAppGame);
+        assert_eq!(intent.runtime_risk, RuntimeRisk::High);
+        assert_eq!(intent.token_risk, TokenRisk::High);
+        assert_eq!(intent.recommended_action, IntentAction::PreviewPlan);
+        assert!(intent.confidence_percent >= 80);
+    }
+
+    #[test]
+    fn context_buckets_are_serialized_for_benchmark_exports() {
+        let buckets = ContextBucketSummary {
+            selected_code_tokens: 1200,
+            omitted_candidate_tokens: 4300,
+            memory_tokens: 100,
+            skill_tokens: 20,
+            artifact_tokens: 30,
+            retry_diagnostic_tokens: 40,
+            tool_output_tokens: 50,
+            deduped_tokens: 60,
+            cached_tokens: 70,
+        };
+        let manifest = ContextManifest {
+            sources: Vec::new(),
+            buckets,
+        };
+
+        let value = serde_json::to_value(manifest).unwrap();
+
+        assert_eq!(value["buckets"]["selected_code_tokens"], 1200);
+        assert_eq!(value["buckets"]["omitted_candidate_tokens"], 4300);
+        assert_eq!(value["buckets"]["cached_tokens"], 70);
+    }
+
+    #[test]
+    fn task_class_serializes_benchmark_names_and_reads_legacy_names() {
+        assert_eq!(
+            serde_json::to_value(TaskClass::BugFix).unwrap(),
+            serde_json::json!("bug_fix")
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskClass>("\"CoreLogic\"").unwrap(),
+            TaskClass::CoreLogic
+        );
     }
 }

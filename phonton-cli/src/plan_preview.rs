@@ -236,7 +236,35 @@ fn append_goal_contract(out: &mut String, contract: &GoalContract) {
         contract.task_class, contract.confidence_percent
     )
     .ok();
+    if let Some(intent) = &contract.intent {
+        writeln!(
+            out,
+            "  intent: {:?}; ambiguity {:?}; blast {:?}; runtime {:?}; token {:?}",
+            intent.recommended_action,
+            intent.ambiguity,
+            intent.blast_radius,
+            intent.runtime_risk,
+            intent.token_risk
+        )
+        .ok();
+    }
     append_string_list(out, "  acceptance:", &contract.acceptance_criteria);
+    if !contract.acceptance_slices.is_empty() {
+        writeln!(out, "  acceptance slices:").ok();
+        for slice in &contract.acceptance_slices {
+            match &slice.artifact_path {
+                Some(path) => writeln!(
+                    out,
+                    "    - {}: {} ({})",
+                    slice.id,
+                    slice.criterion,
+                    path.display()
+                )
+                .ok(),
+                None => writeln!(out, "    - {}: {}", slice.id, slice.criterion).ok(),
+            };
+        }
+    }
     if contract.expected_artifacts.is_empty() {
         writeln!(out, "  expected artifacts: none inferred").ok();
     } else {
@@ -287,6 +315,19 @@ fn append_goal_contract(out: &mut String, contract: &GoalContract) {
         }
     }
     append_string_list(out, "  quality floor:", &contract.quality_floor.criteria);
+    writeln!(
+        out,
+        "  token policy: first_attempt_cap={}, broad_repair={}, surgical_repair={}",
+        contract
+            .token_policy
+            .first_attempt_cap_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "none".into()),
+        contract.token_policy.allow_broad_repair,
+        contract.token_policy.repair_only_missing_criteria
+    )
+    .ok();
+    append_string_list(out, "  token notes:", &contract.token_policy.notes);
     append_string_list(out, "  assumptions:", &contract.assumptions);
     append_string_list(out, "  clarifications:", &contract.clarification_questions);
 }

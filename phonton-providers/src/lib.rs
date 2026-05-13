@@ -888,13 +888,13 @@ fn max_output_tokens_for_prompt(system: &str, user: &str) -> u64 {
         || text.contains("build a")
         || text.contains("make ");
     if repair && generated_app {
-        3_072
+        1_024
     } else if repair {
-        1_536
+        768
     } else if generated_app {
-        3_072
-    } else {
         2_048
+    } else {
+        1_536
     }
 }
 
@@ -1940,22 +1940,22 @@ mod tests {
     fn output_token_ceiling_tracks_prompt_shape() {
         assert_eq!(
             max_output_tokens_for_prompt("sys", "repair verifier failure"),
-            1_536
+            768
         );
         assert_eq!(
             max_output_tokens_for_prompt("sys", "create a playable game"),
-            3_072
+            2_048
         );
         assert_eq!(
             max_output_tokens_for_prompt(
                 "sys",
                 "make chess in html\nprevious verification failed: missing reset behavior"
             ),
-            3_072
+            1_024
         );
         assert_eq!(
             max_output_tokens_for_prompt("sys", "rename config field"),
-            2_048
+            1_536
         );
     }
 

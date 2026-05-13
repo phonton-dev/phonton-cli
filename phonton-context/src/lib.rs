@@ -88,6 +88,8 @@ pub struct ContextPlanRequest<'a> {
     /// Desired prompt target. Defaults to
     /// [`DEFAULT_WORKER_CONTEXT_TARGET_TOKENS`].
     pub target_tokens: Option<u64>,
+    /// Maximum compact repository-map entries to include before code slices.
+    pub max_repo_map_items: usize,
 }
 
 /// Result of context compilation: a typed plan plus the selected slices.
@@ -136,7 +138,8 @@ impl ContextCompiler {
             .saturating_add(request.retry_error_tokens)
             .saturating_add(request.mcp_tool_tokens);
 
-        let repo_map_items = self.repo_map_items(request.candidate_slices, 12);
+        let repo_map_items =
+            self.repo_map_items(request.candidate_slices, request.max_repo_map_items);
         let repo_map_tokens = repo_map_items
             .iter()
             .filter(|item| item.included)
@@ -746,6 +749,7 @@ mod tests {
             mcp_tool_tokens: 0,
             budget_limit: Some(450),
             target_tokens: Some(450),
+            max_repo_map_items: 12,
         });
 
         assert_eq!(compiled.selected_slices.len(), 2);
@@ -780,6 +784,7 @@ mod tests {
             mcp_tool_tokens: 0,
             budget_limit: Some(1_000),
             target_tokens: Some(1_000),
+            max_repo_map_items: 12,
         });
 
         assert_eq!(compiled.selected_slices.len(), 1);
@@ -792,6 +797,35 @@ mod tests {
                 .estimated_total_tokens
                 .saturating_sub(compiled.plan.target_tokens)
         );
+    }
+
+    #[test]
+    fn context_compiler_honors_repo_map_entry_cap() {
+        let slices = vec![
+            code_slice("src/a.rs", "alpha", 10),
+            code_slice("src/b.rs", "beta", 10),
+            code_slice("src/c.rs", "gamma", 10),
+        ];
+        let compiled = ContextCompiler::default().compile(ContextPlanRequest {
+            goal: "fix alpha",
+            candidate_slices: &slices,
+            system_tokens: 50,
+            memory_tokens: 0,
+            attachment_tokens: 0,
+            retry_error_tokens: 0,
+            mcp_tool_tokens: 0,
+            budget_limit: Some(1_000),
+            target_tokens: Some(1_000),
+            max_repo_map_items: 1,
+        });
+
+        let repo_map_count = compiled
+            .plan
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextPlanKind::RepoMap)
+            .count();
+        assert_eq!(repo_map_count, 1);
     }
 
     fn code_slice(path: &str, symbol: &str, token_count: usize) -> CodeSlice {

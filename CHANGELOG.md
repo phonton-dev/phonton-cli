@@ -4,6 +4,41 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.0 - Verified Success Per Token
+
+### Added
+
+- Added structured intent classification with task class, ambiguity, blast
+  radius, runtime risk, token risk, and recommended action before worker
+  dispatch.
+- Added acceptance slices and token policy fields to `GoalContract`, including
+  generated web/game safeguards for broad goals such as HTML chess.
+- Added `phonton benchmark export --latest --format json` for exporting
+  real OutcomeLedger evidence with provider-reported tokens, context buckets,
+  verification, quality gates, and final benchmark status.
+- Added top-level `phonton why-tokens --by-source` for source-attributed token
+  buckets outside the TUI.
+- Added `phonton proof export --latest --format json` for exporting the latest
+  proof bundle from the OutcomeLedger.
+- Added `phonton context eval <fixture>` and
+  `phonton context diff --indexed --non-indexed <fixture>` for deterministic
+  context-selection fixture checks.
+- Added optional Playwright-based browser runtime verification hooks for
+  generated web artifacts.
+
+### Changed
+
+- Generated app/game goals now require preflight-style contracts, runtime proof
+  hooks, capped first attempts, and surgical repair policy instead of broad
+  automatic repair.
+- Generated app/game contracts now decompose into sequential acceptance-slice
+  subtasks, and worker prompts enforce task-class context budgets, smaller
+  semantic top-k retrieval, capped repo maps, capped MCP result context, and
+  lower provider output ceilings.
+- Plan preview now surfaces intent, risk, acceptance slices, and token policy.
+- `/retry` repair prompts include missing or unverified acceptance criteria so
+  repairs are narrower and easier to review.
+
 ## 0.11.1 - Benchmark Hotfix
 
 ### Fixed
