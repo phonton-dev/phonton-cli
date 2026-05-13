@@ -23,7 +23,7 @@
 //!   before any [`ToolCall`] is dispatched. `Block` is terminal — there is
 //!   no override flag and no debug bypass.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -260,7 +260,12 @@ impl Worker {
             }
             None => Vec::new(),
         };
-        let repo_context = dedupe_code_slices(&context_slices, &relevant_slices);
+        let artifact_slices = current_artifact_context_slices(self.guard.project_root(), &subtask);
+        let mut primary_slices =
+            Vec::with_capacity(artifact_slices.len().saturating_add(context_slices.len()));
+        primary_slices.extend(artifact_slices);
+        primary_slices.extend(context_slices);
+        let repo_context = dedupe_code_slices(&primary_slices, &relevant_slices);
 
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
@@ -507,10 +512,7 @@ impl Worker {
                     {
                         let mut ctx = self.context.lock().await;
                         ctx.push(ContextFrame::Summarizable {
-                            content: format!(
-                                "USER: {}\n\nASSISTANT: {}",
-                                user_prompt, response.content
-                            ),
+                            content: compact_success_context(&subtask, &response.content, &hunks),
                             priority: 5, // SUMMARY_PRIORITY equivalent
                         })
                         .await?;
@@ -941,6 +943,130 @@ fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeC
         slices,
         deduped_tokens,
     }
+}
+
+const CURRENT_ARTIFACT_CONTEXT_MAX_CHARS: usize = 3_600;
+
+fn current_artifact_context_slices(root: &Path, subtask: &Subtask) -> Vec<CodeSlice> {
+    artifact_paths_from_subtask(&subtask.description)
+        .into_iter()
+        .filter_map(|path| current_artifact_context_slice(root, path))
+        .collect()
+}
+
+fn current_artifact_context_slice(root: &Path, path: PathBuf) -> Option<CodeSlice> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    let full = root.join(&path);
+    let content = std::fs::read_to_string(&full).ok()?;
+    let compact = compact_current_artifact(&content, CURRENT_ARTIFACT_CONTEXT_MAX_CHARS);
+    let signature = format!(
+        "Patch against this exact current file. If replacing broadly, use a hunk that matches these current lines.\n{}",
+        compact
+    );
+    Some(CodeSlice {
+        file_path: path,
+        symbol_name: "current artifact snapshot".into(),
+        signature,
+        docstring: None,
+        callsites: Vec::new(),
+        token_count: estimate_prompt_tokens(&content).min(900) as usize,
+        origin: SliceOrigin::Fallback,
+    })
+}
+
+fn artifact_paths_from_subtask(description: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for marker in ["Artifact:", "Artifacts:"] {
+        let mut rest = description;
+        while let Some(idx) = rest.find(marker) {
+            rest = &rest[idx + marker.len()..];
+            let sentence_end = rest.find(". ").map(|idx| idx + 1);
+            let newline_end = rest.find('\n');
+            let end = match (sentence_end, newline_end) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => rest.len(),
+            };
+            let raw = &rest[..end];
+            for part in raw.split([',', ';']) {
+                let cleaned = part
+                    .trim()
+                    .trim_end_matches('.')
+                    .trim_matches('`')
+                    .trim_matches('"')
+                    .trim_matches('\'');
+                if cleaned.is_empty() || cleaned.contains(' ') {
+                    continue;
+                }
+                let path = PathBuf::from(cleaned);
+                if !paths.iter().any(|existing| existing == &path) {
+                    paths.push(path);
+                }
+            }
+            rest = &rest[end..];
+        }
+    }
+    paths
+}
+
+fn compact_current_artifact(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+    let head_chars = max_chars.saturating_mul(3) / 4;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(
+        "{head}\n/* ... middle omitted for token budget; prefer small local hunks ... */\n{tail}"
+    )
+}
+
+fn compact_success_context(
+    subtask: &Subtask,
+    response_content: &str,
+    hunks: &[DiffHunk],
+) -> String {
+    let mut by_file: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    for hunk in hunks {
+        let entry = by_file
+            .entry(hunk.file_path.display().to_string())
+            .or_default();
+        entry.0 = entry.0.saturating_add(1);
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Added(_) => entry.1 = entry.1.saturating_add(1),
+                DiffLine::Removed(_) => entry.2 = entry.2.saturating_add(1),
+                DiffLine::Context(_) => {}
+            }
+        }
+    }
+    let mut out = format!(
+        "Completed subtask: {}\nWorker diff was verified and applied; future slices must patch current workspace files, not replay this diff.\nModel output chars: {}\nChanged files:",
+        truncate_chars(&subtask.description, 240),
+        response_content.chars().count()
+    );
+    if by_file.is_empty() {
+        out.push_str("\n- none");
+    } else {
+        for (path, (hunks, added, removed)) in by_file {
+            out.push_str(&format!("\n- {path}: {hunks} hunk(s), +{added}/-{removed}"));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1955,6 +2081,59 @@ mod tests {
 
         assert_eq!(deduped.slices.len(), 1);
         assert_eq!(deduped.deduped_tokens, 42);
+    }
+
+    #[test]
+    fn generated_slice_reads_current_artifact_as_context() {
+        let (base, root) = temp_workspace("artifact-context");
+        let index = root.join("index.html");
+        std::fs::write(
+            &index,
+            "<!doctype html>\n<div id=\"board\">current board</div>\n",
+        )
+        .expect("write artifact");
+        let task = subtask(
+            "Acceptance slice 2/7 for `make chess in html`: show named pieces. Artifact: index.html. Keep the diff minimal.",
+        );
+
+        let slices = current_artifact_context_slices(&root, &task);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].file_path, PathBuf::from("index.html"));
+        assert!(slices[0].symbol_name.contains("current artifact"));
+        assert!(slices[0].signature.contains("current board"));
+        assert!(slices[0]
+            .signature
+            .contains("Patch against this exact current file"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn successful_worker_context_omits_full_diff_body() {
+        let task =
+            subtask("Acceptance slice 2/4 for `make chess`: wire board UI. Artifact: src/App.tsx.");
+        let diff = (0..80)
+            .map(|line| format!("+const generatedLine{line} = {line};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hunk = DiffHunk {
+            file_path: PathBuf::from("src/App.tsx"),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 80,
+            lines: diff
+                .lines()
+                .map(|line| DiffLine::Added(line.trim_start_matches('+').to_string()))
+                .collect(),
+        };
+
+        let frame = compact_success_context(&task, &diff, &[hunk]);
+
+        assert!(frame.contains("Completed subtask"));
+        assert!(frame.contains("src/App.tsx"));
+        assert!(!frame.contains("generatedLine79"));
+        assert!(estimate_prompt_tokens(&frame) < 120);
     }
 
     #[test]

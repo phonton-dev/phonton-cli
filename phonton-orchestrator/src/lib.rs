@@ -1811,34 +1811,82 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
                 .join("\n");
             let _ = std::fs::write(&full, content);
         } else {
-            // Existing file — apply line patches naively.
             let Ok(original) = std::fs::read_to_string(&full) else {
                 continue;
             };
-            let mut out_lines: Vec<String> = original.lines().map(String::from).collect();
-            // Apply hunks in reverse order so line offsets don't shift.
-            let mut sorted = file_hunks.clone();
-            sorted.sort_by_key(|h| std::cmp::Reverse(h.new_start));
-            for hunk in sorted {
-                let start = hunk.new_start.saturating_sub(1) as usize;
-                let remove = hunk.old_count as usize;
-                let added: Vec<String> = hunk
-                    .lines
-                    .iter()
-                    .filter_map(|l| {
-                        if let DiffLine::Added(s) = l {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let end = (start + remove).min(out_lines.len());
-                out_lines.splice(start..end, added);
+            if let Some(updated) = reconstruct_direct_existing_file(&original, &file_hunks) {
+                let _ = std::fs::write(&full, updated);
             }
-            let _ = std::fs::write(&full, out_lines.join("\n"));
         }
     }
+}
+
+fn reconstruct_direct_existing_file(
+    original: &str,
+    hunks: &[&phonton_types::DiffHunk],
+) -> Option<String> {
+    use phonton_types::DiffLine;
+
+    let mut original_lines = split_direct_lines(original);
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    let mut ordered = hunks.to_vec();
+    ordered.sort_by_key(|hunk| hunk.old_start);
+
+    for hunk in ordered {
+        let start = hunk.old_start.saturating_sub(1) as usize;
+        if start < cursor || start > original_lines.len() {
+            return None;
+        }
+        output.extend(original_lines[cursor..start].iter().cloned());
+        cursor = start;
+
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Context(text) => {
+                    let existing = original_lines.get(cursor)?;
+                    if normalize_direct_line(existing) != normalize_direct_line(text) {
+                        return None;
+                    }
+                    output.push(existing.clone());
+                    cursor = cursor.saturating_add(1);
+                }
+                DiffLine::Removed(text) => {
+                    let existing = original_lines.get(cursor)?;
+                    if normalize_direct_line(existing) != normalize_direct_line(text) {
+                        return None;
+                    }
+                    cursor = cursor.saturating_add(1);
+                }
+                DiffLine::Added(text) => output.push(text.clone()),
+            }
+        }
+    }
+
+    output.extend(original_lines.drain(cursor..));
+    Some(join_direct_lines(&output))
+}
+
+fn split_direct_lines(source: &str) -> Vec<String> {
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = normalized
+        .split('\n')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if normalized.ends_with('\n') && lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+fn join_direct_lines(lines: &[String]) -> String {
+    let mut source = lines.join("\n");
+    source.push('\n');
+    source
+}
+
+fn normalize_direct_line(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 // ---------------------------------------------------------------------------
@@ -2554,6 +2602,29 @@ mod tests {
             .expect("token policy should disable broad repair");
 
         assert!(reason.contains("token policy"));
+    }
+
+    #[test]
+    fn direct_hunk_application_uses_old_file_coordinates() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("index.html"), "one\ntwo\nthree\nfour\n")
+            .expect("write fixture");
+        let hunk = DiffHunk {
+            file_path: PathBuf::from("index.html"),
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 2,
+            lines: vec![
+                DiffLine::Context("two".into()),
+                DiffLine::Added("two and a half".into()),
+            ],
+        };
+
+        apply_hunks_direct(&[hunk], temp.path());
+
+        let updated = std::fs::read_to_string(temp.path().join("index.html")).unwrap();
+        assert_eq!(updated, "one\ntwo\ntwo and a half\nthree\nfour\n");
     }
 
     #[tokio::test]

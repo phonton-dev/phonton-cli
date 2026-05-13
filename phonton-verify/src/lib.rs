@@ -160,6 +160,10 @@ pub async fn verify_diff_with_memory(
         }
     }
 
+    if let Some(fail) = verify_node_project(hunks, working_dir).await? {
+        return Ok(fail);
+    }
+
     let packages = touched_packages(hunks);
 
     if let Some(fail) = verify_crate_check(&packages, working_dir).await? {
@@ -674,6 +678,183 @@ pub fn find_cargo_workspace(start: &Path) -> Option<std::path::PathBuf> {
         if !dir.pop() {
             return None;
         }
+    }
+}
+
+async fn verify_node_project(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+) -> Result<Option<VerifyResult>> {
+    let touches_package_json = hunks
+        .iter()
+        .any(|hunk| hunk.file_path == Path::new("package.json"));
+    let touches_web_source = hunks.iter().any(|hunk| {
+        matches!(
+            hunk.file_path.extension().and_then(|ext| ext.to_str()),
+            Some("js" | "jsx" | "ts" | "tsx" | "html" | "css")
+        )
+    });
+    if !touches_package_json && !touches_web_source {
+        return Ok(None);
+    }
+
+    let temp = materialize_post_diff_workspace(hunks, working_dir)?;
+    let package_path = temp.path().join("package.json");
+    if !package_path.is_file() {
+        return Ok(None);
+    }
+    let package_text = std::fs::read_to_string(&package_path)?;
+    let package: serde_json::Value = match serde_json::from_str(&package_text) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    if !touches_package_json && !is_vite_or_react_package(&package) {
+        return Ok(None);
+    }
+
+    let mut commands: Vec<Vec<&str>> = vec![vec!["install", "--no-audit", "--no-fund"]];
+    let scripts = package
+        .get("scripts")
+        .and_then(|scripts| scripts.as_object());
+    if scripts.and_then(|scripts| scripts.get("test")).is_some() {
+        commands.push(vec!["test"]);
+    }
+    if scripts.and_then(|scripts| scripts.get("build")).is_some() {
+        commands.push(vec!["run", "build"]);
+    }
+    if commands.len() == 1 && !touches_package_json {
+        return Ok(None);
+    }
+
+    let mut errors = Vec::new();
+    for args in commands {
+        if let Some(error) = run_npm_command(temp.path(), &args).await? {
+            errors.push(error);
+            break;
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(VerifyResult::Fail {
+            layer: VerifyLayer::Test,
+            errors,
+            attempt: 1,
+        }))
+    }
+}
+
+fn is_vite_or_react_package(package: &serde_json::Value) -> bool {
+    let mut names = Vec::new();
+    for section in ["dependencies", "devDependencies"] {
+        if let Some(map) = package.get(section).and_then(|value| value.as_object()) {
+            names.extend(map.keys().map(|key| key.as_str()));
+        }
+    }
+    names.iter().any(|name| {
+        matches!(
+            *name,
+            "vite" | "react" | "react-dom" | "vitest" | "chess.js"
+        )
+    })
+}
+
+fn materialize_post_diff_workspace(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+) -> Result<tempfile::TempDir> {
+    let temp = tempfile::tempdir()?;
+    copy_workspace_for_verification(working_dir, temp.path())?;
+
+    let mut grouped: BTreeMap<PathBuf, Vec<DiffHunk>> = BTreeMap::new();
+    for hunk in hunks {
+        grouped
+            .entry(hunk.file_path.clone())
+            .or_default()
+            .push(hunk.clone());
+    }
+
+    for (path, file_hunks) in grouped {
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let source = reconstruct_post_diff_source(&path, &file_hunks, Some(working_dir)).map_err(
+            |reason| anyhow::anyhow!("could not materialize {}: {reason}", path.display()),
+        )?;
+        let full = temp.path().join(&path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(full, source)?;
+    }
+
+    Ok(temp)
+}
+
+fn copy_workspace_for_verification(source: &Path, target: &Path) -> Result<()> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            ".git" | "target" | "node_modules" | "dist" | ".phonton"
+        ) || name.ends_with(".sqlite3")
+            || name.ends_with(".log")
+        {
+            continue;
+        }
+        let src = entry.path();
+        let dst = target.join(entry.file_name());
+        if src.is_dir() {
+            std::fs::create_dir_all(&dst)?;
+            copy_workspace_for_verification(&src, &dst)?;
+        } else if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_npm_command(working_dir: &Path, args: &[&str]) -> Result<Option<String>> {
+    let fut = Command::new(npm_bin())
+        .current_dir(working_dir)
+        .args(args)
+        .output();
+    match tokio::time::timeout(Duration::from_secs(180), fut).await {
+        Ok(Ok(out)) if out.status.success() => Ok(None),
+        Ok(Ok(out)) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok(Some(format!(
+                "npm {} failed: {}",
+                args.join(" "),
+                last_lines(&combined, 20)
+            )))
+        }
+        Ok(Err(e)) => Ok(Some(format!(
+            "could not invoke npm {}: {e}",
+            args.join(" ")
+        ))),
+        Err(_) => Ok(Some(format!("npm {} timed out after 180s", args.join(" ")))),
+    }
+}
+
+fn npm_bin() -> &'static str {
+    if cfg!(windows) {
+        "npm.cmd"
+    } else {
+        "npm"
     }
 }
 
@@ -1520,6 +1701,51 @@ mod tests {
         let s = "a\nb\nc\nd\ne";
         assert_eq!(last_lines(s, 2), "d\ne");
         assert_eq!(last_lines(s, 100), "a\nb\nc\nd\ne");
+    }
+
+    #[tokio::test]
+    async fn verify_diff_fails_when_node_build_script_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = DiffHunk {
+            file_path: PathBuf::from("package.json"),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 9,
+            lines: r#"{
+  "type": "module",
+  "scripts": {
+    "test": "node -e \"process.exit(0)\"",
+    "build": "node -e \"process.exit(7)\""
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}"#
+            .lines()
+            .map(|line| DiffLine::Added(line.into()))
+            .collect(),
+        };
+        let source = DiffHunk {
+            file_path: PathBuf::from("src/main.ts"),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Added("export const ok: boolean = true;".into())],
+        };
+
+        let result = verify_diff(&[package, source], tmp.path()).await.unwrap();
+
+        match result {
+            VerifyResult::Fail {
+                layer: VerifyLayer::Test,
+                errors,
+                ..
+            } => {
+                assert!(errors.iter().any(|error| error.contains("npm run build")));
+            }
+            other => panic!("expected failing npm build to fail verification, got {other:?}"),
+        }
     }
 
     /// Regression: every cargo-based verify layer must be a no-op when

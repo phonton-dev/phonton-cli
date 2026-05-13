@@ -4,6 +4,31 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.1 - Chess Benchmark Runtime Fix
+
+- Fixed the playable chess benchmark route for prompts that explicitly require
+  Vite, TypeScript, and React in an empty workspace. Phonton now scaffolds a
+  Vite/React npm app contract instead of simplifying the goal to static
+  `index.html`.
+- Added benchmark-specific acceptance slices for a chess.js-backed rules
+  boundary, rules tests, React board UI, interactions, status/history/reset,
+  and concrete `npm install`, `npm test`, `npm run build`, and `npm run dev`
+  commands.
+- Worker prompts now include the current generated artifact snapshot for later
+  acceptance slices, so repair and follow-up slices patch the file that
+  actually exists instead of guessing stale hunk coordinates.
+- Benchmark acceptance-slice subtasks now use compact goal labels instead of
+  repeating the full pasted benchmark prompt in every worker call.
+- Successful worker slices now store compact change summaries in shared
+  context instead of the full prior diff body, reducing prompt carryover
+  tokens on broad generated-app runs.
+- Node/Vite generated projects now run npm verification from a temporary
+  post-diff workspace when `package.json` or web source files are touched, so
+  failing `npm test` or `npm run build` blocks review-ready status.
+- Fixed no-git direct patch application to reconstruct existing files from
+  old-side hunk coordinates and context/removal lines instead of splicing only
+  additions at new-side offsets.
+
 ## 0.12.0 - Verified Success Per Token
 
 ### Added

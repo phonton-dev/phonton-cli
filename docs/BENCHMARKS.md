@@ -113,6 +113,12 @@ context target; semantic top-k, repo-map entries, MCP result context, and
 provider output ceilings are lower by default. These controls should show up in
 `context_buckets` and provider-reported token usage, not just in estimates.
 
+v0.12.1 tightens the chess generated-app benchmark path specifically. Empty
+workspace prompts that explicitly request Vite, TypeScript, and React now get a
+Vite/React npm GoalContract, chess.js-backed rules/test slices, current
+artifact snapshots between slices, and npm install/test/build verification from
+a temporary post-diff workspace.
+
 Expected per-run files:
 
 ```text
