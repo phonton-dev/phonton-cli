@@ -269,7 +269,7 @@ fn vite_react_chess_acceptance_slices(verify_plan: Vec<VerifyStepSpec>) -> Vec<A
     [
         (
             "scaffold",
-            "scaffold package.json, index.html, src/main.tsx, and src/App.tsx for a Vite, TypeScript, and React chess app with npm scripts",
+            "scaffold package.json, index.html, src/main.tsx, src/App.tsx, a starter src/chessRules.ts rules boundary, and src/chessRules.test.ts smoke test for a Vite, TypeScript, and React chess app with npm scripts",
             "package.json",
         ),
         (
@@ -619,6 +619,16 @@ Expected final state:
             .acceptance_slices
             .iter()
             .any(|slice| slice.criterion.contains("game-state/rules boundary tests")));
+        let scaffold_slice = contract
+            .acceptance_slices
+            .iter()
+            .find(|slice| slice.id == "scaffold")
+            .expect("vite chess contract should include scaffold slice");
+        assert!(
+            scaffold_slice.criterion.contains("src/chessRules.test.ts"),
+            "scaffold slice must create a starter test file so vitest does not fail before the dedicated test slice runs: {}",
+            scaffold_slice.criterion
+        );
         assert!(contract.verify_plan.iter().any(|step| step
             .command
             .as_ref()

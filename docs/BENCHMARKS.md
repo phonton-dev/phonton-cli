@@ -119,6 +119,12 @@ Vite/React npm GoalContract, chess.js-backed rules/test slices, current
 artifact snapshots between slices, and npm install/test/build verification from
 a temporary post-diff workspace.
 
+v0.12.2 fixes an early-slice verification regression from that path. Vite/React
+chess scaffold slices now request a starter rules module plus smoke test, and
+the npm verifier waits to run Vitest/Jest discovery scripts until generated
+test files exist. This prevents a scaffold-only slice from burning repair
+attempts on "no test files found" before the planned rules-test slice runs.
+
 Expected per-run files:
 
 ```text

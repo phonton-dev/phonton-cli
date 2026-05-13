@@ -716,8 +716,13 @@ async fn verify_node_project(
     let scripts = package
         .get("scripts")
         .and_then(|scripts| scripts.as_object());
-    if scripts.and_then(|scripts| scripts.get("test")).is_some() {
-        commands.push(vec!["test"]);
+    if let Some(test_script) = scripts
+        .and_then(|scripts| scripts.get("test"))
+        .and_then(|script| script.as_str())
+    {
+        if should_run_npm_test(temp.path(), test_script) {
+            commands.push(vec!["test"]);
+        }
     }
     if scripts.and_then(|scripts| scripts.get("build")).is_some() {
         commands.push(vec!["run", "build"]);
@@ -758,6 +763,56 @@ fn is_vite_or_react_package(package: &serde_json::Value) -> bool {
             "vite" | "react" | "react-dom" | "vitest" | "chess.js"
         )
     })
+}
+
+fn should_run_npm_test(working_dir: &Path, test_script: &str) -> bool {
+    if has_node_test_file(working_dir) {
+        return true;
+    }
+
+    !is_file_discovery_test_script(test_script)
+}
+
+fn is_file_discovery_test_script(test_script: &str) -> bool {
+    let lower = test_script.to_ascii_lowercase();
+    lower.contains("vitest") || lower.contains("jest")
+}
+
+fn has_node_test_file(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if path.is_dir() {
+            if matches!(
+                name.as_str(),
+                ".git" | ".phonton" | "coverage" | "dist" | "node_modules" | "target"
+            ) {
+                continue;
+            }
+            if has_node_test_file(&path) {
+                return true;
+            }
+        } else if is_node_test_file(&path) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_node_test_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(ext, "js" | "jsx" | "ts" | "tsx")
+        && (file_name.contains(".test.") || file_name.contains(".spec."))
 }
 
 fn materialize_post_diff_workspace(
@@ -1746,6 +1801,69 @@ mod tests {
             }
             other => panic!("expected failing npm build to fail verification, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn verify_diff_skips_vitest_until_test_files_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = DiffHunk {
+            file_path: PathBuf::from("package.json"),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 9,
+            lines: r#"{
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "build": "node -e \"process.exit(0)\""
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}"#
+            .lines()
+            .map(|line| DiffLine::Added(line.into()))
+            .collect(),
+        };
+        let source = DiffHunk {
+            file_path: PathBuf::from("src/main.tsx"),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Added("export const ok: boolean = true;".into())],
+        };
+
+        let result = verify_diff(&[package, source], tmp.path()).await;
+
+        match result {
+            Ok(VerifyResult::Pass { .. }) => {}
+            other => panic!(
+                "vitest should not fail scaffold verification before test files exist: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn npm_test_discovery_scripts_wait_for_test_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            !super::should_run_npm_test(tmp.path(), "vitest run"),
+            "vitest should wait until a test file exists"
+        );
+        assert!(
+            super::should_run_npm_test(tmp.path(), "node scripts/test.js"),
+            "custom test scripts should still run even without test-like filenames"
+        );
+
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("chessRules.test.ts"), "test('ok', () => {})").unwrap();
+
+        assert!(
+            super::should_run_npm_test(tmp.path(), "vitest run"),
+            "vitest should run once generated tests exist"
+        );
     }
 
     /// Regression: every cargo-based verify layer must be a no-op when

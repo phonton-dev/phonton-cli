@@ -4,6 +4,18 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.2 - Chess Benchmark Test Slice Fix
+
+- Fixed generated Vite/React chess scaffolds so the first acceptance slice asks
+  for a starter `src/chessRules.ts` rules boundary and
+  `src/chessRules.test.ts` smoke test instead of leaving Vitest with zero test
+  files.
+- Node verification now waits to run Vitest/Jest-style file-discovery scripts
+  until a `.test.*` or `.spec.*` file exists, while still running custom npm
+  test scripts and running Vitest/Jest once generated tests are present.
+- Added regressions for the exact early-slice failure where `npm test` failed
+  with no discovered test files before the planned rules-test slice could run.
+
 ## 0.12.1 - Chess Benchmark Runtime Fix
 
 - Fixed the playable chess benchmark route for prompts that explicitly require
