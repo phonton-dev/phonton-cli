@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.12.4</h1>
+<h1 align="center">Phonton CLI · v0.12.5</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.12.4-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.12.5-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -75,6 +75,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
 - v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
 - v0.12 enforces lower spend before the provider call: generated app/game goals dispatch as acceptance-slice subtasks, simple/docs/test prompts use small task-class budgets, generated repairs use a sub-1k context target, semantic retrieval top-k and repo maps shrink by task class, MCP result context is capped, and provider output ceilings are lower.
+- v0.12.5 blocks bad provider/model routes before goal dispatch: provider readiness now uses a parseable unified-diff canary, empty OpenAI-compatible responses fail immediately, OpenCode/OpenCode Go routes work through `OPENCODE_API_KEY`, and `phonton providers` can list/sync the Models.dev catalog.
 - v0.12.4 cuts wasted repair tokens in generated-app failures: workers stop after repeated verifier/parser diagnostics, redispatch prompts start with prior verifier evidence, stale hunk repairs get explicit guidance, and the Flight Log shows compact `repair` events before bounded retries.
 - v0.12.3 fixes stale generated-test hunks during the chess benchmark: rules/test slices now carry paired current artifacts, and repair attempts include the exact current file named in verifier diagnostics instead of retrying blind.
 - v0.12.2 fixes early generated Vite/React chess slices so Vitest does not fail before test files exist: scaffold slices now request a starter rules module and smoke test, and npm verification waits to run Vitest/Jest discovery scripts until a test file exists.
@@ -102,7 +103,8 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - `phonton memory` commands for inspecting, editing, deleting, pinning, and unpinning local decision memory.
 - `phonton extensions` commands for inspecting resolved skills, steering, MCP servers, profiles, conflicts, and diagnostics.
 - `phonton mcp` commands for listing configured servers and lazily approving tool discovery or tool calls.
-- BYOK provider adapters for Anthropic, OpenAI, OpenRouter, Gemini, Cloudflare Workers AI, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints. `phonton doctor --provider` verifies your configured provider by checking model discovery and a tiny completion call through the same adapter used for runs.
+- BYOK provider adapters for Anthropic, OpenAI, OpenRouter, OpenCode, OpenCode Go, Gemini/Google, Cloudflare Workers AI, AgentRouter, DeepSeek, xAI/Grok, Groq, Together, Ollama, and custom OpenAI-compatible endpoints. `phonton doctor --provider` verifies your configured provider with a tiny parseable-diff canary through the same adapter used for runs.
+- `phonton providers list|sync|doctor|import-opencode` exposes Models.dev provider metadata, verifies the configured provider/model route, and can read OpenCode auth on demand without copying or printing secrets.
 - Local store, memory, planner, worker, diff, sandbox, verification, and orchestration crates.
 - Prompt-section token manifests in the Flight Log so system, goal, memory, attachment, MCP, and retry-context costs are inspectable.
 - `phonton demo trust-loop` prints a compact proof-oriented walkthrough of the GoalContract -> verification -> receipt -> memory loop for first-run demos, with `--json` for reproducible demos.
@@ -146,7 +148,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.4 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.5 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -162,7 +164,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.4 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.5 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |

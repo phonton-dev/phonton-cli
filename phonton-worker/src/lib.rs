@@ -391,10 +391,31 @@ impl Worker {
                 );
             }
 
-            let response = self
+            let response = match self
                 .provider
                 .call_with_attachments(&system_prompt, &full_prompt, &origins, &subtask.attachments)
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(err) if provider_contract_error(&err) => {
+                    return Ok(failed_result(
+                        subtask.id,
+                        model_tier,
+                        VerifyResult::Fail {
+                            layer: VerifyLayer::Syntax,
+                            errors: vec![format!(
+                                "provider/model failed Phonton diff contract before repair: {err}"
+                            )],
+                            attempt,
+                        },
+                        token_usage,
+                        attempt,
+                        last_provider,
+                        last_model_name,
+                    ));
+                }
+                Err(err) => return Err(err),
+            };
             last_provider = response.provider;
             last_model_name = response.model_name.clone();
             token_usage.add_response(&response);
@@ -927,6 +948,14 @@ pub fn detect_decisions(subtask: &Subtask, task_id: Option<TaskId>) -> Vec<Memor
             task_id,
         })
         .collect()
+}
+
+fn provider_contract_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("empty output")
+        || msg.contains("empty content")
+        || msg.contains("missing model text content")
+        || msg.contains("diff contract")
 }
 
 /// Shape a `Failed` [`SubtaskResult`] with no diffs and the supplied verdict.

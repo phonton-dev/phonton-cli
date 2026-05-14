@@ -13,6 +13,10 @@
 //! model = "claude-sonnet-4-5-20251022"
 //! # Cloudflare-only: Workers AI account ID.
 //! account_id = "..."
+//! # Optional provider catalog and key source.
+//! catalog = "models.dev"
+//! api_key_source = "env" # config | env | opencode
+//! allow_unverified_model = false
 //!
 //! [budget]
 //! max_tokens = 500000
@@ -80,6 +84,20 @@ pub struct ProviderConfig {
     /// `https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1` base URL.
     /// A bare account ID is still accepted here for backward compatibility.
     pub base_url: Option<String>,
+
+    /// Optional provider catalog source. `models.dev` enables OpenCode-style
+    /// provider/model discovery while preserving the existing config format.
+    pub catalog: Option<String>,
+
+    /// Optional credential source: `config`, `env`, or `opencode`.
+    /// OpenCode keys are read from `~/.local/share/opencode/auth.json` only
+    /// when this field is explicitly set to `opencode`.
+    pub api_key_source: Option<String>,
+
+    /// When false, hosted models must pass Phonton's diff-contract canary
+    /// before a goal can spend implementation tokens.
+    #[serde(default)]
+    pub allow_unverified_model: bool,
 }
 
 impl Default for ProviderConfig {
@@ -90,6 +108,9 @@ impl Default for ProviderConfig {
             model: None,
             account_id: None,
             base_url: None,
+            catalog: None,
+            api_key_source: None,
+            allow_unverified_model: false,
         }
     }
 }
@@ -181,22 +202,38 @@ pub fn save(cfg: &Config) -> Result<()> {
 ///
 /// Priority: config file `api_key` → environment variable.
 pub fn resolve_api_key(cfg: &ProviderConfig) -> Option<String> {
+    match cfg.api_key_source.as_deref() {
+        Some("config") => return cfg.api_key.clone(),
+        Some("env") => return resolve_env_api_key(cfg),
+        Some("opencode") => return resolve_opencode_api_key(&cfg.name),
+        Some(_) | None => {}
+    }
+
     if let Some(ref key) = cfg.api_key {
         return Some(key.clone());
     }
+    resolve_env_api_key(cfg)
+}
+
+fn resolve_env_api_key(cfg: &ProviderConfig) -> Option<String> {
     // Each provider gets its own canonical env var so users with multiple
     // keys configured can switch between them without re-pasting.
     let candidates: &[&str] = match cfg.name.as_str() {
         "anthropic" => &["ANTHROPIC_API_KEY"],
         "openai" => &["OPENAI_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
-        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "gemini" | "google" => &[
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+        ],
         "agentrouter" => &["AGENTROUTER_API_KEY", "ANTHROPIC_API_KEY"],
         "cloudflare" => &[
             "CLOUDFLARE_API_TOKEN",
             "CLOUDFLARE_WORKERS_AI_API_TOKEN",
             "CLOUDFLARE_API_KEY",
         ],
+        "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
         "deepseek" => &["DEEPSEEK_API_KEY"],
         "xai" | "grok" => &["XAI_API_KEY", "GROK_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
@@ -214,6 +251,45 @@ pub fn resolve_api_key(cfg: &ProviderConfig) -> Option<String> {
     None
 }
 
+pub fn opencode_auth_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json")
+    })
+}
+
+pub fn resolve_opencode_api_key(provider: &str) -> Option<String> {
+    let path = opencode_auth_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    opencode_api_key_from_value(provider, &v)
+}
+
+pub fn opencode_api_key_from_value(provider: &str, v: &serde_json::Value) -> Option<String> {
+    let candidates = match provider {
+        "opencode-go" => &["opencode-go", "opencode"][..],
+        "opencode" => &["opencode"][..],
+        other => &[other][..],
+    };
+    for key in candidates {
+        let direct = v
+            .get(*key)
+            .or_else(|| v.get("provider").and_then(|p| p.get(*key)))
+            .or_else(|| v.get("providers").and_then(|p| p.get(*key)));
+        if let Some(found) = direct
+            .and_then(|p| p.get("key").or_else(|| p.get("api_key")))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(found.to_string());
+        }
+    }
+    None
+}
+
 /// All provider names recognised by the CLI Settings panel, in the order
 /// they should be presented to the user. Cycling with Tab on the Provider
 /// field walks this list.
@@ -221,7 +297,10 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "anthropic",
     "openai",
     "openrouter",
+    "opencode",
+    "opencode-go",
     "gemini",
+    "google",
     "cloudflare",
     "agentrouter",
     "deepseek",
@@ -306,6 +385,9 @@ mode = "workspace-write"
             model: None,
             account_id: None,
             base_url: None,
+            catalog: None,
+            api_key_source: None,
+            allow_unverified_model: false,
         };
         // No env var set in test — should return None.
         // (In production the real key is present.)
@@ -320,7 +402,27 @@ mode = "workspace-write"
             model: None,
             account_id: None,
             base_url: None,
+            catalog: None,
+            api_key_source: None,
+            allow_unverified_model: false,
         };
         assert_eq!(resolve_api_key(&cfg).as_deref(), Some("from-config"));
+    }
+
+    #[test]
+    fn parses_opencode_auth_shape() {
+        let raw = serde_json::json!({
+            "provider": {
+                "opencode": {
+                    "type": "api",
+                    "key": "opencode-test-key"
+                }
+            }
+        });
+
+        assert_eq!(
+            opencode_api_key_from_value("opencode", &raw).as_deref(),
+            Some("opencode-test-key")
+        );
     }
 }

@@ -4,6 +4,24 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.5 - Provider Reliability
+
+### Added
+
+- Added a Models.dev-backed provider catalog and `phonton providers list|sync|doctor|import-opencode` commands.
+- Added first-class OpenCode and OpenCode Go routes through `OPENCODE_API_KEY` or explicit `provider.api_key_source = "opencode"`.
+- Added a provider/model diff canary so readiness proves the exact unified-diff contract Phonton workers need.
+
+### Changed
+
+- Startup model detection, Settings connection tests, `phonton doctor --provider`, and goal dispatch now validate parseable-diff output instead of a generic JSON reply.
+- Goal dispatch blocks unverified hosted provider/model routes before spending implementation tokens unless `provider.allow_unverified_model = true`.
+
+### Fixed
+
+- Empty OpenAI-compatible responses are now rejected as provider contract failures instead of being retried as syntax repair failures.
+- Worker provider contract failures stop before broad repair, avoiding the multi-thousand-token empty-output failure shown by weak provider routes.
+
 ## 0.12.4 - Autonomy Loop Hotfix
 
 ### Changed

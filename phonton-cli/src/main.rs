@@ -48,6 +48,7 @@ mod memory_cli;
 mod plan_preview;
 mod prompt_buffer;
 mod proof_cli;
+mod providers_cli;
 mod review;
 mod run_command;
 mod tokens_cli;
@@ -55,6 +56,7 @@ mod trust;
 mod tui_commands;
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +89,9 @@ use phonton_mcp::{McpApprovalDecision, McpApprovalRequest, McpApprover};
 use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
 use phonton_planner::{decompose_with_memory_store, Goal};
 use phonton_providers::{
-    discover_models, pick_default_from_list, provider_for, select_best_working_model, Provider,
+    discover_models, models_dev_catalog_from_str, pick_default_from_list, probe_diff_contract,
+    provider_config_from_catalog, provider_for, select_best_working_model, CatalogProvider,
+    Provider,
 };
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
@@ -107,6 +111,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tui_commands::{
     command_suggestions, complete_command_prefix, parse_slash_command, render_command_label,
@@ -1517,6 +1522,9 @@ impl Default for App {
                 model: None,
                 account_id: None,
                 base_url: None,
+                catalog: None,
+                api_key_source: None,
+                allow_unverified_model: false,
             },
             budget: crate::config::BudgetConfig {
                 max_tokens: None,
@@ -5309,6 +5317,134 @@ fn default_store_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
 }
 
+fn models_dev_catalog_cache_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".phonton").join("models-dev-catalog.json"))
+}
+
+fn provider_health_cache_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".phonton").join("provider-health.json"))
+}
+
+fn load_cached_models_dev_catalog() -> Option<Vec<CatalogProvider>> {
+    let path = models_dev_catalog_cache_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    models_dev_catalog_from_str(&raw)
+        .ok()
+        .or_else(|| serde_json::from_str::<Vec<CatalogProvider>>(&raw).ok())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProviderHealthCache {
+    entries: HashMap<String, ProviderHealthEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderHealthEntry {
+    ok: bool,
+    detail: String,
+    checked_at_unix: u64,
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn provider_health_key(
+    provider: &str,
+    model: &str,
+    base_url: Option<&str>,
+    api_key: &str,
+) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    provider.hash(&mut hasher);
+    model.hash(&mut hasher);
+    base_url.unwrap_or("").hash(&mut hasher);
+    api_key.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn load_provider_health_cache() -> ProviderHealthCache {
+    provider_health_cache_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_provider_health_cache(cache: &ProviderHealthCache) {
+    let Some(path) = provider_health_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(path, raw);
+    }
+}
+
+async fn ensure_provider_diff_contract_cached(
+    provider_name: &str,
+    model: &str,
+    api_key: &str,
+    account_id: Option<String>,
+    base_url: Option<String>,
+    allow_unverified_model: bool,
+) -> Result<(), String> {
+    if allow_unverified_model || !provider_requires_key(provider_name) {
+        return Ok(());
+    }
+    let cache_key = provider_health_key(provider_name, model, base_url.as_deref(), api_key);
+    let now = unix_now_secs();
+    let mut cache = load_provider_health_cache();
+    if let Some(entry) = cache.entries.get(&cache_key) {
+        let ttl = if entry.ok { 24 * 60 * 60 } else { 60 * 60 };
+        if now.saturating_sub(entry.checked_at_unix) <= ttl {
+            return if entry.ok {
+                Ok(())
+            } else {
+                Err(entry.detail.clone())
+            };
+        }
+    }
+    let cfg = make_api_provider_config(
+        provider_name,
+        api_key.to_string(),
+        model.to_string(),
+        account_id,
+        base_url,
+    )
+    .ok_or_else(|| provider_config_failure_message(provider_name))?;
+    let provider = provider_for(cfg);
+    let result = probe_diff_contract(provider.as_ref()).await;
+    let entry = match result {
+        Ok(resp) => ProviderHealthEntry {
+            ok: true,
+            detail: format!(
+                "diff canary passed via {} ({})",
+                resp.provider, resp.model_name
+            ),
+            checked_at_unix: now,
+        },
+        Err(err) => ProviderHealthEntry {
+            ok: false,
+            detail: format!("diff canary failed for {provider_name}/{model}: {err}"),
+            checked_at_unix: now,
+        },
+    };
+    let ok = entry.ok;
+    let detail = entry.detail.clone();
+    cache.entries.insert(cache_key, entry);
+    save_provider_health_cache(&cache);
+    if ok {
+        Ok(())
+    } else {
+        Err(detail)
+    }
+}
+
 fn open_persistent_store() -> Result<Store> {
     let path = default_store_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine ~/.phonton path"))?;
@@ -5473,8 +5609,20 @@ fn make_api_provider_config(
             }),
             None => Some(ApiProviderConfig::OpenRouter { api_key, model }),
         },
-        "gemini" => Some(ApiProviderConfig::Gemini { api_key, model }),
+        "gemini" | "google" => Some(ApiProviderConfig::Gemini { api_key, model }),
         "agentrouter" => Some(ApiProviderConfig::AgentRouter { api_key, model }),
+        "opencode" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "opencode".into(),
+            api_key,
+            model,
+            base_url: base_url.unwrap_or_else(|| "https://opencode.ai/zen/v1".into()),
+        }),
+        "opencode-go" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "opencode-go".into(),
+            api_key,
+            model,
+            base_url: base_url.unwrap_or_else(|| "https://opencode.ai/zen/go/v1".into()),
+        }),
         "cloudflare" => cloudflare_base_url(account_id, base_url).map(|url| {
             ApiProviderConfig::OpenAiCompatible {
                 name: "cloudflare".into(),
@@ -5521,7 +5669,9 @@ fn make_api_provider_config(
             model,
             base_url: url,
         }),
-        _ => None,
+        _ => load_cached_models_dev_catalog().and_then(|catalog| {
+            provider_config_from_catalog(name, api_key, model, base_url, &catalog)
+        }),
     }
 }
 
@@ -5599,12 +5749,7 @@ async fn test_provider(
     let cfg = make_api_provider_config(&name, api_key, model, account_id, base_url)
         .ok_or_else(|| provider_config_failure_message(&name))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
-    let resp = provider
-        .call(
-            "You are a terse assistant. Respond only with JSON.",
-            "Return exactly {\"ok\":true} as JSON.",
-            &[],
-        )
+    let resp = probe_diff_contract(provider.as_ref())
         .await
         .map_err(|e| format!("{e}"))?;
     Ok(resp.content)
@@ -5923,13 +6068,15 @@ fn default_model_for(provider: &str) -> String {
         "anthropic" => "claude-haiku-4-5-20251001".into(),
         "openai" => "gpt-4o-mini".into(),
         "openrouter" => "openai/gpt-4o-mini".into(),
+        "opencode" => "big-pickle".into(),
+        "opencode-go" => "deepseek-v4-flash".into(),
         // `gemini-flash-latest` is an always-current alias that points at
         // whichever flash model is generally available on free-tier keys.
         // `gemini-2.5-flash` exists on most keys but the alias avoids
         // surprises when Google rotates the GA model. The Gemini provider
         // also auto-routes to a working model on 404 (see
         // `phonton-providers::GeminiProvider`).
-        "gemini" => "gemini-flash-latest".into(),
+        "gemini" | "google" => "gemini-flash-latest".into(),
         "agentrouter" => "claude-sonnet-4-5".into(),
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "ollama" => "llama3.2:3b".into(),
@@ -5966,6 +6113,7 @@ fn print_help() {
          context           Evaluate deterministic context-selection fixtures\n  \
          review [task-id]  Show verified diff review payloads\n  \
          proof             Export proof bundles from OutcomeLedger\n  \
+         providers         List, sync, and verify provider/model routes\n  \
          run [task-id]     Run a receipt-suggested command from latest task\n  \
          benchmark         Export benchmark evidence from OutcomeLedger\n  \
          why-tokens        Explain latest token buckets by source\n  \
@@ -6218,6 +6366,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             let working_dir =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let code = doctor::run(&working_dir, &args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
+        "providers" => {
+            let code = providers_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -6875,6 +7030,9 @@ async fn run_app<B: Backend>(
                                         Some(app.settings.account_id.clone())
                                     },
                                     base_url: None,
+                                    catalog: None,
+                                    api_key_source: None,
+                                    allow_unverified_model: false,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -6908,10 +7066,10 @@ async fn run_app<B: Backend>(
                                 // settings mode.
                                 let msg = match result {
                                     Ok(reply) => format!(
-                                        "✓ Connected — got reply ({} chars). Key works.",
+                                        "Provider diff canary passed ({} chars). Key works.",
                                         reply.len()
                                     ),
-                                    Err(e) => format!("✗ Connection failed: {e}"),
+                                    Err(e) => format!("Provider diff canary failed: {e}"),
                                 };
                                 let _ = tx2.send(LoopEvent::TestResult(msg)).await;
                             });
@@ -6929,6 +7087,9 @@ async fn run_app<B: Backend>(
                                         Some(app.settings.account_id.clone())
                                     },
                                     base_url: None,
+                                    catalog: None,
+                                    api_key_source: None,
+                                    allow_unverified_model: false,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -7033,6 +7194,9 @@ async fn run_app<B: Backend>(
                                             Some(app.settings.account_id.clone())
                                         },
                                         base_url: None,
+                                        catalog: None,
+                                        api_key_source: None,
+                                        allow_unverified_model: false,
                                     };
                                     provider_key_for_run(&stub).unwrap_or_default()
                                 } else {
@@ -7582,33 +7746,69 @@ async fn spawn_goal(
         ))
     };
 
-    let dispatcher: Arc<dyn WorkerDispatcher> =
-        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
-            let provider_name = cfg.provider.name.clone();
-            let account_id = cfg.provider.account_id.clone();
-            let base_url = cfg.provider.base_url.clone();
-            // CRITICAL: when the user (or auto-detect) picked a specific model,
-            // honour it for *every* tier. The previous behaviour was to call
-            // `model_for_tier(provider, tier)` and silently override the chosen
-            // model with the hard-coded tier default — so a Gemini key that
-            // only has access to `gemma-4-31b-it` would 404 the moment goal
-            // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
-            // model and worked; goals didn't, and the gap was invisible.
-            let configured_model = cfg.provider.model.clone();
-            let validation_model = configured_model.clone().unwrap_or_else(|| {
-                phonton_providers::model_for_tier(&provider_name, phonton_types::ModelTier::Cheap)
-            });
-            let Some(provider_template) = make_api_provider_config(
-                &provider_name,
-                api_key.clone(),
-                validation_model,
-                account_id,
-                base_url,
-            ) else {
-                let reason = provider_config_failure_message(&provider_name);
-                let failed = GlobalState {
+    let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) =
+        provider_key_for_run(&cfg.provider)
+    {
+        let provider_name = cfg.provider.name.clone();
+        let account_id = cfg.provider.account_id.clone();
+        let base_url = cfg.provider.base_url.clone();
+        // CRITICAL: when the user (or auto-detect) picked a specific model,
+        // honour it for *every* tier. The previous behaviour was to call
+        // `model_for_tier(provider, tier)` and silently override the chosen
+        // model with the hard-coded tier default — so a Gemini key that
+        // only has access to `gemma-4-31b-it` would 404 the moment goal
+        // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
+        // model and worked; goals didn't, and the gap was invisible.
+        let configured_model = cfg.provider.model.clone();
+        let validation_model = configured_model.clone().unwrap_or_else(|| {
+            phonton_providers::model_for_tier(&provider_name, phonton_types::ModelTier::Cheap)
+        });
+        let validation_model_for_canary = validation_model.clone();
+        let Some(provider_template) = make_api_provider_config(
+            &provider_name,
+            api_key.clone(),
+            validation_model,
+            account_id.clone(),
+            base_url.clone(),
+        ) else {
+            let reason = provider_config_failure_message(&provider_name);
+            let failed = GlobalState {
+                task_status: TaskStatus::Failed {
+                    reason: reason.clone(),
+                    failed_subtask: None,
+                },
+                goal_contract: plan.goal_contract.clone(),
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: None,
+                estimated_naive_tokens: plan.naive_baseline_tokens,
+                checkpoints: Vec::new(),
+            };
+            if let Ok(g) = store.lock() {
+                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+            }
+            let _ = tx
+                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
+                .await;
+            return;
+        };
+
+        if let Err(reason) = ensure_provider_diff_contract_cached(
+            &provider_name,
+            &validation_model_for_canary,
+            &api_key,
+            account_id.clone(),
+            base_url.clone(),
+            cfg.provider.allow_unverified_model,
+        )
+        .await
+        {
+            let failed = GlobalState {
                     task_status: TaskStatus::Failed {
-                        reason: reason.clone(),
+                        reason: format!(
+                            "provider/model blocked before dispatch: {reason}. Run `phonton providers doctor --configured --canary diff` or pick a verified model in /settings."
+                        ),
                         failed_subtask: None,
                     },
                     goal_contract: plan.goal_contract.clone(),
@@ -7619,37 +7819,40 @@ async fn spawn_goal(
                     estimated_naive_tokens: plan.naive_baseline_tokens,
                     checkpoints: Vec::new(),
                 };
-                if let Ok(g) = store.lock() {
-                    let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
-                }
-                let _ = tx
-                    .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
-                    .await;
-                return;
-            };
-
-            let factory = move |tier: phonton_types::ModelTier| {
-                let model = configured_model
-                    .clone()
-                    .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
-                provider_for(provider_config_with_model(&provider_template, model))
-            };
-
-            let guard = ExecutionGuard::new_with_mode(working_dir.clone(), cfg.permissions.mode);
-            let mut d =
-                phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
-                    .with_task_id(task_id)
-                    .with_memory(memory_store.clone());
-            if let Some(ctx) = semantic_context.clone() {
-                d = d.with_semantic_context(ctx);
+            if let Ok(g) = store.lock() {
+                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
             }
-            if let Some(runtime) = mcp_runtime.clone() {
-                d = d.with_mcp_runtime(runtime);
-            }
-            Arc::new(d)
-        } else {
-            Arc::new(StubDispatcher::new(sandbox.clone()))
+            let _ = tx
+                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
+                .await;
+            return;
+        }
+
+        let routed_model_override = configured_model
+            .clone()
+            .or_else(|| Some(validation_model_for_canary.clone()));
+        let factory = move |tier: phonton_types::ModelTier| {
+            let model = routed_model_override
+                .clone()
+                .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
+            provider_for(provider_config_with_model(&provider_template, model))
         };
+
+        let guard = ExecutionGuard::new_with_mode(working_dir.clone(), cfg.permissions.mode);
+        let mut d =
+            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                .with_task_id(task_id)
+                .with_memory(memory_store.clone());
+        if let Some(ctx) = semantic_context.clone() {
+            d = d.with_semantic_context(ctx);
+        }
+        if let Some(runtime) = mcp_runtime.clone() {
+            d = d.with_mcp_runtime(runtime);
+        }
+        Arc::new(d)
+    } else {
+        Arc::new(StubDispatcher::new(sandbox.clone()))
+    };
 
     // Wire phonton-diff so the orchestrator takes a checkpoint commit
     // after every subtask passes verify.
@@ -8127,6 +8330,9 @@ fn extract_id(line: &str) -> Option<String> {
             model: Some("llama3.2:3b".into()),
             account_id: None,
             base_url: None,
+            catalog: None,
+            api_key_source: None,
+            allow_unverified_model: false,
         };
         assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
 
@@ -8136,6 +8342,9 @@ fn extract_id(line: &str) -> Option<String> {
             model: Some("local-model".into()),
             account_id: None,
             base_url: Some("http://localhost:1234/v1".into()),
+            catalog: None,
+            api_key_source: None,
+            allow_unverified_model: false,
         };
         assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
     }
