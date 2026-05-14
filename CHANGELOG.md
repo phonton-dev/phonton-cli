@@ -4,6 +4,21 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.4 - Autonomy Loop Hotfix
+
+### Changed
+
+- Worker retry policy now stops after two matching verifier/parser diagnostic signatures instead of spending a third blind attempt.
+- Orchestrator retry diagnostics are now included in the next worker's first prompt and semantic-context query, so repair attempts start from the actual verifier evidence.
+- Stale hunk diagnostics now add explicit repair guidance to avoid repeating the same patch and prefer full-file replacement for small generated artifacts.
+- Flight Log now emits a `repair` event before redispatch, making bounded repair/replan behavior visible.
+- Long verifier diagnostics are compacted in Flight Log rendering while the raw event still carries the full error list.
+
+### Fixed
+
+- Small generated artifact full-file replacement hunks are applied directly when safe, avoiding libgit2 patch failures caused by stale removed-line context.
+- Failure receipts no longer say a worker is escalating after exhausting its own retry budget when the worker is actually stopping before another blind retry.
+
 ## 0.12.3 - Chess Benchmark Stale Hunk Fix
 
 - Fixed the next generated chess benchmark failure mode where a rules slice

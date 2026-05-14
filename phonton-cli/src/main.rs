@@ -4736,6 +4736,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::SubtaskFailed { .. } => (DANGER, "subtask-fail"),
         E::VerifyPass { .. } => (SUCCESS, "verify-pass"),
         E::VerifyFail { .. } => (WARN, "verify-fail"),
+        E::RepairPlanned { .. } => (WARN, "repair"),
         E::VerifyEscalated { .. } => (WARN, "escalate"),
         E::TokenMilestone { .. } => (MUTED, "tokens"),
         E::Thinking { .. } => (VIOLET, "thinking"),

@@ -52,8 +52,11 @@ pub use phonton_sandbox::{ExecutionGuard, GuardDecision, ToolCall};
 /// Production [`WorkerDispatcher`] bridge from orchestrator to worker.
 pub mod dispatcher;
 
-/// Maximum verification attempts before escalating model tier.
-pub const MAX_ATTEMPTS: u8 = 3;
+/// Maximum verification attempts before stopping a worker at this tier.
+pub const MAX_ATTEMPTS: u8 = 2;
+
+/// Number of identical diagnostics that proves a blind retry is wasteful.
+pub const SAME_DIAGNOSTIC_LIMIT: u8 = 2;
 
 /// Maximum MCP tool calls a worker may make for one subtask.
 pub const MAX_MCP_CALLS_PER_SUBTASK: usize = 3;
@@ -246,6 +249,18 @@ impl Worker {
         subtask: Subtask,
         context_slices: Vec<CodeSlice>,
     ) -> Result<SubtaskResult> {
+        self.execute_with_prior_errors(subtask, context_slices, Vec::new())
+            .await
+    }
+
+    /// Execute a subtask with verifier diagnostics from an earlier
+    /// orchestrator attempt already available to the first worker prompt.
+    pub async fn execute_with_prior_errors(
+        &self,
+        subtask: Subtask,
+        context_slices: Vec<CodeSlice>,
+        prior_errors: Vec<String>,
+    ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
 
         let relevant_slices: Vec<CodeSlice> = match &self.semantic {
@@ -260,7 +275,9 @@ impl Worker {
             }
             None => Vec::new(),
         };
-        let mut last_errors: Vec<String> = Vec::new();
+        let mut last_errors: Vec<String> = prior_errors;
+        let mut last_layer = VerifyLayer::Syntax;
+        let mut last_signature: Option<String> = None;
         let mut total_tokens: u64 = 0;
         let mut token_usage = TokenUsage::default();
         let mut last_provider = phonton_types::ProviderKind::Anthropic;
@@ -470,13 +487,17 @@ impl Worker {
                 Ok(h) => h,
                 Err(e) => {
                     warn!(attempt, error = %e, "worker could not parse diff; will retry with feedback");
-                    last_errors = vec![format!(
+                    let errors = vec![format!(
                         "Your previous response could not be parsed as a unified diff. \
                          Reply with ONLY a unified diff (no prose, no code fences). \
                          Each file starts with `--- a/<path>` then `+++ b/<path>`, \
                          followed by `@@ -old,n +new,n @@` hunk headers and \
                          ` `/`+`/`-` line prefixes. Parser said: {e}"
                     )];
+                    let signature = diagnostic_signature(VerifyLayer::Syntax, &errors);
+                    let repeated_signature_count =
+                        update_repeated_signature_count(&mut last_signature, &signature);
+                    last_errors = errors;
                     if attempt >= MAX_ATTEMPTS {
                         return Ok(SubtaskResult {
                             id: subtask.id,
@@ -497,6 +518,23 @@ impl Worker {
                             model_name: last_model_name,
                             token_usage,
                         });
+                    }
+                    if repeated_signature_count >= SAME_DIAGNOSTIC_LIMIT {
+                        return Ok(failed_result(
+                            subtask.id,
+                            model_tier,
+                            VerifyResult::Fail {
+                                layer: VerifyLayer::Syntax,
+                                errors: vec![format!(
+                                    "same parser diagnostic repeated {SAME_DIAGNOSTIC_LIMIT} times; stopped before blind retry: {signature}"
+                                )],
+                                attempt,
+                            },
+                            token_usage,
+                            attempt,
+                            last_provider,
+                            last_model_name,
+                        ));
                     }
                     continue;
                 }
@@ -546,13 +584,35 @@ impl Worker {
                     errors,
                     attempt: _,
                 } => {
+                    last_layer = layer;
                     warn!(
                         attempt,
                         ?layer,
                         n = errors.len(),
                         "verify failed; will retry"
                     );
+                    let signature = diagnostic_signature(layer, &errors);
+                    let repeated_signature_count =
+                        update_repeated_signature_count(&mut last_signature, &signature);
                     last_errors = compact_verify_retry_errors(layer, &errors);
+                    last_errors.extend(repair_guidance_for_errors(&errors));
+                    if repeated_signature_count >= SAME_DIAGNOSTIC_LIMIT {
+                        return Ok(failed_result(
+                            subtask.id,
+                            model_tier,
+                            VerifyResult::Fail {
+                                layer,
+                                errors: vec![format!(
+                                    "same verifier diagnostic repeated {SAME_DIAGNOSTIC_LIMIT} times; stopped before blind retry: {signature}"
+                                )],
+                                attempt,
+                            },
+                            token_usage,
+                            attempt,
+                            last_provider,
+                            last_model_name,
+                        ));
+                    }
                 }
                 VerifyResult::Escalate { reason } => {
                     return Ok(failed_result(
@@ -568,9 +628,8 @@ impl Worker {
             }
         }
 
-        // Exhausted MAX_ATTEMPTS retries at the current tier. Surface an
-        // escalation with the last error set so the orchestrator can
-        // re-dispatch at the next tier.
+        // Exhausted MAX_ATTEMPTS retries at the current tier. Stop with
+        // evidence instead of spending another blind repair attempt.
         //
         // Record this as a RejectedApproach so the planner never re-proposes
         // the same subtask in a future goal decomposition.
@@ -587,15 +646,18 @@ impl Worker {
                 warn!(error = %e, "failed to record rejected approach to memory");
             }
         }
-        let escalated = next_tier(model_tier);
         let reason = format!(
-            "verify failed {MAX_ATTEMPTS} attempts at {model_tier}; escalating to {escalated}: {}",
+            "verify failed {MAX_ATTEMPTS} attempts at {model_tier}; stopped before blind retry: {}",
             last_errors.join("; ")
         );
         Ok(failed_result(
             subtask.id,
             model_tier,
-            VerifyResult::Escalate { reason },
+            VerifyResult::Fail {
+                layer: last_layer,
+                errors: vec![reason],
+                attempt: MAX_ATTEMPTS,
+            },
             token_usage,
             MAX_ATTEMPTS,
             last_provider,
@@ -894,9 +956,57 @@ fn failed_result(
     }
 }
 
+/// Normalize verifier output so retry policy can detect repeated failures.
+fn diagnostic_signature(layer: VerifyLayer, errors: &[String]) -> String {
+    let joined = errors.join(" ").to_ascii_lowercase();
+    let without_attempts = match Regex::new(r"\b\d+\b") {
+        Ok(re) => re.replace_all(&joined, "#").into_owned(),
+        Err(_) => joined,
+    };
+    let collapsed = without_attempts
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut signature = format!("{layer:?}:{collapsed}").to_ascii_lowercase();
+    if signature.chars().count() > 240 {
+        signature = signature.chars().take(240).collect();
+    }
+    signature
+}
+
+fn update_repeated_signature_count(last_signature: &mut Option<String>, signature: &str) -> u8 {
+    if last_signature.as_deref() == Some(signature) {
+        2
+    } else {
+        *last_signature = Some(signature.to_string());
+        1
+    }
+}
+
+fn repair_guidance_for_errors(errors: &[String]) -> Vec<String> {
+    if !looks_like_stale_hunk_error(errors) {
+        return Vec::new();
+    }
+    vec![
+        "Repair policy: the previous patch appears stale. Do not retry the same hunk. \
+         For a small generated artifact, replace the whole file with one unified-diff hunk; \
+         otherwise use only exact current surrounding lines from the failing file."
+            .into(),
+    ]
+}
+
+fn looks_like_stale_hunk_error(errors: &[String]) -> bool {
+    let joined = errors.join(" ").to_ascii_lowercase();
+    joined.contains("removed-line mismatch")
+        || joined.contains("could not reconstruct post-diff file")
+        || joined.contains("hunk starts at old line")
+        || joined.contains("git apply failed")
+}
+
 /// One-step model-tier escalation table. `Frontier` already at the top
 /// returns itself — orchestrator inspects this and decides whether to
 /// surface the failure to the user.
+#[cfg(test)]
 fn next_tier(t: ModelTier) -> ModelTier {
     match t {
         ModelTier::Local => ModelTier::Cheap,
@@ -2329,6 +2439,51 @@ mod tests {
         assert!(user.contains("# Subtask"));
         assert!(user.contains("make chess"));
         assert!(!user.contains("You are a Phonton worker"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_prior_errors_includes_them_on_first_prompt() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), guard());
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "fix generated chess tests".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let _ = worker
+            .execute_with_prior_errors(
+                subtask,
+                Vec::new(),
+                vec!["Verifier Syntax: src/chessRules.test.ts removed-line mismatch".into()],
+            )
+            .await
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        let (_, first_user_prompt) = &calls[0];
+        assert!(first_user_prompt.contains("# Previous verification failed"));
+        assert!(first_user_prompt.contains("removed-line mismatch"));
+    }
+
+    #[test]
+    fn repeated_diagnostic_signature_ignores_attempt_noise() {
+        let first = diagnostic_signature(
+            VerifyLayer::Syntax,
+            &["attempt 1 failed at line 14: removed-line mismatch".into()],
+        );
+        let second = diagnostic_signature(
+            VerifyLayer::Syntax,
+            &["attempt 2 failed at line 99: removed-line mismatch".into()],
+        );
+
+        assert_eq!(first, second);
     }
 
     #[test]

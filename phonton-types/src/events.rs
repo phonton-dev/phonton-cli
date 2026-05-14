@@ -166,6 +166,14 @@ pub enum OrchestratorEvent {
         errors: Vec<String>,
         attempt: u8,
     },
+    /// The orchestrator is about to retry with verifier diagnostics instead
+    /// of spending a blind provider call.
+    RepairPlanned {
+        subtask_id: SubtaskId,
+        attempt: u8,
+        tier: ModelTier,
+        reason: String,
+    },
     /// The orchestrator bumped a subtask to a higher model tier.
     VerifyEscalated {
         subtask_id: SubtaskId,
@@ -247,6 +255,7 @@ impl EventRecord {
             OrchestratorEvent::SubtaskFailed { .. } => "subtask-failed",
             OrchestratorEvent::VerifyPass { .. } => "verify-pass",
             OrchestratorEvent::VerifyFail { .. } => "verify-fail",
+            OrchestratorEvent::RepairPlanned { .. } => "repair",
             OrchestratorEvent::VerifyEscalated { .. } => "escalate",
             OrchestratorEvent::TokenMilestone { .. } => "tokens",
             OrchestratorEvent::Thinking { .. } => "thinking",
@@ -457,10 +466,16 @@ impl EventRecord {
                 errors,
                 attempt,
             } => {
-                format!(
-                    "verify fail {subtask_id} layer={layer:?} attempt={attempt}: {}",
-                    errors.join("; ")
-                )
+                let diagnostics = compact_error_list(errors, 160);
+                format!("verify fail {subtask_id} layer={layer:?} attempt={attempt}: {diagnostics}")
+            }
+            OrchestratorEvent::RepairPlanned {
+                subtask_id,
+                attempt,
+                tier,
+                reason,
+            } => {
+                format!("repair planned {subtask_id} tier={tier} attempt={attempt}: {reason}")
             }
             OrchestratorEvent::VerifyEscalated {
                 subtask_id,
@@ -505,5 +520,77 @@ impl EventRecord {
                 format!("review {decision}: {detail}")
             }
         }
+    }
+}
+
+fn compact_error_list(errors: &[String], max_chars: usize) -> String {
+    let label = if errors.len() == 1 {
+        "1 error".to_string()
+    } else {
+        format!("{} errors", errors.len())
+    };
+    if errors.is_empty() {
+        return "0 errors".into();
+    }
+    let joined = errors.join("; ");
+    format!("{label}: {}", truncate_chars(&joined, max_chars))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ModelTier, SubtaskId, TaskId};
+
+    #[test]
+    fn repair_planned_event_is_readable_in_flight_log() {
+        let record = EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 0,
+            event: OrchestratorEvent::RepairPlanned {
+                subtask_id: SubtaskId::new(),
+                attempt: 2,
+                tier: ModelTier::Standard,
+                reason: "using verifier diagnostics; no blind retry".into(),
+            },
+        };
+
+        assert_eq!(record.kind(), "repair");
+        let line = record.render_line();
+        assert!(line.contains("repair planned"));
+        assert!(line.contains("attempt=2"));
+        assert!(line.contains("standard"));
+        assert!(line.contains("no blind retry"));
+    }
+
+    #[test]
+    fn verify_fail_render_line_compacts_long_diagnostics() {
+        let long_error = "x".repeat(600);
+        let record = EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 0,
+            event: OrchestratorEvent::VerifyFail {
+                subtask_id: SubtaskId::new(),
+                layer: crate::VerifyLayer::Syntax,
+                errors: vec![long_error, "second error".into()],
+                attempt: 1,
+            },
+        };
+
+        let line = record.render_line();
+        assert!(line.contains("2 errors"));
+        assert!(line.contains("..."));
+        assert!(
+            line.chars().count() < 260,
+            "flight-log line should stay compact: {line}"
+        );
     }
 }

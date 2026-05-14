@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const MAX_DIRECT_REPLACE_LINES: usize = 400;
+const MAX_DIRECT_REPLACE_BYTES: u64 = 64 * 1024;
+
 pub struct DiffApplier {
     repo: Repository,
     stash_oid: Option<git2::Oid>,
@@ -51,6 +54,7 @@ impl DiffApplier {
         }
 
         let mut new_files: Vec<PathBuf> = Vec::new();
+        let mut direct_written: Vec<PathBuf> = Vec::new();
         let mut modified: BTreeMap<PathBuf, Vec<&DiffHunk>> = BTreeMap::new();
 
         for (path, hs) in grouped {
@@ -65,6 +69,11 @@ impl DiffApplier {
                 std::fs::write(&full, content)
                     .with_context(|| format!("writing new file {}", path.display()))?;
                 new_files.push(path);
+            } else if is_small_full_file_replacement(&hs, &full) {
+                let content = reconstruct_new_side(&hs);
+                std::fs::write(&full, content)
+                    .with_context(|| format!("writing replacement file {}", path.display()))?;
+                direct_written.push(path);
             } else {
                 modified.insert(path, hs);
             }
@@ -80,7 +89,11 @@ impl DiffApplier {
         }
 
         let mut index = self.repo.index()?;
-        for path in new_files.iter().chain(modified.keys()) {
+        for path in new_files
+            .iter()
+            .chain(direct_written.iter())
+            .chain(modified.keys())
+        {
             index
                 .add_path(path)
                 .with_context(|| format!("staging {}", path.display()))?;
@@ -377,6 +390,46 @@ fn reconstruct_new_side(hunks: &[&DiffHunk]) -> String {
     out
 }
 
+fn is_small_full_file_replacement(hunks: &[&DiffHunk], full_path: &Path) -> bool {
+    if hunks.len() != 1 {
+        return false;
+    }
+    let hunk = hunks[0];
+    if hunk.old_start > 1 || hunk.new_start > 1 {
+        return false;
+    }
+    if hunk
+        .lines
+        .iter()
+        .any(|line| matches!(line, DiffLine::Context(_)))
+    {
+        return false;
+    }
+    let added = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Added(_)))
+        .count();
+    let removed = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Removed(_)))
+        .count();
+    if added == 0 || removed == 0 || added > MAX_DIRECT_REPLACE_LINES {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(full_path) else {
+        return false;
+    };
+    if metadata.len() > MAX_DIRECT_REPLACE_BYTES {
+        return false;
+    }
+    let Ok(current) = std::fs::read_to_string(full_path) else {
+        return false;
+    };
+    current.lines().count() <= MAX_DIRECT_REPLACE_LINES
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -446,5 +499,36 @@ mod tests {
         let task = TaskId::new();
         let listed = applier.list_checkpoints(task).unwrap();
         assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn apply_verified_hunks_writes_small_full_file_replacement_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _repo = init_repo_with_seed(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/App.tsx"), "stale old line\n").unwrap();
+
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/App.tsx"),
+            old_start: 1,
+            old_count: 99,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine::Removed("different old line".into()),
+                DiffLine::Added("export function App() {".into()),
+                DiffLine::Added("  return <main>Chess</main>;".into()),
+                DiffLine::Added("}".into()),
+            ],
+        }];
+
+        applier.apply_verified_hunks(&hunks).unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join("src/App.tsx")).unwrap();
+        assert_eq!(
+            written.replace("\r\n", "\n"),
+            "export function App() {\n  return <main>Chess</main>;\n}\n"
+        );
     }
 }

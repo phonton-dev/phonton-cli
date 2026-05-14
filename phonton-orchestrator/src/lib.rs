@@ -1222,6 +1222,14 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                             });
                             (false, false)
                         } else {
+                            events.push(OrchestratorEvent::RepairPlanned {
+                                subtask_id: id,
+                                attempt: 1,
+                                tier: rt.subtask.model_tier,
+                                reason:
+                                    "using verifier diagnostics at escalated tier; no blind retry"
+                                        .into(),
+                            });
                             events.push(OrchestratorEvent::VerifyEscalated {
                                 subtask_id: id,
                                 from: from_tier,
@@ -1232,6 +1240,13 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         }
                     } else {
                         // Re-dispatch at same tier with error context.
+                        events.push(OrchestratorEvent::RepairPlanned {
+                            subtask_id: id,
+                            attempt: rt.attempts_at_tier.saturating_add(1),
+                            tier: rt.subtask.model_tier,
+                            reason: "using verifier diagnostics at same tier; no blind retry"
+                                .into(),
+                        });
                         (true, false)
                     }
                 }
@@ -1254,6 +1269,13 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         });
                         (false, false)
                     } else {
+                        events.push(OrchestratorEvent::RepairPlanned {
+                            subtask_id: id,
+                            attempt: 1,
+                            tier: rt.subtask.model_tier,
+                            reason: "using verifier diagnostics at escalated tier; no blind retry"
+                                .into(),
+                        });
                         events.push(OrchestratorEvent::VerifyEscalated {
                             subtask_id: id,
                             from: from_tier,
@@ -2702,14 +2724,25 @@ mod tests {
         let dispatcher = Arc::new(BrokenDispatcher {
             calls: Mutex::new(Vec::new()),
         });
+        let (events_tx, mut events_rx) = broadcast::channel(32);
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_event_sink(TaskId::new(), "busted", events_tx);
         let status = orch.run_task(plan, empty_state()).await.unwrap();
         assert!(matches!(status, TaskStatus::Failed { .. }));
         let calls = dispatcher.calls.lock().unwrap();
         // At minimum: retries at initial tier plus at least one escalation.
         assert!(calls.len() >= 2);
         assert!(calls.iter().any(|t| *t != ModelTier::Cheap));
+        let mut saw_repair = false;
+        while let Ok(record) = events_rx.try_recv() {
+            if let OrchestratorEvent::RepairPlanned { reason, .. } = record.event {
+                saw_repair = true;
+                assert!(reason.contains("verifier diagnostics"));
+            }
+        }
+        assert!(saw_repair, "expected RepairPlanned event in flight log");
     }
 
     #[tokio::test]

@@ -135,7 +135,7 @@ impl WorkerDispatcher for RealDispatcher {
         msg_tx: Option<tokio::sync::mpsc::Sender<phonton_types::messages::OrchestratorMessage>>,
     ) -> Result<SubtaskResult> {
         let provider = (self.provider_factory)(subtask.model_tier);
-        let context_slices = self.select_context(&subtask).await;
+        let context_slices = self.select_context(&subtask, &prior_errors).await;
         if let Some(tx) = &msg_tx {
             let slices: Vec<ContextAttribution> = context_slices
                 .iter()
@@ -175,11 +175,10 @@ impl WorkerDispatcher for RealDispatcher {
         // The worker's `execute` method runs the full LLM -> verify -> retry
         // loop and returns a SubtaskResult with a VerifyResult already set.
         // The orchestrator re-verifies independently per its own invariant.
-        let mut result = worker.execute(subtask, context_slices).await?;
+        let mut result = worker
+            .execute_with_prior_errors(subtask, context_slices, prior_errors)
+            .await?;
 
-        // Propagate prior errors into the result so the orchestrator can
-        // log a complete audit trail even on the first attempt.
-        let _ = prior_errors; // used via the worker prompt, not here
         result.diff_hunks.retain(|_| true); // no-op, keeps the compiler happy
 
         Ok(result)
@@ -187,14 +186,19 @@ impl WorkerDispatcher for RealDispatcher {
 }
 
 impl RealDispatcher {
-    async fn select_context(&self, subtask: &Subtask) -> Vec<CodeSlice> {
+    async fn select_context(&self, subtask: &Subtask, prior_errors: &[String]) -> Vec<CodeSlice> {
         let Some(semantic) = &self.semantic else {
             return Vec::new();
         };
+        let mut query = subtask.description.clone();
+        if !prior_errors.is_empty() {
+            query.push_str("\nVerifier diagnostics:\n");
+            query.push_str(&prior_errors.join("\n"));
+        }
         phonton_index::query_relevant_slices(
             &semantic.index,
             &semantic.embedder,
-            &subtask.description,
+            &query,
             super::semantic_slice_limit(subtask),
         )
         .await
