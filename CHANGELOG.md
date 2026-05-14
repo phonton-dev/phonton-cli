@@ -4,6 +4,16 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.6 - Provider Contract Hardening
+
+### Fixed
+
+- Treat DeepSeek as a first-class OpenAI-compatible route in provider diagnostics instead of anonymous `openai-compatible`.
+- Disable DeepSeek V4/reasoner thinking mode for diff-only worker calls so provider responses return final `message.content` instead of reasoning-only output.
+- Version the provider-health cache key so stale v0.12.5 canary passes are ignored under the corrected request contract.
+- Fail reasoning-only OpenAI-compatible replies with a precise provider contract error.
+- Bound Settings and provider-doctor diff canaries with a 20s timeout so broken routes do not hang setup.
+
 ## 0.12.5 - Provider Reliability
 
 ### Added

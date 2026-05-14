@@ -147,6 +147,7 @@ const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 const UI_TICK_MS: u64 = 80;
 const LOGO_SHIMMER_SPEED: f32 = 0.026;
 const LOGO_ROW_PHASE: f32 = 0.11;
+const PROVIDER_HEALTH_CONTRACT_VERSION: &str = "diff-canary-v2-disable-thinking";
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
@@ -5359,6 +5360,7 @@ fn provider_health_key(
     api_key: &str,
 ) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    PROVIDER_HEALTH_CONTRACT_VERSION.hash(&mut hasher);
     provider.hash(&mut hasher);
     model.hash(&mut hasher);
     base_url.unwrap_or("").hash(&mut hasher);
@@ -5418,7 +5420,15 @@ async fn ensure_provider_diff_contract_cached(
     )
     .ok_or_else(|| provider_config_failure_message(provider_name))?;
     let provider = provider_for(cfg);
-    let result = probe_diff_contract(provider.as_ref()).await;
+    let result = match tokio::time::timeout(
+        Duration::from_secs(20),
+        probe_diff_contract(provider.as_ref()),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("diff canary timed out after 20s")),
+    };
     let entry = match result {
         Ok(resp) => ProviderHealthEntry {
             ok: true,
@@ -5749,9 +5759,13 @@ async fn test_provider(
     let cfg = make_api_provider_config(&name, api_key, model, account_id, base_url)
         .ok_or_else(|| provider_config_failure_message(&name))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
-    let resp = probe_diff_contract(provider.as_ref())
-        .await
-        .map_err(|e| format!("{e}"))?;
+    let resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        probe_diff_contract(provider.as_ref()),
+    )
+    .await
+    .map_err(|_| "diff canary timed out after 20s".to_string())?
+    .map_err(|e| format!("{e}"))?;
     Ok(resp.content)
 }
 

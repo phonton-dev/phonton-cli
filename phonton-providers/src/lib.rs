@@ -1174,6 +1174,13 @@ pub fn provider_for(config: ProviderConfig) -> Box<dyn Provider> {
                     &endpoint,
                     ProviderKind::Cloudflare,
                 ))
+            } else if name == "deepseek" {
+                Box::new(OpenAiCompatibleProvider::new(
+                    api_key,
+                    model,
+                    &endpoint,
+                    ProviderKind::DeepSeek,
+                ))
             } else {
                 Box::new(OpenAiCompatibleProvider::custom(api_key, model, &endpoint))
             }
@@ -1703,6 +1710,11 @@ impl OpenAiCompatibleProvider {
                 .unwrap_or_default(),
         }
     }
+
+    fn should_disable_deepseek_thinking(&self) -> bool {
+        self.kind == ProviderKind::DeepSeek
+            && (self.model.contains("v4") || self.model.contains("reasoner"))
+    }
 }
 
 fn chat_content_at_path(resp: &Value, pointer: &str) -> Option<String> {
@@ -1788,7 +1800,10 @@ fn parse_openai_compatible_chat_response(
 
     let checked_paths = [
         "/choices/0/message/content",
+        "/choices/0/text",
+        "/choices/0/delta/content",
         "/result/choices/0/message/content",
+        "/result/choices/0/text",
         "/result/response",
         "/result/output_text",
         "/response",
@@ -1807,6 +1822,18 @@ fn parse_openai_compatible_chat_response(
 
     if let Some(detail) = provider_error_detail(resp) {
         return Err(anyhow!("{kind} response error: {detail}"));
+    }
+
+    let reasoning_present = resp
+        .pointer("/choices/0/message/reasoning_content")
+        .or_else(|| resp.pointer("/result/choices/0/message/reasoning_content"))
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if reasoning_present {
+        return Err(anyhow!(
+            "{kind} response contained reasoning_content but no final text content; disable provider thinking or choose a non-reasoning route for diff-only workers"
+        ));
     }
 
     let result_keys = resp
@@ -1871,6 +1898,9 @@ impl Provider for OpenAiCompatibleProvider {
                 "thinking": false,
                 "clear_thinking": true,
             });
+        }
+        if self.should_disable_deepseek_thinking() {
+            body["thinking"] = json!({ "type": "disabled" });
         }
 
         let mut req = self
@@ -2577,6 +2607,26 @@ mod tests {
     }
 
     #[test]
+    fn openai_compat_rejects_reasoning_only_content() {
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning_content": "--- a/probe.txt\n+++ b/probe.txt\n@@ -0,0 +1 @@\n+ok\n"
+                }
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 12 }
+        });
+
+        let err = parse_openai_compatible_chat_response(ProviderKind::DeepSeek, &resp)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("reasoning_content"));
+        assert!(err.contains("no final text content"));
+    }
+
+    #[test]
     fn cloudflare_parses_workers_ai_response_envelope() {
         let resp = json!({
             "success": true,
@@ -2664,6 +2714,7 @@ mod tests {
             saw_max_tokens: Arc<AtomicBool>,
             saw_max_completion: Arc<AtomicBool>,
             saw_cloudflare_no_thinking: Arc<AtomicBool>,
+            saw_deepseek_no_thinking: Arc<AtomicBool>,
         ) -> SocketAddr {
             // Tiny TCP listener that reads one HTTP request, records which
             // token field the caller sent, and answers a valid chat shape.
@@ -2687,6 +2738,9 @@ mod tests {
                     {
                         saw_cloudflare_no_thinking.store(true, Ordering::SeqCst);
                     }
+                    if raw.contains("\"thinking\":{\"type\":\"disabled\"}") {
+                        saw_deepseek_no_thinking.store(true, Ordering::SeqCst);
+                    }
                     let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -2702,7 +2756,14 @@ mod tests {
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
         let saw_ct = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone(), saw_ct.clone()).await;
+        let saw_dt = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(
+            saw_mt.clone(),
+            saw_mc.clone(),
+            saw_ct.clone(),
+            saw_dt.clone(),
+        )
+        .await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
         let _ = p.call("sys", "u", &[]).await;
@@ -2719,7 +2780,14 @@ mod tests {
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
         let saw_ct = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone(), saw_ct.clone()).await;
+        let saw_dt = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(
+            saw_mt.clone(),
+            saw_mc.clone(),
+            saw_ct.clone(),
+            saw_dt.clone(),
+        )
+        .await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p =
             OpenAiCompatibleProvider::new("k".into(), "m".into(), &endpoint, ProviderKind::OpenAI);
@@ -2737,7 +2805,14 @@ mod tests {
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
         let saw_ct = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone(), saw_ct.clone()).await;
+        let saw_dt = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(
+            saw_mt.clone(),
+            saw_mc.clone(),
+            saw_ct.clone(),
+            saw_dt.clone(),
+        )
+        .await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p = OpenAiCompatibleProvider::new(
             "k".into(),
@@ -2757,6 +2832,36 @@ mod tests {
         assert!(
             saw_ct.load(Ordering::SeqCst),
             "Cloudflare must disable provider-side thinking for diff-only worker calls"
+        );
+
+        // DeepSeek V4 defaults to thinking mode; disable it so diff workers
+        // receive final `message.content` instead of reasoning-only output.
+        let saw_mt = Arc::new(AtomicBool::new(false));
+        let saw_mc = Arc::new(AtomicBool::new(false));
+        let saw_ct = Arc::new(AtomicBool::new(false));
+        let saw_dt = Arc::new(AtomicBool::new(false));
+        let addr = body_capture_server(
+            saw_mt.clone(),
+            saw_mc.clone(),
+            saw_ct.clone(),
+            saw_dt.clone(),
+        )
+        .await;
+        let endpoint = format!("http://{}/chat/completions", addr);
+        let p = OpenAiCompatibleProvider::new(
+            "k".into(),
+            "deepseek-v4-flash".into(),
+            &endpoint,
+            ProviderKind::DeepSeek,
+        );
+        let _ = p.call("sys", "u", &[]).await;
+        assert!(
+            saw_mt.load(Ordering::SeqCst),
+            "DeepSeek still uses max_tokens"
+        );
+        assert!(
+            saw_dt.load(Ordering::SeqCst),
+            "DeepSeek V4 must disable thinking for diff-only worker calls"
         );
     }
 

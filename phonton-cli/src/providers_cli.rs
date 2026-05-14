@@ -105,7 +105,13 @@ async fn doctor(args: &[String]) -> Result<i32> {
     )
     .ok_or_else(|| anyhow!(crate::provider_config_failure_message(&cfg.provider.name)))?;
     if canary {
-        let resp = probe_diff_contract(provider_for(provider_cfg).as_ref()).await?;
+        let provider = provider_for(provider_cfg);
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            probe_diff_contract(provider.as_ref()),
+        )
+        .await
+        .map_err(|_| anyhow!("diff canary timed out after 20s"))??;
         println!(
             "✓ configured provider passed diff canary: {} via {}",
             resp.model_name, resp.provider
