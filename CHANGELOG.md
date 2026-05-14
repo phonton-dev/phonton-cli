@@ -4,6 +4,17 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.3 - Chess Benchmark Stale Hunk Fix
+
+- Fixed the next generated chess benchmark failure mode where a rules slice
+  could update `src/chessRules.test.ts` without receiving the current test file
+  snapshot, producing stale removed-line hunks during TypeScript verification.
+- Vite/React chess rules and rules-test slices now carry paired current
+  artifacts: `src/chessRules.ts` with `src/chessRules.test.ts`, and vice versa.
+- Repair attempts now add the exact current file named in verifier diagnostics
+  to context, so a failed hunk repair sees the real file it must patch instead
+  of retrying with only compact error text.
+
 ## 0.12.2 - Chess Benchmark Test Slice Fix
 
 - Fixed generated Vite/React chess scaffolds so the first acceptance slice asks

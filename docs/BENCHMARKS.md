@@ -125,6 +125,12 @@ the npm verifier waits to run Vitest/Jest discovery scripts until generated
 test files exist. This prevents a scaffold-only slice from burning repair
 attempts on "no test files found" before the planned rules-test slice runs.
 
+v0.12.3 fixes stale hunk context for the same benchmark path. Rules and
+rules-test slices now include paired current artifacts, and repair attempts add
+the exact current file named in verifier diagnostics. This keeps the context
+small while preventing repeated TypeScript reconstruction failures on generated
+test files.
+
 Expected per-run files:
 
 ```text

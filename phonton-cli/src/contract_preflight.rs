@@ -325,11 +325,19 @@ fn preflight_acceptance_slice_subtasks(
     let goal_label = compact_goal_label(goal_text);
     for (idx, slice) in slices.iter().enumerate() {
         let id = SubtaskId::new();
-        let artifact = slice
-            .artifact_path
-            .as_ref()
-            .map(|path| format!(" Artifact: {}.", path.display()))
-            .unwrap_or_default();
+        let artifact_paths = acceptance_slice_artifact_paths(slice);
+        let artifact = match artifact_paths.as_slice() {
+            [] => String::new(),
+            [path] => format!(" Artifact: {}.", path.display()),
+            paths => format!(
+                " Artifacts: {}.",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         let extra = if slice.id == "rules" || slice.id == "rules_tests" {
             " Use chess.js through a local wrapper; do not fake rules in UI-only checks."
         } else {
@@ -354,6 +362,25 @@ fn preflight_acceptance_slice_subtasks(
         previous = Some(id);
     }
     subtasks
+}
+
+fn acceptance_slice_artifact_paths(slice: &AcceptanceSlice) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = &slice.artifact_path {
+        paths.push(path.clone());
+    }
+    match slice.id.as_str() {
+        "rules" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts")),
+        "rules_tests" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts")),
+        _ => {}
+    }
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 fn compact_goal_label(goal_text: &str) -> String {
@@ -662,5 +689,25 @@ Expected final state:
             .subtasks
             .iter()
             .all(|subtask| subtask.description.chars().count() < 900));
+        let rules_slice = plan
+            .subtasks
+            .iter()
+            .find(|subtask| subtask.description.contains("game-state/rules boundary"))
+            .expect("expected a rules boundary slice");
+        assert!(
+            rules_slice.description.contains("Artifacts: src/chessRules.ts, src/chessRules.test.ts"),
+            "rules slice must carry the current rules test artifact too so API updates patch against the actual test file: {}",
+            rules_slice.description
+        );
+        let rules_test_slice = plan
+            .subtasks
+            .iter()
+            .find(|subtask| subtask.description.contains("boundary tests"))
+            .expect("expected a rules test slice");
+        assert!(
+            rules_test_slice.description.contains("Artifacts: src/chessRules.test.ts, src/chessRules.ts"),
+            "rules test slice must carry the current rules artifact too so imports match the actual API: {}",
+            rules_test_slice.description
+        );
     }
 }

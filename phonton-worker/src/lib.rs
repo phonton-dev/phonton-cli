@@ -260,13 +260,6 @@ impl Worker {
             }
             None => Vec::new(),
         };
-        let artifact_slices = current_artifact_context_slices(self.guard.project_root(), &subtask);
-        let mut primary_slices =
-            Vec::with_capacity(artifact_slices.len().saturating_add(context_slices.len()));
-        primary_slices.extend(artifact_slices);
-        primary_slices.extend(context_slices);
-        let repo_context = dedupe_code_slices(&primary_slices, &relevant_slices);
-
         let mut last_errors: Vec<String> = Vec::new();
         let mut total_tokens: u64 = 0;
         let mut token_usage = TokenUsage::default();
@@ -279,6 +272,13 @@ impl Worker {
         for attempt in 1..=MAX_ATTEMPTS {
             let prompt_policy = worker_prompt_policy(&subtask, !last_errors.is_empty());
             let system_prompt = system_prompt_for_attempt(&last_errors, self.mcp.is_some());
+            let artifact_slices =
+                current_artifact_context_slices(self.guard.project_root(), &subtask, &last_errors);
+            let mut primary_slices =
+                Vec::with_capacity(artifact_slices.len().saturating_add(context_slices.len()));
+            primary_slices.extend(artifact_slices);
+            primary_slices.extend(context_slices.clone());
+            let repo_context = dedupe_code_slices(&primary_slices, &relevant_slices);
 
             if let Some(tx) = &self.msg_tx {
                 let _ = tx.try_send(
@@ -947,8 +947,18 @@ fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeC
 
 const CURRENT_ARTIFACT_CONTEXT_MAX_CHARS: usize = 3_600;
 
-fn current_artifact_context_slices(root: &Path, subtask: &Subtask) -> Vec<CodeSlice> {
-    artifact_paths_from_subtask(&subtask.description)
+fn current_artifact_context_slices(
+    root: &Path,
+    subtask: &Subtask,
+    prior_errors: &[String],
+) -> Vec<CodeSlice> {
+    let mut paths = artifact_paths_from_subtask(&subtask.description);
+    for path in artifact_paths_from_errors(prior_errors) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
         .into_iter()
         .filter_map(|path| current_artifact_context_slice(root, path))
         .collect()
@@ -1013,6 +1023,64 @@ fn artifact_paths_from_subtask(description: &str) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn artifact_paths_from_errors(errors: &[String]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for error in errors {
+        for token in error.split_whitespace() {
+            let cleaned = token
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_matches('[')
+                .trim_matches(']')
+                .trim_matches('(')
+                .trim_matches(')')
+                .trim_end_matches(':')
+                .trim_end_matches(',')
+                .trim_end_matches(';');
+            if !looks_like_relative_artifact_path(cleaned) {
+                continue;
+            }
+            let path = PathBuf::from(cleaned.replace('\\', "/"));
+            if !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn looks_like_relative_artifact_path(value: &str) -> bool {
+    if value.is_empty() || value.contains("://") {
+        return false;
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return false;
+    }
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some(
+            "css"
+                | "html"
+                | "js"
+                | "jsx"
+                | "json"
+                | "py"
+                | "rs"
+                | "toml"
+                | "ts"
+                | "tsx"
+                | "yaml"
+                | "yml"
+        )
+    )
 }
 
 fn compact_current_artifact(content: &str, max_chars: usize) -> String {
@@ -2096,7 +2164,7 @@ mod tests {
             "Acceptance slice 2/7 for `make chess in html`: show named pieces. Artifact: index.html. Keep the diff minimal.",
         );
 
-        let slices = current_artifact_context_slices(&root, &task);
+        let slices = current_artifact_context_slices(&root, &task, &[]);
 
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].file_path, PathBuf::from("index.html"));
@@ -2105,6 +2173,33 @@ mod tests {
         assert!(slices[0]
             .signature
             .contains("Patch against this exact current file"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn repair_context_reads_file_named_in_verifier_error() {
+        let (base, root) = temp_workspace("repair-artifact-context");
+        let path = root.join("src/chessRules.test.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "import { describe, it, expect } from 'vitest';\nimport { getInitialBoard } from './chessRules';\n",
+        )
+        .unwrap();
+
+        let task = subtask(
+            "Vite React chess app acceptance slice 2/7: implement rules. Artifact: src/chessRules.ts.",
+        );
+        let errors = vec![
+            "Verifier Syntax: [typescript syntax] src/chessRules.test.ts: could not reconstruct post-diff file: removed-line mismatch at line 1".to_string(),
+        ];
+
+        let slices = current_artifact_context_slices(&root, &task, &errors);
+
+        assert!(slices.iter().any(|slice| {
+            slice.file_path.as_path() == Path::new("src/chessRules.test.ts")
+                && slice.signature.contains("import { describe, it, expect }")
+        }));
         let _ = std::fs::remove_dir_all(base);
     }
 
