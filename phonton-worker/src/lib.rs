@@ -2553,6 +2553,42 @@ mod tests {
         assert!(first_user_prompt.contains("removed-line mismatch"));
     }
 
+    #[tokio::test]
+    async fn generated_app_first_prompt_includes_current_artifact_snapshot() {
+        let (base, root) = temp_workspace("generated-artifact-first-prompt");
+        let app = root.join("src").join("App.tsx");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(
+            &app,
+            "import './App.css'\n\nfunction App() { return <main>placeholder</main> }\n\nexport default App\n",
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description:
+                "Vite React chess app acceptance slice 4/7: render board. Artifact: src/App.tsx."
+                    .into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let _ = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        let (_, first_user_prompt) = &calls[0];
+        assert!(first_user_prompt.contains("Patch against this exact current file"));
+        assert!(first_user_prompt.contains("import './App.css'"));
+        assert!(first_user_prompt.contains("function App()"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[derive(Clone)]
     struct BrokenTsxProvider {
         calls: Arc<Mutex<u64>>,

@@ -21,6 +21,7 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
             || lower_goal.contains("create"));
     let wants_static_html = is_chess && (lower_goal.contains("html") || lower_goal.contains("web"));
     let wants_vite_react = is_chess && wants_vite_react_app(&lower_goal);
+    let detected_vite_react = is_vite_react_workspace(working_dir);
     let mut stack_detected = false;
 
     let package_json = working_dir.join("package.json");
@@ -76,7 +77,7 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
         }
     }
 
-    if is_chess && wants_vite_react {
+    if is_chess && (wants_vite_react || detected_vite_react) {
         if !stack_detected {
             contract.assumptions.push(
                 "No package.json, Cargo.toml, or Makefile was detected before planning.".into(),
@@ -186,6 +187,22 @@ fn wants_vite_react_app(lower_goal: &str) -> bool {
         && (lower_goal.contains("typescript") || lower_goal.contains("type script"))
 }
 
+fn is_vite_react_workspace(working_dir: &Path) -> bool {
+    let package_json = working_dir.join("package.json");
+    let Ok(text) = std::fs::read_to_string(package_json) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    let package_mentions_vite_react = lower.contains("vite") && lower.contains("react");
+    let tsx_entrypoints = working_dir.join("src").join("App.tsx").is_file()
+        && working_dir.join("src").join("main.tsx").is_file();
+    let vite_config = ["vite.config.ts", "vite.config.js", "vite.config.mts"]
+        .iter()
+        .any(|name| working_dir.join(name).is_file());
+
+    package_mentions_vite_react || (tsx_entrypoints && vite_config)
+}
+
 fn apply_empty_vite_react_chess_plan(
     plan: &mut PlannerOutput,
     goal_text: &str,
@@ -197,7 +214,7 @@ fn apply_empty_vite_react_chess_plan(
 
     if stack_detected {
         contract.assumptions.push(
-            "An existing or partial project stack was detected, but the prompt explicitly requested a Vite + TypeScript + React chess app; keep the specific compact Vite chess acceptance slices instead of falling back to broad generated-app repair."
+            "An existing or partial Vite + TypeScript + React project stack was detected; keep the specific compact Vite chess acceptance slices instead of falling back to broad generated-app repair."
                 .into(),
         );
     } else {
@@ -763,5 +780,45 @@ Expected final state:
             .subtasks
             .iter()
             .all(|subtask| subtask.description.chars().count() < 700));
+    }
+
+    #[test]
+    fn existing_vite_react_chess_prompt_uses_workspace_stack_even_without_stack_words() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"},"dependencies":{"@vitejs/plugin-react":"latest","react":"latest","react-dom":"latest"},"devDependencies":{"typescript":"latest"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src").join("App.tsx"),
+            "import './App.css'\n\nfunction App() { return <main>placeholder</main> }\n\nexport default App\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src").join("main.tsx"),
+            "import React from 'react'\n",
+        )
+        .unwrap();
+        let goal = "Make a complete local two-player chess game in this repository. Use the existing project stack, package manager, scripts, and dependencies already present in the repo. Do not replace the app with another framework.";
+        let mut plan = plan_for(goal);
+
+        apply_workspace_preflight(&mut plan, temp.path(), goal);
+
+        let contract = plan.goal_contract.as_ref().unwrap();
+        assert!(contract
+            .acceptance_slices
+            .iter()
+            .any(|slice| slice.id == "board_ui"
+                && slice.artifact_path.as_deref() == Some(Path::new("src/App.tsx"))));
+        assert!(plan
+            .subtasks
+            .iter()
+            .any(|subtask| subtask.description.contains("Artifact: src/App.tsx")));
+        assert!(plan
+            .subtasks
+            .iter()
+            .all(|subtask| subtask.description.contains("Vite React chess app")));
     }
 }

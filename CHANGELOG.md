@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.13.2 - Existing Vite Chess Preflight
+
+### Fixed
+
+- Fixed existing-project chess prompts that say to use the current stack but do not literally mention Vite/React/TypeScript. Phonton now detects Vite/React workspace markers and keeps those goals on the compact Vite chess acceptance-slice contract.
+- App UI slices now carry `Artifact: src/App.tsx`, which makes the worker include the actual current App file snapshot in the first provider prompt and avoids stale first-line hunks against placeholder fixtures.
+
 ## 0.13.1 - Generated App Token Guard
 
 ### Fixed
