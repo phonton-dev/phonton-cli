@@ -44,6 +44,8 @@ jobs:
       - name: Cache cargo
         if: runner.os != 'Windows'
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
 
       - name: Build CLI
         run: cargo build --locked --release -p phonton-cli

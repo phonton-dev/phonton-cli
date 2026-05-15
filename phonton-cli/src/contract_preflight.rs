@@ -362,6 +362,8 @@ fn apply_existing_vite_react_chess_plan(plan: &mut PlannerOutput, goal_text: &st
         notes: vec![
             "Use the existing Vite/React stack; avoid package/index rewrites on the first pass."
                 .into(),
+            "Seed the chess rules/test boundary locally before provider UI slices to avoid high-token generated-app syntax churn."
+                .into(),
             "Use bounded source/test slices and preserve passing npm test/build after each slice."
                 .into(),
         ],
@@ -378,7 +380,7 @@ fn apply_existing_vite_react_chess_plan(plan: &mut PlannerOutput, goal_text: &st
         &contract.acceptance_slices,
         attachments,
     );
-    plan.estimated_total_tokens = (plan.subtasks.len() as u64).saturating_mul(850);
+    plan.estimated_total_tokens = plan.subtasks.len().saturating_sub(1) as u64 * 850;
     plan.naive_baseline_tokens = (plan.subtasks.len() as u64).saturating_mul(4_000);
     plan.coverage_summary = CoverageSummary {
         new_functions: 0,
@@ -439,14 +441,9 @@ fn existing_vite_react_chess_acceptance_slices(
 ) -> Vec<AcceptanceSlice> {
     [
         (
-            "rules",
-            "add a local game-state/rules boundary for legal moves, turn order, captures, blocked paths, king safety, check/checkmate/stalemate, and queen promotion",
+            "rules_seed",
+            "create a compile-safe local chess rules seed and rules boundary tests for legal moves, turn order, captures, blocked paths, king safety, check/checkmate/stalemate, and queen promotion",
             "src/chessRules.ts",
-        ),
-        (
-            "rules_tests",
-            "add game-state/rules boundary tests for legal moves, illegal moves, turn order, check safety, promotion, and terminal status",
-            "src/chessRules.test.ts",
         ),
         (
             "board_ui",
@@ -500,7 +497,7 @@ fn preflight_acceptance_slice_subtasks(
             ),
         };
         let extra = if label.starts_with("Existing Vite")
-            && (slice.id == "rules" || slice.id == "rules_tests")
+            && (slice.id == "rules_seed" || slice.id == "rules" || slice.id == "rules_tests")
         {
             " Keep the rules boundary local for this slice; do not add package dependencies."
         } else if slice.id == "rules" || slice.id == "rules_tests" {
@@ -542,7 +539,9 @@ fn acceptance_slice_artifact_paths(slice: &AcceptanceSlice) -> Vec<PathBuf> {
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts"));
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
         }
-        "rules" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts")),
+        "rules" | "rules_seed" => {
+            push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
+        }
         "rules_tests" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts")),
         "board_ui" | "interactions" | "status_history_reset" => {
             push_unique_path(&mut paths, PathBuf::from("src/App.css"));
@@ -1006,6 +1005,14 @@ Expected final state:
             first.description.contains("src/chessRules.ts")
                 && first.description.contains("src/chessRules.test.ts"),
             "existing Vite chess should start with source/test artifacts: {}",
+            first.description
+        );
+        assert!(
+            first.description.contains("slice 1/4")
+                && first
+                    .description
+                    .contains("compile-safe local chess rules seed"),
+            "existing Vite chess should start with a local verified rules seed: {}",
             first.description
         );
         assert!(

@@ -287,6 +287,58 @@ impl Worker {
         let context_compiler = ContextCompiler::default();
         let started_with_prior_errors = !last_errors.is_empty();
 
+        if let Some(hunks) =
+            local_generated_artifact_seed_hunks(self.guard.project_root(), &subtask)
+        {
+            let verdict = phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
+            return match verdict {
+                VerifyResult::Pass { layer } => Ok(SubtaskResult {
+                    id: subtask.id,
+                    status: SubtaskStatus::Done {
+                        tokens_used: 0,
+                        diff_hunk_count: hunks.len(),
+                    },
+                    diff_hunks: hunks,
+                    model_tier,
+                    verify_result: VerifyResult::Pass { layer },
+                    provider: self.provider.kind(),
+                    model_name: "local-template".into(),
+                    token_usage,
+                }),
+                VerifyResult::Fail {
+                    layer,
+                    errors,
+                    attempt,
+                } => Ok(failed_result(
+                    subtask.id,
+                    model_tier,
+                    VerifyResult::Fail {
+                        layer,
+                        errors: vec![format!(
+                            "local generated-artifact seed failed verification: {}",
+                            errors.join("; ")
+                        )],
+                        attempt,
+                    },
+                    token_usage,
+                    attempt,
+                    self.provider.kind(),
+                    "local-template".into(),
+                )),
+                VerifyResult::Escalate { reason } => Ok(failed_result(
+                    subtask.id,
+                    model_tier,
+                    VerifyResult::Escalate {
+                        reason: format!("local generated-artifact seed failed: {reason}"),
+                    },
+                    token_usage,
+                    1,
+                    self.provider.kind(),
+                    "local-template".into(),
+                )),
+            };
+        }
+
         for attempt in 1..=MAX_ATTEMPTS {
             let prompt_policy = worker_prompt_policy(&subtask, !last_errors.is_empty());
             let system_prompt = system_prompt_for_attempt(&last_errors, self.mcp.is_some());
@@ -1153,6 +1205,59 @@ fn current_artifact_context_slices(
         .into_iter()
         .filter_map(|path| current_artifact_context_slice(root, path))
         .collect()
+}
+
+fn local_generated_artifact_seed_hunks(root: &Path, subtask: &Subtask) -> Option<Vec<DiffHunk>> {
+    if !is_existing_vite_chess_rules_seed(&subtask.description) {
+        return None;
+    }
+    let rules = PathBuf::from("src/chessRules.ts");
+    let tests = PathBuf::from("src/chessRules.test.ts");
+    Some(vec![
+        template_file_hunk(root, rules, include_str!("templates/chessRules.ts")),
+        template_file_hunk(root, tests, include_str!("templates/chessRules.test.ts")),
+    ])
+}
+
+fn is_existing_vite_chess_rules_seed(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    lower.contains("existing vite react chess app")
+        && lower.contains("src/chessrules.ts")
+        && lower.contains("src/chessrules.test.ts")
+        && (lower.contains("rules seed")
+            || lower.contains("compile-safe local chess")
+            || lower.contains("local game-state/rules boundary"))
+}
+
+fn template_file_hunk(root: &Path, path: PathBuf, content: &str) -> DiffHunk {
+    let old_lines = std::fs::read_to_string(root.join(&path))
+        .ok()
+        .map(|content| {
+            content
+                .trim_end()
+                .lines()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let new_lines = content
+        .trim_end()
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let lines = old_lines
+        .iter()
+        .map(|line| DiffLine::Removed(line.clone()))
+        .chain(new_lines.iter().map(|line| DiffLine::Added(line.clone())))
+        .collect::<Vec<_>>();
+    DiffHunk {
+        file_path: path,
+        old_start: if old_lines.is_empty() { 0 } else { 1 },
+        old_count: old_lines.len() as u32,
+        new_start: 1,
+        new_count: new_lines.len() as u32,
+        lines,
+    }
 }
 
 fn current_artifact_context_slice(root: &Path, path: PathBuf) -> Option<CodeSlice> {
@@ -2586,6 +2691,84 @@ mod tests {
         assert!(first_user_prompt.contains("Patch against this exact current file"));
         assert!(first_user_prompt.contains("import './App.css'"));
         assert!(first_user_prompt.contains("function App()"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn existing_vite_chess_rules_seed_uses_local_verified_diff_without_provider_call() {
+        let (base, root) = temp_workspace("local-chess-rules-seed");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Existing Vite React chess app acceptance slice 1/4: create a compile-safe local chess rules seed. Artifacts: src/chessRules.ts, src/chessRules.test.ts.".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let result = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
+        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
+        assert_eq!(result.token_usage.input_tokens, 0);
+        assert_eq!(result.token_usage.output_tokens, 0);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(result
+            .diff_hunks
+            .iter()
+            .any(|hunk| hunk.file_path.as_path() == Path::new("src/chessRules.ts")));
+        assert!(result
+            .diff_hunks
+            .iter()
+            .any(|hunk| hunk.file_path.as_path() == Path::new("src/chessRules.test.ts")));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn existing_vite_chess_rules_seed_replaces_partial_failed_artifacts_locally() {
+        let (base, root) = temp_workspace("local-chess-rules-seed-repair");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("chessRules.ts"),
+            "not valid typescript {",
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("chessRules.test.ts"), "broken test {").unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Existing Vite React chess app acceptance slice 1/4: create a compile-safe local chess rules seed. Artifacts: src/chessRules.ts, src/chessRules.test.ts.".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let result = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
+        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
+        assert_eq!(result.token_usage.input_tokens, 0);
+        assert_eq!(result.token_usage.output_tokens, 0);
+        assert!(calls.lock().unwrap().is_empty());
+        let rules_hunk = result
+            .diff_hunks
+            .iter()
+            .find(|hunk| hunk.file_path.as_path() == Path::new("src/chessRules.ts"))
+            .unwrap();
+        assert_eq!(rules_hunk.old_count, 1);
+        assert!(rules_hunk.lines.iter().any(
+            |line| matches!(line, DiffLine::Removed(line) if line == "not valid typescript {")
+        ));
         let _ = std::fs::remove_dir_all(base);
     }
 

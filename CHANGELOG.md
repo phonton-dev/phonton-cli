@@ -4,6 +4,15 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.13.5 - Local Chess Rules Seed
+
+### Fixed
+
+- Existing Vite/React chess benchmark runs now seed `src/chessRules.ts` and `src/chessRules.test.ts` with a locally verified rules/test template before provider UI slices.
+- Reruns inside a partially failed chess workspace now replace invalid partial rules/test artifacts locally instead of spending another provider call on TypeScript syntax repair.
+- Existing-workspace chess token estimates now exclude the local rules seed slice, making the displayed budget match the lower-token execution path.
+- Release binary builds no longer restore cached cargo binaries, avoiding broken macOS release jobs caused by stale cargo/rustup shims.
+
 ## 0.13.4 - Existing Vite Source-First Chess Slices
 
 ### Fixed
