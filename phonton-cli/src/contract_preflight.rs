@@ -76,6 +76,16 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
         }
     }
 
+    if is_chess && wants_vite_react {
+        if !stack_detected {
+            contract.assumptions.push(
+                "No package.json, Cargo.toml, or Makefile was detected before planning.".into(),
+            );
+        }
+        apply_empty_vite_react_chess_plan(plan, goal_text, stack_detected);
+        return;
+    }
+
     if !stack_detected {
         contract
             .assumptions
@@ -85,9 +95,7 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
                 !question.contains("No project stack was detected")
                     && !question.contains("What exact behavior or artifact")
             });
-            if wants_vite_react {
-                apply_empty_vite_react_chess_plan(plan, goal_text);
-            } else if wants_static_html {
+            if wants_static_html {
                 contract.assumptions.push(
                     "No project stack was detected; defaulting to a self-contained static HTML chess page."
                         .into(),
@@ -178,15 +186,26 @@ fn wants_vite_react_app(lower_goal: &str) -> bool {
         && (lower_goal.contains("typescript") || lower_goal.contains("type script"))
 }
 
-fn apply_empty_vite_react_chess_plan(plan: &mut PlannerOutput, goal_text: &str) {
+fn apply_empty_vite_react_chess_plan(
+    plan: &mut PlannerOutput,
+    goal_text: &str,
+    stack_detected: bool,
+) {
     let Some(contract) = plan.goal_contract.as_mut() else {
         return;
     };
 
-    contract.assumptions.push(
-        "No project stack was detected, but the prompt explicitly requested a Vite + TypeScript + React browser app; scaffold that npm app instead of falling back to static HTML."
-            .into(),
-    );
+    if stack_detected {
+        contract.assumptions.push(
+            "An existing or partial project stack was detected, but the prompt explicitly requested a Vite + TypeScript + React chess app; keep the specific compact Vite chess acceptance slices instead of falling back to broad generated-app repair."
+                .into(),
+        );
+    } else {
+        contract.assumptions.push(
+            "No project stack was detected, but the prompt explicitly requested a Vite + TypeScript + React browser app; scaffold that npm app instead of falling back to static HTML."
+                .into(),
+        );
+    }
     contract.acceptance_criteria.extend([
         "Create a modern chess web app using Vite, TypeScript, and React.".into(),
         "Use a clean game-state/rules boundary; prefer a wrapped chess rules library such as chess.js over UI-only move checks.".into(),
@@ -709,5 +728,40 @@ Expected final state:
             "rules test slice must carry the current rules artifact too so imports match the actual API: {}",
             rules_test_slice.description
         );
+    }
+
+    #[test]
+    fn existing_partial_vite_chess_workspace_still_gets_compact_sliced_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src").join("App.tsx"), "invalid syntax").unwrap();
+        let mut plan = plan_for(PLAYABLE_CHESS_BENCHMARK_PROMPT);
+
+        apply_workspace_preflight(&mut plan, temp.path(), PLAYABLE_CHESS_BENCHMARK_PROMPT);
+
+        let contract = plan.goal_contract.as_ref().unwrap();
+        assert!(contract
+            .acceptance_slices
+            .iter()
+            .any(|slice| slice.id == "scaffold"));
+        assert_eq!(plan.subtasks.len(), contract.acceptance_slices.len());
+        assert!(plan.subtasks.iter().all(|subtask| {
+            subtask
+                .description
+                .contains("playable Vite React TypeScript chess app")
+        }));
+        assert!(plan
+            .subtasks
+            .iter()
+            .all(|subtask| !subtask.description.contains("Do not claim success unless")));
+        assert!(plan
+            .subtasks
+            .iter()
+            .all(|subtask| subtask.description.chars().count() < 700));
     }
 }

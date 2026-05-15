@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.13.1 - Generated App Token Guard
+
+### Fixed
+
+- Fixed the chess benchmark path where a global old install could still run v0.12.6 behavior; v0.13.1 keeps explicit Vite/React chess goals on compact acceptance slices even when rerunning inside a partial npm workspace.
+- Classified generated-app acceptance slices as high-risk generated app work so worker context budgets and routing policies stay low-token.
+- Stopped automatic provider repair after a first-attempt generated web-app syntax failure in TSX/JSX/HTML/JavaScript/TypeScript outputs. Phonton now fails with verifier evidence instead of spending another repair call on the same weak route.
+
 ## 0.13.0 - Workspace Ask And Diff QoL
 
 ### Added

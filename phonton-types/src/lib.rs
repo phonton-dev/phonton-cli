@@ -455,7 +455,9 @@ fn is_generated_app_goal(description: &str) -> bool {
             "single page",
         ],
     );
-    has_build_verb && has_generated_target
+    let generated_acceptance_slice =
+        description.contains("acceptance slice") && has_generated_target;
+    (has_build_verb && has_generated_target) || generated_acceptance_slice
 }
 
 /// The effective tier to dispatch a subtask at, given its planner-assigned
@@ -1884,6 +1886,16 @@ mod tests {
         assert_eq!(intent.token_risk, TokenRisk::High);
         assert_eq!(intent.recommended_action, IntentAction::PreviewPlan);
         assert!(intent.confidence_percent >= 80);
+    }
+
+    #[test]
+    fn intent_classifier_keeps_acceptance_slices_as_generated_app_work() {
+        let intent = classify_intent(
+            "Vite React chess app acceptance slice 1/7: scaffold package.json and src/App.tsx",
+        );
+
+        assert_eq!(intent.task_class, TaskClass::GeneratedAppGame);
+        assert_eq!(intent.token_risk, TokenRisk::High);
     }
 
     #[test]

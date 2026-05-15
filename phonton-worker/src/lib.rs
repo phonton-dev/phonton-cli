@@ -285,6 +285,7 @@ impl Worker {
         let mut mcp_results: Vec<McpResultContext> = Vec::new();
         let mut mcp_calls = 0usize;
         let context_compiler = ContextCompiler::default();
+        let started_with_prior_errors = !last_errors.is_empty();
 
         for attempt in 1..=MAX_ATTEMPTS {
             let prompt_policy = worker_prompt_policy(&subtask, !last_errors.is_empty());
@@ -606,6 +607,32 @@ impl Worker {
                     attempt: _,
                 } => {
                     last_layer = layer;
+                    if should_stop_before_generated_app_syntax_repair(
+                        &subtask,
+                        layer,
+                        &errors,
+                        attempt,
+                        started_with_prior_errors,
+                    ) {
+                        let mut fast_fail_errors = vec![format!(
+                            "stopped before generated-app syntax repair to avoid token waste: {}",
+                            diagnostic_signature(layer, &errors)
+                        )];
+                        fast_fail_errors.extend(compact_verify_retry_errors(layer, &errors));
+                        return Ok(failed_result(
+                            subtask.id,
+                            model_tier,
+                            VerifyResult::Fail {
+                                layer,
+                                errors: fast_fail_errors,
+                                attempt,
+                            },
+                            token_usage,
+                            attempt,
+                            last_provider,
+                            last_model_name,
+                        ));
+                    }
                     warn!(
                         attempt,
                         ?layer,
@@ -1010,6 +1037,31 @@ fn update_repeated_signature_count(last_signature: &mut Option<String>, signatur
         *last_signature = Some(signature.to_string());
         1
     }
+}
+
+fn should_stop_before_generated_app_syntax_repair(
+    subtask: &Subtask,
+    layer: VerifyLayer,
+    errors: &[String],
+    attempt: u8,
+    started_with_prior_errors: bool,
+) -> bool {
+    if attempt != 1 || started_with_prior_errors || !matches!(layer, VerifyLayer::Syntax) {
+        return false;
+    }
+    if !matches!(
+        classify_intent(&subtask.description).task_class,
+        TaskClass::GeneratedAppGame
+    ) {
+        return false;
+    }
+    let diagnostics = errors.join("\n").to_ascii_lowercase();
+    diagnostics.contains("typescript")
+        || diagnostics.contains("tsx")
+        || diagnostics.contains("jsx")
+        || diagnostics.contains("javascript")
+        || diagnostics.contains("html")
+        || diagnostics.contains("src/app")
 }
 
 fn repair_guidance_for_errors(errors: &[String]) -> Vec<String> {
@@ -2499,6 +2551,89 @@ mod tests {
         let (_, first_user_prompt) = &calls[0];
         assert!(first_user_prompt.contains("# Previous verification failed"));
         assert!(first_user_prompt.contains("removed-line mismatch"));
+    }
+
+    #[derive(Clone)]
+    struct BrokenTsxProvider {
+        calls: Arc<Mutex<u64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BrokenTsxProvider {
+        async fn call(
+            &self,
+            _system: &str,
+            _user: &str,
+            _slice_origins: &[SliceOrigin],
+        ) -> Result<phonton_types::LLMResponse> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(phonton_types::LLMResponse {
+                content: "\
+--- /dev/null
++++ b/src/App.tsx
+@@ -0,0 +1,2 @@
++import React from 'react';
++export default function App() { return <div>{</div>; }
+"
+                .into(),
+                input_tokens: 900,
+                output_tokens: 40,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                provider: phonton_types::ProviderKind::OpenAiCompatible,
+                model_name: "broken-tsx".into(),
+            })
+        }
+
+        fn kind(&self) -> phonton_types::ProviderKind {
+            phonton_types::ProviderKind::OpenAiCompatible
+        }
+
+        fn model(&self) -> String {
+            "broken-tsx".into()
+        }
+
+        fn clone_box(&self) -> Box<dyn Provider> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_web_syntax_failure_does_not_spend_repair_call() {
+        let (base, root) = temp_workspace("generated-web-fast-fail");
+        let calls = Arc::new(Mutex::new(0));
+        let provider = BrokenTsxProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Vite React chess app acceptance slice 1/7: scaffold src/App.tsx".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let result = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(matches!(result.status, SubtaskStatus::Failed { .. }));
+        match result.verify_result {
+            VerifyResult::Fail {
+                errors, attempt, ..
+            } => {
+                assert_eq!(attempt, 1);
+                assert!(
+                    errors
+                        .join("\n")
+                        .contains("stopped before generated-app syntax repair"),
+                    "{errors:?}"
+                );
+            }
+            other => panic!("expected syntax fail, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
