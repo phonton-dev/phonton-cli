@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.13.4 - Existing Vite Source-First Chess Slices
+
+### Fixed
+
+- Existing Vite/React chess benchmark runs now use a separate source-first contract instead of reusing the empty-workspace scaffold contract.
+- The first existing-workspace slice now targets `src/chessRules.ts` and `src/chessRules.test.ts`, not `package.json` or `index.html`, avoiding cross-file stale hunks from weak diff models.
+- Existing-workspace rules slices no longer request `chess.js`, so the first provider call has no reason to edit package dependencies.
+
 ## 0.13.3 - Complete Vite Chess Artifact Context
 
 ### Fixed

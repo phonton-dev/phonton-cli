@@ -77,7 +77,12 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
         }
     }
 
-    if is_chess && (wants_vite_react || detected_vite_react) {
+    if is_chess && detected_vite_react {
+        apply_existing_vite_react_chess_plan(plan, goal_text);
+        return;
+    }
+
+    if is_chess && wants_vite_react {
         if !stack_detected {
             contract.assumptions.push(
                 "No package.json, Cargo.toml, or Makefile was detected before planning.".into(),
@@ -301,6 +306,86 @@ fn apply_empty_vite_react_chess_plan(
     };
 }
 
+fn apply_existing_vite_react_chess_plan(plan: &mut PlannerOutput, goal_text: &str) {
+    let Some(contract) = plan.goal_contract.as_mut() else {
+        return;
+    };
+
+    contract.assumptions.push(
+        "An existing Vite + TypeScript + React project stack was detected; preserve package/index scaffold files and work in source/test slices."
+            .into(),
+    );
+    contract.acceptance_criteria.extend([
+        "Turn the existing React placeholder into a complete local two-player chess app.".into(),
+        "Keep the existing Vite project structure; do not rewrite package.json or index.html unless a verifier proves they are missing required scripts.".into(),
+        "Use a clean game-state/rules boundary instead of UI-only move checks.".into(),
+        "Do not claim success unless npm test and npm run build pass.".into(),
+    ]);
+    contract.quality_floor.criteria.extend([
+        "Generated React chess must have real board interaction, legal move enforcement, status, reset, and move history.".into(),
+        "Game-state/rules behavior must be covered by tests.".into(),
+    ]);
+
+    for (description, path) in [
+        ("Playable chess React surface", "src/App.tsx"),
+        ("Chess React styles", "src/App.css"),
+        ("Chess game-state/rules boundary", "src/chessRules.ts"),
+        ("Game-state/rules tests", "src/chessRules.test.ts"),
+    ] {
+        push_expected_artifact(contract, description, Some(PathBuf::from(path)));
+        push_likely_file(contract, PathBuf::from(path));
+    }
+
+    push_verify_step(contract, "npm test", vec!["npm".into(), "test".into()]);
+    push_verify_step(
+        contract,
+        "npm run build",
+        vec!["npm".into(), "run".into(), "build".into()],
+    );
+    push_run_command(
+        contract,
+        "Run Vite dev server",
+        vec!["npm".into(), "run".into(), "dev".into()],
+    );
+    contract.run_plan.retain(|cmd| {
+        !cmd.command
+            .windows(3)
+            .any(|parts| parts == ["python", "-m", "http.server"])
+    });
+
+    let verify_plan = contract.verify_plan.clone();
+    contract.acceptance_slices = existing_vite_react_chess_acceptance_slices(verify_plan);
+    contract.token_policy = TokenPolicy {
+        first_attempt_cap_tokens: Some(5_000),
+        allow_broad_repair: false,
+        repair_only_missing_criteria: true,
+        notes: vec![
+            "Use the existing Vite/React stack; avoid package/index rewrites on the first pass."
+                .into(),
+            "Use bounded source/test slices and preserve passing npm test/build after each slice."
+                .into(),
+        ],
+    };
+
+    let attachments = plan
+        .subtasks
+        .first()
+        .map(|subtask| subtask.attachments.clone())
+        .unwrap_or_default();
+    plan.subtasks = preflight_acceptance_slice_subtasks(
+        goal_text,
+        "Existing Vite React chess app",
+        &contract.acceptance_slices,
+        attachments,
+    );
+    plan.estimated_total_tokens = (plan.subtasks.len() as u64).saturating_mul(850);
+    plan.naive_baseline_tokens = (plan.subtasks.len() as u64).saturating_mul(4_000);
+    plan.coverage_summary = CoverageSummary {
+        new_functions: 0,
+        tests_planned: 1,
+    };
+}
+
 fn vite_react_chess_acceptance_slices(verify_plan: Vec<VerifyStepSpec>) -> Vec<AcceptanceSlice> {
     [
         (
@@ -349,6 +434,46 @@ fn vite_react_chess_acceptance_slices(verify_plan: Vec<VerifyStepSpec>) -> Vec<A
     .collect()
 }
 
+fn existing_vite_react_chess_acceptance_slices(
+    verify_plan: Vec<VerifyStepSpec>,
+) -> Vec<AcceptanceSlice> {
+    [
+        (
+            "rules",
+            "add a local game-state/rules boundary for legal moves, turn order, captures, blocked paths, king safety, check/checkmate/stalemate, and queen promotion",
+            "src/chessRules.ts",
+        ),
+        (
+            "rules_tests",
+            "add game-state/rules boundary tests for legal moves, illegal moves, turn order, check safety, promotion, and terminal status",
+            "src/chessRules.test.ts",
+        ),
+        (
+            "board_ui",
+            "replace the placeholder React screen with the actual chess app, board coordinates, named pieces, and clear turn status",
+            "src/App.tsx",
+        ),
+        (
+            "interactions",
+            "support click/tap selection, legal destination highlights, legal moves, captures, blocked-path rejection, and king-safety rejection",
+            "src/App.tsx",
+        ),
+        (
+            "status_history_reset",
+            "show check/checkmate/stalemate status when possible, auto-promote pawns to queen, expose reset/new game, and show readable move history",
+            "src/App.tsx",
+        ),
+    ]
+    .into_iter()
+    .map(|(id, criterion, artifact)| AcceptanceSlice {
+        id: id.into(),
+        criterion: criterion.into(),
+        artifact_path: Some(PathBuf::from(artifact)),
+        verify_plan: verify_plan.clone(),
+    })
+    .collect()
+}
+
 fn preflight_acceptance_slice_subtasks(
     goal_text: &str,
     label: &str,
@@ -374,7 +499,11 @@ fn preflight_acceptance_slice_subtasks(
                     .join(", ")
             ),
         };
-        let extra = if slice.id == "rules" || slice.id == "rules_tests" {
+        let extra = if label.starts_with("Existing Vite")
+            && (slice.id == "rules" || slice.id == "rules_tests")
+        {
+            " Keep the rules boundary local for this slice; do not add package dependencies."
+        } else if slice.id == "rules" || slice.id == "rules_tests" {
             " Use chess.js through a local wrapper; do not fake rules in UI-only checks."
         } else {
             ""
@@ -415,6 +544,9 @@ fn acceptance_slice_artifact_paths(slice: &AcceptanceSlice) -> Vec<PathBuf> {
         }
         "rules" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts")),
         "rules_tests" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts")),
+        "board_ui" | "interactions" | "status_history_reset" => {
+            push_unique_path(&mut paths, PathBuf::from("src/App.css"));
+        }
         _ => {}
     }
     paths
@@ -822,15 +954,64 @@ Expected final state:
         assert!(plan
             .subtasks
             .iter()
-            .any(|subtask| subtask.description.contains("Artifact: src/App.tsx")));
-        let scaffold = plan.subtasks.first().unwrap();
-        assert!(scaffold.description.contains("Artifacts:"));
-        assert!(scaffold.description.contains("package.json"));
-        assert!(scaffold.description.contains("src/App.tsx"));
-        assert!(scaffold.description.contains("src/main.tsx"));
+            .any(|subtask| subtask.description.contains("src/App.tsx")
+                && subtask.description.contains("src/App.css")));
+        let first = plan.subtasks.first().unwrap();
+        assert!(!first.description.contains("package.json"));
+        assert!(!first.description.contains("index.html"));
+        assert!(first.description.contains("src/chessRules.ts"));
         assert!(plan
             .subtasks
             .iter()
             .all(|subtask| subtask.description.contains("Vite React chess app")));
+    }
+
+    #[test]
+    fn existing_vite_react_chess_prompt_starts_with_source_slice_not_scaffold() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"},"dependencies":{"react":"latest","react-dom":"latest"},"devDependencies":{"@vitejs/plugin-react":"latest","typescript":"latest","vite":"latest","vitest":"latest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("index.html"),
+            "<!doctype html>\n<title>fixture</title>\n<div id=\"root\"></div>\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src").join("App.tsx"),
+            "import './App.css'\n\nfunction App() { return <main>placeholder</main> }\n\nexport default App\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src").join("main.tsx"),
+            "import React from 'react'\n",
+        )
+        .unwrap();
+        let goal = "Make a complete local two-player chess game in this repository. Use the existing project stack, package manager, scripts, and dependencies already present in the repo. Do not replace the app with another framework.";
+        let mut plan = plan_for(goal);
+
+        apply_workspace_preflight(&mut plan, temp.path(), goal);
+
+        let first = plan.subtasks.first().unwrap();
+        assert!(
+            !first.description.contains("package.json")
+                && !first.description.contains("index.html"),
+            "existing Vite chess first slice should not invite fragile package/index rewrites: {}",
+            first.description
+        );
+        assert!(
+            first.description.contains("src/chessRules.ts")
+                && first.description.contains("src/chessRules.test.ts"),
+            "existing Vite chess should start with source/test artifacts: {}",
+            first.description
+        );
+        assert!(
+            !first.description.contains("chess.js"),
+            "existing Vite source-first slice should not imply package dependency edits: {}",
+            first.description
+        );
     }
 }
