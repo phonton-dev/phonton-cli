@@ -45,7 +45,7 @@ pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusVie
         }
     }
     let hint = match active {
-        FocusView::Receipt => "f cycle",
+        FocusView::Receipt => "f cycle  d diff",
         FocusView::Problems => "p problems  r retry",
         FocusView::Code => "[ ] file  PgUp/PgDn",
         FocusView::Commands => "[ ] command  /rerun",
@@ -142,11 +142,19 @@ fn code_focus_line_style(line: &str) -> Style {
 pub(crate) fn code_focus_text(goal: &GoalEntry, selected_file: usize) -> String {
     let groups = diff_hunks_by_file(goal);
     if let Some((path, hunks)) = groups.get(selected_file.min(groups.len().saturating_sub(1))) {
+        let (total_added, total_removed) = diff_counts(groups.iter().flat_map(|(_, hunks)| hunks));
+        let (file_added, file_removed) = diff_counts(hunks.iter());
         let mut out = format!(
-            "Code {}/{}\nfile: {}\n",
+            "Code {}/{}  files {}  +{} -{}\nfile: {}  hunks {}  +{} -{}\n",
             selected_file.min(groups.len().saturating_sub(1)) + 1,
             groups.len(),
-            path.display()
+            groups.len(),
+            total_added,
+            total_removed,
+            path.display(),
+            hunks.len(),
+            file_added,
+            file_removed
         );
         for hunk in hunks.iter().take(4) {
             out.push_str(&format!(
@@ -203,6 +211,21 @@ pub(crate) fn code_focus_text(goal: &GoalEntry, selected_file: usize) -> String 
     }
 
     "Code\nNo diff hunks recorded yet.".into()
+}
+
+fn diff_counts<'a>(hunks: impl Iterator<Item = &'a DiffHunk>) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for hunk in hunks {
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Added(_) => added += 1,
+                DiffLine::Removed(_) => removed += 1,
+                DiffLine::Context(_) => {}
+            }
+        }
+    }
+    (added, removed)
 }
 
 pub(crate) fn append_problems_focus_lines(

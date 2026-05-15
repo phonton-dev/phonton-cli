@@ -229,6 +229,14 @@ pub const COMMANDS: &[CommandSpec] = &[
         action: SlashAction::SetFocus(FocusView::Receipt),
     },
     CommandSpec {
+        name: "/diff",
+        aliases: &["/code"],
+        args: "",
+        description: "open the verified diff/code focus view",
+        category: CommandCategory::Loop,
+        action: SlashAction::SetFocus(FocusView::Code),
+    },
+    CommandSpec {
         name: "/copy",
         aliases: &[],
         args: "",
@@ -614,6 +622,14 @@ mod tests {
         );
         assert_eq!(
             parse_slash_command("/focus code"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Code))
+        );
+        assert_eq!(
+            parse_slash_command("/diff"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Code))
+        );
+        assert_eq!(
+            parse_slash_command("/code"),
             SlashParse::Command(SlashAction::SetFocus(FocusView::Code))
         );
         assert_eq!(

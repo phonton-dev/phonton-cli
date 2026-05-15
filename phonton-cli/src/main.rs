@@ -40,6 +40,7 @@ mod config;
 mod context_cli;
 mod contract_preflight;
 mod demo;
+mod diff_cli;
 mod doctor;
 mod extensions_cli;
 mod focus;
@@ -2441,6 +2442,17 @@ impl App {
                 self.focus_scroll = 0;
                 None
             }
+            KeyCode::Char('d') if self.goal_prompt.is_empty() => {
+                self.focus_view = FocusView::Code;
+                self.focus_scroll = 0;
+                self.focused_changed_file = self.focused_changed_file.min(
+                    self.current_goal()
+                        .map(focused_file_count)
+                        .unwrap_or(0)
+                        .saturating_sub(1),
+                );
+                None
+            }
             KeyCode::Char('f') if self.goal_prompt.is_empty() => {
                 self.cycle_focus_view();
                 None
@@ -3417,6 +3429,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             sep.clone(),
             Span::styled("f", key),
             Span::styled(" focus  ", txt),
+            sep.clone(),
+            Span::styled("d", key),
+            Span::styled(" diff  ", txt),
             sep.clone(),
             Span::styled("Ctrl+;", key),
             Span::styled(" ask  ", txt),
@@ -6126,6 +6141,7 @@ fn print_help() {
          plan <goal>       Preview the task DAG without changing files\n  \
          context           Evaluate deterministic context-selection fixtures\n  \
          review [task-id]  Show verified diff review payloads\n  \
+         diff [task-id]    Print verified unified diffs from review-ready tasks\n  \
          proof             Export proof bundles from OutcomeLedger\n  \
          providers         List, sync, and verify provider/model routes\n  \
          run [task-id]     Run a receipt-suggested command from latest task\n  \
@@ -6150,7 +6166,7 @@ fn print_help() {
          TUI SLASH COMMANDS:\n  \
          /settings, /config, /status, /context, /compact, /compress,\n  \
          /problems, /diagnostics, /retry, /repair, /why-tokens, /ask <question>,\n  \
-         /goals, /switch, /focus <view>, /copy, /rerun, /stats, /stop,\n  \
+         /goals, /switch, /focus <view>, /diff, /code, /copy, /rerun, /stats, /stop,\n  \
          /review, /memory, /permissions set <mode>, /trust, /model set <name>,\n  \
          /commands, /run <cmd>, and !<cmd>\n\
          \n\
@@ -6168,6 +6184,9 @@ fn print_help() {
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
          phonton review rollback [--json] [latest|<task-id>] <seq>\n\
+         \n\
+         DIFF:\n  \
+         phonton diff [--json|--stat|--name-only] [latest|<task-id>]\n\
          \n\
          RUN:\n  \
          phonton run [--json] [--index <n>] [latest|<task-id>]\n\
@@ -6444,6 +6463,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
         }
         "review" => {
             let code = review::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
+        "diff" => {
+            let code = diff_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -9392,6 +9418,19 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn diff_shortcut_opens_code_focus_without_typing() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+        app.focus_view = FocusView::Receipt;
+
+        assert_eq!(app.handle_key(key('d')), None);
+        assert_eq!(app.focus_view, FocusView::Code);
+        assert!(app.goal_prompt.is_empty());
+        assert!(app.focus_text().contains("+print('Chess')"));
+    }
+
+    #[test]
     fn code_focus_text_preserves_diff_markers() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
@@ -9400,6 +9439,8 @@ fn extract_id(line: &str) -> Option<String> {
         let text = app.focus_text();
 
         assert!(text.contains("Code"));
+        assert!(text.contains("files 1"));
+        assert!(text.contains("+1 -1"));
         assert!(text.contains("chess.py"));
         assert!(text.contains("+print('Chess')"));
         assert!(text.contains("-print('Hello')"));

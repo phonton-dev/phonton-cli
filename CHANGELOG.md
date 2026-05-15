@@ -4,6 +4,19 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.12.7 - Verified Diff QoL
+
+### Added
+
+- Added `phonton diff [latest|<task-id>]` to export only verified `SubtaskReviewReady` unified diffs from the local task store.
+- Added `phonton diff --stat`, `phonton diff --name-only`, and `phonton diff --json` for compact review and tooling surfaces.
+- Added `/diff` and `/code` slash commands plus the `d` TUI shortcut to jump directly to the Code focus.
+
+### Changed
+
+- Code focus now shows file count plus added/removed line totals at the top of the diff view.
+- Help text and README release docs now include the first-class diff surfaces.
+
 ## 0.12.6 - Provider Contract Hardening
 
 ### Fixed

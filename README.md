@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.12.6</h1>
+<h1 align="center">Phonton CLI · v0.12.7</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.12.6-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.12.7-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -69,12 +69,13 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 ## What Works Today
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
-- Unified slash commands in the TUI: `/settings`, `/config`, `/status`, `/context`, `/compact`, `/compress`, `/problems`, `/diagnostics`, `/retry`, `/repair`, `/why-tokens`, `/ask`, `/goals`, `/switch`, `/focus`, `/copy`, `/rerun`, `/stats`, `/stop`, `/review`, `/memory`, `/permissions`, `/trust`, `/model`, `/commands`, `/run`, and `!` all route through the same command registry and prompt drawer.
+- Unified slash commands in the TUI: `/settings`, `/config`, `/status`, `/context`, `/compact`, `/compress`, `/problems`, `/diagnostics`, `/retry`, `/repair`, `/why-tokens`, `/ask`, `/goals`, `/switch`, `/focus`, `/diff`, `/code`, `/copy`, `/rerun`, `/stats`, `/stop`, `/review`, `/memory`, `/permissions`, `/trust`, `/model`, `/commands`, `/run`, and `!` all route through the same command registry and prompt drawer.
 - Static syntax verification now covers Rust, Python, JavaScript, TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before review-ready status. Generated code that cannot parse stays failed/unverified instead of becoming a receipt.
 - Failed goals default to a Problems focus view with grouped verifier/provider/quality diagnostics, compact repair hints, and `p` / `r` keyboard shortcuts for inspection and repair.
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
 - v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
 - v0.12 enforces lower spend before the provider call: generated app/game goals dispatch as acceptance-slice subtasks, simple/docs/test prompts use small task-class budgets, generated repairs use a sub-1k context target, semantic retrieval top-k and repo maps shrink by task class, MCP result context is capped, and provider output ceilings are lower.
+- v0.12.7 makes verified diffs easier to inspect and export: `phonton diff` prints review-ready unified diffs, `--stat` and `--name-only` provide compact review surfaces, and `/diff`, `/code`, and `d` jump directly to the TUI Code focus.
 - v0.12.6 hardens provider contracts further: DeepSeek V4/reasoner routes disable provider thinking for diff-only worker calls, stale v0.12.5 canary cache entries are invalidated, reasoning-only replies fail clearly, and provider tests time out quickly instead of hanging.
 - v0.12.5 blocks bad provider/model routes before goal dispatch: provider readiness now uses a parseable unified-diff canary, empty OpenAI-compatible responses fail immediately, OpenCode/OpenCode Go routes work through `OPENCODE_API_KEY`, and `phonton providers` can list/sync the Models.dev catalog.
 - v0.12.4 cuts wasted repair tokens in generated-app failures: workers stop after repeated verifier/parser diagnostics, redispatch prompts start with prior verifier evidence, stale hunk repairs get explicit guidance, and the Flight Log shows compact `repair` events before bounded retries.
@@ -84,7 +85,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - `phonton proof export --latest --format json` exports the latest proof bundle from the OutcomeLedger, and `phonton context eval|diff` evaluates deterministic context-selection fixtures before benchmark runs.
 - Ask mode supports `/ask <question>`, scrollable answers, and lightweight markdown-style rendering without mixing Ask into goal memory.
 - Faster multi-goal navigation: the sidebar shows stable goal indexes, `Alt+Up` / `Alt+Down` switches goals even while drafting text, `Alt+1` through `Alt+9` jumps directly, and `/goals` opens a searchable switcher.
-- Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Problems, Code, Commands, and Log tabs in the Active panel plus `p` / `r` / `f` / `[` / `]` keyboard navigation.
+- Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Problems, Code, Commands, and Log tabs in the Active panel plus `p` / `r` / `f` / `d` / `[` / `]` keyboard navigation.
 - Command run receipts stay collapsed by default; the Commands focus view shows status, exit code, duration, and short stdout/stderr previews. `/rerun` repeats the latest command through the same sandbox path and `/copy` copies the current focus view to the Windows clipboard.
 - Saved workspace sessions: use `phonton -r` or `phonton --resume` to reopen the last saved TUI conversation for the current repo.
 - Prompt bar paste artifacts: long or multiline pasted text collapses into a compact colored chip while the full content stays attached to the submitted goal; credential-looking pasted blocks are blocked before they can reach the model.
@@ -97,7 +98,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - Sandboxed command runs from the prompt bar with `/run <cmd>` or `!<cmd>`, plus command status, output previews, context meters, and permission mode controls in the TUI and Flight Log.
 - `phonton doctor` setup diagnostics for config, provider key, store, trust, git, cargo, and Nexus config.
 - `phonton plan` preview for task DAGs and the visible GoalContract before edits happen.
-- `phonton review` surfaces for verified diff review payloads, approvals, rejections, rollback, and Markdown receipt export. Failed runs can still export a failed/unverified Markdown receipt with diagnostics.
+- `phonton review` surfaces for verified diff review payloads, approvals, rejections, rollback, and Markdown receipt export. `phonton diff` exports the verified unified diff or compact file/stat views without opening the TUI. Failed runs can still export a failed/unverified Markdown receipt with diagnostics.
 - `phonton run latest` executes the latest receipt-suggested run command through the sandbox.
 - TUI goal prompts can mention workspace files and images with `@path`; text files become bounded context and image metadata/payloads flow to compatible providers.
 - Review-ready runs now show a handoff receipt in the TUI and persist a minimal outcome ledger for history/review evidence.
@@ -149,7 +150,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.6 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.7 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -165,7 +166,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.6 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.7 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
