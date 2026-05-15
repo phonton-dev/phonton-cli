@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.13.2</h1>
+<h1 align="center">Phonton CLI · v0.13.3</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.13.2-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.13.3-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -75,7 +75,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
 - v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
 - v0.12 enforces lower spend before the provider call: generated app/game goals dispatch as acceptance-slice subtasks, simple/docs/test prompts use small task-class budgets, generated repairs use a sub-1k context target, semantic retrieval top-k and repo maps shrink by task class, MCP result context is capped, and provider output ceilings are lower.
-- v0.13.2 detects existing Vite/React workspaces for chess benchmark prompts that say "use the existing project stack," so App slices receive the current `src/App.tsx` snapshot before the first provider call.
+- v0.13.3 detects existing Vite/React workspaces for chess benchmark prompts that say "use the existing project stack," and ensures every Vite chess slice that can touch `src/App.tsx` advertises it as an artifact before the first provider call.
 - v0.13.1 hardens generated web-app token behavior: Vite/React chess prompts stay on compact acceptance slices even in partial workspaces, and first-attempt TSX/HTML syntax failures stop before automatic repair.
 - v0.13.0 makes Ask workspace-aware under a bounded context budget, freezes the compact TUI header after goals exist, and carries forward verified diff export: `phonton diff`, `--stat`, `--name-only`, `/diff`, `/code`, and `d`.
 - v0.12.6 hardens provider contracts further: DeepSeek V4/reasoner routes disable provider thinking for diff-only worker calls, stale v0.12.5 canary cache entries are invalidated, reasoning-only replies fail clearly, and provider tests time out quickly instead of hanging.
@@ -152,7 +152,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.13.2 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.13.3 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -168,7 +168,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.13.2 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.13.3 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |

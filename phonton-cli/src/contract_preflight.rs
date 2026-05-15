@@ -406,6 +406,13 @@ fn acceptance_slice_artifact_paths(slice: &AcceptanceSlice) -> Vec<PathBuf> {
         paths.push(path.clone());
     }
     match slice.id.as_str() {
+        "scaffold" => {
+            push_unique_path(&mut paths, PathBuf::from("index.html"));
+            push_unique_path(&mut paths, PathBuf::from("src/main.tsx"));
+            push_unique_path(&mut paths, PathBuf::from("src/App.tsx"));
+            push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts"));
+            push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
+        }
         "rules" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts")),
         "rules_tests" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts")),
         _ => {}
@@ -816,6 +823,11 @@ Expected final state:
             .subtasks
             .iter()
             .any(|subtask| subtask.description.contains("Artifact: src/App.tsx")));
+        let scaffold = plan.subtasks.first().unwrap();
+        assert!(scaffold.description.contains("Artifacts:"));
+        assert!(scaffold.description.contains("package.json"));
+        assert!(scaffold.description.contains("src/App.tsx"));
+        assert!(scaffold.description.contains("src/main.tsx"));
         assert!(plan
             .subtasks
             .iter()

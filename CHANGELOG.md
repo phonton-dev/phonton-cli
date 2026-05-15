@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.13.3 - Complete Vite Chess Artifact Context
+
+### Fixed
+
+- Tightened the existing Vite/React chess path so the scaffold slice advertises every file it may touch, including `src/App.tsx`, `src/main.tsx`, `index.html`, and the chess rules/test files.
+- This makes the worker include the current App file snapshot even on the first scaffold slice, preventing stale first-line hunks before repair is even considered.
+
 ## 0.13.2 - Existing Vite Chess Preflight
 
 ### Fixed
