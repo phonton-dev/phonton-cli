@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.12.7</h1>
+<h1 align="center">Phonton CLI · v0.13.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.12.7-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.13.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -75,7 +75,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
 - v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
 - v0.12 enforces lower spend before the provider call: generated app/game goals dispatch as acceptance-slice subtasks, simple/docs/test prompts use small task-class budgets, generated repairs use a sub-1k context target, semantic retrieval top-k and repo maps shrink by task class, MCP result context is capped, and provider output ceilings are lower.
-- v0.12.7 makes verified diffs easier to inspect and export: `phonton diff` prints review-ready unified diffs, `--stat` and `--name-only` provide compact review surfaces, and `/diff`, `/code`, and `d` jump directly to the TUI Code focus.
+- v0.13.0 makes Ask workspace-aware under a bounded context budget, freezes the compact TUI header after goals exist, and carries forward verified diff export: `phonton diff`, `--stat`, `--name-only`, `/diff`, `/code`, and `d`.
 - v0.12.6 hardens provider contracts further: DeepSeek V4/reasoner routes disable provider thinking for diff-only worker calls, stale v0.12.5 canary cache entries are invalidated, reasoning-only replies fail clearly, and provider tests time out quickly instead of hanging.
 - v0.12.5 blocks bad provider/model routes before goal dispatch: provider readiness now uses a parseable unified-diff canary, empty OpenAI-compatible responses fail immediately, OpenCode/OpenCode Go routes work through `OPENCODE_API_KEY`, and `phonton providers` can list/sync the Models.dev catalog.
 - v0.12.4 cuts wasted repair tokens in generated-app failures: workers stop after repeated verifier/parser diagnostics, redispatch prompts start with prior verifier evidence, stale hunk repairs get explicit guidance, and the Flight Log shows compact `repair` events before bounded retries.
@@ -83,7 +83,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - v0.12.2 fixes early generated Vite/React chess slices so Vitest does not fail before test files exist: scaffold slices now request a starter rules module and smoke test, and npm verification waits to run Vitest/Jest discovery scripts until a test file exists.
 - v0.12.1 fixes the playable chess benchmark path: explicit Vite/TypeScript/React prompts now scaffold an npm app contract, use chess.js-backed rules/test slices, carry current artifact snapshots between slices, use compact slice labels instead of repeating the full pasted prompt, and run npm install/test/build verification before review-ready status.
 - `phonton proof export --latest --format json` exports the latest proof bundle from the OutcomeLedger, and `phonton context eval|diff` evaluates deterministic context-selection fixtures before benchmark runs.
-- Ask mode supports `/ask <question>`, scrollable answers, and lightweight markdown-style rendering without mixing Ask into goal memory.
+- Ask mode supports `/ask <question>`, scrollable answers, lightweight markdown-style rendering, and bounded read-only workspace context with visible `ctx:` token/file summaries. `phonton ask --no-workspace` keeps the old stateless behavior.
 - Faster multi-goal navigation: the sidebar shows stable goal indexes, `Alt+Up` / `Alt+Down` switches goals even while drafting text, `Alt+1` through `Alt+9` jumps directly, and `/goals` opens a searchable switcher.
 - Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Problems, Code, Commands, and Log tabs in the Active panel plus `p` / `r` / `f` / `d` / `[` / `]` keyboard navigation.
 - Command run receipts stay collapsed by default; the Commands focus view shows status, exit code, duration, and short stdout/stderr previews. `/rerun` repeats the latest command through the same sandbox path and `/copy` copies the current focus view to the Windows clipboard.
@@ -150,7 +150,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.7 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.13.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -166,7 +166,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.12.7 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.13.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -249,11 +249,12 @@ phonton doctor --provider
 phonton                 Launch the interactive TUI
 phonton -r              Resume the saved TUI session for this workspace
 phonton init            Create ~/.phonton/config.toml if it is missing
-phonton ask <question>  One-shot Q&A using the configured provider
+phonton ask [flags] <q> Workspace-aware Q&A using the configured provider
 phonton demo trust-loop Print the evidence-trail demo loop
 phonton doctor          Check config, store, trust, git, cargo, and Nexus
 phonton plan <goal>     Preview the task DAG and GoalContract without changing files
 phonton review          Show verified diff review payloads
+phonton diff            Print verified unified diffs from review-ready tasks
 phonton run latest      Run the latest receipt-suggested command
 phonton memory list     Inspect local decision memory
 phonton extensions list Inspect skills, steering, MCP servers, and profiles
@@ -269,7 +270,8 @@ Inside the TUI prompt bar:
 /settings, /config      Open provider/model/budget settings
 /status                 Show version, provider, model, workspace, and token state
 /review                 Show review receipt guidance for the selected goal
-/ask <question>         Ask a stateless question without queueing a goal
+/ask <question>         Ask a bounded workspace question without queueing a goal
+/diff, /code, d         Jump to verified Code/Diff focus
 /memory                 Inspect local decision memory
 /permissions            Show sandbox, trust, and approval status
 /trust                  Show or revoke workspace trust records

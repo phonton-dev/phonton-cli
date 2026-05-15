@@ -4,16 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
-## 0.12.7 - Verified Diff QoL
+## 0.13.0 - Workspace Ask And Diff QoL
 
 ### Added
 
+- Added bounded workspace-aware Ask context for TUI Ask and `phonton ask`, including explicit `@file` mentions, current goal diagnostics, workspace facts, file maps, and lexical file excerpts under a 1200-token target.
+- Added `phonton ask --no-workspace` to preserve the old stateless Ask path and `phonton ask --json` for scriptable answer/context metadata.
 - Added `phonton diff [latest|<task-id>]` to export only verified `SubtaskReviewReady` unified diffs from the local task store.
 - Added `phonton diff --stat`, `phonton diff --name-only`, and `phonton diff --json` for compact review and tooling surfaces.
 - Added `/diff` and `/code` slash commands plus the `d` TUI shortcut to jump directly to the Code focus.
 
 ### Changed
 
+- Ask mode now shows a compact `ctx:` summary line so users can see how much workspace context was selected.
+- The compact `phonton` TUI header no longer shimmers rapidly after a goal exists; active task spinners and savings flashes still animate.
 - Code focus now shows file count plus added/removed line totals at the top of the diff view.
 - Help text and README release docs now include the first-class diff surfaces.
 

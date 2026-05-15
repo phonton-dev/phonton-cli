@@ -21,8 +21,8 @@
 //! Modes:
 //! - **Goal** (default): Enter queues the typed goal for planning + running.
 //! - **Task**: single-subtask fast path — reuses the same orchestration spine.
-//! - **Ask**: `Ctrl+;` toggles a side panel for stateless Q&A that does
-//!   *not* touch active-goal context. (The spec calls for `Cmd+;`; on
+//! - **Ask**: `Ctrl+;` toggles a side panel for read-only workspace Q&A that
+//!   never dispatches edits. (The spec calls for `Cmd+;`; on
 //!   POSIX terminals we bind the equivalent Ctrl chord, which most
 //!   keymaps surface the same way.)
 //!
@@ -34,6 +34,7 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod ask_context;
 mod benchmark_cli;
 mod command_runner;
 mod config;
@@ -619,6 +620,8 @@ pub struct App {
     pub ask_prompt: PromptBuffer,
     /// Most recent ask-mode answer, for display in the side panel.
     pub ask_answer: Option<String>,
+    /// One-line context summary for the most recent Ask request.
+    pub ask_context_summary: Option<String>,
     /// Vertical scroll offset for the Ask answer panel.
     pub ask_scroll: usize,
     /// True while an ask-mode provider call is in flight; drives the
@@ -705,6 +708,7 @@ impl App {
             goal_prompt: PromptBuffer::new(),
             ask_prompt: PromptBuffer::new(),
             ask_answer: None,
+            ask_context_summary: None,
             ask_scroll: 0,
             ask_pending: false,
             should_quit: false,
@@ -775,6 +779,7 @@ impl App {
                 self.mode = Mode::Ask;
                 self.ask_prompt.set_text("");
                 self.ask_answer = None;
+                self.ask_context_summary = None;
                 self.ask_scroll = 0;
                 self.ask_pending = true;
                 Some(Intent::Ask(question))
@@ -2521,6 +2526,7 @@ impl App {
                 self.prompt_history.push(submission.display_text);
                 self.prompt_history_cursor = None;
                 self.ask_answer = None;
+                self.ask_context_summary = None;
                 self.ask_scroll = 0;
                 self.ask_pending = true;
                 Some(Intent::Ask(submission.model_text))
@@ -3074,7 +3080,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("/problems", "inspect verifier failures and repair hints"),
         ("/retry", "repair the selected failed goal with diagnostics"),
         ("/why-tokens", "explain latest prompt token buckets"),
-        ("/ask", "ask a stateless question without queueing a goal"),
+        (
+            "/ask",
+            "ask a bounded workspace question without queueing a goal",
+        ),
         ("/commands", "show command and keyboard help"),
         ("/run", "run a command through the sandbox"),
         ("!", "run command shorthand, e.g. !npm test"),
@@ -3380,7 +3389,12 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(p, area);
     } else {
         // Compact one-line header - gradient "phonton" + dim subtitle.
-        let mut spans = gradient_line("✦ phonton", header_phase * 0.8, true).spans;
+        let compact_phase = if app.goals.is_empty() {
+            header_phase * 0.8
+        } else {
+            logo_phase
+        };
+        let mut spans = gradient_line("✦ phonton", compact_phase, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
             "agentic dev environment",
@@ -4781,13 +4795,17 @@ fn fmt_ts(ms: u64) -> String {
 }
 
 fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Ask mode (Ctrl+; to close, Esc to cancel)",
-            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-    ];
+    let mut lines = vec![Line::from(Span::styled(
+        "Ask mode (Ctrl+; to close, Esc to cancel)",
+        Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(summary) = &app.ask_context_summary {
+        lines.push(Line::from(Span::styled(
+            summary.clone(),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::raw(""));
     if app.ask_pending {
         let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
         let frame_ch = SPINNER[frame_idx];
@@ -5534,8 +5552,8 @@ async fn build_semantic_context(
     }
 }
 
-/// Load a provider for ask-mode (stateless Q&A) using the config file or
-/// env vars. Returns `None` when no key is available.
+/// Load a provider for Ask mode using the config file or env vars. Returns
+/// `None` when no key is available.
 fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
     let api_key = provider_key_for_run(&cfg.provider)?;
     let model = cfg
@@ -5595,6 +5613,68 @@ fn provider_key_for_run(cfg: &config::ProviderConfig) -> Option<String> {
             Some(String::new())
         }
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AskCliRequest {
+    question: String,
+    no_workspace: bool,
+    json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AskCliResponse {
+    answer: String,
+    context_tokens: usize,
+    selected_paths: Vec<String>,
+}
+
+fn parse_ask_cli_request(args: &[String]) -> Result<AskCliRequest> {
+    let mut no_workspace = false;
+    let mut json = false;
+    let mut parts = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--no-workspace" => no_workspace = true,
+            "--json" => json = true,
+            "-h" | "--help" => {
+                return Err(anyhow::anyhow!(
+                    "phonton ask [--no-workspace] [--json] <question>"
+                ));
+            }
+            other if other.starts_with('-') => {
+                return Err(anyhow::anyhow!("phonton ask: unknown flag `{other}`"));
+            }
+            _ => parts.push(arg.clone()),
+        }
+    }
+    Ok(AskCliRequest {
+        question: parts.join(" "),
+        no_workspace,
+        json,
+    })
+}
+
+fn selected_goal_ask_context(app: &App) -> (Option<String>, Vec<String>) {
+    let Some(goal) = app.current_goal() else {
+        return (None, Vec::new());
+    };
+    let goal_summary = format!(
+        "{} (status: {})",
+        goal.description,
+        goal_status_label(&goal.status)
+    );
+    let mut diagnostics = problem_diagnostics(goal);
+    if let Some(handoff) = goal
+        .state
+        .as_ref()
+        .and_then(|state| state.handoff_packet.as_ref())
+    {
+        for gap in handoff.known_gaps.iter().take(4) {
+            diagnostics.push(format!("known gap: {gap}"));
+        }
+    }
+    (Some(goal_summary), diagnostics)
 }
 
 /// Build an [`ApiProviderConfig`] from the provider name, resolved key,
@@ -6131,7 +6211,7 @@ fn print_help() {
          SUBCOMMANDS:\n  \
          (none)            Launch the interactive TUI (default)\n  \
          init              Create ~/.phonton/config.toml if it is missing\n  \
-         ask <question>    One-shot Q&A using the configured provider\n  \
+         ask [flags] <q>   One-shot workspace-aware Q&A using the configured provider\n  \
          demo trust-loop   Print the evidence-trail demo loop\n  \
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
          extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
@@ -6178,6 +6258,9 @@ fn print_help() {
          \n\
          PLAN PREVIEW:\n  \
          phonton plan [--json] [--no-memory] [--no-tests] <goal>\n\
+         \n\
+         ASK:\n  \
+         phonton ask [--no-workspace] [--json] <question>\n\
          \n\
          REVIEW:\n  \
          phonton review [--json|--markdown] [latest|<task-id>]\n  \
@@ -6504,8 +6587,14 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             Ok(None)
         }
         "ask" => {
-            let question = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();
-            if question.trim().is_empty() {
+            let request = match parse_ask_cli_request(&args[1..]) {
+                Ok(request) => request,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            };
+            if request.question.trim().is_empty() {
                 eprintln!("phonton: `ask` requires a question.\n  e.g. phonton ask \"how do I add a feature flag?\"");
                 std::process::exit(2);
             }
@@ -6516,12 +6605,52 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
                      or run `phonton` and configure one in Settings"
                 )
             })?;
-            match provider
-                .call("You are a helpful coding assistant.", &question, &[])
-                .await
-            {
+            let workspace_context = if request.no_workspace {
+                None
+            } else {
+                let working_dir =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let attachments = prepare_goal_attachments(&request.question, &working_dir);
+                Some(ask_context::build_ask_context(
+                    ask_context::AskContextRequest {
+                        question: &request.question,
+                        workspace_root: &working_dir,
+                        attachments: &attachments,
+                        current_goal: None,
+                        diagnostics: &[],
+                        max_tokens: ask_context::ASK_CONTEXT_TARGET_TOKENS,
+                    },
+                ))
+            };
+            let stateless_prompt;
+            let user_prompt = if let Some(context) = workspace_context.as_ref() {
+                context.prompt.as_str()
+            } else {
+                stateless_prompt = ask_context::build_stateless_ask_prompt(&request.question);
+                stateless_prompt.as_str()
+            };
+            let system_prompt = if request.no_workspace {
+                "You are a helpful coding assistant."
+            } else {
+                ask_context::ASK_SYSTEM_PROMPT
+            };
+            match provider.call(system_prompt, user_prompt, &[]).await {
                 Ok(resp) => {
-                    println!("{}", resp.content);
+                    if request.json {
+                        let body = AskCliResponse {
+                            answer: resp.content,
+                            context_tokens: workspace_context
+                                .as_ref()
+                                .map(|context| context.context_tokens)
+                                .unwrap_or(0),
+                            selected_paths: workspace_context
+                                .map(|context| context.selected_paths)
+                                .unwrap_or_default(),
+                        };
+                        println!("{}", serde_json::to_string_pretty(&body)?);
+                    } else {
+                        println!("{}", resp.content);
+                    }
                     Ok(None)
                 }
                 Err(e) => {
@@ -7316,17 +7445,31 @@ async fn run_app<B: Backend>(
                             // a no-op.
                         }
                         Intent::Ask(q) => {
-                            // Stateless ask: no orchestrator involvement,
-                            // no goal context, no memory write.
+                            // Ask is read-only: it can inspect bounded
+                            // workspace context but never dispatches the
+                            // orchestrator or writes memory.
                             let tx2 = tx.clone();
                             let provider = ask_provider.clone();
+                            let attachments = prepare_goal_attachments(&q, &working_dir);
+                            let (current_goal, diagnostics) = selected_goal_ask_context(app);
+                            let ask_report =
+                                ask_context::build_ask_context(ask_context::AskContextRequest {
+                                    question: &q,
+                                    workspace_root: &working_dir,
+                                    attachments: &attachments,
+                                    current_goal: current_goal.as_deref(),
+                                    diagnostics: &diagnostics,
+                                    max_tokens: ask_context::ASK_CONTEXT_TARGET_TOKENS,
+                                });
+                            let ask_prompt = ask_report.prompt.clone();
+                            app.ask_context_summary = Some(ask_report.summary.clone());
                             app.ask_pending = true;
                             app.ask_answer = None;
                             app.ask_scroll = 0;
                             tokio::spawn(async move {
                                 let a = match provider {
                                     Some(p) => match p
-                                        .call("You are a helpful coding assistant.", &q, &[])
+                                        .call(ask_context::ASK_SYSTEM_PROMPT, &ask_prompt, &[])
                                         .await
                                     {
                                         Ok(resp) => resp.content,
@@ -9203,6 +9346,22 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn parse_ask_cli_request_accepts_no_workspace_and_json() {
+        let request = parse_ask_cli_request(&[
+            "--no-workspace".into(),
+            "--json".into(),
+            "what".into(),
+            "is".into(),
+            "this?".into(),
+        ])
+        .unwrap();
+
+        assert!(request.no_workspace);
+        assert!(request.json);
+        assert_eq!(request.question, "what is this?");
+    }
+
+    #[test]
     fn ask_answer_scrolls_when_prompt_is_empty() {
         let mut app = App {
             mode: Mode::Ask,
@@ -9219,6 +9378,25 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.ask_scroll, 12);
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.ask_scroll, 0);
+    }
+
+    #[test]
+    fn ask_context_summary_renders_in_ask_panel() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App {
+            mode: Mode::Ask,
+            ask_context_summary: Some("ctx: workspace 3 files, ~900 tok".into()),
+            ask_answer: Some("Use README.md for the overview.".into()),
+            ..App::default()
+        };
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(dump.contains("ctx: workspace 3 files"));
+        assert!(dump.contains("README.md"));
     }
 
     #[test]
@@ -9810,6 +9988,23 @@ fn extract_id(line: &str) -> Option<String> {
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("agentic dev environment"));
         assert!(dump.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn compact_header_is_stable_after_goal_exists() {
+        let backend = TestBackend::new(64, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let first = format!("{:?}", terminal.backend().buffer());
+
+        app.spinner_frame = 64;
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let second = format!("{:?}", terminal.backend().buffer());
+
+        assert_eq!(first, second);
     }
 
     #[test]
