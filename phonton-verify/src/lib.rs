@@ -712,28 +712,35 @@ async fn verify_node_project(
         return Ok(None);
     }
 
-    let mut commands: Vec<Vec<&str>> = vec![vec!["install", "--no-audit", "--no-fund"]];
-    let scripts = package
-        .get("scripts")
-        .and_then(|scripts| scripts.as_object());
-    if let Some(test_script) = scripts
-        .and_then(|scripts| scripts.get("test"))
-        .and_then(|script| script.as_str())
-    {
-        if should_run_npm_test(temp.path(), test_script) {
-            commands.push(vec!["test"]);
+    let scripts_value = package.get("scripts");
+    let scripts = scripts_value.and_then(|s| s.as_object());
+    let mut steps: Vec<NodeVerifyStep> = vec![NodeVerifyStep::new(
+        "npm install --no-audit --no-fund",
+        ["install", "--no-audit", "--no-fund"],
+    )];
+    let raw_test_script = scripts
+        .and_then(|map| map.get("test"))
+        .and_then(|v| v.as_str());
+    let run_tests = match raw_test_script {
+        Some(script) => should_run_npm_test(temp.path(), script),
+        None => false,
+    };
+    if run_tests {
+        if let Some(step) = select_node_test_command(scripts_value) {
+            steps.push(step);
         }
     }
-    if scripts.and_then(|scripts| scripts.get("build")).is_some() {
-        commands.push(vec!["run", "build"]);
+    let has_build = scripts.and_then(|map| map.get("build")).is_some();
+    if has_build {
+        steps.push(NodeVerifyStep::new("npm run build", ["run", "build"]));
     }
-    if commands.len() == 1 && !touches_package_json {
+    if steps.len() == 1 && !touches_package_json {
         return Ok(None);
     }
 
     let mut errors = Vec::new();
-    for args in commands {
-        if let Some(error) = run_npm_command(temp.path(), &args).await? {
+    for step in &steps {
+        if let Some(error) = run_npm_command(temp.path(), step).await? {
             errors.push(error);
             break;
         }
@@ -881,27 +888,169 @@ fn copy_workspace_for_verification(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_npm_command(working_dir: &Path, args: &[&str]) -> Result<Option<String>> {
-    let fut = Command::new(npm_bin())
-        .current_dir(working_dir)
-        .args(args)
-        .output();
-    match tokio::time::timeout(Duration::from_secs(180), fut).await {
+/// One npm subcommand invocation in the Node verification pipeline
+/// (e.g. `npm install`, `npm test -- --run`, `npm run build`).
+///
+/// The `label` is shown verbatim in failure receipts so users see the
+/// exact command Phonton tried; `args` is what we pass to the spawned
+/// `npm` process. CI environment variables are injected by
+/// [`run_npm_command`] and are not part of this struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeVerifyStep {
+    /// Human-readable command shown in receipts and error output.
+    pub label: String,
+    /// Argument vector passed to the `npm` executable.
+    pub args: Vec<String>,
+}
+
+impl NodeVerifyStep {
+    fn new<L, I, S>(label: L, args: I) -> Self
+    where
+        L: Into<String>,
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            label: label.into(),
+            args: args.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Select a deterministic, non-interactive `npm` test command from the
+/// project's `scripts` object.
+///
+/// Returns `None` when there is no usable `test` script (or the project
+/// has no `scripts` map at all). The selection rules, in order:
+///
+/// 1. `test:ci` → `npm run test:ci`
+/// 2. `test:run` → `npm run test:run`
+/// 3. `test`:
+///    * Vitest invocation without explicit `--run`/`run` → `npm test -- --run`
+///    * Jest invocation without `--watchAll=false`/`--ci` → `npm test -- --watchAll=false`
+///    * Otherwise → `npm test`
+///
+/// This addresses the v0.13.x failure mode where `npm test` against a
+/// stock Vite scaffold dropped Vitest into watch mode and hung until the
+/// verifier's 180s timeout fired. Callers must still inject CI/non-
+/// interactive env vars on the spawned process — see
+/// [`npm_verification_env`].
+pub fn select_node_test_command(scripts: Option<&serde_json::Value>) -> Option<NodeVerifyStep> {
+    let map = scripts.and_then(|value| value.as_object())?;
+    for ci_script in ["test:ci", "test:run"] {
+        if let Some(s) = map.get(ci_script).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(NodeVerifyStep::new(
+                    format!("npm run {ci_script}"),
+                    ["run", ci_script],
+                ));
+            }
+        }
+    }
+    let test_script = map.get("test").and_then(|v| v.as_str())?;
+    let trimmed = test_script.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("vitest") {
+        let already_non_watch = lower
+            .split_whitespace()
+            .any(|tok| tok == "run" || tok == "--run")
+            || lower.contains(" --run");
+        if already_non_watch {
+            return Some(NodeVerifyStep::new("npm test", ["test"]));
+        }
+        return Some(NodeVerifyStep::new(
+            "npm test -- --run",
+            ["test", "--", "--run"],
+        ));
+    }
+    if lower.contains("jest") {
+        let already_non_watch = lower.contains("--watchall=false") || lower.contains("--ci");
+        if already_non_watch {
+            return Some(NodeVerifyStep::new("npm test", ["test"]));
+        }
+        return Some(NodeVerifyStep::new(
+            "npm test -- --watchAll=false",
+            ["test", "--", "--watchAll=false"],
+        ));
+    }
+    Some(NodeVerifyStep::new("npm test", ["test"]))
+}
+
+/// Environment variables Phonton always sets on verification subprocesses
+/// to force non-interactive, CI-style behavior.
+///
+/// Vitest and Jest both default to watch mode when stdout looks like a
+/// TTY, and `npm` itself can prompt for confirmation on certain
+/// operations. Setting `CI=1` plus the npm-config equivalents makes the
+/// underlying tools behave deterministically inside the 180s verifier
+/// budget instead of dropping into an interactive loop and timing out.
+///
+/// Exposed for tests and for any future verifier that shells out to npm.
+pub fn npm_verification_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("CI", "1"),
+        ("NPM_CONFIG_YES", "true"),
+        ("NPM_CONFIG_FUND", "false"),
+        ("NPM_CONFIG_AUDIT", "false"),
+        ("NPM_CONFIG_LOGLEVEL", "error"),
+        ("NPM_CONFIG_UPDATE_NOTIFIER", "false"),
+        ("NO_COLOR", "1"),
+        ("FORCE_COLOR", "0"),
+        ("NODE_NO_WARNINGS", "1"),
+    ]
+}
+
+const NPM_STEP_TIMEOUT_SECS: u64 = 180;
+
+/// Format the timeout failure shown to the user when an `npm` step
+/// exceeds its budget.
+///
+/// Test-only steps that are not themselves the project test runner
+/// (currently `npm install` and `npm run build`) get a generic timeout
+/// message; the test runner gets a harness-aware message that names the
+/// likely cause (watch mode) and the concrete repairs Phonton already
+/// understands. Centralising the format here keeps the failure-receipt
+/// language consistent and lets the helper be unit-tested without
+/// actually waiting `secs` seconds.
+fn format_npm_timeout_message(label: &str, secs: u64) -> String {
+    let is_test_step = label.starts_with("npm test") || label.starts_with("npm run test:");
+    if is_test_step {
+        format!(
+            "{label} timed out after {secs}s (test harness timeout — likely interactive/watch mode). \
+             Repair: add a `test:ci` or `test:run` script in package.json that exits, or invoke the runner non-interactively \
+             (vitest with `--run`, jest with `--watchAll=false`)."
+        )
+    } else {
+        format!("{label} timed out after {secs}s")
+    }
+}
+
+async fn run_npm_command(working_dir: &Path, step: &NodeVerifyStep) -> Result<Option<String>> {
+    let mut cmd = Command::new(npm_bin());
+    cmd.current_dir(working_dir).args(&step.args);
+    for (key, value) in npm_verification_env() {
+        cmd.env(key, value);
+    }
+    let fut = cmd.output();
+    match tokio::time::timeout(Duration::from_secs(NPM_STEP_TIMEOUT_SECS), fut).await {
         Ok(Ok(out)) if out.status.success() => Ok(None),
         Ok(Ok(out)) => {
             let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&out.stderr));
             Ok(Some(format!(
-                "npm {} failed: {}",
-                args.join(" "),
+                "{} failed: {}",
+                step.label,
                 last_lines(&combined, 20)
             )))
         }
-        Ok(Err(e)) => Ok(Some(format!(
-            "could not invoke npm {}: {e}",
-            args.join(" ")
+        Ok(Err(e)) => Ok(Some(format!("could not invoke {}: {e}", step.label))),
+        Err(_) => Ok(Some(format_npm_timeout_message(
+            &step.label,
+            NPM_STEP_TIMEOUT_SECS,
         ))),
-        Err(_) => Ok(Some(format!("npm {} timed out after 180s", args.join(" ")))),
     }
 }
 
@@ -1842,6 +1991,138 @@ mod tests {
                 "vitest should not fail scaffold verification before test files exist: {other:?}"
             ),
         }
+    }
+
+    // -------------------------------------------------------------
+    // Node test command selection (v0.14.0)
+    // -------------------------------------------------------------
+
+    fn scripts_value(json: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid json");
+        v.get("scripts").cloned().expect("scripts key present")
+    }
+
+    #[test]
+    fn select_node_test_command_prefers_test_ci_script() {
+        let scripts = scripts_value(
+            r#"{"scripts":{"test":"vitest","test:ci":"vitest run --reporter=verbose"}}"#,
+        );
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.label, "npm run test:ci");
+        assert_eq!(step.args, vec!["run", "test:ci"]);
+    }
+
+    #[test]
+    fn select_node_test_command_prefers_test_run_when_ci_absent() {
+        let scripts = scripts_value(r#"{"scripts":{"test":"jest","test:run":"jest --ci"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.label, "npm run test:run");
+        assert_eq!(step.args, vec!["run", "test:run"]);
+    }
+
+    #[test]
+    fn select_node_test_command_rewrites_vitest_to_non_watch() {
+        // Stock Vite scaffold: `"test": "vitest"` enters watch mode by
+        // default and was the source of the v0.13.x 180s hang.
+        let scripts = scripts_value(r#"{"scripts":{"test":"vitest"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.label, "npm test -- --run");
+        assert_eq!(step.args, vec!["test", "--", "--run"]);
+    }
+
+    #[test]
+    fn select_node_test_command_keeps_explicit_vitest_run() {
+        let scripts = scripts_value(r#"{"scripts":{"test":"vitest run"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.label, "npm test");
+        assert_eq!(step.args, vec!["test"]);
+    }
+
+    #[test]
+    fn select_node_test_command_rewrites_jest_to_no_watch() {
+        let scripts = scripts_value(r#"{"scripts":{"test":"jest"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.label, "npm test -- --watchAll=false");
+        assert_eq!(step.args, vec!["test", "--", "--watchAll=false"]);
+    }
+
+    #[test]
+    fn select_node_test_command_keeps_jest_when_already_ci() {
+        let scripts = scripts_value(r#"{"scripts":{"test":"jest --watchAll=false"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.args, vec!["test"]);
+    }
+
+    #[test]
+    fn select_node_test_command_passes_through_custom_scripts() {
+        let scripts = scripts_value(r#"{"scripts":{"test":"node scripts/test.js"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert_eq!(step.label, "npm test");
+        assert_eq!(step.args, vec!["test"]);
+    }
+
+    #[test]
+    fn select_node_test_command_returns_none_for_missing_or_empty() {
+        let no_scripts: serde_json::Value = serde_json::from_str("{}").unwrap();
+        assert!(super::select_node_test_command(no_scripts.get("scripts")).is_none());
+        let empty_script = scripts_value(r#"{"scripts":{"test":""}}"#);
+        assert!(super::select_node_test_command(Some(&empty_script)).is_none());
+    }
+
+    #[test]
+    fn npm_timeout_message_classifies_test_harness_timeouts() {
+        // The receipt must (a) name the exact attempted command verbatim
+        // and (b) point at the actual repair path. Both behaviours
+        // regress silently if the format string drifts, so pin them.
+        let test_msg = super::format_npm_timeout_message("npm test -- --run", 180);
+        assert!(test_msg.contains("npm test -- --run"));
+        assert!(test_msg.contains("test harness timeout"));
+        assert!(test_msg.contains("test:ci") && test_msg.contains("test:run"));
+        assert!(test_msg.contains("--run") && test_msg.contains("--watchAll=false"));
+
+        let script_msg = super::format_npm_timeout_message("npm run test:ci", 180);
+        assert!(script_msg.contains("npm run test:ci"));
+        assert!(script_msg.contains("test harness timeout"));
+
+        // Non-test steps get the plain timeout message — no test-runner
+        // repair guidance, since that would be misleading.
+        let build_msg = super::format_npm_timeout_message("npm run build", 180);
+        assert!(build_msg.starts_with("npm run build timed out after 180s"));
+        assert!(!build_msg.contains("test harness"));
+        let install_msg =
+            super::format_npm_timeout_message("npm install --no-audit --no-fund", 180);
+        assert!(install_msg.starts_with("npm install --no-audit --no-fund timed out after 180s"));
+        assert!(!install_msg.contains("test harness"));
+    }
+
+    #[test]
+    fn npm_verification_env_forces_non_interactive_mode() {
+        // The CI variables here are the contract that keeps Vitest/Jest
+        // out of watch mode and npm from prompting; regressing this set
+        // is what makes a v0.13.x-style 180s timeout possible again.
+        let env: std::collections::HashMap<_, _> =
+            super::npm_verification_env().into_iter().collect();
+        assert_eq!(env.get("CI"), Some(&"1"));
+        assert_eq!(env.get("NPM_CONFIG_YES"), Some(&"true"));
+        assert_eq!(env.get("NPM_CONFIG_FUND"), Some(&"false"));
+        assert_eq!(env.get("NPM_CONFIG_AUDIT"), Some(&"false"));
+        assert_eq!(env.get("NO_COLOR"), Some(&"1"));
+    }
+
+    /// Regression for the v0.13.5 chess-seed timeout: a stock Vite/React
+    /// project with `"test": "vitest"` and an existing `*.test.ts` file
+    /// previously enqueued `npm test` (watch mode) and hit the 180s
+    /// verifier timeout. The selector must rewrite it to `npm test -- --run`.
+    #[test]
+    fn vitest_watch_mode_scaffold_is_rewritten_to_non_watch() {
+        let scripts =
+            scripts_value(r#"{"scripts":{"test":"vitest","build":"vite build","dev":"vite"}}"#);
+        let step = super::select_node_test_command(Some(&scripts)).expect("step");
+        assert!(
+            step.args == vec!["test", "--", "--run"],
+            "v0.13.x regression: vitest scaffold must run in non-watch mode, got {:?}",
+            step.args
+        );
     }
 
     #[test]
