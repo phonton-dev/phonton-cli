@@ -4,6 +4,28 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.14.0 - Non-Interactive Node Verification
+
+### Fixed
+
+- Generated Vite/React chess seeds no longer fail with `npm test timed out after 180s`. Node verification now rewrites stock `"test": "vitest"` scripts to `npm test -- --run` (and `"test": "jest"` to `npm test -- --watchAll=false`), so Vitest and Jest never enter watch mode during verification.
+- Verification subprocesses always set `CI=1`, `NPM_CONFIG_YES=true`, `NPM_CONFIG_FUND=false`, `NPM_CONFIG_AUDIT=false`, and related non-interactive env vars before spawning `npm`. Stock scaffolds no longer hang waiting for TTY prompts.
+- `test:ci` and `test:run` scripts in `package.json`, when present, are preferred over the default `test` script — projects can opt into a deterministic Phonton verification command without changing their interactive `test` workflow.
+
+### Changed
+
+- Node verification failure receipts now show the exact `npm` command Phonton attempted (e.g. `npm test -- --run failed: ...`, `npm run build failed: ...`), so users see what to repair without re-running.
+- Node test-step timeouts now classify as `test harness timeout — likely interactive/watch mode` and include compact repair guidance (add `test:ci`/`test:run` or invoke the runner non-interactively). Non-test step timeouts (install, build) keep the plain timeout message; they have a different root cause.
+
+### Added
+
+- `phonton_verify::select_node_test_command` and `phonton_verify::npm_verification_env` are now public surface, so future verifiers and downstream tooling can reuse the same deterministic Node command/env shape.
+
+### Notes
+
+- Browser/runtime verification, missing-criteria-only repair, and richer HandoffPacket/OutcomeLedger proof export remain in flight and are not part of this release.
+- Token/cost claims continue to require reproducible artifacts; no benchmark superiority claim is made by this release.
+
 ## 0.13.5 - Local Chess Rules Seed
 
 ### Fixed
