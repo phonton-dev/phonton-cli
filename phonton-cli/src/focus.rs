@@ -17,10 +17,13 @@ use crate::{short, GoalEntry, ACCENT, ACCENT_HI, BG_DEEP, DANGER, MUTED, SUCCESS
 pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusView) {
     lines.push(Line::raw(""));
     let tabs = [
+        FocusView::Plan,
         FocusView::Receipt,
         FocusView::Problems,
         FocusView::Code,
         FocusView::Commands,
+        FocusView::Context,
+        FocusView::Tokens,
         FocusView::Log,
     ];
     let mut spans = vec![Span::styled(
@@ -45,10 +48,13 @@ pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusVie
         }
     }
     let hint = match active {
+        FocusView::Plan => "contract  verify plan",
         FocusView::Receipt => "f cycle  d diff",
         FocusView::Problems => "p problems  r retry",
         FocusView::Code => "[ ] file  PgUp/PgDn",
         FocusView::Commands => "[ ] command  /rerun",
+        FocusView::Context => "/context  /memory",
+        FocusView::Tokens => "/why-tokens",
         FocusView::Log => "PgUp/PgDn  End tail",
     };
     spans.push(Span::styled(hint, Style::default().fg(MUTED)));
@@ -588,6 +594,178 @@ pub(crate) fn log_focus_text(goal: &GoalEntry) -> String {
     for record in goal.flight_log.iter().rev().take(12).rev() {
         out.push_str(&format!("{} {}\n", record.kind(), record.render_line()));
     }
+    out
+}
+
+pub(crate) fn plan_focus_text(goal: &GoalEntry) -> String {
+    let mut out = String::from("Plan\n");
+    let Some(contract) = goal
+        .state
+        .as_ref()
+        .and_then(|state| state.goal_contract.as_ref())
+    else {
+        out.push_str("No GoalContract recorded yet.");
+        return out;
+    };
+
+    out.push_str(&format!(
+        "goal: {}\nclass: {:?}  confidence: {}%\n",
+        contract.goal, contract.task_class, contract.confidence_percent
+    ));
+    out.push_str(&format!(
+        "criteria: {}  slices: {}  expected artifacts: {}  likely files: {}\n",
+        contract.acceptance_criteria.len(),
+        contract.acceptance_slices.len(),
+        contract.expected_artifacts.len(),
+        contract.likely_files.len()
+    ));
+    if !contract.acceptance_criteria.is_empty() {
+        out.push_str("\nAcceptance\n");
+        for criterion in contract.acceptance_criteria.iter().take(6) {
+            out.push_str(&format!("- {}\n", short(criterion, 110)));
+        }
+    }
+    if !contract.acceptance_slices.is_empty() {
+        out.push_str("\nSlices\n");
+        for slice in contract.acceptance_slices.iter().take(8) {
+            let artifact = slice
+                .artifact_path
+                .as_ref()
+                .map(|p| format!(" -> {}", p.display()))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "- {}{}: {}\n",
+                slice.id,
+                artifact,
+                short(&slice.criterion, 92)
+            ));
+        }
+    }
+    if !contract.verify_plan.is_empty() {
+        out.push_str("\nVerify\n");
+        for step in contract.verify_plan.iter().take(6) {
+            let layer = step
+                .layer
+                .map(|layer| format!(" [{layer:?}]"))
+                .unwrap_or_default();
+            let command = step
+                .command
+                .as_ref()
+                .map(|cmd| format!("  $ {}", cmd.command.join(" ")))
+                .unwrap_or_default();
+            out.push_str(&format!("- {}{}{}\n", step.name, layer, command));
+        }
+    }
+    if !contract.run_plan.is_empty() {
+        out.push_str("\nRun\n");
+        for command in contract.run_plan.iter().take(4) {
+            out.push_str(&format!(
+                "- {}: {}\n",
+                command.label,
+                command.command.join(" ")
+            ));
+        }
+    }
+    if !contract.assumptions.is_empty() {
+        out.push_str("\nAssumptions\n");
+        for assumption in contract.assumptions.iter().take(4) {
+            out.push_str(&format!("- {}\n", short(assumption, 100)));
+        }
+    }
+    if !contract.clarification_questions.is_empty() {
+        out.push_str("\nClarification\n");
+        for question in contract.clarification_questions.iter().take(4) {
+            out.push_str(&format!("- {}\n", short(question, 100)));
+        }
+    }
+    out
+}
+
+pub(crate) fn context_focus_text(goal: &GoalEntry) -> String {
+    let mut out = String::from("Context\n");
+    let mut selected = 0usize;
+    let mut selected_tokens = 0usize;
+    let mut prompt_count = 0usize;
+    let mut buckets = phonton_types::ContextBucketSummary::default();
+    for record in &goal.flight_log {
+        match &record.event {
+            OrchestratorEvent::ContextSelected {
+                slices,
+                total_token_count,
+                ..
+            } => {
+                selected = selected.saturating_add(slices.len());
+                selected_tokens = selected_tokens.saturating_add(*total_token_count);
+            }
+            OrchestratorEvent::PromptManifest { manifest, .. } => {
+                prompt_count = prompt_count.saturating_add(1);
+                buckets.add_prompt_manifest(manifest);
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&format!(
+        "selected slices: {}  indexed tokens: {}  prompt manifests: {}\n",
+        selected, selected_tokens, prompt_count
+    ));
+    out.push_str(&format!(
+        "code: {} selected  {} omitted  memory: {}  artifacts: {}\n",
+        buckets.selected_code_tokens,
+        buckets.omitted_candidate_tokens,
+        buckets.memory_tokens,
+        buckets.artifact_tokens
+    ));
+    out.push_str(&format!(
+        "retry diagnostics: {}  tools: {}  deduped: {}  cached: {}\n",
+        buckets.retry_diagnostic_tokens,
+        buckets.tool_output_tokens,
+        buckets.deduped_tokens,
+        buckets.cached_tokens
+    ));
+    if selected == 0 && prompt_count == 0 {
+        out.push_str("No context evidence has been recorded yet.");
+    }
+    out
+}
+
+pub(crate) fn tokens_focus_text(goal: &GoalEntry) -> String {
+    let mut out = String::from("Tokens\n");
+    let mut first_attempt = 0_u64;
+    let mut repair_attempts = 0_u64;
+    let mut total = 0_u64;
+    let mut omitted = 0_u64;
+    let mut deduped = 0_u64;
+    for record in &goal.flight_log {
+        if let OrchestratorEvent::PromptManifest { manifest, .. } = &record.event {
+            total = total.saturating_add(manifest.total_estimated_tokens);
+            omitted = omitted.saturating_add(manifest.omitted_code_tokens);
+            deduped = deduped.saturating_add(manifest.deduped_tokens);
+            if manifest.repair_attempt || manifest.attempt > 1 {
+                repair_attempts = repair_attempts.saturating_add(manifest.total_estimated_tokens);
+            } else {
+                first_attempt = first_attempt.saturating_add(manifest.total_estimated_tokens);
+            }
+        }
+    }
+    let provider = goal
+        .state
+        .as_ref()
+        .and_then(|state| state.handoff_packet.as_ref())
+        .map(|handoff| handoff.token_usage)
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "prompt estimate: {}  first attempt: {}  repair: {}\n",
+        total, first_attempt, repair_attempts
+    ));
+    out.push_str(&format!(
+        "omitted candidate context: {}  deduped: {}\n",
+        omitted, deduped
+    ));
+    out.push_str(&format!(
+        "provider input: {}  output: {}  cached: {}  estimated: {}\n",
+        provider.input_tokens, provider.output_tokens, provider.cached_tokens, provider.estimated
+    ));
+    out.push_str("Provider-reported tokens remain the billing source of truth.");
     out
 }
 

@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::Result;
 use phonton_sandbox::{Sandbox, ToolCall};
 use phonton_store::TaskRecord;
-use phonton_types::{RunCommand, TaskId};
+use phonton_types::{OutcomeLedger, PermissionRecord, RunCommand, TaskId};
 use serde::Serialize;
 
 use crate::{command_runner::summarize_output, open_persistent_store};
@@ -151,7 +151,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     );
     let receipt = RunReceipt {
         task_id: task.id.to_string(),
-        goal: task.goal_text,
+        goal: task.goal_text.clone(),
         command_index: request.index + 1,
         command: summary.command,
         cwd: root.display().to_string(),
@@ -160,6 +160,10 @@ pub async fn run(args: &[String]) -> Result<i32> {
         stdout_preview: summary.stdout_preview,
         stderr_preview: summary.stderr_preview,
     };
+    if let Some(mut ledger) = task.outcome_ledger.clone() {
+        record_run_command_in_ledger(&mut ledger, &receipt, true);
+        let _ = store.upsert_outcome_ledger(&ledger);
+    }
 
     if request.json {
         println!("{}", serde_json::to_string_pretty(&receipt)?);
@@ -267,6 +271,27 @@ fn print_receipt(receipt: &RunReceipt) {
     }
 }
 
+fn record_run_command_in_ledger(ledger: &mut OutcomeLedger, receipt: &RunReceipt, approved: bool) {
+    ledger.permission_ledger.records.push(PermissionRecord {
+        action: "shell".into(),
+        scope: receipt.command.clone(),
+        approved,
+        decision: format!(
+            "phonton run command evidence: exit={} duration={}ms cwd={}",
+            exit_text(receipt.exit_code),
+            receipt.duration_ms,
+            receipt.cwd
+        ),
+    });
+    ledger.summaries = phonton_types::OutcomeSummaries::from_evidence(
+        ledger.goal_contract.as_ref(),
+        &ledger.context_manifest,
+        &ledger.permission_ledger,
+        &ledger.verify_report,
+        ledger.handoff.as_ref(),
+    );
+}
+
 fn exit_text(exit_code: Option<i32>) -> String {
     exit_code
         .map(|code| code.to_string())
@@ -341,6 +366,7 @@ mod tests {
             context_manifest: ContextManifest::default(),
             permission_ledger: PermissionLedger::default(),
             verify_report: VerifyReport::default(),
+            summaries: phonton_types::OutcomeSummaries::default(),
             handoff: None,
         };
         let task = TaskRecord {
@@ -374,6 +400,41 @@ mod tests {
         };
 
         assert_eq!(commands_for_task(&task), vec![handoff_command]);
+    }
+
+    #[test]
+    fn command_receipts_can_be_recorded_in_permission_ledger() {
+        let task_id = TaskId::new();
+        let mut ledger = OutcomeLedger {
+            task_id,
+            goal_contract: None,
+            context_manifest: ContextManifest::default(),
+            permission_ledger: PermissionLedger::default(),
+            verify_report: VerifyReport::default(),
+            summaries: phonton_types::OutcomeSummaries::default(),
+            handoff: None,
+        };
+        let receipt = RunReceipt {
+            task_id: task_id.to_string(),
+            goal: "verify app".into(),
+            command_index: 1,
+            command: "npm run build".into(),
+            cwd: "C:/work/app".into(),
+            exit_code: Some(0),
+            duration_ms: 321,
+            stdout_preview: "built".into(),
+            stderr_preview: String::new(),
+        };
+
+        record_run_command_in_ledger(&mut ledger, &receipt, true);
+
+        assert_eq!(ledger.permission_ledger.records.len(), 1);
+        assert_eq!(ledger.permission_ledger.records[0].action, "shell");
+        assert_eq!(ledger.permission_ledger.records[0].scope, "npm run build");
+        assert!(ledger.permission_ledger.records[0].approved);
+        assert!(ledger.permission_ledger.records[0]
+            .decision
+            .contains("exit=0"));
     }
 
     #[test]

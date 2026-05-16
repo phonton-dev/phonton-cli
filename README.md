@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.14.1</h1>
+<h1 align="center">Phonton CLI · v0.15.0</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.14.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.15.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -54,7 +54,7 @@ That gives Phonton a different shape from an IDE assistant or a chat-first termi
 The product promise is intentionally narrow:
 
 ```text
-goal -> contract -> edit -> verify -> receipt -> remember
+goal -> plan -> edit -> verify -> review -> remember
 ```
 
 Try the proof-oriented demo text before configuring a provider:
@@ -69,10 +69,15 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 ## What Works Today
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
-- Unified slash commands in the TUI: `/settings`, `/config`, `/status`, `/context`, `/compact`, `/compress`, `/problems`, `/diagnostics`, `/retry`, `/repair`, `/why-tokens`, `/ask`, `/goals`, `/switch`, `/focus`, `/diff`, `/code`, `/copy`, `/rerun`, `/stats`, `/stop`, `/review`, `/memory`, `/permissions`, `/trust`, `/model`, `/commands`, `/run`, and `!` all route through the same command registry and prompt drawer.
+- Unified slash commands in the TUI: `/settings`, `/config`, `/status`, `/context`, `/compact`, `/compact-context`, `/compress`, `/problems`, `/diagnostics`, `/retry`, `/repair`, `/why-tokens`, `/ask`, `/plan`, `/approve`, `/goals`, `/switch`, `/focus`, `/diff`, `/code`, `/copy`, `/rerun`, `/stats`, `/stop`, `/review`, `/memory`, `/permissions`, `/trust`, `/model`, `/commands`, `/run`, and `!` all route through the same command registry and prompt drawer.
 - Static syntax verification now covers Rust, Python, JavaScript, TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before review-ready status. Generated code that cannot parse stays failed/unverified instead of becoming a receipt.
 - Failed goals default to a Problems focus view with grouped verifier/provider/quality diagnostics, compact repair hints, and `p` / `r` keyboard shortcuts for inspection and repair.
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
+- v0.15.0 adds a summary-first proof layer: deterministic Plan, Work, Verification, Failure, Token, Context, and Handoff summaries are derived from typed facts and exported through proof/review surfaces.
+- v0.15.0 expands the Active panel focus surfaces to Plan, Receipt, Problems, Code, Commands, Context, Tokens, and Log so broad work can be inspected without opening the Flight Log.
+- `/plan <goal>` now previews the GoalContract and verification/run plan in the TUI without starting workers; `/approve` starts the selected preview after review.
+- OutcomeLedger proof records now carry persisted context buckets, selected index slices, MCP permission evidence, command-run evidence, and summary bundles for history, review JSON, proof export, and benchmark export.
+- Generated web/runtime verification plans that do not produce runtime proof are surfaced as known gaps and verification findings, not treated as proof of correctness.
 - v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
 - v0.12 enforces lower spend before the provider call: generated app/game goals dispatch as acceptance-slice subtasks, simple/docs/test prompts use small task-class budgets, generated repairs use a sub-1k context target, semantic retrieval top-k and repo maps shrink by task class, MCP result context is capped, and provider output ceilings are lower.
 - v0.14.1 fixes generated-web failure diagnostics: Problems focus now jumps to the changed file named by the verifier, `src/App.tsx:1:1` diagnostics are normalized for retry policy, and the local chess rules test seed no longer requires a Vitest import.
@@ -90,7 +95,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - `phonton proof export --latest --format json` exports the latest proof bundle from the OutcomeLedger, and `phonton context eval|diff` evaluates deterministic context-selection fixtures before benchmark runs.
 - Ask mode supports `/ask <question>`, scrollable answers, lightweight markdown-style rendering, and bounded read-only workspace context with visible `ctx:` token/file summaries. `phonton ask --no-workspace` keeps the old stateless behavior.
 - Faster multi-goal navigation: the sidebar shows stable goal indexes, `Alt+Up` / `Alt+Down` switches goals even while drafting text, `Alt+1` through `Alt+9` jumps directly, and `/goals` opens a searchable switcher.
-- Review-ready goals now default to a Code focus view when diff hunks are available, with Receipt, Problems, Code, Commands, and Log tabs in the Active panel plus `p` / `r` / `f` / `d` / `[` / `]` keyboard navigation.
+- Review-ready goals now default to a Receipt focus view, with Plan, Problems, Code, Commands, Context, Tokens, and Log tabs in the Active panel plus `p` / `r` / `f` / `d` / `[` / `]` keyboard navigation.
 - Command run receipts stay collapsed by default; the Commands focus view shows status, exit code, duration, and short stdout/stderr previews. `/rerun` repeats the latest command through the same sandbox path and `/copy` copies the current focus view to the Windows clipboard.
 - Saved workspace sessions: use `phonton -r` or `phonton --resume` to reopen the last saved TUI conversation for the current repo.
 - Prompt bar paste artifacts: long or multiline pasted text collapses into a compact colored chip while the full content stays attached to the submitted goal; credential-looking pasted blocks are blocked before they can reach the model.
@@ -155,7 +160,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.14.1 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.0 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -171,7 +176,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.14.1 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.0 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -276,6 +281,8 @@ Inside the TUI prompt bar:
 /status                 Show version, provider, model, workspace, and token state
 /review                 Show review receipt guidance for the selected goal
 /ask <question>         Ask a bounded workspace question without queueing a goal
+/plan <goal>            Preview a GoalContract and plan without execution
+/approve                Execute the selected plan preview
 /diff, /code, d         Jump to verified Code/Diff focus
 /memory                 Inspect local decision memory
 /permissions            Show sandbox, trust, and approval status

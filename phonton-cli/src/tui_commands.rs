@@ -12,20 +12,26 @@ pub enum CommandCategory {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FocusView {
     #[default]
+    Plan,
     Receipt,
     Problems,
     Code,
     Commands,
+    Context,
+    Tokens,
     Log,
 }
 
 impl FocusView {
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_lowercase().as_str() {
+            "plan" | "contract" => Some(Self::Plan),
             "receipt" | "review" => Some(Self::Receipt),
             "problems" | "problem" | "diagnostics" | "diagnostic" | "diag" => Some(Self::Problems),
             "code" | "diff" => Some(Self::Code),
             "commands" | "command" | "cmd" | "run" => Some(Self::Commands),
+            "context" | "memory" | "influence" => Some(Self::Context),
+            "tokens" | "why-tokens" | "cost" => Some(Self::Tokens),
             "log" | "flight-log" | "flight" => Some(Self::Log),
             _ => None,
         }
@@ -33,21 +39,27 @@ impl FocusView {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Plan => "Plan",
             Self::Receipt => "Receipt",
             Self::Problems => "Problems",
             Self::Code => "Code",
             Self::Commands => "Commands",
+            Self::Context => "Context",
+            Self::Tokens => "Tokens",
             Self::Log => "Log",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
+            Self::Plan => Self::Receipt,
             Self::Receipt => Self::Problems,
             Self::Problems => Self::Code,
             Self::Code => Self::Commands,
-            Self::Commands => Self::Log,
-            Self::Log => Self::Receipt,
+            Self::Commands => Self::Context,
+            Self::Context => Self::Tokens,
+            Self::Tokens => Self::Log,
+            Self::Log => Self::Plan,
         }
     }
 }
@@ -58,6 +70,8 @@ pub enum SlashAction {
     TaskMode,
     AskMode,
     SubmitAsk(String),
+    PreviewPlan(String),
+    ApprovePlan,
     OpenSettings,
     ToggleLog,
     OpenMemory,
@@ -133,6 +147,22 @@ pub const COMMANDS: &[CommandSpec] = &[
         action: SlashAction::AskMode,
     },
     CommandSpec {
+        name: "/plan",
+        aliases: &[],
+        args: "<goal>",
+        description: "preview a GoalContract and plan before execution",
+        category: CommandCategory::Loop,
+        action: SlashAction::SetFocus(FocusView::Plan),
+    },
+    CommandSpec {
+        name: "/approve",
+        aliases: &[],
+        args: "",
+        description: "execute the selected plan preview",
+        category: CommandCategory::Loop,
+        action: SlashAction::ApprovePlan,
+    },
+    CommandSpec {
         name: "/settings",
         aliases: &["/config"],
         args: "",
@@ -182,7 +212,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "/compact",
-        aliases: &["/compress"],
+        aliases: &["/compress", "/compact-context"],
         args: "",
         description: "compact active worker context",
         category: CommandCategory::Trust,
@@ -223,7 +253,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/focus",
         aliases: &[],
-        args: "receipt|problems|code|commands|log",
+        args: "plan|receipt|problems|code|commands|context|tokens|log",
         description: "switch the Active panel focus view",
         category: CommandCategory::Loop,
         action: SlashAction::SetFocus(FocusView::Receipt),
@@ -376,6 +406,17 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
         };
     }
 
+    if head == "/plan" {
+        return if rest.is_empty() {
+            SlashParse::Unknown {
+                command: head.into(),
+                suggestion: Some("/plan <goal>".into()),
+            }
+        } else {
+            SlashParse::Command(SlashAction::PreviewPlan(rest.to_string()))
+        };
+    }
+
     if head == "/permissions" {
         let mut parts = rest.split_whitespace();
         let subcommand = parts.next().unwrap_or_default();
@@ -421,7 +462,9 @@ pub fn parse_slash_command(input: &str) -> SlashParse {
         } else {
             SlashParse::Unknown {
                 command: "/focus".into(),
-                suggestion: Some("/focus receipt|problems|code|commands|log".into()),
+                suggestion: Some(
+                    "/focus plan|receipt|problems|code|commands|context|tokens|log".into(),
+                ),
             }
         };
     }
@@ -605,6 +648,10 @@ mod tests {
             SlashParse::Command(SlashAction::CompactContext)
         );
         assert_eq!(
+            parse_slash_command("/compact-context"),
+            SlashParse::Command(SlashAction::CompactContext)
+        );
+        assert_eq!(
             parse_slash_command("/stop"),
             SlashParse::Command(SlashAction::StopGoal)
         );
@@ -625,6 +672,10 @@ mod tests {
             SlashParse::Command(SlashAction::SetFocus(FocusView::Code))
         );
         assert_eq!(
+            parse_slash_command("/focus plan"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Plan))
+        );
+        assert_eq!(
             parse_slash_command("/diff"),
             SlashParse::Command(SlashAction::SetFocus(FocusView::Code))
         );
@@ -639,6 +690,14 @@ mod tests {
         assert_eq!(
             parse_slash_command("/focus problems"),
             SlashParse::Command(SlashAction::SetFocus(FocusView::Problems))
+        );
+        assert_eq!(
+            parse_slash_command("/focus context"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Context))
+        );
+        assert_eq!(
+            parse_slash_command("/focus tokens"),
+            SlashParse::Command(SlashAction::SetFocus(FocusView::Tokens))
         );
         assert_eq!(
             parse_slash_command("/copy"),
@@ -683,6 +742,14 @@ mod tests {
         assert_eq!(
             parse_slash_command("/ask"),
             SlashParse::Command(SlashAction::AskMode)
+        );
+        assert_eq!(
+            parse_slash_command("/plan build a chess board"),
+            SlashParse::Command(SlashAction::PreviewPlan("build a chess board".into()))
+        );
+        assert_eq!(
+            parse_slash_command("/approve"),
+            SlashParse::Command(SlashAction::ApprovePlan)
         );
     }
 

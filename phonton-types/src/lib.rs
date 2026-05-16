@@ -1739,6 +1739,346 @@ pub struct HandoffPacket {
     pub influence: InfluenceSummary,
 }
 
+/// Deterministic summary of the accepted goal contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSummary {
+    /// Contracted goal text.
+    pub goal: String,
+    /// Inferred task class.
+    pub task_class: TaskClass,
+    /// Confidence as 0-100.
+    pub confidence_percent: u8,
+    /// Number of acceptance criteria.
+    pub acceptance_criteria: usize,
+    /// Number of bounded acceptance slices.
+    pub acceptance_slices: usize,
+    /// Number of expected artifacts.
+    pub expected_artifacts: usize,
+    /// Number of likely files.
+    pub likely_files: usize,
+    /// Number of planned verification steps.
+    pub verify_steps: usize,
+    /// Number of planned run commands.
+    pub run_steps: usize,
+    /// Number of quality-floor criteria.
+    pub quality_floor_criteria: usize,
+    /// Number of assumptions made before execution.
+    pub assumptions: usize,
+    /// Number of unanswered clarification questions.
+    pub clarification_questions: usize,
+    /// Stable token/repair policy description.
+    pub token_policy: String,
+}
+
+impl PlanSummary {
+    /// Build a deterministic summary from a goal contract.
+    pub fn from_contract(contract: &GoalContract) -> Self {
+        let cap = contract
+            .token_policy
+            .first_attempt_cap_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "none".into());
+        let repair = if contract.token_policy.allow_broad_repair {
+            "broad-repair"
+        } else if contract.token_policy.repair_only_missing_criteria {
+            "missing-criteria-repair"
+        } else {
+            "repair-limited"
+        };
+        Self {
+            goal: contract.goal.clone(),
+            task_class: contract.task_class,
+            confidence_percent: contract.confidence_percent,
+            acceptance_criteria: contract.acceptance_criteria.len(),
+            acceptance_slices: contract.acceptance_slices.len(),
+            expected_artifacts: contract.expected_artifacts.len(),
+            likely_files: contract.likely_files.len(),
+            verify_steps: contract.verify_plan.len(),
+            run_steps: contract.run_plan.len(),
+            quality_floor_criteria: contract.quality_floor.criteria.len(),
+            assumptions: contract.assumptions.len(),
+            clarification_questions: contract.clarification_questions.len(),
+            token_policy: format!("first_attempt_cap={cap}; {repair}"),
+        }
+    }
+}
+
+/// Deterministic summary of work produced by a task.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkSummary {
+    /// Files changed.
+    pub files_changed: u32,
+    /// Added lines.
+    pub added_lines: u32,
+    /// Removed lines.
+    pub removed_lines: u32,
+    /// Generated artifact count.
+    pub generated_artifacts: usize,
+    /// Review action count.
+    pub review_actions: usize,
+    /// Rollback point count.
+    pub rollback_points: usize,
+    /// Known gap count.
+    pub known_gaps: usize,
+}
+
+/// Deterministic summary of verification evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationSummary {
+    /// Stable status label; "verified-by-checks" never means generally correct.
+    pub status: String,
+    /// Passed checks.
+    pub passed: usize,
+    /// Findings that require review.
+    pub findings: usize,
+    /// Skipped checks.
+    pub skipped: usize,
+    /// First few review-safe findings.
+    pub primary_findings: Vec<String>,
+}
+
+impl Default for VerificationSummary {
+    fn default() -> Self {
+        Self {
+            status: "unverified".into(),
+            passed: 0,
+            findings: 0,
+            skipped: 0,
+            primary_findings: Vec::new(),
+        }
+    }
+}
+
+impl VerificationSummary {
+    /// Build a deterministic summary from a verification report.
+    pub fn from_report(report: &VerifyReport) -> Self {
+        let status = if !report.findings.is_empty() {
+            "findings"
+        } else if !report.passed.is_empty() {
+            "verified-by-checks"
+        } else if !report.skipped.is_empty() {
+            "skipped"
+        } else {
+            "unverified"
+        };
+        Self {
+            status: status.into(),
+            passed: report.passed.len(),
+            findings: report.findings.len(),
+            skipped: report.skipped.len(),
+            primary_findings: report.findings.iter().take(3).cloned().collect(),
+        }
+    }
+}
+
+/// Deterministic failure summary for failed or partially verified runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureSummary {
+    /// Short primary issue to show in Problems/Receipt surfaces.
+    pub primary_issue: String,
+    /// Suggested next action derived from typed evidence.
+    pub next_action: String,
+}
+
+/// Deterministic token and cost-shape summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenSummary {
+    /// Provider-reported input tokens when known.
+    pub provider_input_tokens: u64,
+    /// Provider-reported output tokens when known.
+    pub provider_output_tokens: u64,
+    /// Provider-reported cached input tokens when known.
+    pub cached_tokens: u64,
+    /// Provider cache-creation tokens when known.
+    pub cache_creation_tokens: u64,
+    /// Total tokens used for budget accounting.
+    pub total_tokens: u64,
+    /// True if token usage is estimated.
+    pub estimated: bool,
+    /// Selected source code context tokens.
+    pub selected_code_tokens: u64,
+    /// Candidate code tokens intentionally omitted.
+    pub omitted_candidate_tokens: u64,
+    /// Retry diagnostic prompt tokens.
+    pub retry_diagnostic_tokens: u64,
+    /// Tokens removed by deduplication.
+    pub deduped_tokens: u64,
+}
+
+impl TokenSummary {
+    /// Build a token summary from provider usage and context attribution.
+    pub fn from_usage_and_context(usage: TokenUsage, context: &ContextManifest) -> Self {
+        Self {
+            provider_input_tokens: usage.input_tokens,
+            provider_output_tokens: usage.output_tokens,
+            cached_tokens: usage.cached_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            total_tokens: usage.budget_tokens(),
+            estimated: usage.estimated,
+            selected_code_tokens: context.buckets.selected_code_tokens,
+            omitted_candidate_tokens: context.buckets.omitted_candidate_tokens,
+            retry_diagnostic_tokens: context.buckets.retry_diagnostic_tokens,
+            deduped_tokens: context.buckets.deduped_tokens,
+        }
+    }
+}
+
+/// Deterministic summary of context and memory influence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSummary {
+    /// Total context sources.
+    pub source_count: usize,
+    /// Memory sources.
+    pub memory_sources: usize,
+    /// Index/code sources.
+    pub index_sources: usize,
+    /// Skill or steering sources.
+    pub skill_sources: usize,
+    /// MCP/tool sources.
+    pub tool_sources: usize,
+    /// Selected source code context tokens.
+    pub selected_code_tokens: u64,
+    /// Candidate code tokens intentionally omitted.
+    pub omitted_candidate_tokens: u64,
+    /// Persistent memory tokens.
+    pub memory_tokens: u64,
+    /// Artifact/attachment tokens.
+    pub artifact_tokens: u64,
+    /// Retry diagnostic tokens.
+    pub retry_diagnostic_tokens: u64,
+    /// MCP/tool output tokens.
+    pub tool_output_tokens: u64,
+}
+
+impl ContextSummary {
+    /// Build a context summary from the durable manifest.
+    pub fn from_manifest(manifest: &ContextManifest) -> Self {
+        let mut summary = Self {
+            source_count: manifest.sources.len(),
+            selected_code_tokens: manifest.buckets.selected_code_tokens,
+            omitted_candidate_tokens: manifest.buckets.omitted_candidate_tokens,
+            memory_tokens: manifest.buckets.memory_tokens,
+            artifact_tokens: manifest.buckets.artifact_tokens,
+            retry_diagnostic_tokens: manifest.buckets.retry_diagnostic_tokens,
+            tool_output_tokens: manifest.buckets.tool_output_tokens,
+            ..Self::default()
+        };
+        for source in &manifest.sources {
+            match source.kind.as_str() {
+                "memory" => summary.memory_sources += 1,
+                "index" | "code" | "semantic-index" => summary.index_sources += 1,
+                "skill" | "steering" => summary.skill_sources += 1,
+                "mcp" | "tool" => summary.tool_sources += 1,
+                _ => {}
+            }
+        }
+        summary
+    }
+}
+
+/// Deterministic summary of the handoff packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffSummary {
+    /// One-line result.
+    pub headline: String,
+    /// Files changed.
+    pub files_changed: u32,
+    /// Added lines.
+    pub added_lines: u32,
+    /// Removed lines.
+    pub removed_lines: u32,
+    /// Generated artifacts.
+    pub generated_artifacts: usize,
+    /// Run commands.
+    pub run_commands: usize,
+    /// Known gaps.
+    pub known_gaps: usize,
+    /// Review actions.
+    pub review_actions: usize,
+    /// Rollback points.
+    pub rollback_points: usize,
+}
+
+impl HandoffSummary {
+    /// Build a deterministic summary from a handoff packet.
+    pub fn from_handoff(handoff: &HandoffPacket) -> Self {
+        Self {
+            headline: handoff.headline.clone(),
+            files_changed: handoff.diff_stats.files_changed,
+            added_lines: handoff.diff_stats.added_lines,
+            removed_lines: handoff.diff_stats.removed_lines,
+            generated_artifacts: handoff.generated_artifacts.len(),
+            run_commands: handoff.run_commands.len(),
+            known_gaps: handoff.known_gaps.len(),
+            review_actions: handoff.review_actions.len(),
+            rollback_points: handoff.rollback_points.len(),
+        }
+    }
+}
+
+/// Deterministic summary bundle exported with proof/review/history data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeSummaries {
+    /// Plan/contract summary when a contract was accepted.
+    pub plan: Option<PlanSummary>,
+    /// Work summary derived from the handoff.
+    pub work: WorkSummary,
+    /// Verification evidence summary.
+    pub verification: VerificationSummary,
+    /// Failure or partial-verification summary when evidence requires attention.
+    pub failure: Option<FailureSummary>,
+    /// Token summary.
+    pub token: TokenSummary,
+    /// Context influence summary.
+    pub context: ContextSummary,
+    /// Handoff summary when a handoff exists.
+    pub handoff: Option<HandoffSummary>,
+}
+
+impl OutcomeSummaries {
+    /// Build deterministic summaries from typed task evidence.
+    pub fn from_evidence(
+        contract: Option<&GoalContract>,
+        context: &ContextManifest,
+        _permissions: &PermissionLedger,
+        verify_report: &VerifyReport,
+        handoff: Option<&HandoffPacket>,
+    ) -> Self {
+        let usage = handoff.map(|h| h.token_usage).unwrap_or_default();
+        let work = handoff
+            .map(|h| WorkSummary {
+                files_changed: h.diff_stats.files_changed,
+                added_lines: h.diff_stats.added_lines,
+                removed_lines: h.diff_stats.removed_lines,
+                generated_artifacts: h.generated_artifacts.len(),
+                review_actions: h.review_actions.len(),
+                rollback_points: h.rollback_points.len(),
+                known_gaps: h.known_gaps.len(),
+            })
+            .unwrap_or_default();
+        let failure = verify_report
+            .findings
+            .first()
+            .cloned()
+            .or_else(|| handoff.and_then(|h| h.known_gaps.first().cloned()))
+            .map(|primary_issue| FailureSummary {
+                primary_issue,
+                next_action:
+                    "Review the finding, run the listed verification command, then retry or repair."
+                        .into(),
+            });
+        Self {
+            plan: contract.map(PlanSummary::from_contract),
+            work,
+            verification: VerificationSummary::from_report(verify_report),
+            failure,
+            token: TokenSummary::from_usage_and_context(usage, context),
+            context: ContextSummary::from_manifest(context),
+            handoff: handoff.map(HandoffSummary::from_handoff),
+        }
+    }
+}
+
 /// Final benchmarkable run status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1776,6 +2116,9 @@ pub struct BenchmarkRunExport {
     pub cost_usd: f64,
     /// Context contribution by source.
     pub context_buckets: ContextBucketSummary,
+    /// Deterministic proof summaries derived from typed facts.
+    #[serde(default)]
+    pub summaries: OutcomeSummaries,
     /// Verification summary keyed by check name.
     pub verification: BTreeMap<String, String>,
     /// Quality gate summary keyed by gate name.
@@ -1803,6 +2146,9 @@ pub struct ProofBundleExport {
     pub verify_report: VerifyReport,
     /// Human-review handoff packet.
     pub handoff_packet: HandoffPacket,
+    /// Deterministic proof summaries derived from typed facts.
+    #[serde(default)]
+    pub summaries: OutcomeSummaries,
     /// Final status suitable for proof/benchmark consumers.
     pub final_status: BenchmarkFinalStatus,
 }
@@ -1820,6 +2166,9 @@ pub struct OutcomeLedger {
     pub permission_ledger: PermissionLedger,
     /// Verification report.
     pub verify_report: VerifyReport,
+    /// Deterministic summaries derived from typed facts.
+    #[serde(default)]
+    pub summaries: OutcomeSummaries,
     /// Handoff packet when available.
     pub handoff: Option<HandoffPacket>,
 }
@@ -1921,6 +2270,126 @@ mod tests {
         assert_eq!(value["buckets"]["selected_code_tokens"], 1200);
         assert_eq!(value["buckets"]["omitted_candidate_tokens"], 4300);
         assert_eq!(value["buckets"]["cached_tokens"], 70);
+    }
+
+    #[test]
+    fn outcome_summaries_are_deterministic_from_typed_evidence() {
+        let task_id = TaskId::new();
+        let contract = GoalContract {
+            goal: "make a web chess board".into(),
+            task_class: TaskClass::GeneratedAppGame,
+            intent: None,
+            confidence_percent: 82,
+            acceptance_criteria: vec!["render an 8x8 board".into(), "reset works".into()],
+            acceptance_slices: vec![AcceptanceSlice {
+                id: "board".into(),
+                criterion: "render an 8x8 board".into(),
+                artifact_path: Some(PathBuf::from("src/App.tsx")),
+                verify_plan: vec![VerifyStepSpec {
+                    name: "browser DOM check".into(),
+                    layer: Some(VerifyLayer::BrowserDomCheck),
+                    command: None,
+                }],
+            }],
+            expected_artifacts: vec![ExpectedArtifact {
+                path: Some(PathBuf::from("src/App.tsx")),
+                description: "React chess surface".into(),
+            }],
+            likely_files: vec![PathBuf::from("src/App.tsx")],
+            verify_plan: vec![VerifyStepSpec {
+                name: "npm run build".into(),
+                layer: Some(VerifyLayer::Test),
+                command: Some(RunCommand {
+                    label: "Build".into(),
+                    command: vec!["npm".into(), "run".into(), "build".into()],
+                    cwd: None,
+                }),
+            }],
+            run_plan: vec![RunCommand {
+                label: "Dev".into(),
+                command: vec!["npm".into(), "run".into(), "dev".into()],
+                cwd: None,
+            }],
+            quality_floor: QualityFloor {
+                criteria: vec!["No syntax-valid placeholders".into()],
+            },
+            clarification_questions: Vec::new(),
+            assumptions: vec!["Use the existing Vite stack".into()],
+            token_policy: TokenPolicy {
+                first_attempt_cap_tokens: Some(5_000),
+                allow_broad_repair: false,
+                repair_only_missing_criteria: true,
+                notes: vec!["Small acceptance slices".into()],
+            },
+        };
+        let mut context = ContextManifest::default();
+        context.sources.push(ContextSource {
+            kind: "index".into(),
+            id: "src/App.tsx".into(),
+            summary: "App component".into(),
+            token_count: Some(180),
+        });
+        context.buckets.selected_code_tokens = 180;
+        context.buckets.omitted_candidate_tokens = 2_000;
+        context.buckets.cached_tokens = 50;
+        let handoff = HandoffPacket {
+            task_id,
+            goal: contract.goal.clone(),
+            headline: "Review ready: 1 file, 1 verified subtask".into(),
+            changed_files: vec![ChangedFileSummary {
+                path: PathBuf::from("src/App.tsx"),
+                added_lines: 20,
+                removed_lines: 2,
+                summary: "board UI".into(),
+            }],
+            generated_artifacts: Vec::new(),
+            diff_stats: DiffStats {
+                files_changed: 1,
+                added_lines: 20,
+                removed_lines: 2,
+            },
+            verification: VerifyReport {
+                passed: vec!["npm run build".into()],
+                findings: vec!["Runtime/browser verification was planned but not recorded.".into()],
+                skipped: Vec::new(),
+            },
+            run_commands: contract.run_plan.clone(),
+            known_gaps: vec!["Runtime/browser verification was planned but not recorded.".into()],
+            review_actions: Vec::new(),
+            rollback_points: Vec::new(),
+            token_usage: TokenUsage {
+                input_tokens: 1_000,
+                output_tokens: 300,
+                cached_tokens: 50,
+                cache_creation_tokens: 0,
+                estimated: false,
+            },
+            influence: InfluenceSummary {
+                index_slices: vec!["src/App.tsx :: App".into()],
+                ..InfluenceSummary::default()
+            },
+        };
+
+        let summaries = OutcomeSummaries::from_evidence(
+            Some(&contract),
+            &context,
+            &PermissionLedger::default(),
+            &handoff.verification,
+            Some(&handoff),
+        );
+
+        assert_eq!(summaries.plan.as_ref().unwrap().acceptance_criteria, 2);
+        assert_eq!(summaries.plan.as_ref().unwrap().confidence_percent, 82);
+        assert_eq!(summaries.context.source_count, 1);
+        assert_eq!(summaries.context.selected_code_tokens, 180);
+        assert_eq!(summaries.token.provider_input_tokens, 1_000);
+        assert_eq!(summaries.token.cached_tokens, 50);
+        assert_eq!(summaries.handoff.as_ref().unwrap().files_changed, 1);
+        assert_eq!(summaries.verification.findings, 1);
+        assert_eq!(
+            summaries.failure.as_ref().unwrap().primary_issue,
+            "Runtime/browser verification was planned but not recorded."
+        );
     }
 
     #[test]

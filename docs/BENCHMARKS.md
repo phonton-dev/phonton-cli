@@ -87,6 +87,8 @@ The export refuses estimated-token ledgers. Benchmark exports require
 provider-reported input/output/cache tokens so `verified_success_per_10k_tokens`
 does not mix estimates with billing-source token usage.
 
+v0.15.0 adds richer proof inputs for future end-to-end benchmark runs. OutcomeLedger records now include deterministic summary bundles, context bucket evidence, selected index sources, permission records, command-run evidence, verification findings, and HandoffPacket known gaps. These records make a run easier to audit, but they still do not prove token savings or quality by themselves.
+
 Inspect source-attributed prompt/context buckets for the latest run:
 
 ```powershell

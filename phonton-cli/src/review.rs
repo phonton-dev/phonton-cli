@@ -11,8 +11,9 @@ use anyhow::Result;
 use phonton_diff::DiffApplier;
 use phonton_store::TaskRecord;
 use phonton_types::{
-    ContextAttribution, CostSummary, DiffHunk, DiffLine, EventRecord, HandoffPacket,
-    OrchestratorEvent, TaskId, TaskStatus, TokenUsage,
+    ContextAttribution, ContextManifest, CostSummary, DiffHunk, DiffLine, EventRecord,
+    HandoffPacket, OrchestratorEvent, OutcomeSummaries, PermissionLedger, TaskId, TaskStatus,
+    TokenUsage,
 };
 use serde::Serialize;
 
@@ -46,6 +47,9 @@ struct ReviewReport {
     status: serde_json::Value,
     total_tokens: u64,
     handoff: Option<HandoffPacket>,
+    context_manifest: ContextManifest,
+    permission_ledger: PermissionLedger,
+    summaries: OutcomeSummaries,
     checkpoints: Vec<CheckpointItem>,
     review_items: Vec<ReviewItem>,
     diagnostics: Vec<String>,
@@ -470,12 +474,39 @@ fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
         }
     }
 
+    let ledger = task.outcome_ledger.as_ref();
+    let context_manifest = ledger
+        .map(|ledger| ledger.context_manifest.clone())
+        .unwrap_or_default();
+    let permission_ledger = ledger
+        .map(|ledger| ledger.permission_ledger.clone())
+        .unwrap_or_default();
+    let verify_report = ledger
+        .map(|ledger| ledger.verify_report.clone())
+        .unwrap_or_default();
+    let handoff = ledger.and_then(|ledger| ledger.handoff.clone());
+    let summaries = ledger
+        .map(|ledger| ledger.summaries.clone())
+        .filter(|summaries| summaries != &OutcomeSummaries::default())
+        .unwrap_or_else(|| {
+            OutcomeSummaries::from_evidence(
+                ledger.and_then(|ledger| ledger.goal_contract.as_ref()),
+                &context_manifest,
+                &permission_ledger,
+                &verify_report,
+                handoff.as_ref(),
+            )
+        });
+
     ReviewReport {
         task_id: task.id.to_string(),
         goal: task.goal_text,
         status: task.status,
         total_tokens: task.total_tokens,
-        handoff: task.outcome_ledger.and_then(|ledger| ledger.handoff),
+        handoff,
+        context_manifest,
+        permission_ledger,
+        summaries,
         checkpoints,
         review_items,
         diagnostics,
@@ -988,6 +1019,7 @@ mod tests {
                     findings: Vec::new(),
                     skipped: Vec::new(),
                 },
+                summaries: phonton_types::OutcomeSummaries::default(),
                 handoff: Some(HandoffPacket {
                     task_id,
                     goal: "add validation".into(),
@@ -1043,5 +1075,82 @@ mod tests {
         assert!(markdown.contains("## Run Commands"));
         assert!(markdown.contains("## Known Gaps"));
         assert!(markdown.contains("## Influence And Memory"));
+    }
+
+    #[test]
+    fn json_report_exposes_proof_summaries_context_and_permissions() {
+        let task_id = TaskId::new();
+        let mut context_manifest = phonton_types::ContextManifest::default();
+        context_manifest.sources.push(phonton_types::ContextSource {
+            kind: "index".into(),
+            id: "src/lib.rs".into(),
+            summary: "selected helper".into(),
+            token_count: Some(42),
+        });
+        context_manifest.buckets.selected_code_tokens = 42;
+        let permission_ledger = phonton_types::PermissionLedger {
+            records: vec![phonton_types::PermissionRecord {
+                action: "mcp".into(),
+                scope: "fixture.read_context".into(),
+                approved: true,
+                decision: "approved by workspace trust".into(),
+            }],
+        };
+        let verify_report = phonton_types::VerifyReport {
+            passed: vec!["cargo test".into()],
+            findings: Vec::new(),
+            skipped: Vec::new(),
+        };
+        let handoff = HandoffPacket {
+            task_id,
+            goal: "add helper".into(),
+            headline: "Review ready: helper added".into(),
+            changed_files: vec![phonton_types::ChangedFileSummary {
+                path: "src/lib.rs".into(),
+                added_lines: 3,
+                removed_lines: 0,
+                summary: "helper".into(),
+            }],
+            generated_artifacts: Vec::new(),
+            diff_stats: phonton_types::DiffStats {
+                files_changed: 1,
+                added_lines: 3,
+                removed_lines: 0,
+            },
+            verification: verify_report.clone(),
+            run_commands: Vec::new(),
+            known_gaps: Vec::new(),
+            review_actions: Vec::new(),
+            rollback_points: Vec::new(),
+            token_usage: TokenUsage::estimated(99),
+            influence: phonton_types::InfluenceSummary::default(),
+        };
+        let task = TaskRecord {
+            id: task_id,
+            goal_text: "add helper".into(),
+            status: serde_json::json!({"Reviewing": {"tokens_used": 99}}),
+            created_at: 1,
+            total_tokens: 99,
+            outcome_ledger: Some(phonton_types::OutcomeLedger {
+                task_id,
+                goal_contract: None,
+                context_manifest,
+                permission_ledger,
+                verify_report,
+                summaries: phonton_types::OutcomeSummaries::default(),
+                handoff: Some(handoff),
+            }),
+        };
+
+        let report = build_report(task, Vec::new());
+        let value = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(value["context_manifest"]["sources"][0]["id"], "src/lib.rs");
+        assert_eq!(
+            value["permission_ledger"]["records"][0]["scope"],
+            "fixture.read_context"
+        );
+        assert_eq!(value["summaries"]["context"]["source_count"], 1);
+        assert_eq!(value["summaries"]["handoff"]["files_changed"], 1);
     }
 }

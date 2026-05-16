@@ -4,6 +4,25 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.15.0 - Summary-First Proof Candidate
+
+### Added
+
+- Added deterministic proof summary types for Plan, Work, Verification, Failure, Token, Context, and Handoff evidence. These summaries are derived from typed GoalContract, OutcomeLedger, ContextManifest, PermissionLedger, VerifyReport, and HandoffPacket data instead of another model call.
+- Expanded the Active panel focus cycle to Plan, Receipt, Problems, Code, Commands, Context, Tokens, and Log so broad work, context influence, and token spend are visible from the main TUI surface.
+- `phonton proof export --latest --format json`, `phonton review --json latest`, and benchmark export now expose deterministic summary bundles alongside the underlying typed evidence.
+- Added `/plan <goal>` and `/approve` in the TUI so broad work can be previewed as a GoalContract before execution.
+
+### Changed
+
+- OutcomeLedger persistence now carries context bucket evidence, selected index slices, MCP permission records, command-run evidence, and derived summaries for history, review, proof export, and future benchmark exports.
+- Runtime/browser verification plans that do not produce runtime proof now become explicit verification findings and known gaps in the HandoffPacket instead of being implied as successful by syntax/build/test checks.
+- `phonton run latest` records sandboxed command execution evidence back into the task PermissionLedger, including command, cwd, exit status, and duration.
+
+### Notes
+
+- v0.15.0 does not publish a numeric token-savings or competitor-superiority claim. Token-efficiency work is exposed through manifests, buckets, summaries, and tests; public efficiency claims still require reproducible benchmark artifacts.
+
 ## 0.14.1 - Generated Web Failure Diagnostics
 
 ### Fixed

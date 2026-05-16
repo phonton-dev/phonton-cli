@@ -82,8 +82,8 @@ use crossterm::terminal::{
 use focus::{
     append_code_focus_lines, append_command_run_lines, append_focus_tabs, append_log_focus_lines,
     append_problems_focus_lines, code_focus_text, commands_focus_text, compact_problem_diagnostics,
-    focused_file_count, goal_failure_kind, log_focus_text, problem_diagnostics,
-    problems_focus_text, receipt_focus_text,
+    context_focus_text, focused_file_count, goal_failure_kind, log_focus_text, plan_focus_text,
+    problem_diagnostics, problems_focus_text, receipt_focus_text, tokens_focus_text,
 };
 use phonton_diff::DiffApplier;
 use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions, ExtensionSet};
@@ -98,13 +98,13 @@ use phonton_providers::{
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
-    BudgetLimits, ContextManifest, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId,
-    GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
-    OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PermissionMode,
-    PlannerOutput, PromptAttachment, PromptAttachmentKind, PromptContextManifest,
-    ProviderConfig as ApiProviderConfig, ProviderKind, SessionGoalSnapshot, SessionSnapshot,
-    SessionTotals, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus,
-    TokenUsage, VerifyLayer, VerifyResult,
+    BudgetLimits, ContextManifest, ContextSource, CoverageSummary, DiffHunk, DiffLine, EventRecord,
+    ExtensionId, GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier,
+    OrchestratorEvent, OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger,
+    PermissionMode, PermissionRecord, PlannerOutput, PromptAttachment, PromptAttachmentKind,
+    PromptContextManifest, ProviderConfig as ApiProviderConfig, ProviderKind, SessionGoalSnapshot,
+    SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
+    TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use prompt_buffer::PromptBuffer;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -553,6 +553,8 @@ pub struct GoalEntry {
     pub task_id: TaskId,
     /// Every [`EventRecord`] observed for this goal, oldest first.
     pub flight_log: Vec<EventRecord>,
+    /// True when this row is a TUI plan preview waiting for `/approve`.
+    pub plan_preview: bool,
     /// Index into `state.checkpoints` the user is hovering over in the
     /// checkpoint picker. `None` when the picker has no focus.
     pub checkpoint_cursor: Option<usize>,
@@ -596,6 +598,19 @@ impl GoalEntry {
             state: None,
             task_id: TaskId::new(),
             flight_log: Vec::new(),
+            plan_preview: false,
+            checkpoint_cursor: None,
+        }
+    }
+
+    fn new_plan_preview(description: String) -> Self {
+        Self {
+            description,
+            status: TaskStatus::Planning,
+            state: None,
+            task_id: TaskId::new(),
+            flight_log: Vec::new(),
+            plan_preview: true,
             checkpoint_cursor: None,
         }
     }
@@ -784,6 +799,22 @@ impl App {
                 self.ask_pending = true;
                 Some(Intent::Ask(question))
             }
+            SlashAction::PreviewPlan(goal) => {
+                let entry = GoalEntry::new_plan_preview(goal.clone());
+                let task_id = entry.task_id;
+                self.goals.insert(0, entry);
+                self.selected = 0;
+                self.focus_view = FocusView::Plan;
+                self.focus_scroll = 0;
+                self.command_notice =
+                    Some("Plan preview requested. Review Plan, then /approve to execute.".into());
+                Some(Intent::PreviewPlan {
+                    goal_index: 0,
+                    task_id,
+                    text: goal,
+                })
+            }
+            SlashAction::ApprovePlan => self.approve_selected_plan_intent(),
             SlashAction::OpenSettings | SlashAction::ManageModel => {
                 self.mode = Mode::Settings;
                 None
@@ -1226,6 +1257,33 @@ impl App {
         Some(Intent::QueueGoal(prompt))
     }
 
+    fn approve_selected_plan_intent(&mut self) -> Option<Intent> {
+        let selected = self.selected;
+        let (task_id, text) = {
+            let Some(goal) = self.goals.get_mut(selected) else {
+                self.command_notice = Some("No selected plan preview to approve.".into());
+                return None;
+            };
+            if !goal.plan_preview {
+                self.command_notice =
+                    Some("Selected goal is not a plan preview. Use /plan <goal> first.".into());
+                return None;
+            }
+            goal.plan_preview = false;
+            goal.status = TaskStatus::Queued;
+            goal.state = None;
+            (goal.task_id, goal.description.clone())
+        };
+        self.focus_view = FocusView::Plan;
+        self.focus_scroll = 0;
+        self.command_notice = Some("Plan approved; execution queued.".into());
+        Some(Intent::ApprovePlan {
+            goal_index: selected,
+            task_id,
+            text,
+        })
+    }
+
     fn selected_goal_can_be_controlled(&self) -> bool {
         self.goals
             .get(self.selected)
@@ -1321,6 +1379,7 @@ impl App {
                 state: goal.state,
                 task_id: goal.task_id,
                 flight_log: goal.flight_log,
+                plan_preview: false,
                 checkpoint_cursor: None,
             })
             .collect();
@@ -1576,15 +1635,19 @@ impl App {
             self.focus_view = FocusView::Problems;
             self.focus_scroll = 0;
         }
+        if index == self.selected
+            && matches!(
+                self.goals.get(index).map(|g| &g.status),
+                Some(TaskStatus::NeedsClarification { .. })
+            )
+        {
+            self.focus_view = FocusView::Plan;
+            self.focus_scroll = 0;
+        }
     }
 
     /// Append a flight-log event to the goal at `index`.
     pub fn apply_event(&mut self, index: usize, event: EventRecord) {
-        let should_default_code_focus = index == self.selected
-            && matches!(
-                &event.event,
-                OrchestratorEvent::SubtaskReviewReady { diff_hunks, .. } if !diff_hunks.is_empty()
-            );
         let should_default_problems_focus = index == self.selected
             && matches!(
                 &event.event,
@@ -1599,10 +1662,6 @@ impl App {
         if should_default_problems_focus {
             self.focus_view = FocusView::Problems;
             self.focus_scroll = 0;
-            return;
-        }
-        if should_default_code_focus && self.focus_view == FocusView::Receipt {
-            self.focus_view = FocusView::Code;
         }
     }
 
@@ -1622,12 +1681,15 @@ impl App {
             return "Phonton\nNo goal selected.".into();
         };
         match self.active_focus_view_for_current_goal() {
+            FocusView::Plan => plan_focus_text(goal),
             FocusView::Receipt => receipt_focus_text(goal),
             FocusView::Problems => problems_focus_text(goal, self.focused_changed_file),
             FocusView::Code => code_focus_text(goal, self.focused_changed_file),
             FocusView::Commands => {
                 commands_focus_text(&self.command_runs, self.focused_command_run)
             }
+            FocusView::Context => context_focus_text(goal),
+            FocusView::Tokens => tokens_focus_text(goal),
             FocusView::Log => log_focus_text(goal),
         }
     }
@@ -1641,7 +1703,7 @@ impl App {
         self.selected = self.selected.saturating_sub(1);
         self.focus_scroll = 0;
         self.clamp_focus_indices();
-        self.default_to_code_focus_for_reviewable_goal();
+        self.default_focus_for_selected_goal();
     }
 
     fn next_goal(&mut self) {
@@ -1650,7 +1712,7 @@ impl App {
         }
         self.focus_scroll = 0;
         self.clamp_focus_indices();
-        self.default_to_code_focus_for_reviewable_goal();
+        self.default_focus_for_selected_goal();
     }
 
     fn jump_to_goal_number(&mut self, number: usize) {
@@ -1658,7 +1720,7 @@ impl App {
             self.selected = number - 1;
             self.focus_scroll = 0;
             self.clamp_focus_indices();
-            self.default_to_code_focus_for_reviewable_goal();
+            self.default_focus_for_selected_goal();
         }
     }
 
@@ -1670,19 +1732,12 @@ impl App {
             .min(self.command_runs.len().saturating_sub(1));
     }
 
-    fn default_to_code_focus_for_reviewable_goal(&mut self) {
+    fn default_focus_for_selected_goal(&mut self) {
         if self
             .current_goal()
             .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
         {
             self.focus_view = FocusView::Problems;
-            self.focus_scroll = 0;
-            return;
-        }
-        if self.focus_view == FocusView::Receipt
-            && self.current_goal().map(focused_file_count).unwrap_or(0) > 0
-        {
-            self.focus_view = FocusView::Code;
             self.focus_scroll = 0;
         }
     }
@@ -2157,7 +2212,7 @@ impl App {
                 if let Some(goal_index) = filtered.get(self.goal_switcher.selected).copied() {
                     self.selected = goal_index;
                     self.clamp_focus_indices();
-                    self.default_to_code_focus_for_reviewable_goal();
+                    self.default_focus_for_selected_goal();
                 }
                 self.goal_switcher.open = false;
             }
@@ -2782,6 +2837,18 @@ pub enum Intent {
     QueueGoal(String),
     /// User submitted a direct single subtask. Skips planner decomposition.
     QueueTask(String),
+    /// User requested a TUI plan preview without executing workers.
+    PreviewPlan {
+        goal_index: usize,
+        task_id: TaskId,
+        text: String,
+    },
+    /// User approved a selected TUI plan preview for execution.
+    ApprovePlan {
+        goal_index: usize,
+        task_id: TaskId,
+        text: String,
+    },
     /// User submitted an ask-mode question. Isolated from goal context.
     Ask(String),
     /// User submitted `/run <cmd>` or `!<cmd>` from the prompt bar.
@@ -3077,6 +3144,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
             "inspect memories that can influence future tasks",
         ),
         ("/review", "use `phonton review latest` outside the TUI"),
+        ("/plan", "preview a GoalContract before execution"),
+        ("/approve", "execute the selected plan preview"),
+        ("/context", "show prompt context usage and token sections"),
+        ("/compact-context", "compact active worker context"),
         ("/problems", "inspect verifier failures and repair hints"),
         ("/retry", "repair the selected failed goal with diagnostics"),
         ("/why-tokens", "explain latest prompt token buckets"),
@@ -4122,6 +4193,14 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
 
         append_focus_tabs(&mut lines, app.active_focus_view_for_current_goal());
         match app.active_focus_view_for_current_goal() {
+            FocusView::Plan => {
+                for line in plan_focus_text(g).lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
             FocusView::Receipt => {
                 if let Some(handoff) = &state.handoff_packet {
                     append_handoff_lines(&mut lines, handoff);
@@ -4138,6 +4217,22 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             FocusView::Code => append_code_focus_lines(&mut lines, g, app.focused_changed_file),
             FocusView::Commands => {
                 append_command_run_lines(&mut lines, &app.command_runs, app.focused_command_run)
+            }
+            FocusView::Context => {
+                for line in context_focus_text(g).lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
+            FocusView::Tokens => {
+                for line in tokens_focus_text(g).lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::White),
+                    )));
+                }
             }
             FocusView::Log => append_log_focus_lines(&mut lines, g),
         }
@@ -6244,8 +6339,9 @@ fn print_help() {
          ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
          \n\
          TUI SLASH COMMANDS:\n  \
-         /settings, /config, /status, /context, /compact, /compress,\n  \
+         /settings, /config, /status, /context, /compact, /compact-context, /compress,\n  \
          /problems, /diagnostics, /retry, /repair, /why-tokens, /ask <question>,\n  \
+         /plan <goal>, /approve,\n  \
          /goals, /switch, /focus <view>, /diff, /code, /copy, /rerun, /stats, /stop,\n  \
          /review, /memory, /permissions set <mode>, /trust, /model set <name>,\n  \
          /commands, /run <cmd>, and !<cmd>\n\
@@ -7081,6 +7177,54 @@ async fn run_app<B: Backend>(
                                 });
                             }
                         }
+                        Intent::PreviewPlan {
+                            goal_index,
+                            task_id,
+                            text,
+                        } => {
+                            let tx_goal = tx.clone();
+                            let store_goal = Arc::clone(&store);
+                            let working_dir_goal = working_dir.clone();
+                            tokio::spawn(async move {
+                                preview_goal_plan(
+                                    goal_index,
+                                    task_id,
+                                    text,
+                                    tx_goal,
+                                    store_goal,
+                                    working_dir_goal,
+                                )
+                                .await;
+                            });
+                        }
+                        Intent::ApprovePlan {
+                            goal_index,
+                            task_id,
+                            text,
+                        } => {
+                            apply_settings_to_config(&app.settings, &mut cfg);
+                            let tx_goal = tx.clone();
+                            let store_goal = Arc::clone(&store);
+                            let sandbox_goal = Arc::clone(&sandbox);
+                            let controls_goal = Arc::clone(&controls);
+                            let cfg_goal = cfg.clone();
+                            let working_dir_goal = working_dir.clone();
+                            tokio::spawn(async move {
+                                spawn_goal(
+                                    goal_index,
+                                    task_id,
+                                    text,
+                                    false,
+                                    tx_goal,
+                                    store_goal,
+                                    sandbox_goal,
+                                    controls_goal,
+                                    cfg_goal,
+                                    working_dir_goal,
+                                )
+                                .await;
+                            });
+                        }
                         Intent::QueueGoal(text) | Intent::QueueTask(text) => {
                             let direct_task = app.mode == Mode::Task;
                             // `handle_key` inserts the goal at index 0.
@@ -7789,14 +7933,83 @@ fn mime_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<OutcomeLedger> {
+#[derive(Debug, Clone, Default)]
+struct LedgerEvidence {
+    context_manifest: ContextManifest,
+    permission_ledger: PermissionLedger,
+}
+
+impl LedgerEvidence {
+    fn apply_event(&mut self, record: &EventRecord) {
+        match &record.event {
+            OrchestratorEvent::ContextSelected { slices, .. } => {
+                for slice in slices {
+                    self.context_manifest.sources.push(ContextSource {
+                        kind: "index".into(),
+                        id: slice.file_path.display().to_string(),
+                        summary: if slice.symbol_name.is_empty() {
+                            "selected code context".into()
+                        } else {
+                            format!("{} ({:?})", slice.symbol_name, slice.origin)
+                        },
+                        token_count: Some(slice.token_count as u64),
+                    });
+                }
+            }
+            OrchestratorEvent::PromptManifest { manifest, .. } => {
+                self.context_manifest.buckets.add_prompt_manifest(manifest);
+            }
+            OrchestratorEvent::McpToolApproved {
+                server_id,
+                tool_name,
+            } => self.permission_ledger.records.push(PermissionRecord {
+                action: "mcp".into(),
+                scope: format!("{server_id}.{tool_name}"),
+                approved: true,
+                decision: "approved by workspace trust or user approval".into(),
+            }),
+            OrchestratorEvent::McpToolDenied {
+                server_id,
+                tool_name,
+                reason,
+            } => self.permission_ledger.records.push(PermissionRecord {
+                action: "mcp".into(),
+                scope: format!("{server_id}.{tool_name}"),
+                approved: false,
+                decision: reason.clone(),
+            }),
+            _ => {}
+        }
+    }
+}
+
+fn outcome_ledger_from_state_with_evidence(
+    task_id: TaskId,
+    state: &GlobalState,
+    evidence: &LedgerEvidence,
+) -> Option<OutcomeLedger> {
     let handoff = state.handoff_packet.clone()?;
+    let mut context_manifest = evidence.context_manifest.clone();
+    let permission_ledger = evidence.permission_ledger.clone();
+    context_manifest.buckets.cached_tokens = context_manifest
+        .buckets
+        .cached_tokens
+        .saturating_add(handoff.token_usage.cached_tokens);
+    let verify_report = handoff.verification.clone();
+    let summaries = phonton_types::OutcomeSummaries::from_evidence(
+        state.goal_contract.as_ref(),
+        &context_manifest,
+        &permission_ledger,
+        &verify_report,
+        Some(&handoff),
+    );
     Some(OutcomeLedger {
         task_id,
         goal_contract: state.goal_contract.clone(),
-        context_manifest: ContextManifest::default(),
-        permission_ledger: PermissionLedger::default(),
-        verify_report: handoff.verification.clone(),
+        context_manifest,
+        permission_ledger,
+        verify_report,
+        summaries,
         handoff: Some(handoff),
     })
 }
@@ -7812,6 +8025,66 @@ fn state_for_plan_status(plan: &PlannerOutput, task_status: TaskStatus) -> Globa
         estimated_naive_tokens: plan.naive_baseline_tokens,
         checkpoints: Vec::new(),
     }
+}
+
+async fn preview_goal_plan(
+    goal_index: usize,
+    task_id: TaskId,
+    text: String,
+    tx: mpsc::Sender<LoopEvent>,
+    store: Arc<std::sync::Mutex<Store>>,
+    working_dir: std::path::PathBuf,
+) {
+    let attachments = prepare_goal_attachments(&text, &working_dir);
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
+    }
+
+    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(&store)).await;
+    let goal = Goal::new(text.clone()).with_attachments(attachments);
+    let plan_result = decompose_with_memory_store(&goal, &memory_store).await;
+    let mut plan = match plan_result {
+        Ok(plan) => plan,
+        Err(err) => {
+            let failed = GlobalState {
+                task_status: TaskStatus::Failed {
+                    reason: format!("plan preview failed: {err}"),
+                    failed_subtask: None,
+                },
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: None,
+                estimated_naive_tokens: 0,
+                checkpoints: Vec::new(),
+            };
+            if let Ok(g) = store.lock() {
+                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+            }
+            let _ = tx
+                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
+                .await;
+            return;
+        }
+    };
+    apply_workspace_preflight(&mut plan, &working_dir, &text);
+
+    let preview_state = state_for_plan_status(
+        &plan,
+        TaskStatus::NeedsClarification {
+            questions: vec![
+                "Plan preview only. Review the Plan focus, then run /approve to execute or /delete to discard."
+                    .into(),
+            ],
+        },
+    );
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(task_id, &text, &preview_state.task_status, 0);
+    }
+    let _ = tx
+        .send(LoopEvent::StateUpdate(goal_index, Box::new(preview_state)))
+        .await;
 }
 
 async fn spawn_goal(
@@ -8093,12 +8366,24 @@ async fn spawn_goal(
     }
 
     // Drive the orchestrator and forward every `GlobalState` update.
+    let ledger_evidence = Arc::new(std::sync::Mutex::new(LedgerEvidence::default()));
+    let latest_state_for_ledger = Arc::new(std::sync::Mutex::new(None::<GlobalState>));
     let tx_updates = tx.clone();
     let store_for_states = store.clone();
     let goal_text_for_states = text.clone();
+    let evidence_for_states = Arc::clone(&ledger_evidence);
+    let latest_state_for_states = Arc::clone(&latest_state_for_ledger);
     tokio::spawn(async move {
         while state_rx.changed().await.is_ok() {
             let s = state_rx.borrow().clone();
+            if let Ok(mut latest) = latest_state_for_states.lock() {
+                *latest = Some(s.clone());
+            }
+            let evidence = evidence_for_states
+                .lock()
+                .map(|e| e.clone())
+                .unwrap_or_default();
+            let ledger = outcome_ledger_from_state_with_evidence(task_id, &s, &evidence);
             if let Ok(g) = store_for_states.lock() {
                 let _ = g.upsert_task(
                     task_id,
@@ -8106,7 +8391,7 @@ async fn spawn_goal(
                     &s.task_status,
                     s.tokens_used,
                 );
-                if let Some(ledger) = outcome_ledger_from_state(task_id, &s) {
+                if let Some(ledger) = ledger {
                     let _ = g.upsert_outcome_ledger(&ledger);
                 }
             }
@@ -8122,10 +8407,32 @@ async fn spawn_goal(
 
     // Forward events to the TUI Flight Log.
     let tx_events = tx.clone();
+    let evidence_for_events = Arc::clone(&ledger_evidence);
+    let latest_state_for_events = Arc::clone(&latest_state_for_ledger);
+    let store_for_events = store.clone();
     tokio::spawn(async move {
         loop {
             match event_rx_ui.recv().await {
                 Ok(rec) => {
+                    let evidence = if let Ok(mut evidence) = evidence_for_events.lock() {
+                        evidence.apply_event(&rec);
+                        evidence.clone()
+                    } else {
+                        LedgerEvidence::default()
+                    };
+                    let latest_state = latest_state_for_events
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.clone());
+                    if let Some(state) = latest_state {
+                        if let Some(ledger) =
+                            outcome_ledger_from_state_with_evidence(task_id, &state, &evidence)
+                        {
+                            if let Ok(g) = store_for_events.lock() {
+                                let _ = g.upsert_outcome_ledger(&ledger);
+                            }
+                        }
+                    }
                     if tx_events
                         .send(LoopEvent::FlightEvent(goal_index, rec))
                         .await
@@ -8383,6 +8690,134 @@ mod tests {
             estimated_naive_tokens: 1000,
             checkpoints: Vec::new(),
         }
+    }
+
+    #[test]
+    fn ledger_evidence_records_prompt_context_and_mcp_permissions() {
+        let subtask_id = SubtaskId::new();
+        let mut evidence = LedgerEvidence::default();
+        evidence.apply_event(&EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 1,
+            event: OrchestratorEvent::ContextSelected {
+                subtask_id,
+                slices: vec![phonton_types::ContextAttribution {
+                    file_path: PathBuf::from("src/lib.rs"),
+                    symbol_name: "foo".into(),
+                    origin: phonton_types::SliceOrigin::Semantic,
+                    token_count: 42,
+                }],
+                total_token_count: 42,
+            },
+        });
+        evidence.apply_event(&EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 2,
+            event: OrchestratorEvent::PromptManifest {
+                subtask_id,
+                manifest: PromptContextManifest {
+                    system_tokens: 10,
+                    user_goal_tokens: 6,
+                    code_context_tokens: 42,
+                    omitted_code_tokens: 200,
+                    total_estimated_tokens: 58,
+                    ..PromptContextManifest::default()
+                },
+            },
+        });
+        evidence.apply_event(&EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 3,
+            event: OrchestratorEvent::McpToolApproved {
+                server_id: ExtensionId::new("docs"),
+                tool_name: "read_context".into(),
+            },
+        });
+
+        assert_eq!(evidence.context_manifest.sources.len(), 1);
+        assert_eq!(evidence.context_manifest.sources[0].id, "src/lib.rs");
+        assert_eq!(evidence.context_manifest.buckets.selected_code_tokens, 42);
+        assert_eq!(
+            evidence.context_manifest.buckets.omitted_candidate_tokens,
+            200
+        );
+        assert_eq!(evidence.permission_ledger.records.len(), 1);
+        assert_eq!(
+            evidence.permission_ledger.records[0].scope,
+            "docs.read_context"
+        );
+        assert!(evidence.permission_ledger.records[0].approved);
+    }
+
+    #[test]
+    fn outcome_ledger_can_refresh_after_evidence_arrives_after_handoff() {
+        let task_id = TaskId::new();
+        let subtask_id = SubtaskId::new();
+        let state = GlobalState {
+            task_status: TaskStatus::Reviewing {
+                tokens_used: 12,
+                estimated_savings_tokens: 88,
+            },
+            goal_contract: None,
+            handoff_packet: Some(HandoffPacket {
+                task_id,
+                goal: "record context proof".into(),
+                headline: "Review ready: 1 file(s), 1 verified subtask(s)".into(),
+                changed_files: vec![phonton_types::ChangedFileSummary {
+                    path: PathBuf::from("src/lib.rs"),
+                    added_lines: 1,
+                    removed_lines: 0,
+                    summary: "updated proof ledger".into(),
+                }],
+                generated_artifacts: Vec::new(),
+                diff_stats: phonton_types::DiffStats {
+                    files_changed: 1,
+                    added_lines: 1,
+                    removed_lines: 0,
+                },
+                verification: phonton_types::VerifyReport {
+                    passed: vec!["cargo test".into()],
+                    findings: Vec::new(),
+                    skipped: Vec::new(),
+                },
+                run_commands: Vec::new(),
+                known_gaps: Vec::new(),
+                review_actions: Vec::new(),
+                rollback_points: Vec::new(),
+                token_usage: TokenUsage::estimated(12),
+                influence: phonton_types::InfluenceSummary::default(),
+            }),
+            active_workers: Vec::new(),
+            tokens_used: 12,
+            tokens_budget: None,
+            estimated_naive_tokens: 100,
+            checkpoints: Vec::new(),
+        };
+        let mut evidence = LedgerEvidence::default();
+        let initial = outcome_ledger_from_state_with_evidence(task_id, &state, &evidence)
+            .expect("handoff state should produce a ledger");
+        assert!(initial.context_manifest.sources.is_empty());
+
+        evidence.apply_event(&EventRecord {
+            task_id,
+            timestamp_ms: 1,
+            event: OrchestratorEvent::ContextSelected {
+                subtask_id,
+                slices: vec![phonton_types::ContextAttribution {
+                    file_path: PathBuf::from("src/lib.rs"),
+                    symbol_name: "ledger_refresh".into(),
+                    origin: phonton_types::SliceOrigin::Semantic,
+                    token_count: 12,
+                }],
+                total_token_count: 12,
+            },
+        });
+        let refreshed = outcome_ledger_from_state_with_evidence(task_id, &state, &evidence)
+            .expect("handoff state should refresh a ledger");
+
+        assert_eq!(refreshed.context_manifest.sources.len(), 1);
+        assert_eq!(refreshed.context_manifest.sources[0].id, "src/lib.rs");
+        assert_eq!(refreshed.summaries.context.index_sources, 1);
     }
 
     #[derive(Clone, Default)]
@@ -9539,14 +9974,69 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn focus_defaults_to_code_for_review_hunks_and_can_cycle() {
+    fn review_hunks_default_to_receipt_and_can_cycle_focus() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
         app.apply_event(0, review_ready_event("chess.py"));
 
-        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Code);
+        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Receipt);
         app.handle_key(key('f'));
-        assert_eq!(app.focus_view, FocusView::Commands);
+        assert_eq!(app.focus_view, FocusView::Problems);
+    }
+
+    #[test]
+    fn slash_plan_preview_requires_approval_before_execution() {
+        let mut app = App::default();
+        let intent = app.apply_slash_action(SlashAction::PreviewPlan("make chess".into()));
+        let Intent::PreviewPlan {
+            goal_index,
+            task_id,
+            text,
+        } = intent.expect("preview intent")
+        else {
+            panic!("expected preview intent");
+        };
+        assert_eq!(goal_index, 0);
+        assert_eq!(text, "make chess");
+        assert_eq!(app.goals[0].task_id, task_id);
+        assert!(app.goals[0].plan_preview);
+        assert_eq!(app.focus_view, FocusView::Plan);
+
+        app.apply_state(
+            0,
+            GlobalState {
+                task_status: TaskStatus::NeedsClarification {
+                    questions: vec!["Plan preview only. Run /approve.".into()],
+                },
+                goal_contract: Some(Goal::new("make chess").contract()),
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: None,
+                estimated_naive_tokens: 0,
+                checkpoints: Vec::new(),
+            },
+        );
+        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Plan);
+        assert!(app.focus_text().contains("goal: make chess"));
+        assert!(app.focus_text().contains("Verify"));
+
+        let approve = app
+            .apply_slash_action(SlashAction::ApprovePlan)
+            .expect("approve intent");
+        let Intent::ApprovePlan {
+            goal_index,
+            task_id,
+            text,
+        } = approve
+        else {
+            panic!("expected approve intent");
+        };
+        assert_eq!(goal_index, 0);
+        assert_eq!(task_id, app.goals[0].task_id);
+        assert_eq!(text, "make chess");
+        assert!(!app.goals[0].plan_preview);
+        assert_eq!(app.goals[0].status, TaskStatus::Queued);
     }
 
     #[test]
@@ -9679,6 +10169,7 @@ fn extract_id(line: &str) -> Option<String> {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
         app.apply_event(0, review_ready_event("chess.py"));
+        app.focus_view = FocusView::Code;
 
         let text = app.focus_text();
 
@@ -9750,6 +10241,7 @@ fn extract_id(line: &str) -> Option<String> {
             stderr_preview: String::new(),
             duration_ms: Some(42),
         });
+        app.focus_view = FocusView::Code;
 
         for ch in "/copy".chars() {
             app.handle_key(key(ch));
@@ -9773,6 +10265,7 @@ fn extract_id(line: &str) -> Option<String> {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
         app.apply_event(0, review_ready_event("chess.py"));
+        app.focus_view = FocusView::Code;
 
         app.push_command_run(CommandRunSummary {
             command: "python chess.py".into(),
@@ -9786,7 +10279,7 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn focus_text_payloads_cover_code_commands_and_log() {
+    fn focus_text_payloads_cover_plan_receipt_context_tokens_code_commands_and_log() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
         app.apply_event(0, review_ready_event("chess.py"));
@@ -9797,6 +10290,9 @@ fn extract_id(line: &str) -> Option<String> {
             stderr_preview: String::new(),
             duration_ms: Some(42),
         });
+
+        app.focus_view = FocusView::Plan;
+        assert!(app.focus_text().contains("Plan"));
 
         app.focus_view = FocusView::Receipt;
         assert!(app.focus_text().contains("Receipt"));
@@ -9809,6 +10305,12 @@ fn extract_id(line: &str) -> Option<String> {
 
         app.focus_view = FocusView::Commands;
         assert!(app.focus_text().contains("python chess.py"));
+
+        app.focus_view = FocusView::Context;
+        assert!(app.focus_text().contains("Context"));
+
+        app.focus_view = FocusView::Tokens;
+        assert!(app.focus_text().contains("Tokens"));
 
         app.focus_view = FocusView::Log;
         assert!(app.focus_text().contains("review-ready"));
@@ -9937,6 +10439,7 @@ fn extract_id(line: &str) -> Option<String> {
             }),
             task_id: TaskId::new(),
             flight_log: Vec::new(),
+            plan_preview: false,
             checkpoint_cursor: None,
         });
         app.goals.push(GoalEntry {
@@ -9960,6 +10463,7 @@ fn extract_id(line: &str) -> Option<String> {
             }),
             task_id: TaskId::new(),
             flight_log: Vec::new(),
+            plan_preview: false,
             checkpoint_cursor: None,
         });
         app.best_savings_pct = Some(75);
@@ -10118,6 +10622,7 @@ fn extract_id(line: &str) -> Option<String> {
             }),
             task_id: TaskId::new(),
             flight_log: Vec::new(),
+            plan_preview: false,
             checkpoint_cursor: None,
         });
 

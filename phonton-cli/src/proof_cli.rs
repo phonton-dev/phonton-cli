@@ -81,8 +81,19 @@ fn build_export(task: &TaskRecord) -> Result<ProofBundleExport> {
         context_manifest: ledger.context_manifest.clone(),
         permission_ledger: ledger.permission_ledger.clone(),
         verify_report: ledger.verify_report.clone(),
-        final_status: proof_final_status(task, &ledger.verify_report),
         handoff_packet: handoff,
+        summaries: if ledger.summaries == phonton_types::OutcomeSummaries::default() {
+            phonton_types::OutcomeSummaries::from_evidence(
+                ledger.goal_contract.as_ref(),
+                &ledger.context_manifest,
+                &ledger.permission_ledger,
+                &ledger.verify_report,
+                ledger.handoff.as_ref(),
+            )
+        } else {
+            ledger.summaries.clone()
+        },
+        final_status: proof_final_status(task, &ledger.verify_report),
     })
 }
 
@@ -147,6 +158,7 @@ mod tests {
                 context_manifest: ContextManifest::default(),
                 permission_ledger: PermissionLedger::default(),
                 verify_report: report,
+                summaries: phonton_types::OutcomeSummaries::default(),
                 handoff: Some(handoff),
             }),
         }
@@ -165,5 +177,23 @@ mod tests {
         assert_eq!(export.goal, "fix config panic");
         assert_eq!(export.handoff_packet.headline, "verified");
         assert_eq!(export.final_status, BenchmarkFinalStatus::VerifiedSuccess);
+    }
+
+    #[test]
+    fn proof_export_includes_deterministic_summary_bundle() {
+        let task = task_with_ledger(VerifyReport {
+            passed: vec!["cargo test".into()],
+            findings: Vec::new(),
+            skipped: Vec::new(),
+        });
+
+        let export = build_export(&task).unwrap();
+
+        assert_eq!(export.summaries.verification.passed, 1);
+        assert_eq!(
+            export.summaries.handoff.as_ref().unwrap().headline,
+            "verified"
+        );
+        assert_eq!(export.summaries.token.total_tokens, 42);
     }
 }

@@ -103,6 +103,15 @@ fn build_export(
     context_buckets.cached_tokens = context_buckets
         .cached_tokens
         .saturating_add(usage.cached_tokens);
+    let mut summary_context = ledger.context_manifest.clone();
+    summary_context.buckets = context_buckets;
+    let summaries = phonton_types::OutcomeSummaries::from_evidence(
+        ledger.goal_contract.as_ref(),
+        &summary_context,
+        &ledger.permission_ledger,
+        &ledger.verify_report,
+        Some(handoff),
+    );
 
     let review_event = events.iter().rev().find_map(|record| match &record.event {
         OrchestratorEvent::SubtaskReviewReady {
@@ -141,6 +150,7 @@ fn build_export(
         cached_tokens: usage.cached_tokens,
         cost_usd: cost_micros as f64 / 1_000_000.0,
         context_buckets,
+        summaries,
         verification: verification_map(&ledger.verify_report),
         quality_gates: quality_gate_map(ledger),
         handoff_packet_id: handoff.task_id.to_string(),
@@ -264,6 +274,7 @@ mod tests {
                 context_manifest: ContextManifest::default(),
                 permission_ledger: PermissionLedger::default(),
                 verify_report: handoff.verification.clone(),
+                summaries: phonton_types::OutcomeSummaries::default(),
                 handoff: Some(handoff),
             }),
         }
@@ -337,6 +348,9 @@ mod tests {
         assert_eq!(export.context_buckets.selected_code_tokens, 900);
         assert_eq!(export.context_buckets.omitted_candidate_tokens, 4000);
         assert_eq!(export.context_buckets.cached_tokens, 300);
+        assert_eq!(export.summaries.context.selected_code_tokens, 900);
+        assert_eq!(export.summaries.token.provider_input_tokens, 2000);
+        assert_eq!(export.summaries.verification.passed, 1);
         assert_eq!(export.final_status, BenchmarkFinalStatus::VerifiedSuccess);
     }
 

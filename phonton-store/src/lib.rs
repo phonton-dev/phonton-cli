@@ -1041,6 +1041,7 @@ mod tests {
                 findings: Vec::new(),
                 skipped: Vec::new(),
             },
+            summaries: phonton_types::OutcomeSummaries::default(),
             handoff: None,
         };
         s.upsert_outcome_ledger(&ledger).unwrap();

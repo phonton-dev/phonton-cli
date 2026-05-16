@@ -1438,6 +1438,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut verified = Vec::new();
         let mut findings = Vec::new();
         let mut reached_test_layer = false;
+        let mut reached_runtime_layer = false;
 
         for rt in runtimes.values() {
             usage.input_tokens = usage
@@ -1458,6 +1459,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             match &rt.verify_result {
                 Some(VerifyResult::Pass { layer }) => {
                     reached_test_layer |= *layer == VerifyLayer::Test;
+                    reached_runtime_layer |= is_runtime_layer(*layer);
                     verified.push(format!("{clean_desc} passed {}", verify_layer_name(*layer)));
                 }
                 Some(VerifyResult::Fail { errors, layer, .. }) => {
@@ -1507,6 +1509,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
         for failure in self.quality_gate_failures(plan, runtimes) {
             findings.push(format!("Quality gate: {failure}"));
+        }
+        let planned_runtime = plan.goal_contract.as_ref().is_some_and(|contract| {
+            contract
+                .verify_plan
+                .iter()
+                .any(|step| step.layer.map(is_runtime_layer).unwrap_or(false))
+        });
+        let missing_runtime_proof = planned_runtime && !reached_runtime_layer;
+        if missing_runtime_proof {
+            findings.push("Runtime/browser verification was planned but not recorded.".into());
         }
 
         verified.sort();
@@ -1565,6 +1577,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         }
         if !reached_test_layer {
             known_gaps.push("No explicit test layer was recorded by this run.".into());
+        }
+        if missing_runtime_proof {
+            known_gaps.push("Runtime/browser verification was planned but not recorded.".into());
         }
         if checkpoints.is_empty() && !changed_files.is_empty() {
             known_gaps.push("No git rollback checkpoint was recorded.".into());
@@ -1737,6 +1752,13 @@ fn verify_layer_name(layer: VerifyLayer) -> &'static str {
         VerifyLayer::BrowserDomCheck => "browser DOM check",
         VerifyLayer::InteractionCheck => "interaction check",
     }
+}
+
+fn is_runtime_layer(layer: VerifyLayer) -> bool {
+    matches!(
+        layer,
+        VerifyLayer::RuntimeSmoke | VerifyLayer::BrowserDomCheck | VerifyLayer::InteractionCheck
+    )
 }
 
 /// Try to bump `rt`'s tier by one step. Returns `false` if already at the
@@ -2273,6 +2295,69 @@ mod tests {
             .passed
             .iter()
             .any(|line| line.contains("passed")));
+    }
+
+    #[tokio::test]
+    async fn runtime_verify_plan_without_runtime_result_is_a_known_gap() {
+        let a = subtask("create web UI", vec![]);
+        let contract = GoalContract {
+            goal: "make a web dashboard".into(),
+            task_class: TaskClass::GeneratedAppGame,
+            intent: None,
+            confidence_percent: 90,
+            acceptance_criteria: vec!["render a board".into()],
+            acceptance_slices: Vec::new(),
+            expected_artifacts: Vec::new(),
+            likely_files: Vec::new(),
+            verify_plan: vec![VerifyStepSpec {
+                name: "browser DOM check".into(),
+                layer: Some(VerifyLayer::BrowserDomCheck),
+                command: None,
+            }],
+            run_plan: Vec::new(),
+            quality_floor: QualityFloor {
+                criteria: Vec::new(),
+            },
+            clarification_questions: Vec::new(),
+            assumptions: Vec::new(),
+            token_policy: Default::default(),
+        };
+        let plan = PlannerOutput {
+            subtasks: vec![a],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(contract),
+        };
+        let (state_tx, state_rx) = watch::channel(GlobalState {
+            task_status: TaskStatus::Queued,
+            goal_contract: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+        });
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+
+        let status = orch.run_task(plan, state_tx).await.unwrap();
+        assert!(matches!(status, TaskStatus::Reviewing { .. }));
+
+        let state = state_rx.borrow().clone();
+        let handoff = state.handoff_packet.expect("handoff packet");
+        assert!(handoff
+            .known_gaps
+            .iter()
+            .any(|gap| gap.contains("Runtime/browser verification was planned but not recorded")));
+        assert!(handoff
+            .verification
+            .findings
+            .iter()
+            .any(|finding| finding
+                .contains("Runtime/browser verification was planned but not recorded")));
     }
 
     #[test]
