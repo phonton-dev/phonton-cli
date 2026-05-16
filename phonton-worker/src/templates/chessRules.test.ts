@@ -1,4 +1,3 @@
-import { describe, expect, it } from 'vitest'
 import {
   createGame,
   createInitialGame,
@@ -9,62 +8,58 @@ import {
   movePiece,
 } from './chessRules'
 
-describe('chess rules boundary', () => {
-  it('creates the standard starting position', () => {
-    const game = createInitialGame()
-    const pieceCount = Object.values(game.board).filter(Boolean).length
+function assert(condition: unknown, message: string): asserts condition {
+  if (!condition) {
+    throw new Error(message)
+  }
+}
 
-    expect(pieceCount).toBe(32)
-    expect(game.turn).toBe('white')
-    expect(game.board.e1?.kind).toBe('king')
-    expect(game.board.e8?.kind).toBe('king')
-  })
+function assertIncludes(values: string[], expected: string, message: string) {
+  assert(values.includes(expected), message)
+}
 
-  it('allows normal pawn and knight moves and enforces turn order', () => {
-    const game = createInitialGame()
+function assertExcludes(values: string[], expected: string, message: string) {
+  assert(!values.includes(expected), message)
+}
 
-    expect(legalMovesFor(game, 'e2')).toContain('e4')
-    expect(legalMovesFor(game, 'g1')).toContain('f3')
+export function runRulesSeedTests() {
+  const initial = createInitialGame()
+  const pieceCount = Object.values(initial.board).filter(Boolean).length
 
-    const moved = movePiece(game, 'e2', 'e4')
-    expect(moved.ok).toBe(true)
-    if (moved.ok) {
-      expect(moved.state.turn).toBe('black')
-      expect(movePiece(moved.state, 'e4', 'e5').ok).toBe(false)
-    }
-  })
+  assert(pieceCount === 32, 'starting position has 32 pieces')
+  assert(initial.turn === 'white', 'white moves first')
+  assert(initial.board.e1?.kind === 'king', 'white king starts on e1')
+  assert(initial.board.e8?.kind === 'king', 'black king starts on e8')
 
-  it('rejects blocked and illegal moves', () => {
-    const game = createInitialGame()
+  assertIncludes(legalMovesFor(initial, 'e2'), 'e4', 'white pawn can move two squares')
+  assertIncludes(legalMovesFor(initial, 'g1'), 'f3', 'white knight can move from g1 to f3')
 
-    expect(legalMovesFor(game, 'a1')).not.toContain('a4')
-    expect(movePiece(game, 'e2', 'e5').ok).toBe(false)
-  })
+  const moved = movePiece(initial, 'e2', 'e4')
+  assert(moved.ok, 'legal pawn move succeeds')
+  assert(moved.state.turn === 'black', 'turn switches after legal move')
+  assert(!movePiece(moved.state, 'e4', 'e5').ok, 'turn order is enforced')
 
-  it('detects check and filters king moves into attacked squares', () => {
-    const board = emptyBoard()
-    board.e1 = makePiece('white', 'king')
-    board.a8 = makePiece('black', 'king')
-    board.e8 = makePiece('black', 'rook')
-    const game = createGame(board, 'white')
+  assertExcludes(legalMovesFor(initial, 'a1'), 'a4', 'rook cannot jump blocked pawns')
+  assert(!movePiece(initial, 'e2', 'e5').ok, 'illegal pawn move is rejected')
 
-    expect(isInCheck(game.board, 'white')).toBe(true)
-    expect(legalMovesFor(game, 'e1')).not.toContain('e2')
-  })
+  const checkBoard = emptyBoard()
+  checkBoard.e1 = makePiece('white', 'king')
+  checkBoard.a8 = makePiece('black', 'king')
+  checkBoard.e8 = makePiece('black', 'rook')
+  const checkGame = createGame(checkBoard, 'white')
+  assert(isInCheck(checkGame.board, 'white'), 'rook gives check on open file')
+  assertExcludes(legalMovesFor(checkGame, 'e1'), 'e2', 'king cannot move into check')
 
-  it('promotes pawns to queens', () => {
-    const board = emptyBoard()
-    board.e1 = makePiece('white', 'king')
-    board.e8 = makePiece('black', 'king')
-    board.a7 = makePiece('white', 'pawn')
-    const game = createGame(board, 'white')
+  const promotionBoard = emptyBoard()
+  promotionBoard.e1 = makePiece('white', 'king')
+  promotionBoard.e8 = makePiece('black', 'king')
+  promotionBoard.a7 = makePiece('white', 'pawn')
+  const promotionGame = createGame(promotionBoard, 'white')
+  const promotion = movePiece(promotionGame, 'a7', 'a8')
 
-    const result = movePiece(game, 'a7', 'a8')
+  assert(promotion.ok, 'promotion move succeeds')
+  assert(promotion.state.board.a8?.kind === 'queen', 'pawn promotes to queen')
+  assert(promotion.move.promotion === 'queen', 'promotion is recorded')
+}
 
-    expect(result.ok).toBe(true)
-    if (result.ok) {
-      expect(result.state.board.a8?.kind).toBe('queen')
-      expect(result.move.promotion).toBe('queen')
-    }
-  })
-})
+runRulesSeedTests()

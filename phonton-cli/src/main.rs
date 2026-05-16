@@ -9576,6 +9576,72 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn problems_focus_prioritizes_changed_excerpt_for_diagnostic_file() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(
+            0,
+            EventRecord {
+                task_id: TaskId::new(),
+                timestamp_ms: 1,
+                event: OrchestratorEvent::SubtaskReviewReady {
+                    subtask_id: SubtaskId::new(),
+                    description: "generated chess slice".into(),
+                    tier: ModelTier::Standard,
+                    tokens_used: 10,
+                    token_usage: TokenUsage::estimated(10),
+                    cost: phonton_types::CostSummary::default(),
+                    diff_hunks: vec![
+                        DiffHunk {
+                            file_path: PathBuf::from("src/chessRules.ts"),
+                            old_start: 0,
+                            old_count: 0,
+                            new_start: 1,
+                            new_count: 1,
+                            lines: vec![DiffLine::Added("export const rules = true".into())],
+                        },
+                        DiffHunk {
+                            file_path: PathBuf::from("src/App.tsx"),
+                            old_start: 0,
+                            old_count: 0,
+                            new_start: 1,
+                            new_count: 1,
+                            lines: vec![DiffLine::Added("```tsx".into())],
+                        },
+                    ],
+                    verify_result: VerifyResult::Fail {
+                        layer: VerifyLayer::Syntax,
+                        errors: vec!["[typescript syntax] src/App.tsx:1:1 invalid syntax".into()],
+                        attempt: 1,
+                    },
+                    provider: ProviderKind::OpenAiCompatible,
+                    model_name: "fixture".into(),
+                },
+            },
+        );
+        app.apply_event(
+            0,
+            EventRecord {
+                task_id: TaskId::new(),
+                timestamp_ms: 2,
+                event: OrchestratorEvent::VerifyFail {
+                    subtask_id: SubtaskId::new(),
+                    layer: VerifyLayer::Syntax,
+                    errors: vec!["[typescript syntax] src/App.tsx:1:1 invalid syntax".into()],
+                    attempt: 1,
+                },
+            },
+        );
+        app.apply_state(0, failed_state("syntax verification failed"));
+
+        let text = app.focus_text();
+
+        assert!(text.contains("file: src/App.tsx"), "{text}");
+        assert!(!text.contains("file: src/chessRules.ts"), "{text}");
+        assert!(text.contains("+```tsx"), "{text}");
+    }
+
+    #[test]
     fn problems_shortcuts_open_and_retry_failed_goal() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));

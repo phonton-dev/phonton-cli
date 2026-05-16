@@ -1104,7 +1104,8 @@ fn should_stop_before_generated_app_syntax_repair(
     if !matches!(
         classify_intent(&subtask.description).task_class,
         TaskClass::GeneratedAppGame
-    ) {
+    ) && !diagnostics_name_generated_web_artifact(&subtask.description, errors)
+    {
         return false;
     }
     let diagnostics = errors.join("\n").to_ascii_lowercase();
@@ -1114,6 +1115,28 @@ fn should_stop_before_generated_app_syntax_repair(
         || diagnostics.contains("javascript")
         || diagnostics.contains("html")
         || diagnostics.contains("src/app")
+}
+
+fn diagnostics_name_generated_web_artifact(description: &str, errors: &[String]) -> bool {
+    let mut paths = artifact_paths_from_subtask(description);
+    for path in artifact_paths_from_errors(errors) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths.iter().any(|path| {
+        let normalized = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        normalized == "index.html"
+            || normalized == "src/app.tsx"
+            || normalized == "src/app.jsx"
+            || normalized == "src/main.tsx"
+            || normalized == "src/main.jsx"
+            || normalized.ends_with(".tsx")
+            || normalized.ends_with(".jsx")
+    })
 }
 
 fn repair_guidance_for_errors(errors: &[String]) -> Vec<String> {
@@ -1336,6 +1359,7 @@ fn artifact_paths_from_errors(errors: &[String]) -> Vec<PathBuf> {
                 .trim_end_matches(':')
                 .trim_end_matches(',')
                 .trim_end_matches(';');
+            let cleaned = strip_diagnostic_location_suffix(cleaned);
             if !looks_like_relative_artifact_path(cleaned) {
                 continue;
             }
@@ -1346,6 +1370,16 @@ fn artifact_paths_from_errors(errors: &[String]) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn strip_diagnostic_location_suffix(mut value: &str) -> &str {
+    while let Some((head, tail)) = value.rsplit_once(':') {
+        if head.is_empty() || tail.is_empty() || !tail.chars().all(|ch| ch.is_ascii_digit()) {
+            break;
+        }
+        value = head;
+    }
+    value
 }
 
 fn looks_like_relative_artifact_path(value: &str) -> bool {
@@ -2772,6 +2806,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn local_chess_rules_test_seed_does_not_require_test_runner_dependency() {
+        let template = include_str!("templates/chessRules.test.ts");
+
+        assert!(
+            !template.contains("from 'vitest'") && !template.contains("from \"vitest\""),
+            "existing Vite seed must not require adding Vitest before package.json is repaired"
+        );
+        assert!(
+            template.contains("runRulesSeedTests()"),
+            "template should still self-execute assertions when a runner discovers the file"
+        );
+    }
+
     #[derive(Clone)]
     struct BrokenTsxProvider {
         calls: Arc<Mutex<u64>>,
@@ -2853,6 +2901,24 @@ mod tests {
             other => panic!("expected syntax fail, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn generated_web_syntax_fast_fail_uses_artifact_diagnostics_when_description_is_generic() {
+        let task = subtask("Repair verifier failure from previous attempt");
+        let errors =
+            vec!["Verifier Syntax: [typescript syntax] src/App.tsx:1:1 invalid syntax".into()];
+
+        assert!(
+            should_stop_before_generated_app_syntax_repair(
+                &task,
+                VerifyLayer::Syntax,
+                &errors,
+                1,
+                false
+            ),
+            "web artifact syntax diagnostics should stop before another broad provider repair"
+        );
     }
 
     #[test]

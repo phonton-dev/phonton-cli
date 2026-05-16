@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.14.1 - Generated Web Failure Diagnostics
+
+### Fixed
+
+- Problems focus now shows the changed-file excerpt that matches the verifier diagnostic path. A failure such as `[typescript syntax] src/App.tsx:1:1 invalid syntax` now jumps to the `src/App.tsx` diff instead of showing the first unrelated changed file.
+- Generated web syntax diagnostics that include line/column suffixes such as `src/App.tsx:1:1` are normalized back to artifact paths before retry policy runs. This keeps generic repair contexts on the generated-web fast-fail path instead of spending another broad provider repair.
+- The existing Vite/React chess rules test seed no longer imports `vitest`. The seeded test file uses self-executing assertions, so it does not require Phonton to repair `package.json` before local rules verification can pass.
+
 ## 0.14.0 - Non-Interactive Node Verification
 
 ### Fixed

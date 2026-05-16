@@ -275,10 +275,11 @@ pub(crate) fn problems_focus_text(goal: &GoalEntry, selected_file: usize) -> Str
     out.push_str("\nRepair\n- Press r or run /retry to queue a repair with compact diagnostics.\n- Use /why-tokens to inspect retry/context token buckets.\n");
 
     let groups = diff_hunks_by_file(goal);
-    if let Some((path, hunks)) = groups.get(selected_file.min(groups.len().saturating_sub(1))) {
+    let selected_group = problem_excerpt_index(&diagnostics, &groups, selected_file);
+    if let Some((path, hunks)) = groups.get(selected_group) {
         out.push_str(&format!(
             "\nChanged excerpt {}/{}\nfile: {}\n",
-            selected_file.min(groups.len().saturating_sub(1)) + 1,
+            selected_group + 1,
             groups.len(),
             path.display()
         ));
@@ -307,6 +308,32 @@ pub(crate) fn problems_focus_text(goal: &GoalEntry, selected_file: usize) -> Str
         }
     }
     out
+}
+
+fn problem_excerpt_index(
+    diagnostics: &[String],
+    groups: &[(PathBuf, Vec<DiffHunk>)],
+    selected_file: usize,
+) -> usize {
+    if groups.is_empty() {
+        return 0;
+    }
+    let diagnostic_text = diagnostics
+        .iter()
+        .map(|item| item.replace('\\', "/").to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some((idx, _)) = groups.iter().enumerate().find(|(_, (path, _))| {
+        diagnostic_text.contains(
+            &path
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase(),
+        )
+    }) {
+        return idx;
+    }
+    selected_file.min(groups.len().saturating_sub(1))
 }
 
 pub(crate) fn problem_diagnostics(goal: &GoalEntry) -> Vec<String> {
