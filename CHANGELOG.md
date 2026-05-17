@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.15.3 - Vite Chess App Test Hotfix
+
+### Fixed
+
+- Existing Vite/React chess UI seeds now replace stale `src/App.test.*` placeholder assertions when those tests already exist, preventing local zero-token App shell seeds from failing verification against old heading expectations.
+- The seeded App test uses React server rendering plus Vitest assertions, so it does not require Testing Library, jsdom, or custom matcher setup.
+
 ## 0.15.2 - Vite Chess Token And Cursor Hotfix
 
 ### Fixed

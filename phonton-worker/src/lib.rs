@@ -1247,7 +1247,7 @@ fn local_generated_artifact_seed_hunks(root: &Path, subtask: &Subtask) -> Option
         ));
     }
     if is_existing_vite_chess_app_shell_seed(&subtask.description) {
-        return Some(template_file_hunks(
+        let mut hunks = template_file_hunks(
             root,
             [
                 (
@@ -1263,7 +1263,9 @@ fn local_generated_artifact_seed_hunks(root: &Path, subtask: &Subtask) -> Option
                     include_str!("templates/vite-env.d.ts"),
                 ),
             ],
-        ));
+        );
+        hunks.extend(existing_app_test_template_hunks(root));
+        return Some(hunks);
     }
     None
 }
@@ -1297,6 +1299,29 @@ fn template_file_hunks<const N: usize>(
         .into_iter()
         .filter_map(|(path, content)| template_file_hunk(root, path, content))
         .collect()
+}
+
+fn existing_app_test_template_hunks(root: &Path) -> Vec<DiffHunk> {
+    [
+        "src/App.test.tsx",
+        "src/App.spec.tsx",
+        "src/App.test.ts",
+        "src/App.spec.ts",
+        "src/App.test.jsx",
+        "src/App.spec.jsx",
+        "src/App.test.js",
+        "src/App.spec.js",
+    ]
+    .into_iter()
+    .filter(|path| root.join(path).is_file())
+    .filter_map(|path| {
+        template_file_hunk(
+            root,
+            PathBuf::from(path),
+            include_str!("templates/App.test.tsx"),
+        )
+    })
+    .collect()
 }
 
 fn template_file_hunk(root: &Path, path: PathBuf, content: &str) -> Option<DiffHunk> {
@@ -2908,6 +2933,34 @@ mod tests {
             .diff_hunks
             .iter()
             .any(|hunk| hunk.file_path.as_path() == Path::new("src/vite-env.d.ts")));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn existing_vite_chess_app_shell_seed_replaces_stale_app_test_when_present() {
+        let (base, root) = temp_workspace("local-chess-app-shell-test-seed");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("App.test.tsx"),
+            "expect(screen.getByRole('heading', { name: /replace this placeholder chess/i })).toBeInTheDocument()\n",
+        )
+        .unwrap();
+        let subtask = subtask(
+            "Existing Vite React chess app acceptance slice 2/4: replace the placeholder React screen with the actual chess app, board coordinates, named pieces, and clear turn status. Artifacts: src/App.tsx, src/App.css.",
+        );
+
+        let hunks = local_generated_artifact_seed_hunks(&root, &subtask).unwrap();
+
+        let test_hunk = hunks
+            .iter()
+            .find(|hunk| hunk.file_path.as_path() == Path::new("src/App.test.tsx"))
+            .expect("existing App test should be replaced with local seed expectations");
+        assert!(test_hunk.lines.iter().any(
+            |line| matches!(line, DiffLine::Removed(line) if line.contains("placeholder chess"))
+        ));
+        assert!(test_hunk.lines.iter().any(
+            |line| matches!(line, DiffLine::Added(line) if line.contains("local chess shell"))
+        ));
         let _ = std::fs::remove_dir_all(base);
     }
 
