@@ -453,7 +453,7 @@ fn build_doctor_report(workspace: &Path, set: &ExtensionSet) -> ExtensionDoctorR
     let approval_gated: Vec<String> = set
         .mcp_servers
         .iter()
-        .filter(|server| server.permissions.iter().any(permission_requires_approval))
+        .filter(|server| server_requires_approval(server))
         .map(|server| server.id.to_string())
         .collect();
     if active_mcp == 0 {
@@ -555,7 +555,7 @@ fn mcp_row(workspace: &Path, server: &McpServerDefinition) -> McpRow {
                 present: std::env::var_os(name).is_some(),
             })
             .collect(),
-        approval_required: server.permissions.iter().any(permission_requires_approval),
+        approval_required: server_requires_approval(server),
         workspace_trust_required: server.source == ExtensionSource::Workspace
             && !trust::is_trusted(workspace),
     }
@@ -612,6 +612,13 @@ fn permissions(permissions: &[Permission]) -> Vec<String> {
 
 fn permission_requires_approval(permission: &Permission) -> bool {
     !matches!(permission, Permission::FsReadWorkspace)
+}
+
+fn server_requires_approval(server: &McpServerDefinition) -> bool {
+    matches!(
+        server.trust,
+        phonton_types::TrustLevel::MutatingTool | phonton_types::TrustLevel::NetworkedTool
+    ) || server.permissions.iter().any(permission_requires_approval)
 }
 
 fn transport(transport: &McpTransport) -> String {
@@ -858,5 +865,37 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.id == "mcp.disabled" && check.severity == "warn"));
+    }
+
+    #[test]
+    fn doctor_warns_on_networked_or_mutating_mcp_trust() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServerDefinition {
+            id: "github".into(),
+            name: "GitHub".into(),
+            source: ExtensionSource::UserHome,
+            transport: McpTransport::Http {
+                url: "https://example.invalid/mcp".into(),
+            },
+            trust: TrustLevel::NetworkedTool,
+            permissions: Vec::new(),
+            applies_to: AppliesTo::default(),
+            env: Vec::new(),
+            enabled: true,
+        };
+        let set = ExtensionSet {
+            mcp_servers: vec![server],
+            ..ExtensionSet::default()
+        };
+
+        let report = build_doctor_report(tmp.path(), &set);
+        let inventory = build_inventory_report(tmp.path(), &set, View::Mcp);
+
+        assert!(report.checks.iter().any(|check| {
+            check.id == "mcp.permissions"
+                && check.severity == "warn"
+                && check.detail.contains("github")
+        }));
+        assert!(inventory.mcp_servers[0].approval_required);
     }
 }

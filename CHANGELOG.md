@@ -4,6 +4,24 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.16.0 - Addressable Context And Extension Evidence
+
+### Added
+
+- Added typed `@...` context mention records for files, directories, symbols, MCP servers, and MCP tools. TUI goal runs now resolve mentions before dispatch and show resolved, missing, and approval-gated rows in `/context` and the Context focus surface.
+- Added local mention token estimates using the tokenizer-backed context counter when available, with directory mentions represented as bounded summaries instead of recursive dumps.
+- Added explicit `phonton why-tokens --by-source` output lines for local prompt estimates, provider-reported input/output/cache usage, provider usage source, attribution-only `@...` mention totals, and `no provider call` local-only runs. Prompt manifest events also carry the resolved mention rows for audit surfaces without adding them to the total twice.
+
+### Changed
+
+- MCP mention resolution uses configured extension metadata without starting or calling servers. Networked or mutating MCP tools remain approval-gated.
+- `phonton extensions doctor` now treats networked and mutating MCP trust levels as approval-gated even when the server has not declared explicit permissions.
+- README install examples and release markers now target v0.16.0.
+
+### Notes
+
+- v0.16.0 positions Phonton as a proof-carrying ADE built around visible context, verification, and handoff evidence. It does not claim superiority over Cursor, Claude Code, Codex, HermesAgent, BridgeSpace, or other ADEs without reproducible benchmark artifacts.
+
 ## 0.15.5 - TUI Prompt And Ask Formatting Hotfix
 
 ### Fixed

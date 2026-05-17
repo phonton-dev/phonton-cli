@@ -320,7 +320,7 @@ impl EventRecord {
                     String::new()
                 };
                 format!(
-                    "prompt {subtask_id}: attempt={}{} target={}{} system={} goal={} memory={} map={} code={} omitted={} attachments={} mcp={} retry={} compacted={} deduped={} total~{}",
+                    "prompt {subtask_id}: attempt={}{} target={}{} system={} goal={} memory={} map={} code={} omitted={} attachments={} mcp={} mentions={} retry={} compacted={} deduped={} total~{}",
                     manifest.attempt,
                     if manifest.repair_attempt { " repair" } else { "" },
                     manifest.context_target_tokens,
@@ -333,6 +333,7 @@ impl EventRecord {
                     manifest.omitted_code_tokens,
                     manifest.attachment_tokens,
                     manifest.mcp_tool_tokens,
+                    manifest.context_mention_tokens,
                     manifest.retry_error_tokens,
                     manifest.compacted_tokens,
                     manifest.deduped_tokens,

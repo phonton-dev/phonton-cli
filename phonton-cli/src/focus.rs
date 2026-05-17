@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::command_runner::CommandRunSummary;
+use crate::context_mentions::render_context_mentions;
 use crate::tui_commands::FocusView;
 use crate::{short, GoalEntry, ACCENT, ACCENT_HI, BG_DEEP, DANGER, MUTED, SUCCESS, WARN};
 
@@ -599,6 +600,10 @@ pub(crate) fn log_focus_text(goal: &GoalEntry) -> String {
 
 pub(crate) fn plan_focus_text(goal: &GoalEntry) -> String {
     let mut out = String::from("Plan\n");
+    if !goal.context_mentions.is_empty() {
+        out.push_str(&render_context_mentions(&goal.context_mentions));
+        out.push('\n');
+    }
     let Some(contract) = goal
         .state
         .as_ref()
@@ -716,12 +721,17 @@ pub(crate) fn context_focus_text(goal: &GoalEntry) -> String {
         buckets.artifact_tokens
     ));
     out.push_str(&format!(
-        "retry diagnostics: {}  tools: {}  deduped: {}  cached: {}\n",
+        "retry diagnostics: {}  tools: {}  @mentions: {}  deduped: {}  cached: {}\n",
         buckets.retry_diagnostic_tokens,
         buckets.tool_output_tokens,
+        buckets.context_mention_tokens,
         buckets.deduped_tokens,
         buckets.cached_tokens
     ));
+    if !goal.context_mentions.is_empty() {
+        out.push('\n');
+        out.push_str(&render_context_mentions(&goal.context_mentions));
+    }
     if selected == 0 && prompt_count == 0 {
         out.push_str("No context evidence has been recorded yet.");
     }
@@ -758,8 +768,17 @@ pub(crate) fn tokens_focus_text(goal: &GoalEntry) -> String {
         total, first_attempt, repair_attempts
     ));
     out.push_str(&format!(
-        "omitted candidate context: {}  deduped: {}\n",
-        omitted, deduped
+        "omitted candidate context: {}  @mentions: {}  deduped: {}\n",
+        omitted,
+        goal.flight_log
+            .iter()
+            .filter_map(|record| match &record.event {
+                OrchestratorEvent::PromptManifest { manifest, .. } =>
+                    Some(manifest.context_mention_tokens),
+                _ => None,
+            })
+            .sum::<u64>(),
+        deduped
     ));
     out.push_str(&format!(
         "provider input: {}  output: {}  cached: {}  estimated: {}\n",

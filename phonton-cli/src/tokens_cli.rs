@@ -30,25 +30,12 @@ pub async fn run(args: &[String]) -> Result<i32> {
         .map(|handoff| handoff.token_usage)
         .unwrap_or_default();
     let buckets = aggregate_context_buckets(&events, usage);
+    let prompt_estimate = aggregate_prompt_estimate(&events);
 
-    println!("Why tokens by source");
-    println!("task: {}", task.goal_text);
-    println!("selected_code_tokens: {}", buckets.selected_code_tokens);
-    println!(
-        "omitted_candidate_tokens: {}",
-        buckets.omitted_candidate_tokens
+    print!(
+        "{}",
+        render_why_tokens_by_source(&task.goal_text, &buckets, usage, prompt_estimate)
     );
-    println!("memory_tokens: {}", buckets.memory_tokens);
-    println!("skill_tokens: {}", buckets.skill_tokens);
-    println!("artifact_tokens: {}", buckets.artifact_tokens);
-    println!(
-        "retry_diagnostic_tokens: {}",
-        buckets.retry_diagnostic_tokens
-    );
-    println!("tool_output_tokens: {}", buckets.tool_output_tokens);
-    println!("deduped_tokens: {}", buckets.deduped_tokens);
-    println!("cached_tokens: {}", buckets.cached_tokens);
-    println!("provider_reported_tokens_are_billing_source: true");
     Ok(0)
 }
 
@@ -67,6 +54,103 @@ fn aggregate_context_buckets(events: &[EventRecord], usage: TokenUsage) -> Conte
     }
     buckets.cached_tokens = buckets.cached_tokens.saturating_add(usage.cached_tokens);
     buckets
+}
+
+fn aggregate_prompt_estimate(events: &[EventRecord]) -> u64 {
+    events
+        .iter()
+        .filter_map(|record| match &record.event {
+            OrchestratorEvent::PromptManifest { manifest, .. } => {
+                Some(manifest.total_estimated_tokens)
+            }
+            _ => None,
+        })
+        .sum()
+}
+
+fn render_why_tokens_by_source(
+    goal_text: &str,
+    buckets: &ContextBucketSummary,
+    usage: TokenUsage,
+    local_prompt_estimate_tokens: u64,
+) -> String {
+    let mut out = String::new();
+    out.push_str("Why tokens by source\n");
+    out.push_str(&format!("task: {goal_text}\n"));
+    out.push_str(&format!(
+        "local_prompt_estimate_tokens: {local_prompt_estimate_tokens}\n"
+    ));
+    out.push_str("estimate_source: local tokenizer estimate\n");
+    out.push_str(&format!(
+        "provider_usage_source: {}\n",
+        provider_usage_source(usage)
+    ));
+    out.push_str(&format!(
+        "provider_reported_input_tokens: {}\n",
+        provider_value(usage, usage.input_tokens)
+    ));
+    out.push_str(&format!(
+        "provider_reported_output_tokens: {}\n",
+        provider_value(usage, usage.output_tokens)
+    ));
+    out.push_str(&format!(
+        "provider_cached_tokens: {}\n",
+        provider_value(usage, usage.cached_tokens)
+    ));
+    out.push_str(&format!(
+        "provider_cache_creation_tokens: {}\n",
+        provider_value(usage, usage.cache_creation_tokens)
+    ));
+    out.push_str(&format!(
+        "selected_code_tokens: {}\n",
+        buckets.selected_code_tokens
+    ));
+    out.push_str(&format!(
+        "omitted_candidate_tokens: {}\n",
+        buckets.omitted_candidate_tokens
+    ));
+    out.push_str(&format!("memory_tokens: {}\n", buckets.memory_tokens));
+    out.push_str(&format!("skill_tokens: {}\n", buckets.skill_tokens));
+    out.push_str(&format!("artifact_tokens: {}\n", buckets.artifact_tokens));
+    out.push_str(&format!(
+        "retry_diagnostic_tokens: {}\n",
+        buckets.retry_diagnostic_tokens
+    ));
+    out.push_str(&format!(
+        "tool_output_tokens: {}\n",
+        buckets.tool_output_tokens
+    ));
+    out.push_str(&format!(
+        "context_mention_tokens: {} (attribution only; already counted in concrete buckets)\n",
+        buckets.context_mention_tokens
+    ));
+    out.push_str(&format!("deduped_tokens: {}\n", buckets.deduped_tokens));
+    out.push_str(&format!("cached_tokens: {}\n", buckets.cached_tokens));
+    out.push_str("provider_reported_tokens_are_billing_source: true\n");
+    out
+}
+
+fn provider_usage_source(usage: TokenUsage) -> &'static str {
+    if usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cached_tokens == 0
+        && usage.cache_creation_tokens == 0
+        && !usage.estimated
+    {
+        "no provider call"
+    } else if usage.estimated {
+        "estimated legacy aggregate"
+    } else {
+        "provider reported"
+    }
+}
+
+fn provider_value(usage: TokenUsage, value: u64) -> String {
+    if provider_usage_source(usage) == "no provider call" {
+        "no provider call".into()
+    } else {
+        value.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +175,7 @@ mod tests {
                     attachment_tokens: 30,
                     retry_error_tokens: 40,
                     mcp_tool_tokens: 50,
+                    context_mention_tokens: 30,
                     deduped_tokens: 60,
                     ..Default::default()
                 },
@@ -111,7 +196,53 @@ mod tests {
         assert_eq!(buckets.artifact_tokens, 30);
         assert_eq!(buckets.retry_diagnostic_tokens, 40);
         assert_eq!(buckets.tool_output_tokens, 50);
+        assert_eq!(buckets.context_mention_tokens, 30);
         assert_eq!(buckets.deduped_tokens, 60);
         assert_eq!(buckets.cached_tokens, 300);
+    }
+
+    #[test]
+    fn render_labels_estimates_separately_from_provider_usage() {
+        let buckets = ContextBucketSummary {
+            selected_code_tokens: 900,
+            artifact_tokens: 30,
+            cached_tokens: 300,
+            ..Default::default()
+        };
+
+        let rendered = render_why_tokens_by_source(
+            "fix parser",
+            &buckets,
+            TokenUsage {
+                input_tokens: 1200,
+                output_tokens: 400,
+                cached_tokens: 300,
+                cache_creation_tokens: 20,
+                estimated: false,
+            },
+            1800,
+        );
+
+        assert!(rendered.contains("local_prompt_estimate_tokens: 1800"));
+        assert!(rendered.contains("estimate_source: local tokenizer estimate"));
+        assert!(rendered.contains("provider_reported_input_tokens: 1200"));
+        assert!(rendered.contains("provider_reported_output_tokens: 400"));
+        assert!(rendered.contains("provider_usage_source: provider reported"));
+        assert!(rendered.contains("context_mention_tokens: 0 (attribution only"));
+        assert!(rendered.contains("provider_reported_tokens_are_billing_source: true"));
+    }
+
+    #[test]
+    fn render_zero_provider_usage_as_no_provider_call() {
+        let rendered = render_why_tokens_by_source(
+            "seed local demo",
+            &ContextBucketSummary::default(),
+            TokenUsage::default(),
+            0,
+        );
+
+        assert!(rendered.contains("provider_usage_source: no provider call"));
+        assert!(rendered.contains("provider_reported_input_tokens: no provider call"));
+        assert!(!rendered.contains("provider_reported_input_tokens: 0"));
     }
 }

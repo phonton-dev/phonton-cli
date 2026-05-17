@@ -39,6 +39,7 @@ mod benchmark_cli;
 mod command_runner;
 mod config;
 mod context_cli;
+mod context_mentions;
 mod contract_preflight;
 mod demo;
 mod diff_cli;
@@ -69,6 +70,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use command_runner::{parse_prompt_command, summarize_output_with_duration, CommandRunSummary};
+use context_mentions::{render_context_mentions, ContextMentionResolver, MentionCapabilityCatalog};
 use contract_preflight::apply_workspace_preflight;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -98,9 +100,9 @@ use phonton_providers::{
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
-    BudgetLimits, ContextManifest, ContextSource, CoverageSummary, DiffHunk, DiffLine, EventRecord,
-    ExtensionId, GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier,
-    OrchestratorEvent, OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger,
+    BudgetLimits, ContextManifest, ContextMention, ContextSource, CoverageSummary, DiffHunk,
+    DiffLine, EventRecord, ExtensionId, GlobalState, HandoffPacket, MemoryRecord, ModelPricing,
+    ModelTier, OrchestratorEvent, OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger,
     PermissionMode, PermissionRecord, PlannerOutput, PromptAttachment, PromptAttachmentKind,
     PromptContextManifest, ProviderConfig as ApiProviderConfig, ProviderKind, SessionGoalSnapshot,
     SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
@@ -555,6 +557,8 @@ pub struct GoalEntry {
     pub flight_log: Vec<EventRecord>,
     /// True when this row is a TUI plan preview waiting for `/approve`.
     pub plan_preview: bool,
+    /// Resolved `@...` context mentions captured before goal dispatch.
+    pub context_mentions: Vec<ContextMention>,
     /// Index into `state.checkpoints` the user is hovering over in the
     /// checkpoint picker. `None` when the picker has no focus.
     pub checkpoint_cursor: Option<usize>,
@@ -599,6 +603,7 @@ impl GoalEntry {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             plan_preview: false,
+            context_mentions: Vec::new(),
             checkpoint_cursor: None,
         }
     }
@@ -611,6 +616,7 @@ impl GoalEntry {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             plan_preview: true,
+            context_mentions: Vec::new(),
             checkpoint_cursor: None,
         }
     }
@@ -1013,14 +1019,15 @@ impl App {
     }
 
     fn context_command_summary(&self) -> String {
+        let mentions = self.selected_context_mentions_summary();
         let Some(m) = &self.last_prompt_manifest else {
             return format!(
-                "Context\nlatest prompt: none yet\nsession prompt total: {}\ncompacted by user: {}\nworker compression: automatic near the context threshold\ncommand: /compact",
+                "Context\n{mentions}\nlatest prompt: none yet\nsession prompt total: {}\ncompacted by user: {}\nworker compression: automatic near the context threshold\ncommand: /compact",
                 self.session_prompt_tokens, self.compacted_prompt_tokens
             );
         };
         format!(
-            "Context\nlatest prompt total: {}\ncontext target: {}{}\nattempt: {}{}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo map: {}\nrepo code: {}\nomitted code: {}\nattachments: {}\nmcp/tools: {}\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
+            "Context\n{mentions}\nlatest prompt total: {}\ncontext target: {}{}\nattempt: {}{}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo map: {}\nrepo code: {}\nomitted code: {}\nattachments: {}\nmcp/tools: {}\n@mentions: {} attribution only\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
             m.total_estimated_tokens,
             if m.context_target_tokens == 0 {
                 "unknown".into()
@@ -1042,6 +1049,7 @@ impl App {
             m.omitted_code_tokens,
             m.attachment_tokens,
             m.mcp_tool_tokens,
+            m.context_mention_tokens,
             m.retry_error_tokens,
             m.budget_limit
                 .map(|limit| limit.to_string())
@@ -1051,6 +1059,13 @@ impl App {
             self.session_prompt_tokens,
             self.compacted_prompt_tokens
         )
+    }
+
+    fn selected_context_mentions_summary(&self) -> String {
+        self.goals
+            .get(self.selected)
+            .map(|goal| render_context_mentions(&goal.context_mentions))
+            .unwrap_or_else(|| "Context mentions: none".into())
     }
 
     fn why_tokens_command_summary(&self) -> String {
@@ -1066,7 +1081,7 @@ impl App {
             self.prompt_attempt_buckets();
         let routing_note = self.routing_note_for_goal(active_goal);
         format!(
-            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\ncontext target: {}{}\nattempt buckets:\n- first attempt: {}\n- repair attempts: {}\n- context/artifacts: {}\n- verifier retry diagnostics: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- repo map: {} compact orientation tokens\n- code: {} selected repository context tokens\n- omitted code: {} candidate tokens skipped by the context compiler\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\n{}provider-reported completion tokens remain the billing source of truth.",
+            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\ncontext target: {}{}\nattempt buckets:\n- first attempt: {}\n- repair attempts: {}\n- context/artifacts: {}\n- verifier retry diagnostics: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- repo map: {} compact orientation tokens\n- code: {} selected repository context tokens\n- omitted code: {} candidate tokens skipped by the context compiler\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- @mentions: {} attribution-only tokens already counted in the concrete buckets above\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\n{}provider-reported completion tokens remain the billing source of truth.",
             active_goal,
             m.total_estimated_tokens,
             if m.context_target_tokens == 0 {
@@ -1091,6 +1106,7 @@ impl App {
             m.omitted_code_tokens,
             m.attachment_tokens,
             m.mcp_tool_tokens,
+            m.context_mention_tokens,
             m.retry_error_tokens,
             m.compacted_tokens,
             m.deduped_tokens,
@@ -1380,6 +1396,7 @@ impl App {
                 task_id: goal.task_id,
                 flight_log: goal.flight_log,
                 plan_preview: false,
+                context_mentions: Vec::new(),
                 checkpoint_cursor: None,
             })
             .collect();
@@ -7304,6 +7321,10 @@ async fn run_app<B: Backend>(
                             task_id,
                             text,
                         } => {
+                            if let Some(goal) = app.goals.get_mut(goal_index) {
+                                goal.context_mentions =
+                                    resolve_context_mentions_for_prompt(&text, &working_dir);
+                            }
                             let tx_goal = tx.clone();
                             let store_goal = Arc::clone(&store);
                             let working_dir_goal = working_dir.clone();
@@ -7351,6 +7372,10 @@ async fn run_app<B: Backend>(
                             let direct_task = app.mode == Mode::Task;
                             // `handle_key` inserts the goal at index 0.
                             let task_id = app.goals.first().map(|g| g.task_id).unwrap_or_default();
+                            if let Some(goal) = app.goals.first_mut() {
+                                goal.context_mentions =
+                                    resolve_context_mentions_for_prompt(&text, &working_dir);
+                            }
                             // Sync any in-memory Settings inputs into cfg so
                             // this goal uses the *currently displayed*
                             // provider/model/key — not the stale on-disk
@@ -7854,6 +7879,22 @@ fn prepare_goal_attachments(text: &str, working_dir: &Path) -> Vec<PromptAttachm
     attachments
 }
 
+fn resolve_context_mentions_for_prompt(text: &str, working_dir: &Path) -> Vec<ContextMention> {
+    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(working_dir));
+    let catalog = MentionCapabilityCatalog::from_mcp_servers(&extension_set.mcp_servers);
+    ContextMentionResolver::new(working_dir, catalog).resolve_text(text)
+}
+
+fn annotate_prompt_manifest_event(
+    mut record: EventRecord,
+    context_mentions: &[ContextMention],
+) -> EventRecord {
+    if let OrchestratorEvent::PromptManifest { manifest, .. } = &mut record.event {
+        manifest.context_mentions = context_mentions.to_vec();
+    }
+    record
+}
+
 fn extract_file_mentions(text: &str) -> Vec<String> {
     let mut mentions = Vec::new();
     let mut iter = text.char_indices().peekable();
@@ -8307,6 +8348,7 @@ async fn spawn_goal(
     let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(&working_dir));
     apply_extension_context_to_plan(&mut plan, &extension_set);
     publish_extension_events(task_id, &extension_set, &event_tx);
+    let context_mentions_for_events = resolve_context_mentions_for_prompt(&text, &working_dir);
 
     let naive = plan.naive_baseline_tokens;
     let semantic_context = build_semantic_context(&working_dir).await;
@@ -8532,10 +8574,12 @@ async fn spawn_goal(
     let evidence_for_events = Arc::clone(&ledger_evidence);
     let latest_state_for_events = Arc::clone(&latest_state_for_ledger);
     let store_for_events = store.clone();
+    let ui_context_mentions = context_mentions_for_events.clone();
     tokio::spawn(async move {
         loop {
             match event_rx_ui.recv().await {
                 Ok(rec) => {
+                    let rec = annotate_prompt_manifest_event(rec, &ui_context_mentions);
                     let evidence = if let Ok(mut evidence) = evidence_for_events.lock() {
                         evidence.apply_event(&rec);
                         evidence.clone()
@@ -8572,10 +8616,12 @@ async fn spawn_goal(
     // Persist every event — rusqlite is sync, so hop onto spawn_blocking
     // whenever we have a record to write.
     let store_for_events = store.clone();
+    let store_context_mentions = context_mentions_for_events;
     tokio::spawn(async move {
         loop {
             match event_rx_store.recv().await {
                 Ok(rec) => {
+                    let rec = annotate_prompt_manifest_event(rec, &store_context_mentions);
                     let store = store_for_events.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Ok(g) = store.lock() {
@@ -8725,7 +8771,8 @@ fn current_timestamp_ms() -> u64 {
 mod tests {
     use super::*;
     use phonton_types::{
-        AppliesTo, ExtensionSource, LLMResponse, McpServerDefinition, McpTransport, TrustLevel,
+        AppliesTo, ContextMentionKind, ContextMentionStatus, ExtensionSource, LLMResponse,
+        McpServerDefinition, McpTransport, TrustLevel,
     };
     use ratatui::backend::TestBackend;
     use std::path::{Path, PathBuf};
@@ -9414,6 +9461,8 @@ fn extract_id(line: &str) -> Option<String> {
             target_exceeded: false,
             over_target_tokens: 0,
             mcp_tool_tokens: 1,
+            context_mention_tokens: 2,
+            context_mentions: Vec::new(),
             retry_error_tokens: 0,
             total_estimated_tokens: 21,
             budget_limit: Some(120_000),
@@ -9432,6 +9481,45 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(answer.contains("Context"));
         assert!(answer.contains("total: 21"));
         assert!(app.goals.is_empty());
+    }
+
+    #[test]
+    fn prompt_manifest_event_carries_context_mentions_without_changing_total() {
+        let mention = ContextMention {
+            raw: "@README.md".into(),
+            label: "README.md".into(),
+            kind: ContextMentionKind::File,
+            status: ContextMentionStatus::Resolved,
+            path: Some(PathBuf::from("README.md")),
+            symbol: None,
+            server: None,
+            tool: None,
+            source_bucket: "attachment".into(),
+            estimated_tokens: Some(12),
+            note: Some("42 bytes".into()),
+        };
+        let record = EventRecord {
+            task_id: TaskId::new(),
+            timestamp_ms: 1,
+            event: OrchestratorEvent::PromptManifest {
+                subtask_id: SubtaskId::new(),
+                manifest: PromptContextManifest {
+                    attachment_tokens: 12,
+                    context_mention_tokens: 12,
+                    total_estimated_tokens: 50,
+                    ..PromptContextManifest::default()
+                },
+            },
+        };
+
+        let annotated = annotate_prompt_manifest_event(record, std::slice::from_ref(&mention));
+
+        let OrchestratorEvent::PromptManifest { manifest, .. } = annotated.event else {
+            panic!("expected prompt manifest event");
+        };
+        assert_eq!(manifest.total_estimated_tokens, 50);
+        assert_eq!(manifest.context_mention_tokens, 12);
+        assert_eq!(manifest.context_mentions, vec![mention]);
     }
 
     #[test]
@@ -10719,6 +10807,7 @@ fn extract_id(line: &str) -> Option<String> {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             plan_preview: false,
+            context_mentions: Vec::new(),
             checkpoint_cursor: None,
         });
         app.goals.push(GoalEntry {
@@ -10743,6 +10832,7 @@ fn extract_id(line: &str) -> Option<String> {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             plan_preview: false,
+            context_mentions: Vec::new(),
             checkpoint_cursor: None,
         });
         app.best_savings_pct = Some(75);
@@ -10917,6 +11007,7 @@ fn extract_id(line: &str) -> Option<String> {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             plan_preview: false,
+            context_mentions: Vec::new(),
             checkpoint_cursor: None,
         });
 

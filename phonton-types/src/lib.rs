@@ -850,6 +850,75 @@ pub struct ContextPlan {
     pub items: Vec<ContextPlanItem>,
 }
 
+/// Kind of context target referenced by a user with `@...` syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMentionKind {
+    /// A single file in the active workspace.
+    File,
+    /// A directory in the active workspace, represented by a bounded summary.
+    Directory,
+    /// A symbol or named code entity.
+    Symbol,
+    /// A configured MCP server.
+    McpServer,
+    /// A tool exposed by a configured MCP server.
+    McpTool,
+    /// The mention was syntactically recognized but did not match a known target.
+    Unknown,
+}
+
+/// Resolution state for a user-authored `@...` context mention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMentionStatus {
+    /// Mention resolved and can influence context without extra approval.
+    Resolved,
+    /// Mention could not be resolved in the active workspace or capability set.
+    Unresolved,
+    /// Mention resolved to a known target but cannot be used by this surface.
+    Unsupported,
+    /// Mention resolved to a capability that requires explicit approval.
+    PermissionGated,
+}
+
+/// Typed record for one user-authored `@...` context mention.
+///
+/// The CLI owns filesystem and MCP lookup, but this shape crosses crate
+/// boundaries through prompt manifests, handoff evidence, and future desktop
+/// surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMention {
+    /// Original mention text, including the leading `@`.
+    pub raw: String,
+    /// User-facing normalized label.
+    pub label: String,
+    /// Mention category.
+    pub kind: ContextMentionKind,
+    /// Resolution outcome.
+    pub status: ContextMentionStatus,
+    /// Workspace-relative path for file or directory mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// Symbol name for `@symbol:` mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// MCP server id for `@mcp:` mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// MCP tool name for `@mcp:server/tool` mentions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Prompt manifest bucket this mention contributes to.
+    pub source_bucket: String,
+    /// Local tokenizer estimate for the context carried by this mention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens: Option<u64>,
+    /// Review-safe resolution note for preflight, `/context`, and receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Provenance of a [`CodeSlice`].
 ///
 /// Recorded so downstream consumers (planner, worker) can reason about
@@ -1412,6 +1481,14 @@ pub struct ContextBucketSummary {
     /// Tokens from MCP/tool output.
     #[serde(default)]
     pub tool_output_tokens: u64,
+    /// Attribution-only tokens from user-authored `@...` mentions.
+    ///
+    /// These tokens are already represented in the concrete artifact/tool/code
+    /// buckets that carried the content. This field exists so receipts can
+    /// show how much prompt context came from explicit user addressing without
+    /// counting those tokens twice.
+    #[serde(default)]
+    pub context_mention_tokens: u64,
     /// Tokens removed by context deduplication.
     #[serde(default)]
     pub deduped_tokens: u64,
@@ -1441,6 +1518,9 @@ impl ContextBucketSummary {
         self.tool_output_tokens = self
             .tool_output_tokens
             .saturating_add(manifest.mcp_tool_tokens);
+        self.context_mention_tokens = self
+            .context_mention_tokens
+            .saturating_add(manifest.context_mention_tokens);
         self.deduped_tokens = self.deduped_tokens.saturating_add(manifest.deduped_tokens);
     }
 }
@@ -1501,6 +1581,21 @@ pub struct PromptContextManifest {
     /// Tokens attributed to MCP/tool instructions and results.
     #[serde(default)]
     pub mcp_tool_tokens: u64,
+    /// Attribution-only tokens from user-authored `@...` mentions.
+    ///
+    /// Do not add this to [`Self::total_estimated_tokens`]. Mentioned file
+    /// payloads are already counted in [`Self::attachment_tokens`], mentioned
+    /// MCP capability context is already counted in [`Self::mcp_tool_tokens`],
+    /// and mentioned code context is already counted in repository buckets.
+    #[serde(default)]
+    pub context_mention_tokens: u64,
+    /// Resolved mention rows associated with this prompt, when captured by the
+    /// CLI before dispatch.
+    ///
+    /// This is metadata for audit and receipt surfaces. The concrete prompt
+    /// cost remains represented by the section token buckets above.
+    #[serde(default)]
+    pub context_mentions: Vec<ContextMention>,
     /// Tokens attributed to retry/verification error context.
     #[serde(default)]
     pub retry_error_tokens: u64,
@@ -1948,6 +2043,8 @@ pub struct ContextSummary {
     pub retry_diagnostic_tokens: u64,
     /// MCP/tool output tokens.
     pub tool_output_tokens: u64,
+    /// Attribution-only tokens from user-authored `@...` mentions.
+    pub context_mention_tokens: u64,
 }
 
 impl ContextSummary {
@@ -1961,6 +2058,7 @@ impl ContextSummary {
             artifact_tokens: manifest.buckets.artifact_tokens,
             retry_diagnostic_tokens: manifest.buckets.retry_diagnostic_tokens,
             tool_output_tokens: manifest.buckets.tool_output_tokens,
+            context_mention_tokens: manifest.buckets.context_mention_tokens,
             ..Self::default()
         };
         for source in &manifest.sources {
@@ -2207,6 +2305,36 @@ mod tests {
         assert!(!manifest.repair_attempt);
         assert!(!manifest.target_exceeded);
         assert_eq!(manifest.over_target_tokens, 0);
+        assert_eq!(manifest.context_mention_tokens, 0);
+        assert!(manifest.context_mentions.is_empty());
+    }
+
+    #[test]
+    fn context_mentions_serialize_stable_resolution_shape() {
+        let mention = ContextMention {
+            raw: "@mcp:github/create_issue".into(),
+            label: "github/create_issue".into(),
+            kind: ContextMentionKind::McpTool,
+            status: ContextMentionStatus::PermissionGated,
+            path: None,
+            symbol: None,
+            server: Some("github".into()),
+            tool: Some("create_issue".into()),
+            source_bucket: "mcp".into(),
+            estimated_tokens: Some(32),
+            note: Some("mutating MCP tool requires approval".into()),
+        };
+
+        let value = serde_json::to_value(&mention).unwrap();
+
+        assert_eq!(value["kind"], "mcp_tool");
+        assert_eq!(value["status"], "permission_gated");
+        assert_eq!(value["server"], "github");
+        assert_eq!(value["tool"], "create_issue");
+        assert_eq!(value["estimated_tokens"], 32);
+
+        let round_trip: ContextMention = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip, mention);
     }
 
     #[test]
@@ -2257,6 +2385,7 @@ mod tests {
             artifact_tokens: 30,
             retry_diagnostic_tokens: 40,
             tool_output_tokens: 50,
+            context_mention_tokens: 25,
             deduped_tokens: 60,
             cached_tokens: 70,
         };
@@ -2269,6 +2398,7 @@ mod tests {
 
         assert_eq!(value["buckets"]["selected_code_tokens"], 1200);
         assert_eq!(value["buckets"]["omitted_candidate_tokens"], 4300);
+        assert_eq!(value["buckets"]["context_mention_tokens"], 25);
         assert_eq!(value["buckets"]["cached_tokens"], 70);
     }
 

@@ -1828,6 +1828,9 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
     let retry_error_tokens = estimate_prompt_tokens(&prior_errors.join("\n"));
     let mcp_text = render_mcp_budget_text(mcp, mcp_results);
     let mcp_tool_tokens = estimate_prompt_tokens(&mcp_text);
+    // Attribution only: mentioned file payloads are already included in the
+    // attachment bucket that participates in the prompt total.
+    let context_mention_tokens = attachment_tokens;
     let total_estimated_tokens = system_tokens
         .saturating_add(user_goal_tokens)
         .saturating_add(memory_tokens)
@@ -1851,6 +1854,8 @@ fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManif
         target_exceeded,
         over_target_tokens,
         mcp_tool_tokens,
+        context_mention_tokens,
+        context_mentions: Vec::new(),
         retry_error_tokens,
         total_estimated_tokens,
         budget_limit,
@@ -2517,6 +2522,7 @@ mod tests {
                 .saturating_add(manifest.mcp_tool_tokens)
                 .saturating_add(manifest.retry_error_tokens)
         );
+        assert_eq!(manifest.context_mention_tokens, manifest.attachment_tokens);
     }
 
     #[test]
