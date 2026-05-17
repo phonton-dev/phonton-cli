@@ -3460,11 +3460,7 @@ fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(p, area);
     } else {
         // Compact one-line header - gradient "phonton" + dim subtitle.
-        let compact_phase = if app.goals.is_empty() {
-            header_phase * 0.8
-        } else {
-            logo_phase
-        };
+        let compact_phase = logo_phase + header_phase * 0.8;
         let mut spans = gradient_line("✦ phonton", compact_phase, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
@@ -4524,7 +4520,7 @@ fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
     let max_scroll = total.saturating_sub(inner_h);
     // None == "tail mode": always show the newest content. Some(n) == the
     // user has scrolled, n is the offset from the top.
-    let scroll = app.flight_log_scroll.unwrap_or(max_scroll).min(max_scroll);
+    let scroll = resolved_flight_log_scroll(app.flight_log_scroll, max_scroll);
     let visible: Vec<Line> = lines.into_iter().skip(scroll).take(inner_h).collect();
 
     let p = Paragraph::new(visible)
@@ -4842,6 +4838,17 @@ fn wrap_text(s: &str, w: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+fn resolved_flight_log_scroll(raw_scroll: Option<usize>, max_scroll: usize) -> usize {
+    match raw_scroll {
+        None => max_scroll,
+        Some(raw) if raw > max_scroll => {
+            let distance_from_tail = usize::MAX.saturating_sub(raw);
+            max_scroll.saturating_sub(distance_from_tail)
+        }
+        Some(raw) => raw.min(max_scroll),
+    }
 }
 
 fn event_style(rec: &EventRecord) -> (Color, &'static str) {
@@ -8629,6 +8636,20 @@ mod tests {
         }
     }
 
+    fn buffer_lines(buf: &ratatui::buffer::Buffer, width: usize) -> Vec<String> {
+        buf.content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
     fn review_ready_event(path: &str) -> EventRecord {
         EventRecord {
             task_id: TaskId::new(),
@@ -10182,6 +10203,37 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn focus_tabs_do_not_wrap_diff_hint_at_compact_width() {
+        let backend = TestBackend::new(88, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+        app.focus_view = FocusView::Receipt;
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines = buffer_lines(&buf, 88);
+
+        assert!(
+            !lines.iter().any(|line| line.trim() == "diff"),
+            "focus shortcut hint should not wrap to an orphaned line: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn receipt_focus_tabs_fit_common_right_pane_width() {
+        let mut lines = Vec::new();
+        append_focus_tabs(&mut lines, FocusView::Receipt);
+        let text = line_text(&lines[1]);
+
+        assert!(
+            text.chars().count() <= 96,
+            "receipt focus tabs should fit without wrapping the d diff hint: {text}"
+        );
+    }
+
+    #[test]
     fn page_keys_scroll_active_code_focus_when_prompt_empty() {
         let mut app = App::default();
         app.goals.push(GoalEntry::new("make chess".into()));
@@ -10217,6 +10269,56 @@ fn extract_id(line: &str) -> Option<String> {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.focus_scroll, 0);
+    }
+
+    #[test]
+    fn flight_log_pageup_from_tail_shows_older_events() {
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let task_id = TaskId::new();
+        let mut goal = GoalEntry::new("inspect log".into());
+        for n in 0..30 {
+            goal.flight_log.push(EventRecord {
+                task_id,
+                timestamp_ms: n * 1000,
+                event: OrchestratorEvent::TaskStarted {
+                    task_id,
+                    goal: format!("log-entry-{n:02}"),
+                    subtask_count: 1,
+                },
+            });
+        }
+        let mut app = App {
+            flight_log_open: true,
+            ..App::default()
+        };
+        app.goals.push(goal);
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let tail_dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(tail_dump.contains("log-entry-29"));
+        assert!(!tail_dump.contains("log-entry-05"));
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let scrolled_dump: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            scrolled_dump.contains("log-entry-05"),
+            "PageUp from tail mode should move to older Flight Log events"
+        );
     }
 
     #[test]
@@ -10561,7 +10663,7 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn compact_header_is_stable_after_goal_exists() {
+    fn compact_header_animates_after_goal_exists() {
         let backend = TestBackend::new(64, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::default();
@@ -10574,7 +10676,7 @@ fn extract_id(line: &str) -> Option<String> {
         terminal.draw(|f| render(f, &app)).unwrap();
         let second = format!("{:?}", terminal.backend().buffer());
 
-        assert_eq!(first, second);
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -4,6 +4,15 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.15.1 - TUI And Vite Chess Hotfix
+
+### Fixed
+
+- Existing Vite/React chess rules seeds now declare a real Vitest suite instead of relying on self-executing assertions in `src/chessRules.test.ts`. This fixes Vitest failures that reported `No test suite found in file`.
+- The compact `phonton` header gradient animates while a goal is active again.
+- The Active panel focus tabs use compact labels for Commands, Context, and Tokens so the Receipt `d diff` shortcut hint does not wrap onto a stranded line at common terminal widths.
+- Flight Log scrolling now works from tail mode with `PgUp`, arrow keys, and the mouse wheel instead of staying pinned to the newest event.
+
 ## 0.15.0 - Summary-First Proof Candidate
 
 ### Added

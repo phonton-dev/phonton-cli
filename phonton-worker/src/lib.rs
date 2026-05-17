@@ -2807,16 +2807,31 @@ mod tests {
     }
 
     #[test]
-    fn local_chess_rules_test_seed_does_not_require_test_runner_dependency() {
+    fn local_chess_rules_test_seed_uses_vitest_runner_contract() {
         let template = include_str!("templates/chessRules.test.ts");
 
         assert!(
-            !template.contains("from 'vitest'") && !template.contains("from \"vitest\""),
-            "existing Vite seed must not require adding Vitest before package.json is repaired"
+            template.contains("from 'vitest'") || template.contains("from \"vitest\""),
+            "existing Vite seed is discovered by Vitest and must use its test API"
         );
         assert!(
-            template.contains("runRulesSeedTests()"),
-            "template should still self-execute assertions when a runner discovers the file"
+            template.contains("describe(")
+                && (template.contains("it(") || template.contains("test(")),
+            "template should declare a runnable suite when Vitest discovers the file"
+        );
+    }
+
+    #[test]
+    fn local_chess_rules_test_seed_declares_a_vitest_suite() {
+        let template = include_str!("templates/chessRules.test.ts");
+
+        assert!(
+            template.contains("from 'vitest'") || template.contains("from \"vitest\""),
+            "Vitest treats discovered *.test.ts files with zero tests as failed suites"
+        );
+        assert!(
+            template.contains("test(") || template.contains("it("),
+            "seeded *.test.ts file must declare at least one runnable test"
         );
     }
 

@@ -7,6 +7,7 @@ import {
   makePiece,
   movePiece,
 } from './chessRules'
+import { describe, it } from 'vitest'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -22,7 +23,7 @@ function assertExcludes(values: string[], expected: string, message: string) {
   assert(!values.includes(expected), message)
 }
 
-export function runRulesSeedTests() {
+function runRulesSeedTests() {
   const initial = createInitialGame()
   const pieceCount = Object.values(initial.board).filter(Boolean).length
 
@@ -62,4 +63,8 @@ export function runRulesSeedTests() {
   assert(promotion.move.promotion === 'queen', 'promotion is recorded')
 }
 
-runRulesSeedTests()
+describe('chess rules seed', () => {
+  it('supports core legal moves, turn order, check, and promotion', () => {
+    runRulesSeedTests()
+  })
+})

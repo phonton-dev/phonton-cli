@@ -50,6 +50,19 @@ impl FocusView {
         }
     }
 
+    pub fn tab_label(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Receipt => "Receipt",
+            Self::Problems => "Problems",
+            Self::Code => "Code",
+            Self::Commands => "Cmds",
+            Self::Context => "Ctx",
+            Self::Tokens => "Tok",
+            Self::Log => "Log",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Plan => Self::Receipt,

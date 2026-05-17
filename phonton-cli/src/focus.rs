@@ -40,7 +40,7 @@ pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusVie
         } else {
             Style::default().fg(MUTED)
         };
-        spans.push(Span::styled(format!(" {} ", view.as_str()), style));
+        spans.push(Span::styled(format!(" {} ", view.tab_label()), style));
         if idx + 1 < tabs.len() {
             spans.push(Span::styled(" | ", Style::default().fg(MUTED)));
         } else {

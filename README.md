@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.15.0</h1>
+<h1 align="center">Phonton CLI · v0.15.1</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.15.0-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.15.1-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -73,6 +73,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - Static syntax verification now covers Rust, Python, JavaScript, TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before review-ready status. Generated code that cannot parse stays failed/unverified instead of becoming a receipt.
 - Failed goals default to a Problems focus view with grouped verifier/provider/quality diagnostics, compact repair hints, and `p` / `r` keyboard shortcuts for inspection and repair.
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
+- v0.15.1 fixes the v0.15.0 hot path: generated Vite chess rules seeds declare a real Vitest suite, the compact header gradient animates while work is active, the Receipt focus shortcut row no longer wraps `d diff` onto a stranded line, and Flight Log PgUp/mouse scrolling works from tail mode.
 - v0.15.0 adds a summary-first proof layer: deterministic Plan, Work, Verification, Failure, Token, Context, and Handoff summaries are derived from typed facts and exported through proof/review surfaces.
 - v0.15.0 expands the Active panel focus surfaces to Plan, Receipt, Problems, Code, Commands, Context, Tokens, and Log so broad work can be inspected without opening the Flight Log.
 - `/plan <goal>` now previews the GoalContract and verification/run plan in the TUI without starting workers; `/approve` starts the selected preview after review.
@@ -80,12 +81,12 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - Generated web/runtime verification plans that do not produce runtime proof are surfaced as known gaps and verification findings, not treated as proof of correctness.
 - v0.11 context planning builds a compact repo map, selects only the highest-value code slices under a target budget, exposes omitted code tokens, and labels target-exceeded prompts honestly when one required slice must go over budget.
 - v0.12 enforces lower spend before the provider call: generated app/game goals dispatch as acceptance-slice subtasks, simple/docs/test prompts use small task-class budgets, generated repairs use a sub-1k context target, semantic retrieval top-k and repo maps shrink by task class, MCP result context is capped, and provider output ceilings are lower.
-- v0.14.1 fixes generated-web failure diagnostics: Problems focus now jumps to the changed file named by the verifier, `src/App.tsx:1:1` diagnostics are normalized for retry policy, and the local chess rules test seed no longer requires a Vitest import.
+- v0.14.1 fixes generated-web failure diagnostics: Problems focus now jumps to the changed file named by the verifier, and `src/App.tsx:1:1` diagnostics are normalized for retry policy.
 - v0.14.0 hardens Node verification so stock Vite/Vitest/Jest test scripts run in non-interactive CI mode instead of hanging in watch mode.
 - v0.13.5 seeds the existing Vite/React chess rules/test boundary with a locally verified template before provider UI slices, including recovery from partial invalid `src/chessRules.ts` artifacts without another provider call.
 - v0.13.4 detects existing Vite/React workspaces for chess benchmark prompts that say "use the existing project stack," then starts on source/test slices instead of fragile `package.json` or `index.html` scaffold edits.
 - v0.13.1 hardens generated web-app token behavior: Vite/React chess prompts stay on compact acceptance slices even in partial workspaces, and first-attempt TSX/HTML syntax failures stop before automatic repair.
-- v0.13.0 makes Ask workspace-aware under a bounded context budget, freezes the compact TUI header after goals exist, and carries forward verified diff export: `phonton diff`, `--stat`, `--name-only`, `/diff`, `/code`, and `d`.
+- v0.13.0 makes Ask workspace-aware under a bounded context budget and carries forward verified diff export: `phonton diff`, `--stat`, `--name-only`, `/diff`, `/code`, and `d`.
 - v0.12.6 hardens provider contracts further: DeepSeek V4/reasoner routes disable provider thinking for diff-only worker calls, stale v0.12.5 canary cache entries are invalidated, reasoning-only replies fail clearly, and provider tests time out quickly instead of hanging.
 - v0.12.5 blocks bad provider/model routes before goal dispatch: provider readiness now uses a parseable unified-diff canary, empty OpenAI-compatible responses fail immediately, OpenCode/OpenCode Go routes work through `OPENCODE_API_KEY`, and `phonton providers` can list/sync the Models.dev catalog.
 - v0.12.4 cuts wasted repair tokens in generated-app failures: workers stop after repeated verifier/parser diagnostics, redispatch prompts start with prior verifier evidence, stale hunk repairs get explicit guidance, and the Flight Log shows compact `repair` events before bounded retries.
@@ -160,7 +161,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.0 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.1 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -176,7 +177,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.0 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.1 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
