@@ -148,6 +148,7 @@ h1 {
 }
 
 .status-card,
+.piece-legend,
 .history-card {
   border: 1px solid rgba(145, 185, 220, 0.36);
   border-radius: 8px;
@@ -166,9 +167,25 @@ h1 {
 }
 
 .status-card span,
+.piece-legend li,
 .history-card p,
 .history-card li {
   color: #c9d8e8;
+}
+
+.piece-legend ul {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  text-transform: capitalize;
+}
+
+.piece-legend li {
+  min-width: 0;
+  font-weight: 700;
 }
 
 .history-card ol {

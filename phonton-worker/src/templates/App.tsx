@@ -5,6 +5,7 @@ import type { GameState, Piece } from './chessRules'
 
 const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] as const
 const ranks = ['8', '7', '6', '5', '4', '3', '2', '1'] as const
+const namedPieces = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'] as const
 
 function squareName(file: string, rank: string) {
   return `${file}${rank}`
@@ -109,6 +110,14 @@ function App() {
           <p className="eyebrow">Turn</p>
           <strong>{game.status.message}</strong>
           <span>{notice}</span>
+        </div>
+        <div className="piece-legend" aria-label="Named chess pieces">
+          <p className="eyebrow">Pieces</p>
+          <ul>
+            {namedPieces.map((pieceName) => (
+              <li key={pieceName}>{pieceName}</li>
+            ))}
+          </ul>
         </div>
         <div className="history-card">
           <p className="eyebrow">Moves</p>

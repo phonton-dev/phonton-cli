@@ -2964,6 +2964,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn local_chess_app_shell_template_contains_named_piece_evidence_for_quality_gate() {
+        let template = include_str!("templates/App.tsx").to_ascii_lowercase();
+        let named_piece_hits = ["king", "queen", "rook", "bishop", "knight", "pawn"]
+            .into_iter()
+            .filter(|piece| template.contains(piece))
+            .count();
+
+        assert!(
+            named_piece_hits >= 4,
+            "the chess quality gate evaluates added diff text, so the App shell template must include literal named piece evidence"
+        );
+    }
+
     #[tokio::test]
     async fn existing_vite_chess_app_shell_seed_is_noop_when_files_are_current() {
         let (base, root) = temp_workspace("local-chess-app-shell-seed-noop");

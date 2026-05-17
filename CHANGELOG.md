@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.15.4 - Vite Chess Quality Gate Hotfix
+
+### Fixed
+
+- Existing Vite/React chess App shell seeds now render an accessible named-piece legend for king, queen, rook, bishop, knight, and pawn, so the diff-based playable chess quality gate sees explicit piece evidence instead of failing after a locally verified zero-token UI seed.
+- The seeded App test now asserts named chess piece evidence, preventing regressions where the local App shell is playable at runtime but too implicit for Phonton's review-quality diagnostics.
+
 ## 0.15.3 - Vite Chess App Test Hotfix
 
 ### Fixed
