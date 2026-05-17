@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.15.1</h1>
+<h1 align="center">Phonton CLI · v0.15.2</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.15.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.15.2-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -73,6 +73,7 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 - Static syntax verification now covers Rust, Python, JavaScript, TypeScript, JSON, TOML, YAML, HTML, and CSS changed files before review-ready status. Generated code that cannot parse stays failed/unverified instead of becoming a receipt.
 - Failed goals default to a Problems focus view with grouped verifier/provider/quality diagnostics, compact repair hints, and `p` / `r` keyboard shortcuts for inspection and repair.
 - `/why-tokens` and `phonton why-tokens --by-source` explain the latest prompt manifest in plain language, including first-attempt, repair-attempt, context/artifact, system, goal, memory, attachment, repo-code, MCP/tool, retry, compaction, dedupe, and cached-token buckets.
+- v0.15.2 fixes the existing Vite chess UI hot path: `src/App.tsx`, `src/App.css`, and `src/vite-env.d.ts` seed locally with a playable app shell, repeated UI slices become zero-token no-ops, and the TUI no longer shows a blinking native cursor over the prompt or compact header.
 - v0.15.1 fixes the v0.15.0 hot path: generated Vite chess rules seeds declare a real Vitest suite, the compact header gradient animates while work is active, the Receipt focus shortcut row no longer wraps `d diff` onto a stranded line, and Flight Log PgUp/mouse scrolling works from tail mode.
 - v0.15.0 adds a summary-first proof layer: deterministic Plan, Work, Verification, Failure, Token, Context, and Handoff summaries are derived from typed facts and exported through proof/review surfaces.
 - v0.15.0 expands the Active panel focus surfaces to Plan, Receipt, Problems, Code, Commands, Context, Tokens, and Log so broad work can be inspected without opening the Flight Log.
@@ -161,7 +162,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.1 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.2 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -177,7 +178,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.1 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.15.2 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |

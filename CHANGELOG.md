@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.15.2 - Vite Chess Token And Cursor Hotfix
+
+### Fixed
+
+- Existing Vite/React chess App/UI slices now seed `src/App.tsx`, `src/App.css`, and `src/vite-env.d.ts` from a locally verified playable chess shell instead of spending a provider call on fragile generated CSS hunks.
+- Repeated existing Vite chess UI slices become zero-token no-ops once the local shell is already current, avoiding noisy remove/add copies of the same files.
+- The TUI no longer requests a native terminal cursor during frame renders, removing the blinking prompt/header bar while keeping the animated compact `phonton` gradient.
+
 ## 0.15.1 - TUI And Vite Chess Hotfix
 
 ### Fixed

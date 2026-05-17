@@ -5135,20 +5135,6 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(Alignment::Right)
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
-
-    // Draw a native terminal cursor instead of a manual in-buffer caret.
-    // Native cursors are handled efficiently by the terminal emulator and
-    // don't flicker on every frame draw.
-    if !matches!(
-        app.mode,
-        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
-    ) {
-        let cx = row[0].x + prompt_prefix_w + (cursor_clamped - scroll) as u16;
-        let cy = row[0].y;
-        if cx < row[0].x + row[0].width {
-            frame.set_cursor_position((cx, cy));
-        }
-    }
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -6888,6 +6874,7 @@ async fn main() -> Result<()> {
     execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
 
     let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(512);
     spawn_input_task(evt_tx.clone());
@@ -10677,6 +10664,21 @@ fn extract_id(line: &str) -> Option<String> {
         let second = format!("{:?}", terminal.backend().buffer());
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tui_render_keeps_native_cursor_hidden() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+
+        let backend_debug = format!("{:?}", terminal.backend());
+        assert!(
+            backend_debug.contains("cursor: false"),
+            "TUI should not request a native terminal cursor because it blinks over the prompt/header: {backend_debug}"
+        );
     }
 
     #[test]

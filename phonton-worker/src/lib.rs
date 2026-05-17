@@ -1231,15 +1231,41 @@ fn current_artifact_context_slices(
 }
 
 fn local_generated_artifact_seed_hunks(root: &Path, subtask: &Subtask) -> Option<Vec<DiffHunk>> {
-    if !is_existing_vite_chess_rules_seed(&subtask.description) {
-        return None;
+    if is_existing_vite_chess_rules_seed(&subtask.description) {
+        return Some(template_file_hunks(
+            root,
+            [
+                (
+                    PathBuf::from("src/chessRules.ts"),
+                    include_str!("templates/chessRules.ts"),
+                ),
+                (
+                    PathBuf::from("src/chessRules.test.ts"),
+                    include_str!("templates/chessRules.test.ts"),
+                ),
+            ],
+        ));
     }
-    let rules = PathBuf::from("src/chessRules.ts");
-    let tests = PathBuf::from("src/chessRules.test.ts");
-    Some(vec![
-        template_file_hunk(root, rules, include_str!("templates/chessRules.ts")),
-        template_file_hunk(root, tests, include_str!("templates/chessRules.test.ts")),
-    ])
+    if is_existing_vite_chess_app_shell_seed(&subtask.description) {
+        return Some(template_file_hunks(
+            root,
+            [
+                (
+                    PathBuf::from("src/App.tsx"),
+                    include_str!("templates/App.tsx"),
+                ),
+                (
+                    PathBuf::from("src/App.css"),
+                    include_str!("templates/App.css"),
+                ),
+                (
+                    PathBuf::from("src/vite-env.d.ts"),
+                    include_str!("templates/vite-env.d.ts"),
+                ),
+            ],
+        ));
+    }
+    None
 }
 
 fn is_existing_vite_chess_rules_seed(description: &str) -> bool {
@@ -1252,7 +1278,28 @@ fn is_existing_vite_chess_rules_seed(description: &str) -> bool {
             || lower.contains("local game-state/rules boundary"))
 }
 
-fn template_file_hunk(root: &Path, path: PathBuf, content: &str) -> DiffHunk {
+fn is_existing_vite_chess_app_shell_seed(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    lower.contains("existing vite react chess app")
+        && lower.contains("src/app.tsx")
+        && lower.contains("src/app.css")
+        && (lower.contains("actual chess app")
+            || lower.contains("board coordinates")
+            || lower.contains("legal destination highlights")
+            || lower.contains("move history"))
+}
+
+fn template_file_hunks<const N: usize>(
+    root: &Path,
+    specs: [(PathBuf, &'static str); N],
+) -> Vec<DiffHunk> {
+    specs
+        .into_iter()
+        .filter_map(|(path, content)| template_file_hunk(root, path, content))
+        .collect()
+}
+
+fn template_file_hunk(root: &Path, path: PathBuf, content: &str) -> Option<DiffHunk> {
     let old_lines = std::fs::read_to_string(root.join(&path))
         .ok()
         .map(|content| {
@@ -1268,19 +1315,22 @@ fn template_file_hunk(root: &Path, path: PathBuf, content: &str) -> DiffHunk {
         .lines()
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
+    if old_lines == new_lines {
+        return None;
+    }
     let lines = old_lines
         .iter()
         .map(|line| DiffLine::Removed(line.clone()))
         .chain(new_lines.iter().map(|line| DiffLine::Added(line.clone())))
         .collect::<Vec<_>>();
-    DiffHunk {
+    Some(DiffHunk {
         file_path: path,
         old_start: if old_lines.is_empty() { 0 } else { 1 },
         old_count: old_lines.len() as u32,
         new_start: 1,
         new_count: new_lines.len() as u32,
         lines,
-    }
+    })
 }
 
 fn current_artifact_context_slice(root: &Path, path: PathBuf) -> Option<CodeSlice> {
@@ -2803,6 +2853,105 @@ mod tests {
         assert!(rules_hunk.lines.iter().any(
             |line| matches!(line, DiffLine::Removed(line) if line == "not valid typescript {")
         ));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn existing_vite_chess_app_shell_seed_uses_local_verified_diff_without_provider_call() {
+        let (base, root) = temp_workspace("local-chess-app-shell-seed");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("App.tsx"),
+            "export default function App() { return <main /> }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("App.css"),
+            ".fixture-shell {\n  color: black;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("chessRules.ts"),
+            include_str!("templates/chessRules.ts"),
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Existing Vite React chess app acceptance slice 2/4: replace the placeholder React screen with the actual chess app, board coordinates, named pieces, and clear turn status. Artifacts: src/App.tsx, src/App.css. Keep the diff minimal; satisfy only this slice, preserve earlier slices, and keep npm test/build passing.".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let result = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
+        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
+        assert_eq!(result.token_usage.input_tokens, 0);
+        assert_eq!(result.token_usage.output_tokens, 0);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(result
+            .diff_hunks
+            .iter()
+            .any(|hunk| hunk.file_path.as_path() == Path::new("src/App.tsx")));
+        assert!(result
+            .diff_hunks
+            .iter()
+            .any(|hunk| hunk.file_path.as_path() == Path::new("src/App.css")));
+        assert!(result
+            .diff_hunks
+            .iter()
+            .any(|hunk| hunk.file_path.as_path() == Path::new("src/vite-env.d.ts")));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn existing_vite_chess_app_shell_seed_is_noop_when_files_are_current() {
+        let (base, root) = temp_workspace("local-chess-app-shell-seed-noop");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("App.tsx"),
+            include_str!("templates/App.tsx"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("App.css"),
+            include_str!("templates/App.css"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src").join("vite-env.d.ts"),
+            include_str!("templates/vite-env.d.ts"),
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            calls: Arc::clone(&calls),
+        };
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Existing Vite React chess app acceptance slice 3/4: support click/tap selection, legal destination highlights, legal moves, captures, blocked-path rejection, and king-safety rejection. Artifacts: src/App.tsx, src/App.css.".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let result = worker.execute(subtask, Vec::new()).await.unwrap();
+
+        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
+        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
+        assert!(result.diff_hunks.is_empty());
+        assert_eq!(result.token_usage.input_tokens, 0);
+        assert_eq!(result.token_usage.output_tokens, 0);
+        assert!(calls.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(base);
     }
 
