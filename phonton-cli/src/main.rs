@@ -2309,8 +2309,85 @@ impl App {
     }
 
     fn handle_goal_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.cycle_focus_view();
+                    return None;
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.focus_view = FocusView::Problems;
+                    self.focus_scroll = 0;
+                    return None;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    self.focus_view = FocusView::Code;
+                    self.focus_scroll = 0;
+                    self.focused_changed_file = self.focused_changed_file.min(
+                        self.current_goal()
+                            .map(focused_file_count)
+                            .unwrap_or(0)
+                            .saturating_sub(1),
+                    );
+                    return None;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if self
+                        .current_goal()
+                        .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
+                    {
+                        return self.retry_selected_goal_intent();
+                    }
+                    let goal_index = self.selected;
+                    if let Some(g) = self.goals.get(goal_index) {
+                        if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref())
+                        {
+                            if let Some(cp) = state.checkpoints.get(cursor) {
+                                return Some(Intent::Rollback {
+                                    goal_index,
+                                    to_seq: cp.seq,
+                                });
+                            }
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Char('[') => {
+                    match self.active_focus_view_for_current_goal() {
+                        FocusView::Code => {
+                            self.focused_changed_file = self.focused_changed_file.saturating_sub(1)
+                        }
+                        FocusView::Commands => {
+                            self.focused_command_run = self.focused_command_run.saturating_sub(1)
+                        }
+                        _ => {}
+                    }
+                    return None;
+                }
+                KeyCode::Char(']') => {
+                    match self.active_focus_view_for_current_goal() {
+                        FocusView::Code => {
+                            let max = self
+                                .current_goal()
+                                .map(focused_file_count)
+                                .unwrap_or(0)
+                                .saturating_sub(1);
+                            self.focused_changed_file = (self.focused_changed_file + 1).min(max);
+                        }
+                        FocusView::Commands => {
+                            let max = self.command_runs.len().saturating_sub(1);
+                            self.focused_command_run = (self.focused_command_run + 1).min(max);
+                        }
+                        _ => {}
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         // Ctrl+Up / Ctrl+Down navigate the checkpoint picker inside the
-        // currently selected goal.  'r' triggers a rollback to the
+        // currently selected goal. Alt+R triggers a rollback to the
         // cursor-highlighted checkpoint.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -2471,79 +2548,6 @@ impl App {
             KeyCode::Tab => {
                 if let Some(completion) = complete_command_prefix(self.goal_prompt.display_text()) {
                     self.goal_prompt.set_text(completion);
-                }
-                None
-            }
-            KeyCode::Char('r') if self.goal_prompt.is_empty() => {
-                if self
-                    .current_goal()
-                    .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
-                {
-                    return self.retry_selected_goal_intent();
-                }
-                // Rollback shortcut — only when the goal bar is empty so the
-                // user can still type words starting with 'r' normally.
-                let goal_index = self.selected;
-                if let Some(g) = self.goals.get(goal_index) {
-                    if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref()) {
-                        if let Some(cp) = state.checkpoints.get(cursor) {
-                            return Some(Intent::Rollback {
-                                goal_index,
-                                to_seq: cp.seq,
-                            });
-                        }
-                    }
-                }
-                self.goal_prompt.insert_char('r');
-                None
-            }
-            KeyCode::Char('p') if self.goal_prompt.is_empty() => {
-                self.focus_view = FocusView::Problems;
-                self.focus_scroll = 0;
-                None
-            }
-            KeyCode::Char('d') if self.goal_prompt.is_empty() => {
-                self.focus_view = FocusView::Code;
-                self.focus_scroll = 0;
-                self.focused_changed_file = self.focused_changed_file.min(
-                    self.current_goal()
-                        .map(focused_file_count)
-                        .unwrap_or(0)
-                        .saturating_sub(1),
-                );
-                None
-            }
-            KeyCode::Char('f') if self.goal_prompt.is_empty() => {
-                self.cycle_focus_view();
-                None
-            }
-            KeyCode::Char('[') if self.goal_prompt.is_empty() => {
-                match self.active_focus_view_for_current_goal() {
-                    FocusView::Code => {
-                        self.focused_changed_file = self.focused_changed_file.saturating_sub(1)
-                    }
-                    FocusView::Commands => {
-                        self.focused_command_run = self.focused_command_run.saturating_sub(1)
-                    }
-                    _ => {}
-                }
-                None
-            }
-            KeyCode::Char(']') if self.goal_prompt.is_empty() => {
-                match self.active_focus_view_for_current_goal() {
-                    FocusView::Code => {
-                        let max = self
-                            .current_goal()
-                            .map(focused_file_count)
-                            .unwrap_or(0)
-                            .saturating_sub(1);
-                        self.focused_changed_file = (self.focused_changed_file + 1).min(max);
-                    }
-                    FocusView::Commands => {
-                        let max = self.command_runs.len().saturating_sub(1);
-                        self.focused_command_run = (self.focused_command_run + 1).min(max);
-                    }
-                    _ => {}
                 }
                 None
             }
@@ -3171,11 +3175,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("← / →", "move caret in the input bar"),
         ("Home / End", "jump to start/end of the input"),
         ("Ctrl+↑↓", "move the checkpoint cursor"),
-        ("p", "open Problems focus (input empty)"),
-        (
-            "r",
-            "retry failed goal or rollback checkpoint (input empty)",
-        ),
+        ("Alt+F", "cycle Active panel focus"),
+        ("Alt+D", "open the verified diff/code focus"),
+        ("Alt+P", "open Problems focus"),
+        ("Alt+R", "retry failed goal or rollback checkpoint"),
         ("Ctrl+C", "ask to save and quit"),
         ("Esc", "close overlay / cancel / ask to quit"),
     ];
@@ -3508,10 +3511,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Alt+↑↓", key),
             Span::styled(" goal  ", txt),
             sep.clone(),
-            Span::styled("f", key),
+            Span::styled("Alt+F", key),
             Span::styled(" focus  ", txt),
             sep.clone(),
-            Span::styled("d", key),
+            Span::styled("Alt+D", key),
             Span::styled(" diff  ", txt),
             sep.clone(),
             Span::styled("Ctrl+;", key),
@@ -4981,9 +4984,107 @@ fn render_rich_text_lines(text: &str) -> Vec<Line<'static>> {
         } else {
             Style::default().fg(Color::White)
         };
-        lines.push(Line::from(Span::styled(line, style)));
+        if in_code {
+            lines.push(Line::from(Span::styled(line, style)));
+        } else {
+            lines.push(Line::from(render_inline_markdown_spans(&line, style)));
+        }
     }
     lines
+}
+
+fn render_inline_markdown_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_marker(&chars, i + 2, "**") {
+                push_plain_span(&mut spans, &mut plain, base_style);
+                let content: String = chars[i + 2..end].iter().collect();
+                spans.push(Span::styled(
+                    content,
+                    base_style.add_modifier(Modifier::BOLD),
+                ));
+                i = end + 2;
+                continue;
+            }
+        }
+        if i + 1 < chars.len() && chars[i] == '_' && chars[i + 1] == '_' {
+            if let Some(end) = find_marker(&chars, i + 2, "__") {
+                push_plain_span(&mut spans, &mut plain, base_style);
+                let content: String = chars[i + 2..end].iter().collect();
+                spans.push(Span::styled(
+                    content,
+                    base_style.add_modifier(Modifier::BOLD),
+                ));
+                i = end + 2;
+                continue;
+            }
+        }
+        if chars[i] == '`' {
+            if let Some(end) = find_marker(&chars, i + 1, "`") {
+                push_plain_span(&mut spans, &mut plain, base_style);
+                let content: String = chars[i + 1..end].iter().collect();
+                spans.push(Span::styled(
+                    content,
+                    base_style.fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                ));
+                i = end + 1;
+                continue;
+            }
+        }
+        if chars[i] == '*' {
+            if let Some(end) = find_marker(&chars, i + 1, "*") {
+                push_plain_span(&mut spans, &mut plain, base_style);
+                let content: String = chars[i + 1..end].iter().collect();
+                spans.push(Span::styled(
+                    content,
+                    base_style.add_modifier(Modifier::ITALIC),
+                ));
+                i = end + 1;
+                continue;
+            }
+        }
+        if chars[i] == '_' {
+            if let Some(end) = find_marker(&chars, i + 1, "_") {
+                push_plain_span(&mut spans, &mut plain, base_style);
+                let content: String = chars[i + 1..end].iter().collect();
+                spans.push(Span::styled(
+                    content,
+                    base_style.add_modifier(Modifier::ITALIC),
+                ));
+                i = end + 1;
+                continue;
+            }
+        }
+        plain.push(chars[i]);
+        i += 1;
+    }
+    push_plain_span(&mut spans, &mut plain, base_style);
+    spans
+}
+
+fn find_marker(chars: &[char], start: usize, marker: &str) -> Option<usize> {
+    let marker_chars: Vec<char> = marker.chars().collect();
+    if marker_chars.is_empty() {
+        return None;
+    }
+    let mut i = start;
+    while i + marker_chars.len() <= chars.len() {
+        if chars[i..i + marker_chars.len()] == marker_chars {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn push_plain_span(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
+    if !plain.is_empty() {
+        spans.push(Span::styled(std::mem::take(plain), style));
+    }
 }
 
 fn numbered_list_prefix(line: &str) -> bool {
@@ -5113,10 +5214,6 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 
     // Horizontal scroll so the caret is always visible inside the input slot.
     let input_width = row[0].width.saturating_sub(prompt_prefix_w) as usize;
-    let total_chars = char_count(buf);
-    let cursor_clamped = cursor.min(total_chars);
-    let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
-    let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
 
     let mut prompt_spans = vec![Span::styled(
         prompt_prefix,
@@ -5124,9 +5221,12 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             .fg(border_color)
             .add_modifier(Modifier::BOLD),
     )];
-    prompt_spans.extend(artifact_text_spans(
-        &visible,
+    prompt_spans.extend(prompt_input_spans_with_caret(
+        buf,
+        cursor,
+        input_width.max(1),
         Style::default().fg(Color::White),
+        Style::default().bg(border_color).fg(BG_DEEP),
     ));
     let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
@@ -5135,6 +5235,34 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(Alignment::Right)
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
+}
+
+fn prompt_input_spans_with_caret(
+    text: &str,
+    cursor: usize,
+    width: usize,
+    text_style: Style,
+    caret_style: Style,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let total_chars = char_count(text);
+    let cursor = cursor.min(total_chars);
+    let scroll = cursor.saturating_sub(width.saturating_sub(1));
+    let visible_chars: Vec<char> = text.chars().skip(scroll).take(width).collect();
+    let relative_cursor = cursor.saturating_sub(scroll).min(width.saturating_sub(1));
+
+    let before: String = visible_chars.iter().take(relative_cursor).collect();
+    let mut spans = artifact_text_spans(&before, text_style);
+    if let Some(ch) = visible_chars.get(relative_cursor) {
+        spans.push(Span::styled(ch.to_string(), caret_style));
+        let after: String = visible_chars.iter().skip(relative_cursor + 1).collect();
+        spans.extend(artifact_text_spans(&after, text_style));
+    } else {
+        spans.push(Span::styled(" ", caret_style));
+    }
+    spans
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -8612,6 +8740,9 @@ mod tests {
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
     fn approval_prompt(id: u64) -> PendingMcpApproval {
         PendingMcpApproval {
             id,
@@ -9853,6 +9984,29 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn ask_rich_text_renderer_applies_inline_markdown_formatting() {
+        let lines = render_rich_text_lines("Use **bold** and `code` plus *italics*.");
+
+        assert_eq!(line_text(&lines[0]), "Use bold and code plus italics.");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|span| span.content == "bold"
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.content == "code" && span.style.fg == Some(ACCENT_HI)));
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.content == "italics"
+                && span.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
     fn esc_from_ask_returns_to_goal_without_quitting() {
         let mut app = App::default();
         app.handle_key(ctrl(';'));
@@ -9988,7 +10142,7 @@ fn extract_id(line: &str) -> Option<String> {
         app.apply_event(0, review_ready_event("chess.py"));
 
         assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Receipt);
-        app.handle_key(key('f'));
+        app.handle_key(alt('f'));
         assert_eq!(app.focus_view, FocusView::Problems);
     }
 
@@ -10147,10 +10301,10 @@ fn extract_id(line: &str) -> Option<String> {
         app.apply_state(0, failed_state("syntax verification failed"));
         app.focus_view = FocusView::Receipt;
 
-        assert_eq!(app.handle_key(key('p')), None);
+        assert_eq!(app.handle_key(alt('p')), None);
         assert_eq!(app.focus_view, FocusView::Problems);
 
-        match app.handle_key(key('r')) {
+        match app.handle_key(alt('r')) {
             Some(Intent::QueueGoal(prompt)) => {
                 assert!(prompt.contains("Repair the previous failed Phonton goal"));
                 assert!(prompt.contains("[python syntax] chess.py"));
@@ -10166,10 +10320,46 @@ fn extract_id(line: &str) -> Option<String> {
         app.apply_event(0, review_ready_event("chess.py"));
         app.focus_view = FocusView::Receipt;
 
-        assert_eq!(app.handle_key(key('d')), None);
+        assert_eq!(app.handle_key(alt('d')), None);
         assert_eq!(app.focus_view, FocusView::Code);
         assert!(app.goal_prompt.is_empty());
         assert!(app.focus_text().contains("+print('Chess')"));
+    }
+
+    #[test]
+    fn bare_focus_shortcut_letters_type_into_empty_prompt() {
+        let mut app = App::default();
+        app.goals.push(GoalEntry::new("make chess".into()));
+        app.apply_event(0, review_ready_event("chess.py"));
+
+        for ch in "fdpr".chars() {
+            app.handle_key(key(ch));
+        }
+
+        assert_eq!(app.goal_prompt.display_text(), "fdpr");
+        assert_eq!(app.focus_view, FocusView::Receipt);
+    }
+
+    #[test]
+    fn prompt_bar_renders_static_caret_rectangle() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines = buffer_lines(&buf, 80);
+        let input_y = lines
+            .iter()
+            .position(|line| line.contains("GOAL"))
+            .expect("input row should include the mode badge");
+        let prompt_marker_x = (0..80)
+            .find(|x| buf.content()[input_y * 80 + *x].symbol() == "›")
+            .expect("input row should include the prompt marker");
+        let prompt_x = prompt_marker_x + 2;
+        let caret = &buf.content()[input_y * 80 + prompt_x];
+
+        assert_eq!(caret.bg, ACCENT);
     }
 
     #[test]

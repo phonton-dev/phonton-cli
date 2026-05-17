@@ -49,10 +49,10 @@ pub(crate) fn append_focus_tabs(lines: &mut Vec<Line<'static>>, active: FocusVie
     }
     let hint = match active {
         FocusView::Plan => "contract  verify plan",
-        FocusView::Receipt => "f cycle  d diff",
-        FocusView::Problems => "p problems  r retry",
-        FocusView::Code => "[ ] file  PgUp/PgDn",
-        FocusView::Commands => "[ ] command  /rerun",
+        FocusView::Receipt => "Alt+F/D",
+        FocusView::Problems => "Alt+P/R",
+        FocusView::Code => "Alt+[/]  PgUp/PgDn",
+        FocusView::Commands => "Alt+[/] command  /rerun",
         FocusView::Context => "/context  /memory",
         FocusView::Tokens => "/why-tokens",
         FocusView::Log => "PgUp/PgDn  End tail",
@@ -278,7 +278,7 @@ pub(crate) fn problems_focus_text(goal: &GoalEntry, selected_file: usize) -> Str
     if let Some(note) = routing_note(goal) {
         out.push_str(&format!("\nRouting\n{note}\n"));
     }
-    out.push_str("\nRepair\n- Press r or run /retry to queue a repair with compact diagnostics.\n- Use /why-tokens to inspect retry/context token buckets.\n");
+    out.push_str("\nRepair\n- Press Alt+R or run /retry to queue a repair with compact diagnostics.\n- Use /why-tokens to inspect retry/context token buckets.\n");
 
     let groups = diff_hunks_by_file(goal);
     let selected_group = problem_excerpt_index(&diagnostics, &groups, selected_file);

@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.15.5 - TUI Prompt And Ask Formatting Hotfix
+
+### Fixed
+
+- Bare prompt-bar letters such as `f`, `d`, `p`, and `r` now type normally instead of triggering focus, diff, problems, or retry shortcuts before the user can start a sentence. Those shortcuts now use `Alt+F`, `Alt+D`, `Alt+P`, and `Alt+R`.
+- The prompt bar now renders a static caret rectangle in the input area while keeping the native terminal cursor hidden, avoiding the previous blinking cursor regression without leaving the input position invisible.
+- Ask-mode answers now render common inline markdown styling for bold, italic, and inline code spans instead of displaying raw `**bold**`, `*italic*`, and `` `code` `` markers.
+
 ## 0.15.4 - Vite Chess Quality Gate Hotfix
 
 ### Fixed
