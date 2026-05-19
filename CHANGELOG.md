@@ -4,6 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.16.1 - Extension Installer
+
+### Added
+
+- Added `phonton extensions install <source>` for installing `.phonton` extension packs from GitHub, local paths, or built-in open-source MCP catalog ids. The installer supports `--scope workspace|user`, `--ref <ref>` for GitHub packs, `--dry-run`, `--force`, and `--json`.
+- Added `phonton extensions catalog` to list open-source MCP manifest recipes for GitHub, Context7, Chrome DevTools, Playwright, Firecrawl, Supabase, MongoDB, and Figma/Framelink.
+- Added `phonton extensions new <path> [skill|steering|mcp-server|profile]` for scaffolding small auditable `.phonton` extension packs.
+- Added `phonton extensions validate` as a Gemini-style alias for `phonton extensions doctor`.
+- Added `.phonton/mcp.d/*.toml` loading so catalog installs can write one MCP manifest per extension instead of overwriting a shared `mcp.toml`.
+
+### Notes
+
+- v0.16.1 keeps extension installs local and inspectable. Installing an MCP entry writes configuration only; MCP servers still require workspace trust and approval before tools can affect a run.
+
 ## 0.16.0 - Addressable Context And Extension Evidence
 
 ### Added

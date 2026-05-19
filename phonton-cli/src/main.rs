@@ -6447,7 +6447,7 @@ fn print_help() {
          ask [flags] <q>   One-shot workspace-aware Q&A using the configured provider\n  \
          demo trust-loop   Print the evidence-trail demo loop\n  \
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
-         extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
+         extensions        Install and inspect steering, skills, MCP, and profiles\n  \
          skills            Inspect loaded skills\n  \
          steering          Inspect loaded steering rules\n  \
          mcp               List configured MCP servers and explicitly call tools\n  \
@@ -6521,8 +6521,12 @@ fn print_help() {
          phonton mcp call <server-id> <tool-name> [json-args] [--json] [--yes]\n\
          \n\
          EXTENSIONS:\n  \
+         phonton extensions install <source> [--scope workspace|user] [--ref <ref>]\n  \
+         phonton extensions catalog [--json]\n  \
          phonton extensions list [--json]\n  \
          phonton extensions doctor [--json]\n  \
+         phonton extensions validate [--json]\n  \
+         phonton extensions new <path> [skill|steering|mcp-server|profile]\n  \
          phonton skills list [--json]\n  \
          phonton steering list [--json]\n\
          \n\

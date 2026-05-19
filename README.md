@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.16.0</h1>
+<h1 align="center">Phonton CLI · v0.16.1</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.16.0-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.16.1-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -69,6 +69,8 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 ## What Works Today
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
+- v0.16.1 adds `phonton extensions install <source>` for installing audited `.phonton` packs from GitHub or local paths, plus built-in open-source MCP catalog ids such as `context7`, `github`, `chrome-devtools`, `playwright`, `firecrawl`, `supabase`, `mongodb`, and `figma`.
+- v0.16.1 adds `phonton extensions catalog`, `phonton extensions new <path> [skill|steering|mcp-server|profile]`, and `phonton extensions validate` so extension discovery, scaffolding, and validation feel closer to Gemini CLI while preserving Phonton's local trust and approval model.
 - v0.16.0 adds typed `@...` context mentions for files, directories, symbols, MCP servers, and MCP tools, with resolved/missing/approval-gated rows visible in `/context` and the Context focus surface.
 - v0.16.0 separates local prompt token estimates from provider-reported billing usage in `phonton why-tokens --by-source`; local-only runs now render as `no provider call`, and prompt manifests carry resolved `@...` mention rows plus attribution-only token totals instead of double-counting attachments or MCP/tool context.
 - v0.16.0 tightens extension and MCP diagnostics so `phonton extensions doctor` warns on networked or mutating MCP trust even when a server has not listed explicit permissions.
@@ -168,7 +170,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.0 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.1 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -184,7 +186,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.0 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.1 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -275,7 +277,7 @@ phonton review          Show verified diff review payloads
 phonton diff            Print verified unified diffs from review-ready tasks
 phonton run latest      Run the latest receipt-suggested command
 phonton memory list     Inspect local decision memory
-phonton extensions list Inspect skills, steering, MCP servers, and profiles
+phonton extensions      Install and inspect skills, steering, MCP servers, and profiles
 phonton mcp list        Show configured MCP servers without starting them
 phonton config path     Print the resolved config file path
 phonton config show     Dump resolved config as TOML
@@ -343,8 +345,13 @@ phonton memory delete <id>
 Extension visibility:
 
 ```bash
+phonton extensions catalog
+phonton extensions install context7
+phonton extensions install https://github.com/phonton-dev/phonton-review-gate-extension
+phonton extensions new ./my-extension skill
 phonton extensions list --json
 phonton extensions doctor --json
+phonton extensions validate --json
 phonton skills list --json
 phonton steering list --json
 phonton mcp list --json

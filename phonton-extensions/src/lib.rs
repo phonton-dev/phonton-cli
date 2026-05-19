@@ -214,6 +214,7 @@ fn load_source(
         scope.clone(),
         precedence,
     );
+    load_mcp_dir(set, &dir.join("mcp.d"), source, scope.clone(), precedence);
     load_profiles(set, &dir.join("profiles.toml"), source, scope, precedence);
 }
 
@@ -399,6 +400,42 @@ fn load_mcp(
         };
         set.manifests.push(manifest);
         set.mcp_servers.push(definition);
+    }
+}
+
+fn load_mcp_dir(
+    set: &mut ExtensionSet,
+    dir: &Path,
+    source: ExtensionSource,
+    scope: ExtensionScope,
+    precedence: u32,
+) {
+    if !dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            diagnostic(
+                set,
+                DiagnosticSeverity::Error,
+                source,
+                Some(dir.to_path_buf()),
+                format!("failed to read MCP extension directory: {e}"),
+            );
+            return;
+        }
+    };
+
+    let mut files: Vec<_> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .collect();
+    files.sort();
+
+    for path in files {
+        load_mcp(set, &path, source, scope.clone(), precedence);
     }
 }
 
@@ -972,6 +1009,31 @@ permissions = ["network.request"]
         assert!(set.mcp_servers.is_empty());
         assert_eq!(set.manifests.len(), 1);
         assert!(!set.manifests[0].enabled);
+    }
+
+    #[test]
+    fn mcp_extension_directory_files_are_loaded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write(
+            &root.join(".phonton/mcp.d/context7.toml"),
+            r#"
+[[servers]]
+id = "context7"
+name = "Context7"
+url = "https://mcp.context7.com/mcp"
+trust = "networked-tool"
+permissions = ["network.request"]
+"#,
+        );
+
+        let options = ExtensionLoadOptions::for_workspace(root).without_user_dir();
+        let set = load_extensions(&options);
+
+        assert!(!set.has_errors());
+        assert_eq!(set.mcp_servers.len(), 1);
+        assert_eq!(set.mcp_servers[0].id.to_string(), "context7");
+        assert_eq!(set.manifests.len(), 1);
     }
 
     #[test]
