@@ -512,6 +512,7 @@ fn apply_env_scrub(cmd: &mut Command) {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn job_assignment_warning_text(error: &str) -> String {
     format!(
         "Windows job-object assignment failed ({error}); this can happen inside a nested Windows Job Object. Continuing with tokio kill_on_drop for the direct child, but descendant process cleanup is not guaranteed."
