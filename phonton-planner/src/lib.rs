@@ -122,6 +122,38 @@ impl Goal {
                 path: Some(a.path.clone()),
             })
             .collect();
+        for path in prompt_mentioned_paths(&self.description) {
+            if !likely_files.iter().any(|existing| existing == &path) {
+                expected_artifacts.push(ExpectedArtifact {
+                    description: format!("Honor prompt-mentioned file {}", path.display()),
+                    path: Some(path.clone()),
+                });
+                likely_files.push(path);
+            }
+        }
+        for api in prompt_public_api_constraints(&self.description) {
+            acceptance_criteria.push(format!(
+                "Preserve prompt-mentioned public API `{api}` unless the goal explicitly asks to change it."
+            ));
+        }
+        for command in prompt_test_first_commands(&self.description) {
+            if !verify_plan.iter().any(|step| {
+                step.command
+                    .as_ref()
+                    .is_some_and(|existing| existing.command == command)
+            }) {
+                let joined = command.join(" ");
+                verify_plan.push(VerifyStepSpec {
+                    name: format!("Capture baseline test evidence with `{joined}`"),
+                    layer: Some(VerifyLayer::Test),
+                    command: Some(RunCommand {
+                        label: format!("Baseline {joined}"),
+                        command,
+                        cwd: None,
+                    }),
+                });
+            }
+        }
         if chess_goal {
             acceptance_criteria.extend([
                 "Produce a playable chess artifact, not a placeholder or greeting.".into(),
@@ -242,6 +274,118 @@ impl Goal {
             token_policy,
         }
     }
+}
+
+fn prompt_mentioned_paths(description: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for token in description.split_whitespace() {
+        let cleaned = clean_prompt_path_token(token);
+        let normalized = cleaned.replace('\\', "/");
+        if !looks_like_prompt_path(&normalized) {
+            continue;
+        }
+        let path = PathBuf::from(normalized);
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn clean_prompt_path_token(token: &str) -> String {
+    let mut value = token.trim();
+    loop {
+        let next = value
+            .trim_start_matches(['`', '"', '\'', '[', '('])
+            .trim_end_matches(['`', '"', '\'', ']', ')', ':', ',', ';', '.']);
+        if next.len() == value.len() {
+            return next.to_string();
+        }
+        value = next;
+    }
+}
+
+fn looks_like_prompt_path(value: &str) -> bool {
+    if value.is_empty() || value.contains("://") {
+        return false;
+    }
+    let path = std::path::Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if !(value.contains('/') || value.contains('\\')) {
+        return false;
+    }
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some(
+            "css"
+                | "html"
+                | "js"
+                | "jsx"
+                | "json"
+                | "md"
+                | "py"
+                | "rs"
+                | "toml"
+                | "ts"
+                | "tsx"
+                | "yaml"
+                | "yml"
+        )
+    )
+}
+
+fn prompt_public_api_constraints(description: &str) -> Vec<String> {
+    let re = Regex::new(r"\b[A-Za-z_$][A-Za-z0-9_$]*\s*\([^()\n]{0,80}\)").unwrap();
+    let mut apis = Vec::new();
+    for matched in re.find_iter(description) {
+        let api = matched.as_str().trim().replace(" (", "(");
+        let api = api.replace("( ", "(").replace(" )", ")");
+        if !apis.iter().any(|existing| existing == &api) {
+            apis.push(api);
+        }
+    }
+    apis
+}
+
+fn prompt_test_first_commands(description: &str) -> Vec<Vec<String>> {
+    if !prompt_requests_test_first(description) {
+        return Vec::new();
+    }
+    let lower = description.to_ascii_lowercase();
+    let candidates: [(&str, &[&str]); 5] = [
+        ("npm test", &["npm", "test"]),
+        ("pnpm test", &["pnpm", "test"]),
+        ("yarn test", &["yarn", "test"]),
+        ("cargo test", &["cargo", "test"]),
+        ("pytest", &["pytest"]),
+    ];
+    let mut commands = Vec::new();
+    for (needle, command) in candidates {
+        if lower.contains(needle) {
+            commands.push(command.iter().map(|part| (*part).to_string()).collect());
+        }
+    }
+    commands
+}
+
+fn prompt_requests_test_first(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    [
+        "run tests first",
+        "run the tests first",
+        "run test first",
+        "run the test suite first",
+        "test first",
+        "baseline test",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 fn is_chess_goal(description: &str) -> bool {
@@ -1241,6 +1385,37 @@ mod tests {
             |slice| slice.artifact_path.as_deref() == Some(std::path::Path::new("index.html"))
         ));
         assert!(!contract.token_policy.allow_broad_repair);
+    }
+
+    #[test]
+    fn prompt_contract_extracts_file_api_and_test_first_signals() {
+        let contract = Goal::new(
+            "Run npm test first, then refactor `src/receipt.js` without changing buildReceipt(run).",
+        )
+        .contract();
+
+        assert!(contract
+            .likely_files
+            .iter()
+            .any(|path| path == &std::path::PathBuf::from("src/receipt.js")));
+        assert!(contract.acceptance_criteria.iter().any(|criterion| {
+            criterion.contains("buildReceipt(run)") && criterion.contains("Preserve")
+        }));
+        assert!(contract.verify_plan.iter().any(|step| {
+            step.command.as_ref().is_some_and(|command| {
+                command.command == vec!["npm".to_string(), "test".to_string()]
+            })
+        }));
+    }
+
+    #[test]
+    fn prompt_contract_extracts_backtick_path_before_sentence_punctuation() {
+        let contract = Goal::new("Run the test suite first. Fix `src/config.js`.").contract();
+
+        assert!(contract
+            .likely_files
+            .iter()
+            .any(|path| path == &std::path::PathBuf::from("src/config.js")));
     }
 
     #[test]

@@ -83,9 +83,31 @@ Export the latest real Phonton run from the local OutcomeLedger:
 phonton benchmark export --latest --format json
 ```
 
-The export refuses estimated-token ledgers. Benchmark exports require
-provider-reported input/output/cache tokens so `verified_success_per_10k_tokens`
-does not mix estimates with billing-source token usage.
+For reproducible headless Phonton runs, use the same goal spine without TUI
+paste, clipboard, or PTY automation:
+
+```powershell
+phonton goal --prompt-file prompt.md --json --yes --timeout-seconds 900
+```
+
+As of v0.16.2, prompts that ask to run tests first capture bounded baseline
+test evidence before editing. Prompt-mentioned paths and API signatures are
+also copied into the GoalContract so small refactor benchmarks can keep files
+such as `src/receipt.js` and APIs such as `buildReceipt(run)` in the repair
+surface. On Windows, Node package-manager baselines use the correct command
+shims such as `npm.cmd`. If a benchmark work folder is nested under a larger
+git repo but is not itself a git root, Phonton applies verified hunks directly
+inside the work folder and reports that rollback checkpoints were unavailable.
+
+The export now preserves estimated, local-template, failed, and provider-backed
+runs, but labels comparability explicitly. Consumers must check
+`token_usage_source`, `execution_mode`, `provider_call_count`,
+`token_claim_eligible`, and `benchmark_warnings` before scoring. Only verified
+provider runs with `token_claim_eligible: true` belong in
+`verified_success_per_10k_tokens`; product-mode/local-template wins belong in a
+separate reliability table. Mixed local-template/provider runs are also
+ineligible for provider-token efficiency claims, even when they have provider
+usage metadata.
 
 v0.15.0 adds richer proof inputs for future end-to-end benchmark runs. OutcomeLedger records now include deterministic summary bundles, context bucket evidence, selected index sources, permission records, command-run evidence, verification findings, and HandoffPacket known gaps. These records make a run easier to audit, but they still do not prove token savings or quality by themselves.
 
@@ -162,6 +184,8 @@ Good release evidence should include:
 - provider/model where live model calls are used;
 - verification command results;
 - failures, not just wins.
+- the full exported fields for `final_status`, `execution_mode`,
+  `token_usage_source`, `token_claim_eligible`, and `benchmark_warnings`.
 
 The end-to-end score report ranks tools by verified success per 10k tokens.
 A tool that uses fewer tokens but fails verification should score lower than a

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Result};
 use phonton_store::TaskRecord;
 use phonton_types::{
-    BenchmarkFinalStatus, BenchmarkRunExport, EventRecord, OrchestratorEvent, TaskStatus,
-    TokenUsage, VerifyReport,
+    BenchmarkExecutionMode, BenchmarkFinalStatus, BenchmarkRunExport, BenchmarkTokenUsageSource,
+    EventRecord, OrchestratorEvent, TaskStatus, TokenUsage, VerifyReport,
 };
 
 use crate::open_persistent_store;
@@ -87,12 +87,15 @@ fn build_export(
         .handoff
         .as_ref()
         .ok_or_else(|| anyhow!("OutcomeLedger has no HandoffPacket"))?;
-    let usage = handoff.token_usage;
-    if usage.estimated {
-        return Err(anyhow!(
-            "benchmark export requires provider-reported tokens; this ledger only has estimated tokens"
-        ));
-    }
+    let model_event = latest_benchmark_model_event(events);
+    let usage = if handoff.token_usage.budget_tokens() > 0 || handoff.token_usage.estimated {
+        handoff.token_usage
+    } else {
+        model_event
+            .as_ref()
+            .map(|event| event.token_usage)
+            .unwrap_or_default()
+    };
 
     let mut context_buckets = ledger.context_manifest.buckets;
     for record in events {
@@ -113,21 +116,37 @@ fn build_export(
         Some(handoff),
     );
 
-    let review_event = events.iter().rev().find_map(|record| match &record.event {
-        OrchestratorEvent::SubtaskReviewReady {
-            provider,
-            model_name,
-            cost,
-            ..
-        } => Some((
-            provider.to_string(),
-            model_name.clone(),
-            cost.total_usd_micros,
-        )),
-        _ => None,
-    });
-    let (provider, model, cost_micros) =
-        review_event.unwrap_or_else(|| (String::new(), String::new(), 0));
+    let (provider, model, cost_micros) = model_event
+        .as_ref()
+        .map(|event| {
+            (
+                event.provider.clone(),
+                event.model.clone(),
+                event.cost_micros,
+            )
+        })
+        .unwrap_or_else(|| (String::new(), String::new(), 0));
+    let provider_call_count = provider_call_count(events, usage, &model);
+    let execution_mode = execution_mode(events, &model, provider_call_count);
+    let token_usage_source = token_usage_source(usage, execution_mode, provider_call_count);
+    let final_status = final_status(task, &ledger.verify_report, usage);
+    let token_claim_eligible = matches!(final_status, BenchmarkFinalStatus::VerifiedSuccess)
+        && matches!(execution_mode, BenchmarkExecutionMode::Provider)
+        && matches!(
+            token_usage_source,
+            BenchmarkTokenUsageSource::ProviderReported
+        )
+        && provider_call_count > 0
+        && !provider.trim().is_empty()
+        && !model.trim().is_empty();
+    let benchmark_warnings = benchmark_warnings(
+        final_status,
+        execution_mode,
+        token_usage_source,
+        provider_call_count,
+        &provider,
+        &model,
+    );
 
     let task_class = ledger
         .goal_contract
@@ -145,17 +164,213 @@ fn build_export(
         repo_commit,
         provider,
         model,
+        execution_mode,
+        token_usage_source,
+        token_claim_eligible,
+        provider_call_count,
+        benchmark_warnings,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_tokens: usage.cached_tokens,
+        cache_creation_tokens: usage.cache_creation_tokens,
         cost_usd: cost_micros as f64 / 1_000_000.0,
         context_buckets,
         summaries,
         verification: verification_map(&ledger.verify_report),
         quality_gates: quality_gate_map(ledger),
         handoff_packet_id: handoff.task_id.to_string(),
-        final_status: final_status(task, &ledger.verify_report, usage),
+        final_status,
     })
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkModelEvent {
+    provider: String,
+    model: String,
+    token_usage: TokenUsage,
+    cost_micros: u64,
+}
+
+fn latest_benchmark_model_event(events: &[EventRecord]) -> Option<BenchmarkModelEvent> {
+    events.iter().rev().find_map(|record| match &record.event {
+        OrchestratorEvent::SubtaskReviewReady {
+            provider,
+            model_name,
+            token_usage,
+            cost,
+            ..
+        } => Some(BenchmarkModelEvent {
+            provider: provider.to_string(),
+            model: model_name.clone(),
+            token_usage: *token_usage,
+            cost_micros: cost.total_usd_micros,
+        }),
+        OrchestratorEvent::SubtaskFailed {
+            provider,
+            model_name,
+            token_usage,
+            ..
+        } if provider.is_some()
+            || !model_name.trim().is_empty()
+            || token_usage.budget_tokens() > 0 =>
+        {
+            Some(BenchmarkModelEvent {
+                provider: provider
+                    .as_ref()
+                    .map(|provider| provider.to_string())
+                    .unwrap_or_default(),
+                model: model_name.clone(),
+                token_usage: *token_usage,
+                cost_micros: 0,
+            })
+        }
+        _ => None,
+    })
+}
+
+fn provider_call_count(events: &[EventRecord], usage: TokenUsage, model: &str) -> u64 {
+    let count = events
+        .iter()
+        .filter(|record| match &record.event {
+            OrchestratorEvent::SubtaskReviewReady {
+                model_name,
+                token_usage,
+                ..
+            }
+            | OrchestratorEvent::SubtaskFailed {
+                model_name,
+                token_usage,
+                ..
+            } => is_provider_call(*token_usage, model_name),
+            _ => false,
+        })
+        .count() as u64;
+
+    if count == 0 && is_provider_call(usage, model) {
+        1
+    } else {
+        count
+    }
+}
+
+fn execution_mode(
+    events: &[EventRecord],
+    model: &str,
+    provider_call_count: u64,
+) -> BenchmarkExecutionMode {
+    let saw_local_template = is_local_template(model)
+        || events.iter().any(|record| match &record.event {
+            OrchestratorEvent::SubtaskReviewReady { model_name, .. }
+            | OrchestratorEvent::SubtaskFailed { model_name, .. } => is_local_template(model_name),
+            _ => false,
+        });
+
+    match (provider_call_count > 0, saw_local_template) {
+        (true, true) => BenchmarkExecutionMode::Mixed,
+        (true, false) => BenchmarkExecutionMode::Provider,
+        (false, true) => BenchmarkExecutionMode::LocalTemplate,
+        (false, false) => BenchmarkExecutionMode::Unknown,
+    }
+}
+
+fn token_usage_source(
+    usage: TokenUsage,
+    execution_mode: BenchmarkExecutionMode,
+    provider_call_count: u64,
+) -> BenchmarkTokenUsageSource {
+    if usage.estimated {
+        return BenchmarkTokenUsageSource::Estimated;
+    }
+    match execution_mode {
+        BenchmarkExecutionMode::LocalTemplate => BenchmarkTokenUsageSource::NoProviderCall,
+        BenchmarkExecutionMode::Provider | BenchmarkExecutionMode::Mixed
+            if usage.budget_tokens() > 0 && provider_call_count > 0 =>
+        {
+            BenchmarkTokenUsageSource::ProviderReported
+        }
+        _ => BenchmarkTokenUsageSource::Unavailable,
+    }
+}
+
+fn benchmark_warnings(
+    final_status: BenchmarkFinalStatus,
+    execution_mode: BenchmarkExecutionMode,
+    token_usage_source: BenchmarkTokenUsageSource,
+    provider_call_count: u64,
+    provider: &str,
+    model: &str,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    match token_usage_source {
+        BenchmarkTokenUsageSource::Estimated => warnings.push(
+            "token usage is estimated; exclude this run from public efficiency claims".into(),
+        ),
+        BenchmarkTokenUsageSource::NoProviderCall => warnings.push(
+            "run used local-template/no-provider execution; treat it as product evidence, not provider-token evidence".into(),
+        ),
+        BenchmarkTokenUsageSource::Unavailable => warnings.push(
+            "token source is unavailable; exclude this run from public efficiency claims".into(),
+        ),
+        BenchmarkTokenUsageSource::ProviderReported => {}
+    }
+
+    if matches!(
+        execution_mode,
+        BenchmarkExecutionMode::LocalTemplate | BenchmarkExecutionMode::Mixed
+    ) && !warnings
+        .iter()
+        .any(|warning| warning.contains("local-template"))
+    {
+        warnings.push(
+            "run includes local-template execution; do not compare it against provider-token runs"
+                .into(),
+        );
+    }
+
+    if matches!(execution_mode, BenchmarkExecutionMode::Mixed)
+        && !warnings.iter().any(|warning| warning.contains("mixed"))
+    {
+        warnings.push(
+            "run mixed provider and local-template execution; exclude it from provider-token efficiency claims"
+                .into(),
+        );
+    }
+
+    if provider_call_count == 0
+        && matches!(
+            token_usage_source,
+            BenchmarkTokenUsageSource::ProviderReported
+        )
+    {
+        warnings.push(
+            "provider-reported token source has no matching provider-call event evidence".into(),
+        );
+    }
+
+    if matches!(
+        token_usage_source,
+        BenchmarkTokenUsageSource::ProviderReported
+    ) && (provider.trim().is_empty() || model.trim().is_empty())
+    {
+        warnings.push("provider or model identity is missing from benchmark evidence".into());
+    }
+
+    if !matches!(final_status, BenchmarkFinalStatus::VerifiedSuccess) {
+        warnings.push(
+            "final status is not verified_success; exclude this run from headline wins".into(),
+        );
+    }
+
+    warnings
+}
+
+fn is_provider_call(usage: TokenUsage, model: &str) -> bool {
+    usage.budget_tokens() > 0 && !is_local_template(model)
+}
+
+fn is_local_template(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("local-template")
 }
 
 fn verification_map(report: &VerifyReport) -> BTreeMap<String, String> {
@@ -355,15 +570,179 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_export_rejects_estimated_tokens() {
+    fn benchmark_export_marks_estimated_tokens_ineligible() {
         let task = task_with_ledger(TokenUsage {
             estimated: true,
             input_tokens: 100,
             ..Default::default()
         });
 
-        let err = build_export(&task, &[], "abc123".into()).unwrap_err();
+        let export = build_export(&task, &[], "abc123".into()).unwrap();
 
-        assert!(err.to_string().contains("provider-reported tokens"));
+        assert_eq!(
+            export.token_usage_source,
+            phonton_types::BenchmarkTokenUsageSource::Estimated
+        );
+        assert!(!export.token_claim_eligible);
+        assert!(export
+            .benchmark_warnings
+            .iter()
+            .any(|warning| warning.contains("estimated")));
+        assert_eq!(export.final_status, BenchmarkFinalStatus::Unverified);
+    }
+
+    #[test]
+    fn benchmark_export_marks_local_template_runs_not_token_comparable() {
+        let task = task_with_ledger(TokenUsage::default());
+        let subtask_id = SubtaskId::new();
+        let events = vec![EventRecord {
+            task_id: task.id,
+            timestamp_ms: 1,
+            event: OrchestratorEvent::SubtaskReviewReady {
+                subtask_id,
+                description: "refactor receipt renderer".into(),
+                tier: phonton_types::ModelTier::Standard,
+                tokens_used: 0,
+                token_usage: TokenUsage::default(),
+                cost: CostSummary::default(),
+                diff_hunks: Vec::new(),
+                verify_result: VerifyResult::Pass {
+                    layer: VerifyLayer::Test,
+                },
+                provider: ProviderKind::DeepSeek,
+                model_name: "local-template".into(),
+            },
+        }];
+
+        let export = build_export(&task, &events, "abc123".into()).unwrap();
+
+        assert_eq!(
+            export.execution_mode,
+            phonton_types::BenchmarkExecutionMode::LocalTemplate
+        );
+        assert_eq!(
+            export.token_usage_source,
+            phonton_types::BenchmarkTokenUsageSource::NoProviderCall
+        );
+        assert_eq!(export.provider_call_count, 0);
+        assert!(!export.token_claim_eligible);
+        assert!(export
+            .benchmark_warnings
+            .iter()
+            .any(|warning| warning.contains("local-template")));
+    }
+
+    #[test]
+    fn benchmark_export_marks_mixed_runs_ineligible_for_token_claims() {
+        let task = task_with_ledger(TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            ..Default::default()
+        });
+        let subtask_id = SubtaskId::new();
+        let events = vec![
+            EventRecord {
+                task_id: task.id,
+                timestamp_ms: 1,
+                event: OrchestratorEvent::SubtaskReviewReady {
+                    subtask_id,
+                    description: "seed from local template".into(),
+                    tier: phonton_types::ModelTier::Cheap,
+                    tokens_used: 0,
+                    token_usage: TokenUsage::default(),
+                    cost: CostSummary::default(),
+                    diff_hunks: Vec::new(),
+                    verify_result: VerifyResult::Pass {
+                        layer: VerifyLayer::Syntax,
+                    },
+                    provider: ProviderKind::DeepSeek,
+                    model_name: "local-template".into(),
+                },
+            },
+            EventRecord {
+                task_id: task.id,
+                timestamp_ms: 2,
+                event: OrchestratorEvent::SubtaskReviewReady {
+                    subtask_id,
+                    description: "provider repair".into(),
+                    tier: phonton_types::ModelTier::Standard,
+                    tokens_used: 1200,
+                    token_usage: TokenUsage {
+                        input_tokens: 1000,
+                        output_tokens: 200,
+                        ..Default::default()
+                    },
+                    cost: CostSummary {
+                        pricing_known: true,
+                        input_usd_micros: 100,
+                        output_usd_micros: 200,
+                        total_usd_micros: 300,
+                    },
+                    diff_hunks: Vec::new(),
+                    verify_result: VerifyResult::Pass {
+                        layer: VerifyLayer::Test,
+                    },
+                    provider: ProviderKind::DeepSeek,
+                    model_name: "deepseek-v4-flash".into(),
+                },
+            },
+        ];
+
+        let export = build_export(&task, &events, "abc123".into()).unwrap();
+
+        assert_eq!(export.execution_mode, BenchmarkExecutionMode::Mixed);
+        assert_eq!(
+            export.token_usage_source,
+            BenchmarkTokenUsageSource::ProviderReported
+        );
+        assert_eq!(export.final_status, BenchmarkFinalStatus::VerifiedSuccess);
+        assert!(!export.token_claim_eligible);
+        assert!(export
+            .benchmark_warnings
+            .iter()
+            .any(|warning| warning.contains("mixed") || warning.contains("local-template")));
+    }
+
+    #[test]
+    fn benchmark_export_uses_failed_event_provider_identity() {
+        let mut task = task_with_ledger(TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            ..Default::default()
+        });
+        task.status = serde_json::to_value(TaskStatus::Failed {
+            reason: "syntax failure".into(),
+            failed_subtask: None,
+        })
+        .unwrap();
+        let subtask_id = SubtaskId::new();
+        let events = vec![EventRecord {
+            task_id: task.id,
+            timestamp_ms: 1,
+            event: OrchestratorEvent::SubtaskFailed {
+                subtask_id,
+                reason: "syntax failure".into(),
+                attempt: 4,
+                token_usage: TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 200,
+                    ..Default::default()
+                },
+                provider: Some(ProviderKind::DeepSeek),
+                model_name: "deepseek-v4-flash".into(),
+            },
+        }];
+
+        let export = build_export(&task, &events, "abc123".into()).unwrap();
+
+        assert_eq!(export.provider, "deepseek");
+        assert_eq!(export.model, "deepseek-v4-flash");
+        assert_eq!(export.provider_call_count, 1);
+        assert_eq!(
+            export.token_usage_source,
+            phonton_types::BenchmarkTokenUsageSource::ProviderReported
+        );
+        assert!(!export.token_claim_eligible);
+        assert_eq!(export.final_status, BenchmarkFinalStatus::Failed);
     }
 }

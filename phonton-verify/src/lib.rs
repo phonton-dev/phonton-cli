@@ -17,9 +17,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use phonton_memory::MemoryStore;
+use phonton_sandbox::{CrateLock, CrateLockGuard};
 use phonton_types::{DiffHunk, DiffLine, MemoryRecord, VerifyLayer, VerifyResult};
 use tokio::process::Command;
 use tree_sitter::{Language, Node, Parser};
+
+const MAX_DIRECT_REPLACE_LINES: usize = 400;
+const MAX_DIRECT_REPLACE_BYTES: usize = 64 * 1024;
 
 /// Browser/runtime verification request for a generated web artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,14 +349,21 @@ fn parse_tree_sitter(language: SyntaxLanguage, path: &Path, source: &str) -> Opt
     };
     let root = tree.root_node();
     if root.has_error() || contains_error_node(root) {
-        let location = first_error_position(root)
+        let position = first_error_position(root);
+        let location = position
             .map(|(line, col)| format!(":{line}:{col}"))
             .unwrap_or_default();
+        let excerpt = position
+            .map(|(line, _)| syntax_error_excerpt(source, line))
+            .filter(|excerpt| !excerpt.is_empty())
+            .map(|excerpt| format!(" near `{excerpt}`"))
+            .unwrap_or_default();
         return Some(format!(
-            "[{} syntax] {}{}: invalid syntax",
+            "[{} syntax] {}{}: invalid syntax{}",
             language.label(),
             path.display(),
-            location
+            location,
+            excerpt
         ));
     }
     None
@@ -457,6 +468,9 @@ fn reconstruct_post_diff_source(
     let full_path = root.join(path);
     let current = std::fs::read_to_string(&full_path)
         .map_err(|e| format!("could not read {}: {e}", full_path.display()))?;
+    if is_small_full_file_replacement(hunks, &current) {
+        return Ok(reconstruct_new_side_from_hunks(hunks));
+    }
     let mut original_lines = split_source_lines(&current);
     let mut output = Vec::new();
     let mut cursor = 0usize;
@@ -538,6 +552,41 @@ fn reconstruct_new_side_from_hunks(hunks: &[DiffHunk]) -> String {
     out
 }
 
+fn is_small_full_file_replacement(hunks: &[DiffHunk], current: &str) -> bool {
+    if hunks.len() != 1 {
+        return false;
+    }
+    let hunk = &hunks[0];
+    if hunk.old_start > 1 || hunk.new_start > 1 {
+        return false;
+    }
+    if hunk
+        .lines
+        .iter()
+        .any(|line| matches!(line, DiffLine::Context(_)))
+    {
+        return false;
+    }
+    let added = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Added(_)))
+        .count();
+    let removed = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Removed(_)))
+        .count();
+    if hunk.old_count <= 1 && added <= 1 && removed <= 1 {
+        return false;
+    }
+    added > 0
+        && removed > 0
+        && added <= MAX_DIRECT_REPLACE_LINES
+        && current.len() <= MAX_DIRECT_REPLACE_BYTES
+        && current.lines().count() <= MAX_DIRECT_REPLACE_LINES
+}
+
 fn split_source_lines(source: &str) -> Vec<String> {
     let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines = normalized
@@ -567,6 +616,22 @@ fn trim_for_error(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+fn syntax_error_excerpt(source: &str, line: usize) -> String {
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let idx = line.saturating_sub(1).min(lines.len().saturating_sub(1));
+    let start = idx.saturating_sub(1);
+    let end = (idx + 2).min(lines.len());
+    lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, text)| format!("{}: {}", start + offset + 1, trim_for_error(text)))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn offset_to_line_col(source: &str, offset: usize) -> (usize, usize) {
@@ -681,6 +746,16 @@ pub fn find_cargo_workspace(start: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+fn cargo_lock_dir(workspace: &Path) -> PathBuf {
+    workspace.join("target").join(".phonton-locks")
+}
+
+async fn acquire_cargo_lock(workspace: &Path) -> CrateLockGuard {
+    CrateLock::new_with_dir(cargo_lock_dir(workspace))
+        .acquire("cargo-target")
+        .await
+}
+
 async fn verify_node_project(
     hunks: &[DiffHunk],
     working_dir: &Path,
@@ -708,10 +783,6 @@ async fn verify_node_project(
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    if !touches_package_json && !is_vite_or_react_package(&package) {
-        return Ok(None);
-    }
-
     let scripts_value = package.get("scripts");
     let scripts = scripts_value.and_then(|s| s.as_object());
     let mut steps: Vec<NodeVerifyStep> = vec![NodeVerifyStep::new(
@@ -755,21 +826,6 @@ async fn verify_node_project(
             attempt: 1,
         }))
     }
-}
-
-fn is_vite_or_react_package(package: &serde_json::Value) -> bool {
-    let mut names = Vec::new();
-    for section in ["dependencies", "devDependencies"] {
-        if let Some(map) = package.get(section).and_then(|value| value.as_object()) {
-            names.extend(map.keys().map(|key| key.as_str()));
-        }
-    }
-    names.iter().any(|name| {
-        matches!(
-            *name,
-            "vite" | "react" | "react-dom" | "vitest" | "chess.js"
-        )
-    })
 }
 
 fn should_run_npm_test(working_dir: &Path, test_script: &str) -> bool {
@@ -1043,7 +1099,7 @@ async fn run_npm_command(working_dir: &Path, step: &NodeVerifyStep) -> Result<Op
             Ok(Some(format!(
                 "{} failed: {}",
                 step.label,
-                last_lines(&combined, 20)
+                head_and_tail_lines(&combined, 12, 20)
             )))
         }
         Ok(Err(e)) => Ok(Some(format!("could not invoke {}: {e}", step.label))),
@@ -1076,9 +1132,10 @@ pub async fn verify_crate_check(
     // error with "could not find Cargo.toml" and turn every legitimate
     // create-a-new-project goal into a failure. Syntax (Layer 1) still
     // catches malformed Rust regardless of project shape.
-    if find_cargo_workspace(working_dir).is_none() {
+    let Some(workspace) = find_cargo_workspace(working_dir) else {
         return Ok(None);
-    }
+    };
+    let _cargo_lock = acquire_cargo_lock(&workspace).await;
     let mut errors = Vec::new();
     for pkg in packages {
         let output = Command::new("cargo")
@@ -1119,9 +1176,10 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
     // nothing for cargo to verify. The previous behaviour was to surface
     // "cargo check --workspace failed: could not find `Cargo.toml`" as a
     // hard failure, which broke every project-bootstrap goal.
-    if find_cargo_workspace(working_dir).is_none() {
+    let Some(workspace) = find_cargo_workspace(working_dir) else {
         return Ok(None);
-    }
+    };
+    let _cargo_lock = acquire_cargo_lock(&workspace).await;
     let output = Command::new("cargo")
         .current_dir(working_dir)
         .args(["check", "--workspace", "--message-format", "json"])
@@ -1168,9 +1226,10 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
 /// assertion without flooding the UI.
 pub async fn verify_test(packages: &[String], working_dir: &Path) -> Result<Option<VerifyResult>> {
     // Skip for the same reason the cargo check layers do.
-    if find_cargo_workspace(working_dir).is_none() {
+    let Some(workspace) = find_cargo_workspace(working_dir) else {
         return Ok(None);
-    }
+    };
+    let _cargo_lock = acquire_cargo_lock(&workspace).await;
     let mut errors = Vec::new();
     for pkg in packages {
         let fut = Command::new("cargo")
@@ -1506,6 +1565,17 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+fn head_and_tail_lines(text: &str, head: usize, tail: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() <= head.saturating_add(tail) {
+        return lines.join("\n");
+    }
+    let mut out = lines[..head].join("\n");
+    out.push_str("\n...\n");
+    out.push_str(&lines[lines.len().saturating_sub(tail)..].join("\n"));
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1733,8 +1803,10 @@ mod tests {
                 errors,
                 ..
             }) => assert!(
-                errors.iter().any(|error| error.contains("app.js")),
-                "reconstructed-file syntax error should mention app.js: {errors:?}"
+                errors.iter().any(|error| {
+                    error.contains("app.js") && error.contains("return ; }")
+                }),
+                "reconstructed-file syntax error should mention app.js and the bad generated line: {errors:?}"
             ),
             other => panic!("expected reconstructed syntax failure, got {other:?}"),
         }
@@ -1907,6 +1979,27 @@ mod tests {
         assert_eq!(last_lines(s, 100), "a\nb\nc\nd\ne");
     }
 
+    #[test]
+    fn head_and_tail_lines_preserves_primary_error_and_tail() {
+        let s = (0..40)
+            .map(|line| {
+                if line == 0 {
+                    "SyntaxError: missing export".to_string()
+                } else {
+                    format!("line {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let compact = head_and_tail_lines(&s, 3, 4);
+
+        assert!(compact.contains("SyntaxError: missing export"));
+        assert!(compact.contains("..."));
+        assert!(compact.contains("line 39"));
+        assert!(!compact.contains("line 20"));
+    }
+
     #[tokio::test]
     async fn verify_diff_fails_when_node_build_script_fails() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1950,6 +2043,87 @@ mod tests {
             }
             other => panic!("expected failing npm build to fail verification, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn verify_diff_runs_generic_node_tests_for_js_source_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/receipt.js"),
+            "export function buildReceipt(run) {\n  return run.goal;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("test/receipt.test.js"),
+            "import assert from 'node:assert/strict';\nimport test from 'node:test';\nimport { buildReceipt } from '../src/receipt.js';\ntest('exports buildReceipt', () => assert.equal(buildReceipt({ goal: 'ok' }), 'ok'));\n",
+        )
+        .unwrap();
+        let source = DiffHunk {
+            file_path: PathBuf::from("src/receipt.js"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("export function buildReceipt(run) {".into()),
+                DiffLine::Added("function buildReceipt(run) {".into()),
+            ],
+        };
+
+        let result = verify_diff(&[source], tmp.path()).await.unwrap();
+
+        match result {
+            VerifyResult::Fail {
+                layer: VerifyLayer::Test,
+                errors,
+                ..
+            } => assert!(
+                errors.iter().any(|error| error.contains("npm test")),
+                "generic Node test failure should be surfaced: {errors:?}"
+            ),
+            other => panic!("expected node test failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_registry_accepts_small_full_replacement_with_loose_removed_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("receipt.js"),
+            "export function buildReceipt(run) {\n  let out = '';\n  return out;\n}\n",
+        )
+        .unwrap();
+        let h = DiffHunk {
+            file_path: PathBuf::from("receipt.js"),
+            old_start: 1,
+            old_count: 99,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine::Removed("export function buildReceipt(run) {".into()),
+                DiffLine::Removed("  let out".into()),
+                DiffLine::Added("export function buildReceipt(run) {".into()),
+                DiffLine::Added("  return run.goal || \"\";".into()),
+                DiffLine::Added("}".into()),
+            ],
+        };
+
+        assert!(
+            verify_syntax_in_workspace(&[h], tmp.path()).is_none(),
+            "small whole-file replacement should parse the added side even when removed lines are loose"
+        );
     }
 
     #[tokio::test]

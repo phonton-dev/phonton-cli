@@ -15,10 +15,14 @@ function pieceClass(piece: Piece | null) {
   return piece ? `piece piece-${piece.color}` : 'piece'
 }
 
+function squareLabel(square: string, piece: Piece | null) {
+  return piece ? `${square} ${piece.kind}, ${piece.color}` : `${square} empty`
+}
+
 function App() {
   const [game, setGame] = useState<GameState>(() => createInitialGame())
   const [selected, setSelected] = useState<string | null>(null)
-  const [notice, setNotice] = useState('White to move')
+  const [notice, setNotice] = useState('Select a white piece')
 
   const legalMoves = useMemo(
     () => (selected ? legalMovesFor(game, selected) : []),
@@ -28,7 +32,7 @@ function App() {
   const resetGame = () => {
     setGame(createInitialGame())
     setSelected(null)
-    setNotice('White to move')
+    setNotice('Select a white piece')
   }
 
   const selectSquare = (square: string) => {
@@ -84,7 +88,7 @@ function App() {
 
               return (
                 <button
-                  aria-label={`${square}${piece ? ` ${piece.name}` : ''}`}
+                  aria-label={squareLabel(square, piece)}
                   className={[
                     'square',
                     dark ? 'dark' : 'light',
@@ -93,7 +97,6 @@ function App() {
                   ].join(' ')}
                   key={square}
                   onClick={() => selectSquare(square)}
-                  role="gridcell"
                   type="button"
                 >
                   <span className="coord">{square}</span>

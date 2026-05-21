@@ -340,6 +340,18 @@ pub fn classify_intent(description: &str) -> IntentClassification {
         };
     }
 
+    if contains_any(&d, &["refactor", "restructure", "rename module", "extract"]) {
+        return IntentClassification {
+            task_class: TaskClass::Refactor,
+            confidence_percent: 78,
+            ambiguity: AmbiguityLevel::Medium,
+            blast_radius: BlastRadius::Workspace,
+            runtime_risk: RuntimeRisk::Medium,
+            token_risk: TokenRisk::Medium,
+            recommended_action: IntentAction::PreviewPlan,
+        };
+    }
+
     if d.contains("test") || d.contains("unit-test") || d.contains("integration test") {
         return IntentClassification {
             task_class: TaskClass::TestGeneration,
@@ -387,18 +399,6 @@ pub fn classify_intent(description: &str) -> IntentClassification {
             runtime_risk: RuntimeRisk::Low,
             token_risk: TokenRisk::Low,
             recommended_action: IntentAction::ExecuteDirectTask,
-        };
-    }
-
-    if contains_any(&d, &["refactor", "restructure", "rename module", "extract"]) {
-        return IntentClassification {
-            task_class: TaskClass::Refactor,
-            confidence_percent: 78,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::Workspace,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::Medium,
-            recommended_action: IntentAction::PreviewPlan,
         };
     }
 
@@ -2044,6 +2044,7 @@ pub struct ContextSummary {
     /// MCP/tool output tokens.
     pub tool_output_tokens: u64,
     /// Attribution-only tokens from user-authored `@...` mentions.
+    #[serde(default)]
     pub context_mention_tokens: u64,
 }
 
@@ -2191,6 +2192,36 @@ pub enum BenchmarkFinalStatus {
     Unverified,
 }
 
+/// Source class for token data included in a benchmark export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkTokenUsageSource {
+    /// Token counts came from provider-reported usage metadata.
+    ProviderReported,
+    /// The run made no provider call, for example a local deterministic template.
+    NoProviderCall,
+    /// Token counts are local estimates and not suitable for claims.
+    Estimated,
+    /// Token source could not be established from the evidence.
+    #[default]
+    Unavailable,
+}
+
+/// Execution mode inferred from the events that produced a benchmark export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkExecutionMode {
+    /// At least one provider model call produced the measured output.
+    Provider,
+    /// The run used Phonton's deterministic local template path.
+    LocalTemplate,
+    /// The run mixed provider calls with local-template output.
+    Mixed,
+    /// The exporter could not infer the execution mode.
+    #[default]
+    Unknown,
+}
+
 /// Exportable benchmark evidence for one completed Phonton run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRunExport {
@@ -2204,12 +2235,30 @@ pub struct BenchmarkRunExport {
     pub provider: String,
     /// Model that served the final model call.
     pub model: String,
+    /// Inferred execution mode for benchmark comparability.
+    #[serde(default)]
+    pub execution_mode: BenchmarkExecutionMode,
+    /// Whether token fields came from provider usage, estimates, or no provider call.
+    #[serde(default)]
+    pub token_usage_source: BenchmarkTokenUsageSource,
+    /// True only when this run may be included in provider-token efficiency claims.
+    #[serde(default)]
+    pub token_claim_eligible: bool,
+    /// Number of provider-call evidence events observed for this run.
+    #[serde(default)]
+    pub provider_call_count: u64,
+    /// Benchmark caveats that consumers must carry into reports.
+    #[serde(default)]
+    pub benchmark_warnings: Vec<String>,
     /// Provider-reported input tokens.
     pub input_tokens: u64,
     /// Provider-reported output tokens.
     pub output_tokens: u64,
     /// Provider-reported cached input tokens.
     pub cached_tokens: u64,
+    /// Provider-reported prompt cache creation tokens.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     /// Estimated USD cost.
     pub cost_usd: f64,
     /// Context contribution by source.
@@ -2376,6 +2425,16 @@ mod tests {
     }
 
     #[test]
+    fn intent_classifier_prioritizes_refactor_over_test_mentions() {
+        let intent = classify_intent(
+            "Refactor src/receipt.js into smaller helpers, preserve behavior, and run npm test.",
+        );
+
+        assert_eq!(intent.task_class, TaskClass::Refactor);
+        assert_eq!(intent.runtime_risk, RuntimeRisk::Medium);
+    }
+
+    #[test]
     fn context_buckets_are_serialized_for_benchmark_exports() {
         let buckets = ContextBucketSummary {
             selected_code_tokens: 1200,
@@ -2400,6 +2459,57 @@ mod tests {
         assert_eq!(value["buckets"]["omitted_candidate_tokens"], 4300);
         assert_eq!(value["buckets"]["context_mention_tokens"], 25);
         assert_eq!(value["buckets"]["cached_tokens"], 70);
+    }
+
+    #[test]
+    fn outcome_summaries_backfill_context_mention_tokens() {
+        let raw = r#"{
+            "work": {
+                "files_changed": 0,
+                "added_lines": 0,
+                "removed_lines": 0,
+                "generated_artifacts": 0,
+                "review_actions": 0,
+                "rollback_points": 0,
+                "known_gaps": 0
+            },
+            "verification": {
+                "status": "unverified",
+                "passed": 0,
+                "findings": 0,
+                "skipped": 0,
+                "primary_findings": []
+            },
+            "token": {
+                "provider_input_tokens": 0,
+                "provider_output_tokens": 0,
+                "cached_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 0,
+                "estimated": false,
+                "selected_code_tokens": 0,
+                "omitted_candidate_tokens": 0,
+                "retry_diagnostic_tokens": 0,
+                "deduped_tokens": 0
+            },
+            "context": {
+                "source_count": 0,
+                "memory_sources": 0,
+                "index_sources": 0,
+                "skill_sources": 0,
+                "tool_sources": 0,
+                "selected_code_tokens": 0,
+                "omitted_candidate_tokens": 0,
+                "memory_tokens": 0,
+                "artifact_tokens": 0,
+                "retry_diagnostic_tokens": 0,
+                "tool_output_tokens": 0
+            }
+        }"#;
+
+        let summaries: OutcomeSummaries = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(summaries.context.context_mention_tokens, 0);
     }
 
     #[test]

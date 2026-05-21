@@ -21,12 +21,12 @@ pub struct DiffApplier {
 
 impl DiffApplier {
     /// Open the repository at `path`. Returns a clear error if `path`
-    /// is not inside a git repository.
+    /// is not a git repository root.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref();
-        let repo = Repository::discover(p).map_err(|e| {
+        let repo = Repository::open(p).map_err(|e| {
             anyhow!(
-                "'{}' is not inside a git repository (git2: {})",
+                "'{}' is not a git repository root (git2: {})",
                 p.display(),
                 e.message()
             )
@@ -81,11 +81,26 @@ impl DiffApplier {
 
         if !modified.is_empty() {
             let diff_text = build_unified_diff(&modified);
-            let diff = git2::Diff::from_buffer(diff_text.as_bytes())
-                .context("constructing git2::Diff from unified patch text")?;
-            self.repo
-                .apply(&diff, git2::ApplyLocation::WorkDir, None)
-                .context("git apply failed in worktree")?;
+            match git2::Diff::from_buffer(diff_text.as_bytes()) {
+                Ok(diff) => {
+                    if let Err(error) = self.repo.apply(&diff, git2::ApplyLocation::WorkDir, None) {
+                        apply_modified_hunks_direct(&workdir, &modified).with_context(|| {
+                            format!(
+                                "git apply failed in worktree ({}); direct reconstruction fallback failed",
+                                error.message()
+                            )
+                        })?;
+                    }
+                }
+                Err(error) => {
+                    apply_modified_hunks_direct(&workdir, &modified).with_context(|| {
+                        format!(
+                            "constructing git2::Diff from unified patch text failed ({}); direct reconstruction fallback failed",
+                            error.message()
+                        )
+                    })?;
+                }
+            }
         }
 
         let mut index = self.repo.index()?;
@@ -168,10 +183,23 @@ impl DiffApplier {
         seq: u32,
         message: &str,
     ) -> Result<Checkpoint> {
-        // Stage everything in the worktree so the checkpoint snapshots
-        // the *whole* current state, not just the last apply.
+        // Snapshot the worktree state, but leave local dependency/build/cache
+        // folders out of the index. Checkpoints are evidence for verified task
+        // output, not a reason to publish semantic-index or package-manager
+        // scratch files.
         let mut index = self.repo.index()?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+        let mut filter = |path: &Path, _matched: &[u8]| -> i32 {
+            if should_skip_checkpoint_path(path) {
+                1
+            } else {
+                0
+            }
+        };
+        index.add_all(
+            ["*"].iter(),
+            git2::IndexAddOption::DEFAULT,
+            Some(&mut filter),
+        )?;
         index.write()?;
         let tree_oid = index.write_tree()?;
         let tree = self.repo.find_tree(tree_oid)?;
@@ -339,6 +367,21 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn should_skip_checkpoint_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        matches!(
+            name.as_ref(),
+            ".fastembed_cache"
+                | "node_modules"
+                | "dist"
+                | "target"
+                | "test-results"
+                | "playwright-report"
+        )
+    })
+}
+
 fn build_unified_diff(by_file: &BTreeMap<PathBuf, Vec<&DiffHunk>>) -> String {
     let mut out = String::new();
     for (path, hunks) in by_file {
@@ -390,6 +433,124 @@ fn reconstruct_new_side(hunks: &[&DiffHunk]) -> String {
     out
 }
 
+fn apply_modified_hunks_direct(
+    workdir: &Path,
+    by_file: &BTreeMap<PathBuf, Vec<&DiffHunk>>,
+) -> Result<()> {
+    for (path, hunks) in by_file {
+        let full = workdir.join(path);
+        let current = std::fs::read_to_string(&full)
+            .with_context(|| format!("reading {}", full.display()))?;
+        let updated = reconstruct_existing_file(&current, hunks)
+            .with_context(|| format!("reconstructing {}", path.display()))?;
+        std::fs::write(&full, updated).with_context(|| format!("writing {}", full.display()))?;
+    }
+    Ok(())
+}
+
+fn reconstruct_existing_file(original: &str, hunks: &[&DiffHunk]) -> Result<String> {
+    let mut original_lines = split_source_lines(original);
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    let mut ordered = hunks.to_vec();
+    ordered.sort_by_key(|hunk| hunk.old_start);
+
+    for hunk in ordered {
+        let start = hunk.old_start.saturating_sub(1) as usize;
+        if start < cursor {
+            return Err(anyhow!(
+                "overlapping hunk at old line {} after cursor {}",
+                hunk.old_start,
+                cursor + 1
+            ));
+        }
+        if start > original_lines.len() {
+            return Err(anyhow!(
+                "hunk starts at old line {}, beyond {} line(s)",
+                hunk.old_start,
+                original_lines.len()
+            ));
+        }
+        output.extend(original_lines[cursor..start].iter().cloned());
+        cursor = start;
+
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Context(text) => {
+                    let existing = original_lines.get(cursor).ok_or_else(|| {
+                        anyhow!(
+                            "context line `{}` expected after end of file",
+                            trim_for_error(text)
+                        )
+                    })?;
+                    if normalize_line(existing) != normalize_line(text) {
+                        return Err(anyhow!(
+                            "context mismatch at line {}: expected `{}`, got `{}`",
+                            cursor + 1,
+                            trim_for_error(text),
+                            trim_for_error(existing)
+                        ));
+                    }
+                    output.push(existing.clone());
+                    cursor += 1;
+                }
+                DiffLine::Removed(text) => {
+                    let existing = original_lines.get(cursor).ok_or_else(|| {
+                        anyhow!(
+                            "removed line `{}` expected after end of file",
+                            trim_for_error(text)
+                        )
+                    })?;
+                    if normalize_line(existing) != normalize_line(text) {
+                        return Err(anyhow!(
+                            "removed-line mismatch at line {}: expected `{}`, got `{}`",
+                            cursor + 1,
+                            trim_for_error(text),
+                            trim_for_error(existing)
+                        ));
+                    }
+                    cursor += 1;
+                }
+                DiffLine::Added(text) => output.push(text.clone()),
+            }
+        }
+    }
+
+    output.extend(original_lines.drain(cursor..));
+    Ok(join_source_lines(&output))
+}
+
+fn split_source_lines(source: &str) -> Vec<String> {
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = normalized
+        .split('\n')
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if normalized.ends_with('\n') && lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+fn join_source_lines(lines: &[String]) -> String {
+    let mut source = lines.join("\n");
+    source.push('\n');
+    source
+}
+
+fn normalize_line(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+fn trim_for_error(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() > 80 {
+        format!("{}...", text.chars().take(77).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 fn is_small_full_file_replacement(hunks: &[&DiffHunk], full_path: &Path) -> bool {
     if hunks.len() != 1 {
         return false;
@@ -415,6 +576,9 @@ fn is_small_full_file_replacement(hunks: &[&DiffHunk], full_path: &Path) -> bool
         .iter()
         .filter(|line| matches!(line, DiffLine::Removed(_)))
         .count();
+    if hunk.old_count <= 1 && added <= 1 && removed <= 1 {
+        return false;
+    }
     if added == 0 || removed == 0 || added > MAX_DIRECT_REPLACE_LINES {
         return false;
     }
@@ -530,5 +694,99 @@ mod tests {
             written.replace("\r\n", "\n"),
             "export function App() {\n  return <main>Chess</main>;\n}\n"
         );
+    }
+
+    #[test]
+    fn apply_verified_hunks_falls_back_to_direct_reconstruction_for_loose_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _repo = init_repo_with_seed(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.js"),
+            "export function loadConfig(raw = {}) {\n  return raw.provider || \"openai\";\n}\n",
+        )
+        .unwrap();
+
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/config.js"),
+            old_start: 1,
+            old_count: 99,
+            new_start: 1,
+            new_count: 5,
+            lines: vec![
+                DiffLine::Context("export function loadConfig(raw = {}) {".into()),
+                DiffLine::Removed("  return raw.provider || \"openai\";".into()),
+                DiffLine::Added("  const provider = raw.provider ?? \"openai\";".into()),
+                DiffLine::Added("  if (!provider.trim()) throw new Error(\"provider\");".into()),
+                DiffLine::Added("  return provider.trim();".into()),
+                DiffLine::Context("}".into()),
+            ],
+        }];
+
+        applier.apply_verified_hunks(&hunks).unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join("src/config.js")).unwrap();
+        assert!(written.contains("provider.trim()"));
+        assert!(!written.contains("raw.provider ||"));
+    }
+
+    #[test]
+    fn checkpoint_does_not_stage_unrelated_untracked_cache_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _repo = init_repo_with_seed(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".fastembed_cache")).unwrap();
+        std::fs::write(tmp.path().join(".fastembed_cache/model.onnx"), "cache").unwrap();
+
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("tracked.txt"),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Added("tracked change".into())],
+        }];
+        applier.apply_verified_hunks(&hunks).unwrap();
+        applier
+            .commit_checkpoint(TaskId::new(), SubtaskId::new(), 1, "tracked only")
+            .unwrap();
+
+        let statuses = applier.repo().statuses(None).unwrap();
+        let cache_status = statuses.iter().find(|entry| {
+            entry
+                .path()
+                .is_some_and(|path| path.contains(".fastembed_cache"))
+        });
+        assert!(
+            !cache_status
+                .map(|entry| {
+                    let status = entry.status();
+                    status.intersects(
+                        git2::Status::INDEX_NEW
+                            | git2::Status::INDEX_MODIFIED
+                            | git2::Status::INDEX_DELETED
+                            | git2::Status::INDEX_RENAMED
+                            | git2::Status::INDEX_TYPECHANGE,
+                    )
+                })
+                .unwrap_or(false),
+            "checkpoint should not stage unrelated cache files"
+        );
+    }
+
+    #[test]
+    fn open_does_not_discover_parent_repo_for_nested_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _repo = init_repo_with_seed(tmp.path());
+        let nested = tmp.path().join("runs").join("phonton").join("work");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let err = match DiffApplier::open(&nested) {
+            Ok(_) => panic!("nested workspace should not discover parent repo"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("git repository root"));
     }
 }

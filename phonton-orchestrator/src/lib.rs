@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use petgraph::graph::{DiGraph, NodeIndex};
 use phonton_types::{
@@ -697,25 +697,39 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     if let Some(diff) = &self.diff_applier {
                         // Git-backed path: apply hunks → stage → checkpoint commit.
                         let checkpoint = match diff.lock() {
-                            Ok(mut d) => {
-                                if let Err(e) = d.apply_verified_hunks(&hunks) {
-                                    warn!(error = %e, subtask = %sid, "apply_verified_hunks failed");
-                                }
-                                match d.commit_checkpoint(self.task_id, sid, seq, &desc) {
-                                    Ok(c) => Some(c),
-                                    Err(e) => {
-                                        warn!(error = %e, subtask = %sid, "checkpoint commit failed");
-                                        None
+                            Ok(mut d) => match checkpoint_verified_hunks(
+                                &mut d,
+                                self.task_id,
+                                sid,
+                                seq,
+                                &desc,
+                                &hunks,
+                            ) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    let reason = format!("{e:#}");
+                                    warn!(error = %reason, subtask = %sid, "checkpoint verified hunks failed");
+                                    fail_subtask(&mut runtimes, sid, reason.clone());
+                                    if failure.is_none() {
+                                        failure = Some((sid, reason));
                                     }
+                                    joinset.abort_all();
+                                    None
                                 }
-                            }
+                            },
                             Err(e) => {
-                                warn!(error = %e, "diff applier mutex poisoned");
+                                let reason = format!("diff applier mutex poisoned: {e}");
+                                warn!(error = %reason, "diff applier mutex poisoned");
+                                fail_subtask(&mut runtimes, sid, reason.clone());
+                                if failure.is_none() {
+                                    failure = Some((sid, reason));
+                                }
+                                joinset.abort_all();
                                 None
                             }
                         };
-                        checkpointed.insert(sid);
                         if let Some(c) = checkpoint {
+                            checkpointed.insert(sid);
                             self.emit(OrchestratorEvent::CheckpointCreated {
                                 task_id: self.task_id,
                                 subtask_id: sid,
@@ -727,8 +741,17 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     } else {
                         // No git repo — write files directly to disk so the
                         // user sees output even without a git repository.
-                        apply_hunks_direct(&hunks, &self.working_dir);
-                        checkpointed.insert(sid);
+                        if let Err(e) = apply_hunks_direct(&hunks, &self.working_dir) {
+                            let reason = format!("failed to apply verified diff: {e:#}");
+                            warn!(error = %reason, subtask = %sid, "direct hunk application failed");
+                            fail_subtask(&mut runtimes, sid, reason.clone());
+                            if failure.is_none() {
+                                failure = Some((sid, reason));
+                            }
+                            joinset.abort_all();
+                        } else {
+                            checkpointed.insert(sid);
+                        }
                     }
                 }
             }
@@ -1124,6 +1147,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     subtask_id: id,
                     reason,
                     attempt,
+                    token_usage: rt.token_usage,
+                    provider: Some(rt.provider),
+                    model_name: rt.model_name.clone(),
                 });
                 return Ok(());
             }
@@ -1219,6 +1245,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                                 subtask_id: id,
                                 reason,
                                 attempt: rt.attempts_at_tier,
+                                token_usage: rt.token_usage,
+                                provider: Some(rt.provider),
+                                model_name: rt.model_name.clone(),
                             });
                             (false, false)
                         } else {
@@ -1266,6 +1295,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                             subtask_id: id,
                             reason: msg,
                             attempt: rt.attempts_at_tier,
+                            token_usage: rt.token_usage,
+                            provider: Some(rt.provider),
+                            model_name: rt.model_name.clone(),
                         });
                         (false, false)
                     } else {
@@ -1460,7 +1492,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 Some(VerifyResult::Pass { layer }) => {
                     reached_test_layer |= *layer == VerifyLayer::Test;
                     reached_runtime_layer |= is_runtime_layer(*layer);
-                    verified.push(format!("{clean_desc} passed {}", verify_layer_name(*layer)));
+                    verified.push(verification_pass_label(
+                        plan.goal_contract.as_ref(),
+                        *layer,
+                        &clean_desc,
+                    ));
                 }
                 Some(VerifyResult::Fail { errors, layer, .. }) => {
                     let detail = if errors.is_empty() {
@@ -1468,18 +1504,21 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     } else {
                         errors.join("; ")
                     };
-                    findings.push(format!(
-                        "{clean_desc} failed {}: {detail}",
-                        verify_layer_name(*layer)
+                    findings.push(verification_failure_label(
+                        plan.goal_contract.as_ref(),
+                        *layer,
+                        &clean_desc,
+                        &detail,
                     ));
                 }
                 Some(VerifyResult::Escalate { reason }) => {
                     findings.push(format!("{clean_desc} escalated: {reason}"));
                 }
                 None if rt.is_failed() => {
-                    findings.push(format!(
-                        "{clean_desc} failed: {}",
-                        failure_reason(&rt.status)
+                    findings.push(subtask_failure_label(
+                        plan.goal_contract.as_ref(),
+                        &clean_desc,
+                        &failure_reason(&rt.status),
                     ));
                 }
                 None => {}
@@ -1680,6 +1719,123 @@ fn compact_description(description: &str) -> String {
         .to_string()
 }
 
+fn verification_pass_label(
+    contract: Option<&GoalContract>,
+    layer: VerifyLayer,
+    clean_desc: &str,
+) -> String {
+    if let Some(label) =
+        contract.and_then(|contract| planned_verification_command_label(contract, layer))
+    {
+        return format!("{label} passed");
+    }
+
+    let layer_name = verify_layer_name(layer);
+    if looks_like_prompt_tail(clean_desc) {
+        format!("{layer_name} verification passed")
+    } else {
+        format!("{clean_desc} passed {layer_name}")
+    }
+}
+
+fn verification_failure_label(
+    contract: Option<&GoalContract>,
+    layer: VerifyLayer,
+    clean_desc: &str,
+    detail: &str,
+) -> String {
+    if let Some(label) =
+        contract.and_then(|contract| planned_verification_command_label(contract, layer))
+    {
+        return format!("{label} failed: {detail}");
+    }
+
+    let layer_name = verify_layer_name(layer);
+    if looks_like_prompt_tail(clean_desc) {
+        format!("{layer_name} verification failed: {detail}")
+    } else {
+        format!("{clean_desc} failed {layer_name}: {detail}")
+    }
+}
+
+fn subtask_failure_label(
+    contract: Option<&GoalContract>,
+    clean_desc: &str,
+    reason: &str,
+) -> String {
+    if let Some(label) = contract
+        .and_then(|contract| planned_verification_command_label(contract, VerifyLayer::Test))
+    {
+        return format!("{label} failed: {reason}");
+    }
+
+    if looks_like_prompt_tail(clean_desc) {
+        format!("task failed: {reason}")
+    } else {
+        format!("{clean_desc} failed: {reason}")
+    }
+}
+
+fn planned_verification_command_label(
+    contract: &GoalContract,
+    layer: VerifyLayer,
+) -> Option<String> {
+    let layer_name = verify_layer_name(layer);
+    let matching = contract.verify_plan.iter().find_map(|step| {
+        let label = step
+            .command
+            .as_ref()
+            .and_then(command_label)
+            .filter(|label| !label.trim().is_empty())?;
+        let step_matches_layer = step.layer == Some(layer);
+        let name = step.name.to_ascii_lowercase();
+        let label_lower = label.to_ascii_lowercase();
+        let text_matches_layer = name.contains(layer_name)
+            || label_lower.contains(layer_name)
+            || (layer == VerifyLayer::Test && label_lower.contains("test"));
+        if step_matches_layer || text_matches_layer {
+            Some(label)
+        } else {
+            None
+        }
+    });
+
+    if matching.is_some() {
+        return matching;
+    }
+
+    if layer == VerifyLayer::Test {
+        return contract
+            .verify_plan
+            .iter()
+            .find_map(|step| step.command.as_ref().and_then(command_label));
+    }
+
+    None
+}
+
+fn command_label(command: &phonton_types::RunCommand) -> Option<String> {
+    let label = command.label.trim();
+    if !label.is_empty() {
+        return Some(label.to_string());
+    }
+    if command.command.is_empty() {
+        None
+    } else {
+        Some(command.command.join(" "))
+    }
+}
+
+fn looks_like_prompt_tail(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('-')
+        || trimmed.len() > 96
+        || trimmed.ends_with(':')
+        || trimmed
+            .to_ascii_lowercase()
+            .contains("expected final state")
+}
+
 fn is_chess_goal_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("chess")
@@ -1815,10 +1971,27 @@ fn failure_reason(status: &SubtaskStatus) -> String {
     }
 }
 
+fn checkpoint_verified_hunks(
+    diff: &mut phonton_diff::DiffApplier,
+    task_id: TaskId,
+    subtask_id: SubtaskId,
+    seq: u32,
+    description: &str,
+    hunks: &[phonton_types::DiffHunk],
+) -> Result<Checkpoint> {
+    diff.apply_verified_hunks(hunks)
+        .context("failed to apply verified diff")?;
+    diff.commit_checkpoint(task_id, subtask_id, seq, description)
+        .context("failed to checkpoint verified diff")
+}
+
 /// Fallback diff application for projects without a git repository.
 /// Writes new files and applies simple line-based patches directly to disk.
 /// Silently skips hunks whose parent directory can't be created.
-fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path::Path) {
+fn apply_hunks_direct(
+    hunks: &[phonton_types::DiffHunk],
+    working_dir: &std::path::Path,
+) -> Result<()> {
     use phonton_types::DiffLine;
     use std::collections::BTreeMap;
 
@@ -1831,7 +2004,8 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
         let full = working_dir.join(rel_path);
         // Create parent dirs if needed.
         if let Some(parent) = full.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent directory {}", parent.display()))?;
         }
 
         let is_new = file_hunks
@@ -1853,16 +2027,18 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let _ = std::fs::write(&full, content);
+            std::fs::write(&full, content)
+                .with_context(|| format!("writing {}", full.display()))?;
         } else {
-            let Ok(original) = std::fs::read_to_string(&full) else {
-                continue;
-            };
-            if let Some(updated) = reconstruct_direct_existing_file(&original, &file_hunks) {
-                let _ = std::fs::write(&full, updated);
-            }
+            let original = std::fs::read_to_string(&full)
+                .with_context(|| format!("reading {}", full.display()))?;
+            let updated = reconstruct_direct_existing_file(&original, &file_hunks)
+                .with_context(|| format!("reconstructing {}", full.display()))?;
+            std::fs::write(&full, updated)
+                .with_context(|| format!("writing {}", full.display()))?;
         }
     }
+    Ok(())
 }
 
 fn reconstruct_direct_existing_file(
@@ -2434,6 +2610,147 @@ mod tests {
             .any(|failure| failure.contains("named chess pieces")));
     }
 
+    #[test]
+    fn handoff_verification_prefers_planned_command_over_prompt_tail() {
+        let prompt = "# Benchmark Prompt\n\nFix the config loader.\n\nExpected final state:\n\n- The final response lists the verification command and any known gaps.";
+        let a = subtask(prompt, vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(GoalContract {
+                goal: prompt.into(),
+                task_class: TaskClass::BugFix,
+                intent: None,
+                confidence_percent: 80,
+                acceptance_criteria: vec!["npm test passes".into()],
+                acceptance_slices: Vec::new(),
+                expected_artifacts: Vec::new(),
+                likely_files: Vec::new(),
+                verify_plan: vec![VerifyStepSpec {
+                    name: "npm test".into(),
+                    layer: Some(VerifyLayer::Test),
+                    command: Some(RunCommand {
+                        label: "npm test".into(),
+                        command: vec!["npm".into(), "test".into()],
+                        cwd: None,
+                    }),
+                }],
+                run_plan: Vec::new(),
+                quality_floor: QualityFloor {
+                    criteria: vec!["Verification outcome is surfaced honestly.".into()],
+                },
+                clarification_questions: Vec::new(),
+                assumptions: Vec::new(),
+                token_policy: Default::default(),
+            }),
+        };
+        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
+        runtime.status = SubtaskStatus::Done {
+            tokens_used: 100,
+            diff_hunk_count: 1,
+        };
+        runtime.verify_result = Some(VerifyResult::Pass {
+            layer: VerifyLayer::Test,
+        });
+        runtime.diff_hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/config.js"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("export function loadConfig() {}".into()),
+                DiffLine::Added(
+                    "export function loadConfig(raw, env) { return { raw, env }; }".into(),
+                ),
+            ],
+        }];
+        let mut runtimes = HashMap::new();
+        runtimes.insert(a.id, runtime);
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let orch = Orchestrator::new(dispatcher);
+
+        let handoff = orch.build_handoff_packet(
+            &plan,
+            &runtimes,
+            &TaskStatus::Reviewing {
+                tokens_used: 100,
+                estimated_savings_tokens: 0,
+            },
+            100,
+            &[],
+        );
+
+        assert_eq!(handoff.verification.passed, vec!["npm test passed"]);
+        assert!(!handoff.verification.passed[0].contains("final response"));
+    }
+
+    #[test]
+    fn handoff_failure_prefers_planned_command_over_prompt_tail() {
+        let prompt = "# Benchmark Prompt\n\nRefactor the receipt renderer.\n\nExpected final state:\n\n- The final response lists the verification command and any known gaps.";
+        let a = subtask(prompt, vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(GoalContract {
+                goal: prompt.into(),
+                task_class: TaskClass::Refactor,
+                intent: None,
+                confidence_percent: 80,
+                acceptance_criteria: vec!["npm test passes".into()],
+                acceptance_slices: Vec::new(),
+                expected_artifacts: Vec::new(),
+                likely_files: Vec::new(),
+                verify_plan: vec![VerifyStepSpec {
+                    name: "npm test".into(),
+                    layer: None,
+                    command: Some(RunCommand {
+                        label: "npm test".into(),
+                        command: vec!["npm".into(), "test".into()],
+                        cwd: None,
+                    }),
+                }],
+                run_plan: Vec::new(),
+                quality_floor: QualityFloor {
+                    criteria: vec!["Verification outcome is surfaced honestly.".into()],
+                },
+                clarification_questions: Vec::new(),
+                assumptions: Vec::new(),
+                token_policy: Default::default(),
+            }),
+        };
+        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
+        runtime.status = SubtaskStatus::Failed {
+            reason: "verify failed 4 attempts at standard".into(),
+            attempt: 4,
+        };
+        let mut runtimes = HashMap::new();
+        runtimes.insert(a.id, runtime);
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let orch = Orchestrator::new(dispatcher);
+
+        let handoff = orch.build_handoff_packet(
+            &plan,
+            &runtimes,
+            &TaskStatus::Failed {
+                reason: "verify failed 4 attempts at standard".into(),
+                failed_subtask: Some(a.id),
+            },
+            100,
+            &[],
+        );
+
+        assert_eq!(
+            handoff.verification.findings,
+            vec!["npm test failed: verify failed 4 attempts at standard"]
+        );
+        assert!(!handoff.verification.findings[0].contains("final response"));
+    }
+
     fn chess_contract(goal: &str) -> GoalContract {
         GoalContract {
             goal: goal.into(),
@@ -2728,10 +3045,67 @@ mod tests {
             ],
         };
 
-        apply_hunks_direct(&[hunk], temp.path());
+        apply_hunks_direct(&[hunk], temp.path()).unwrap();
 
         let updated = std::fs::read_to_string(temp.path().join("index.html")).unwrap();
         assert_eq!(updated, "one\ntwo\ntwo and a half\nthree\nfour\n");
+    }
+
+    #[test]
+    fn checkpoint_verified_hunks_reports_apply_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "phonton-test@local"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git config email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Phonton Test"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git config name");
+        std::fs::write(temp.path().join("index.js"), "export const ok = true;\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp.path())
+            .status()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "seed"])
+            .current_dir(temp.path())
+            .status()
+            .expect("git commit");
+
+        let hunk = DiffHunk {
+            file_path: PathBuf::from("index.js"),
+            old_start: 99,
+            old_count: 1,
+            new_start: 99,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("export const ok = true;".into()),
+                DiffLine::Added("export const ok = false;".into()),
+            ],
+        };
+        let mut diff = phonton_diff::DiffApplier::open(temp.path()).unwrap();
+
+        let err = checkpoint_verified_hunks(
+            &mut diff,
+            TaskId::new(),
+            SubtaskId::new(),
+            1,
+            "bad apply",
+            &[hunk],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("failed to apply verified diff"));
     }
 
     #[tokio::test]

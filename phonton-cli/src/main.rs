@@ -64,7 +64,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -106,7 +106,7 @@ use phonton_types::{
     PermissionMode, PermissionRecord, PlannerOutput, PromptAttachment, PromptAttachmentKind,
     PromptContextManifest, ProviderConfig as ApiProviderConfig, ProviderKind, SessionGoalSnapshot,
     SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
-    TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    TaskStatus, TokenUsage, VerifyLayer, VerifyResult, WorkspaceTrustSource,
 };
 use prompt_buffer::PromptBuffer;
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -5848,6 +5848,581 @@ fn provider_key_for_run(cfg: &config::ProviderConfig) -> Option<String> {
     })
 }
 
+async fn maybe_detect_provider_model(cfg: &mut config::Config) {
+    if cfg.provider.model.is_some() {
+        return;
+    }
+    let Some(api_key) = provider_key_for_run(&cfg.provider) else {
+        return;
+    };
+    let detect = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        select_best_working_model(
+            &cfg.provider.name,
+            &api_key,
+            cfg.provider.base_url.as_deref(),
+            3,
+        ),
+    )
+    .await;
+    if let Ok(Ok(Some(model))) = detect {
+        cfg.provider.model = Some(model);
+        let _ = config::save(cfg);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoalCliRequest {
+    goal_parts: Vec<String>,
+    prompt_file: Option<PathBuf>,
+    stdin: bool,
+    json: bool,
+    yes: bool,
+    direct_task: bool,
+    permission_mode: Option<PermissionMode>,
+    timeout: Option<Duration>,
+}
+
+impl GoalCliRequest {
+    fn prompt_source_count(&self) -> usize {
+        usize::from(!self.goal_parts.is_empty())
+            + usize::from(self.prompt_file.is_some())
+            + usize::from(self.stdin)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GoalCliReport {
+    task_id: TaskId,
+    status: TaskStatus,
+    status_label: String,
+    tokens_used: u64,
+    estimated_naive_tokens: u64,
+    event_count: usize,
+    goal_contract: Option<phonton_types::GoalContract>,
+    handoff_packet: Option<HandoffPacket>,
+}
+
+struct GoalCliOutcome {
+    state: GlobalState,
+    evidence: LedgerEvidence,
+    event_count: usize,
+}
+
+fn parse_goal_cli_request(args: &[String]) -> Result<GoalCliRequest> {
+    let mut request = GoalCliRequest {
+        goal_parts: Vec::new(),
+        prompt_file: None,
+        stdin: false,
+        json: false,
+        yes: false,
+        direct_task: false,
+        permission_mode: None,
+        timeout: None,
+    };
+
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => request.json = true,
+            "--yes" | "-y" => request.yes = true,
+            "--task" => request.direct_task = true,
+            "--stdin" => request.stdin = true,
+            "--full-access" => request.permission_mode = Some(PermissionMode::FullAccess),
+            "--prompt-file" | "--file" | "-f" => {
+                let path = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--prompt-file requires a path"))?;
+                request.prompt_file = Some(PathBuf::from(path));
+            }
+            "--permission-mode" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--permission-mode requires a value"))?;
+                request.permission_mode = PermissionMode::parse(raw)
+                    .ok_or_else(|| anyhow::anyhow!("unknown permission mode `{raw}`"))
+                    .map(Some)?;
+            }
+            "--timeout" | "--timeout-seconds" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a value in seconds"))?;
+                let seconds = raw
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("{arg} must be an integer number of seconds"))?;
+                request.timeout = Some(Duration::from_secs(seconds));
+            }
+            "-h" | "--help" => {
+                return Err(anyhow::anyhow!(
+                    "usage: phonton goal [--json] [--yes] [--permission-mode <mode>] [--timeout-seconds <n>] [--prompt-file <path>|--stdin|<goal>]"
+                ));
+            }
+            "--" => {
+                request.goal_parts.extend(iter.cloned());
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(anyhow::anyhow!("unknown goal option `{other}`"));
+            }
+            other => request.goal_parts.push(other.to_string()),
+        }
+    }
+
+    if request.prompt_source_count() > 1 {
+        return Err(anyhow::anyhow!(
+            "only one prompt source is allowed: use a goal argument, --prompt-file, or --stdin"
+        ));
+    }
+    if request.prompt_source_count() == 0 {
+        return Err(anyhow::anyhow!(
+            "`phonton goal` requires a prompt, e.g. `phonton goal --prompt-file prompt.md`"
+        ));
+    }
+
+    Ok(request)
+}
+
+fn read_goal_cli_text(request: &GoalCliRequest) -> Result<String> {
+    if let Some(path) = &request.prompt_file {
+        return std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()));
+    }
+    if request.stdin {
+        let mut text = String::new();
+        let mut stdin = std::io::stdin();
+        use std::io::Read as _;
+        stdin.read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    Ok(request.goal_parts.join(" "))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeadlessBaselineCommand {
+    label: String,
+    command: Vec<String>,
+}
+
+fn headless_baseline_commands(prompt: &str, workspace: &Path) -> Vec<HeadlessBaselineCommand> {
+    if !prompt_requests_headless_baseline(prompt) {
+        return Vec::new();
+    }
+
+    let mut commands = Vec::new();
+    let lower = prompt.to_ascii_lowercase();
+    let explicit: [(&str, &[&str], &str); 5] = [
+        ("npm test", &["npm", "test"], "baseline npm test"),
+        ("pnpm test", &["pnpm", "test"], "baseline pnpm test"),
+        ("yarn test", &["yarn", "test"], "baseline yarn test"),
+        ("cargo test", &["cargo", "test"], "baseline cargo test"),
+        ("pytest", &["pytest"], "baseline pytest"),
+    ];
+    for (needle, command, label) in explicit {
+        if lower.contains(needle) {
+            push_headless_baseline_command(&mut commands, label, command);
+        }
+    }
+
+    if commands.is_empty() {
+        if workspace.join("package.json").is_file() {
+            push_headless_baseline_command(&mut commands, "baseline npm test", &["npm", "test"]);
+        } else if workspace.join("Cargo.toml").is_file() {
+            push_headless_baseline_command(
+                &mut commands,
+                "baseline cargo test",
+                &["cargo", "test"],
+            );
+        } else if workspace.join("pyproject.toml").is_file()
+            || workspace.join("pytest.ini").is_file()
+        {
+            push_headless_baseline_command(&mut commands, "baseline pytest", &["pytest"]);
+        }
+    }
+
+    commands
+}
+
+fn prompt_requests_headless_baseline(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    [
+        "run tests first",
+        "run the tests first",
+        "run test first",
+        "run the test suite first",
+        "test first",
+        "baseline test",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
+fn push_headless_baseline_command(
+    commands: &mut Vec<HeadlessBaselineCommand>,
+    label: &str,
+    command: &[&str],
+) {
+    let command: Vec<String> = command.iter().map(|part| (*part).to_string()).collect();
+    if commands.iter().any(|existing| existing.command == command) {
+        return;
+    }
+    commands.push(HeadlessBaselineCommand {
+        label: label.into(),
+        command,
+    });
+}
+
+fn run_headless_baseline_commands(
+    commands: &[HeadlessBaselineCommand],
+    workspace: &Path,
+) -> Vec<CommandRunSummary> {
+    commands
+        .iter()
+        .filter_map(|baseline| {
+            let program = baseline.command.first()?;
+            let started = Instant::now();
+            let output = std::process::Command::new(headless_spawn_program(program))
+                .args(&baseline.command[1..])
+                .current_dir(workspace)
+                .output();
+            let duration_ms = started.elapsed().as_millis().try_into().ok();
+            let command_line = baseline.command.join(" ");
+            Some(match output {
+                Ok(output) => summarize_output_with_duration(
+                    &command_line,
+                    output.status.code(),
+                    &output.stdout,
+                    &output.stderr,
+                    duration_ms,
+                ),
+                Err(e) => CommandRunSummary {
+                    command: command_line,
+                    exit_code: None,
+                    stdout_preview: String::new(),
+                    stderr_preview: format!("failed to start command: {e}"),
+                    duration_ms,
+                },
+            })
+        })
+        .collect()
+}
+
+fn headless_spawn_program(program: &str) -> String {
+    if cfg!(windows) {
+        match program.to_ascii_lowercase().as_str() {
+            "npm" | "pnpm" | "yarn" | "npx" => format!("{program}.cmd"),
+            _ => program.to_string(),
+        }
+    } else {
+        program.to_string()
+    }
+}
+
+fn render_headless_baseline_evidence(summaries: &[CommandRunSummary]) -> Option<String> {
+    if summaries.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "Headless baseline test evidence captured before editing. Use this as failing-test context, not as final verification:\n",
+    );
+    for summary in summaries.iter().take(3) {
+        let status = summary
+            .exit_code
+            .map(|code| format!("exit {code}"))
+            .unwrap_or_else(|| "not started".into());
+        let duration = summary
+            .duration_ms
+            .map(|ms| format!(", {ms}ms"))
+            .unwrap_or_default();
+        out.push_str(&format!("- `{}`: {status}{duration}\n", summary.command));
+        if !summary.stdout_preview.trim().is_empty() {
+            out.push_str("  stdout: ");
+            out.push_str(&compact_headless_evidence_text(
+                &summary.stdout_preview,
+                260,
+            ));
+            out.push('\n');
+        }
+        if !summary.stderr_preview.trim().is_empty() {
+            out.push_str("  stderr: ");
+            out.push_str(&compact_headless_evidence_text(
+                &summary.stderr_preview,
+                360,
+            ));
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+fn compact_headless_evidence_text(value: &str, max_chars: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut compact: String = collapsed.chars().take(max_chars).collect();
+    compact.push_str(" ...");
+    compact
+}
+
+fn append_headless_worker_context(plan: &mut PlannerOutput, context: &str) {
+    let context = context.trim();
+    if context.is_empty() {
+        return;
+    }
+    let path = PathBuf::from(".phonton/headless-baseline.txt");
+    let attachment = PromptAttachment {
+        path: path.clone(),
+        kind: PromptAttachmentKind::Text,
+        mime_type: Some("text/plain".into()),
+        size_bytes: context.len() as u64,
+        text: Some(context.to_string()),
+        data_base64: None,
+        truncated: false,
+        note: Some("Captured before headless editing as bounded baseline test evidence.".into()),
+    };
+    for subtask in &mut plan.subtasks {
+        if !subtask
+            .attachments
+            .iter()
+            .any(|existing| existing.path == path)
+        {
+            subtask.attachments.push(attachment.clone());
+        }
+    }
+}
+
+async fn run_goal_cli(args: &[String]) -> Result<i32> {
+    let request = match parse_goal_cli_request(args) {
+        Ok(request) => request,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.starts_with("usage:") {
+                println!("{msg}");
+                return Ok(0);
+            }
+            eprintln!("phonton goal: {msg}");
+            eprintln!("Run `phonton goal --help` for usage.");
+            return Ok(2);
+        }
+    };
+
+    let text = read_goal_cli_text(&request)?;
+    if text.trim().is_empty() {
+        eprintln!("phonton goal: prompt is empty");
+        return Ok(2);
+    }
+
+    let mut cfg = config::load().unwrap_or_default();
+    if let Some(mode) = request.permission_mode {
+        cfg.permissions.mode = mode;
+    }
+    maybe_detect_provider_model(&mut cfg).await;
+
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if request.yes {
+        let _ = trust::record_trust_with_mode(
+            &working_dir,
+            cfg.permissions.mode,
+            WorkspaceTrustSource::JsonRecord,
+        );
+    } else if !trust::prompt_if_needed(&working_dir)? {
+        return Ok(1);
+    }
+
+    let store = match open_persistent_store() {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("phonton goal: memory store unavailable ({e}); using in-memory store");
+            Store::in_memory()?
+        }
+    };
+    if let Some(record) = trust::trust_record(&working_dir) {
+        let _ = store.upsert_workspace_trust(&record);
+    }
+    let store = Arc::new(std::sync::Mutex::new(store));
+    let sandbox = Arc::new(Sandbox::new_with_mode(
+        working_dir.clone(),
+        "phonton-cli".to_string(),
+        cfg.permissions.mode,
+    ));
+    let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (tx, rx) = mpsc::channel::<LoopEvent>(512);
+    let task_id = TaskId::new();
+    let baseline_commands = headless_baseline_commands(&text, &working_dir);
+    let baseline_summaries = run_headless_baseline_commands(&baseline_commands, &working_dir);
+    let baseline_context = render_headless_baseline_evidence(&baseline_summaries);
+
+    spawn_goal(
+        0,
+        task_id,
+        text.clone(),
+        request.direct_task,
+        baseline_context,
+        tx.clone(),
+        Arc::clone(&store),
+        sandbox,
+        Arc::clone(&controls),
+        cfg,
+        working_dir,
+    )
+    .await;
+
+    let wait = wait_for_goal_cli(task_id, rx, request.yes);
+    let outcome = if let Some(timeout) = request.timeout {
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(outcome) => outcome?,
+            Err(_) => {
+                if let Ok(registry) = controls.lock() {
+                    if let Some(control) = registry.get(&0) {
+                        let _ = control
+                            .control_tx
+                            .try_send(OrchestratorMessage::UserCancelled);
+                    }
+                }
+                eprintln!(
+                    "phonton goal: timed out after {} seconds",
+                    timeout.as_secs()
+                );
+                return Ok(124);
+            }
+        }
+    } else {
+        wait.await?
+    };
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(
+            task_id,
+            &text,
+            &outcome.state.task_status,
+            outcome.state.tokens_used,
+        );
+        if let Some(ledger) =
+            outcome_ledger_from_state_with_evidence(task_id, &outcome.state, &outcome.evidence)
+        {
+            let _ = g.upsert_outcome_ledger(&ledger);
+        }
+    }
+    let report = goal_cli_report(task_id, &outcome.state, outcome.event_count);
+
+    if request.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_goal_cli_report(&report);
+    }
+
+    Ok(if goal_cli_success(&report.status) {
+        0
+    } else {
+        1
+    })
+}
+
+async fn wait_for_goal_cli(
+    task_id: TaskId,
+    mut rx: mpsc::Receiver<LoopEvent>,
+    auto_approve: bool,
+) -> Result<GoalCliOutcome> {
+    let mut latest: Option<GlobalState> = None;
+    let mut terminal: Option<GlobalState> = None;
+    let mut evidence = LedgerEvidence::default();
+    let mut event_count = 0usize;
+    loop {
+        let event = if terminal.is_some() {
+            match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
+                Ok(event) => event,
+                Err(_) => break,
+            }
+        } else {
+            rx.recv().await
+        };
+        let Some(event) = event else { break };
+        match event {
+            LoopEvent::StateUpdate(_, state) => {
+                latest = Some((*state).clone());
+                if let Some(state) = latest.as_ref() {
+                    if goal_cli_terminal(&state.task_status) {
+                        terminal = Some(state.clone());
+                    }
+                }
+            }
+            LoopEvent::FlightEvent(_, record) => {
+                evidence.apply_event(&record);
+                event_count = event_count.saturating_add(1);
+            }
+            LoopEvent::McpApprovalRequested { reply_tx, .. } => {
+                let decision = if auto_approve {
+                    McpApprovalDecision::Approved
+                } else {
+                    McpApprovalDecision::Denied
+                };
+                let _ = reply_tx.send(decision);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(state) = terminal.or(latest) {
+        return Ok(GoalCliOutcome {
+            state,
+            evidence,
+            event_count,
+        });
+    }
+
+    Err(anyhow::anyhow!(
+        "goal {task_id} ended before any state was reported"
+    ))
+}
+
+fn goal_cli_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Reviewing { .. }
+            | TaskStatus::Done { .. }
+            | TaskStatus::Failed { .. }
+            | TaskStatus::NeedsClarification { .. }
+            | TaskStatus::Paused { .. }
+            | TaskStatus::Rejected
+    )
+}
+
+fn goal_cli_success(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
+    )
+}
+
+fn goal_cli_report(task_id: TaskId, state: &GlobalState, event_count: usize) -> GoalCliReport {
+    GoalCliReport {
+        task_id,
+        status: state.task_status.clone(),
+        status_label: goal_status_label(&state.task_status).to_string(),
+        tokens_used: state.tokens_used,
+        estimated_naive_tokens: state.estimated_naive_tokens,
+        event_count,
+        goal_contract: state.goal_contract.clone(),
+        handoff_packet: state.handoff_packet.clone(),
+    }
+}
+
+fn print_goal_cli_report(report: &GoalCliReport) {
+    println!("Phonton goal");
+    println!("task_id: {}", report.task_id);
+    println!("status: {}", report.status_label);
+    println!(
+        "tokens: {} / naive baseline {}",
+        report.tokens_used, report.estimated_naive_tokens
+    );
+    if let Some(handoff) = &report.handoff_packet {
+        println!("changed_files: {}", handoff.changed_files.len());
+        println!("known_gaps: {}", handoff.known_gaps.len());
+    }
+    if let TaskStatus::Failed { reason, .. } = &report.status {
+        println!("failure: {reason}");
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AskCliRequest {
     question: String,
@@ -6445,6 +7020,7 @@ fn print_help() {
          (none)            Launch the interactive TUI (default)\n  \
          init              Create ~/.phonton/config.toml if it is missing\n  \
          ask [flags] <q>   One-shot workspace-aware Q&A using the configured provider\n  \
+         goal [flags] <p>  Execute one goal without launching the TUI\n  \
          demo trust-loop   Print the evidence-trail demo loop\n  \
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
          extensions        Install and inspect steering, skills, MCP, and profiles\n  \
@@ -6492,6 +7068,10 @@ fn print_help() {
          \n\
          PLAN PREVIEW:\n  \
          phonton plan [--json] [--no-memory] [--no-tests] <goal>\n\
+         \n\
+         HEADLESS GOAL:\n  \
+         phonton goal [--json] [--yes] [--permission-mode <mode>] [--timeout-seconds <n>] <goal>\n  \
+         phonton goal --prompt-file prompt.md --yes --permission-mode full-access\n\
          \n\
          ASK:\n  \
          phonton ask [--no-workspace] [--json] <question>\n\
@@ -6770,6 +7350,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
         }
         "plan" => {
             let code = plan_preview::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(None)
+        }
+        "goal" => {
+            let code = run_goal_cli(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -7362,6 +7949,7 @@ async fn run_app<B: Backend>(
                                     task_id,
                                     text,
                                     false,
+                                    None,
                                     tx_goal,
                                     store_goal,
                                     sandbox_goal,
@@ -7400,6 +7988,7 @@ async fn run_app<B: Backend>(
                                     task_id,
                                     text,
                                     direct_task,
+                                    None,
                                     tx_goal,
                                     store_goal,
                                     sandbox_goal,
@@ -8259,6 +8848,7 @@ async fn spawn_goal(
     task_id: TaskId,
     text: String,
     direct_task: bool,
+    headless_worker_context: Option<String>,
     tx: mpsc::Sender<LoopEvent>,
     store: Arc<std::sync::Mutex<Store>>,
     sandbox: Arc<Sandbox>,
@@ -8296,9 +8886,33 @@ async fn spawn_goal(
     };
     let mut plan = match plan_result {
         Ok(p) => p,
-        Err(_) => return,
+        Err(err) => {
+            let failed = GlobalState {
+                task_status: TaskStatus::Failed {
+                    reason: format!("planning failed: {err}"),
+                    failed_subtask: None,
+                },
+                goal_contract: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: cfg.budget.max_tokens,
+                estimated_naive_tokens: 0,
+                checkpoints: Vec::new(),
+            };
+            if let Ok(g) = store.lock() {
+                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+            }
+            let _ = tx
+                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
+                .await;
+            return;
+        }
     };
     apply_workspace_preflight(&mut plan, &working_dir, &text);
+    if let Some(context) = headless_worker_context.as_deref() {
+        append_headless_worker_context(&mut plan, context);
+    }
 
     let planning_state = state_for_plan_status(&plan, TaskStatus::Planning);
     let _ = tx
@@ -10025,6 +10639,105 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(request.no_workspace);
         assert!(request.json);
         assert_eq!(request.question, "what is this?");
+    }
+
+    #[test]
+    fn parse_goal_cli_request_accepts_prompt_file_and_headless_flags() {
+        let request = parse_goal_cli_request(&[
+            "--json".into(),
+            "--yes".into(),
+            "--permission-mode".into(),
+            "full-access".into(),
+            "--timeout-seconds".into(),
+            "900".into(),
+            "--prompt-file".into(),
+            "prompt.md".into(),
+        ])
+        .unwrap();
+
+        assert!(request.json);
+        assert!(request.yes);
+        assert_eq!(request.permission_mode, Some(PermissionMode::FullAccess));
+        assert_eq!(request.timeout, Some(Duration::from_secs(900)));
+        assert_eq!(request.prompt_file, Some(PathBuf::from("prompt.md")));
+        assert!(!request.stdin);
+        assert!(request.goal_parts.is_empty());
+    }
+
+    #[test]
+    fn parse_goal_cli_request_rejects_multiple_prompt_sources() {
+        let err =
+            parse_goal_cli_request(&["--stdin".into(), "--prompt-file".into(), "prompt.md".into()])
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("only one prompt source"));
+    }
+
+    #[test]
+    fn headless_baseline_commands_detect_test_first_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        let commands =
+            headless_baseline_commands("Run tests first, then fix `src/receipt.js`.", temp.path());
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].label, "baseline npm test");
+        assert_eq!(
+            commands[0].command,
+            vec!["npm".to_string(), "test".to_string()]
+        );
+    }
+
+    #[test]
+    fn headless_baseline_uses_windows_command_shims_for_node_tools() {
+        if cfg!(windows) {
+            assert_eq!(headless_spawn_program("npm"), "npm.cmd");
+            assert_eq!(headless_spawn_program("pnpm"), "pnpm.cmd");
+            assert_eq!(headless_spawn_program("yarn"), "yarn.cmd");
+        } else {
+            assert_eq!(headless_spawn_program("npm"), "npm");
+        }
+    }
+
+    #[test]
+    fn headless_baseline_evidence_is_bounded_for_repair_context() {
+        let summary = CommandRunSummary {
+            command: "npm test".into(),
+            exit_code: Some(1),
+            stdout_preview: "x".repeat(900),
+            stderr_preview: "Assertion failed in src/receipt.test.js".into(),
+            duration_ms: Some(1250),
+        };
+
+        let evidence = render_headless_baseline_evidence(&[summary]).unwrap();
+
+        assert!(evidence.contains("Headless baseline test evidence"));
+        assert!(evidence.contains("npm test"));
+        assert!(evidence.contains("exit 1"));
+        assert!(evidence.contains("src/receipt.test.js"));
+        assert!(evidence.chars().count() < 1200);
+        assert!(!evidence.contains(&"x".repeat(400)));
+    }
+
+    #[test]
+    fn headless_baseline_worker_context_preserves_goal_contract_goal() {
+        let mut plan = single_task_plan("fix config loader".into(), Vec::new());
+
+        append_headless_worker_context(&mut plan, "Headless baseline test evidence");
+
+        assert_eq!(
+            plan.goal_contract.as_ref().unwrap().goal,
+            "fix config loader"
+        );
+        assert!(plan.subtasks[0].attachments.iter().any(|attachment| {
+            attachment.path == Path::new(".phonton/headless-baseline.txt")
+                && attachment
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("Headless baseline test evidence"))
+        }));
     }
 
     #[test]

@@ -5,11 +5,10 @@
 //! planner calls [`MemoryStore::query`] before decomposing a new goal to
 //! surface prior context relevant to the request.
 //!
-//! Relevance at this layer is **keyword-overlap only** — no embeddings,
-//! no FTS. Each record's searchable text is tokenised (whitespace +
-//! ASCII punctuation, case-insensitive), deduplicated, and scored by the
-//! size of its intersection with the goal's token set. Good enough to
-//! surface obvious hits; explicitly not good enough for semantic recall.
+//! Relevance at this layer is local and deterministic: tokenisation,
+//! light stemming, a small synonym table for engineering terms, stopword
+//! filtering, and IDF-weighted overlap. It is not a replacement for
+//! embeddings, but it avoids the most brittle exact-keyword misses.
 //!
 //! ## Storage note
 //!
@@ -19,7 +18,7 @@
 //! store in `Arc<Mutex<Store>>` internally. `MemoryStore` exposes an
 //! async API so planner/worker call sites don't have to reach around it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -61,8 +60,8 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Return up to `limit` records ranked by keyword overlap with
-    /// `goal_text`. Records with zero shared tokens are excluded.
+    /// Return up to `limit` records ranked by weighted local relevance with
+    /// `goal_text`. Records with zero shared terms are excluded.
     pub async fn query(&self, goal_text: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -73,21 +72,23 @@ impl MemoryStore {
         }
 
         let all = self.load_all().await?;
-        let mut scored: Vec<(usize, MemoryRecord)> = all
+        let mut docs: Vec<(HashSet<String>, MemoryRecord)> = all
             .into_iter()
-            .map(|rec| {
-                let text = searchable_text(&rec);
-                let rec_tokens = tokenize(&text);
-                let score = goal_tokens.intersection(&rec_tokens).count();
-                (score, rec)
+            .map(|rec| (tokenize(&searchable_text(&rec)), rec))
+            .collect();
+        let doc_freq = document_frequencies(docs.iter().map(|(tokens, _)| tokens));
+        let doc_count = docs.len() as f64;
+        let mut scored: Vec<(f64, MemoryRecord)> = docs
+            .drain(..)
+            .filter_map(|(rec_tokens, rec)| {
+                let score = weighted_overlap_score(&goal_tokens, &rec_tokens, &doc_freq, doc_count);
+                (score > 0.0).then_some((score, rec))
             })
-            .filter(|(score, _)| *score > 0)
             .collect();
 
-        // Descending by score. Stable sort keeps insertion order (which
-        // reflects recency, since we selected without an ORDER BY) as the
-        // tiebreaker — slightly preferring older entries. Good enough.
-        scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        // Descending by score. Stable sort keeps insertion order as the
+        // tiebreaker for equally relevant entries.
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(_, r)| r).collect())
     }
@@ -199,13 +200,122 @@ impl MemoryStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Tokenise `text` on whitespace and ASCII punctuation, lowercase, dedup.
-/// Empty tokens (possible after stripping punctuation runs) are dropped.
+/// Tokenise `text` on whitespace and punctuation, lowercase, lightly stem,
+/// expand selected engineering synonyms, and dedup.
 fn tokenize(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_ascii_lowercase())
-        .collect()
+    let mut out = HashSet::new();
+    for raw in text.split(|c: char| !c.is_alphanumeric()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let lower = raw.to_ascii_lowercase();
+        let stemmed = stem(&lower);
+        if stemmed.is_empty() || is_stopword(&stemmed) {
+            continue;
+        }
+        out.insert(stemmed.clone());
+        for related in related_terms(&stemmed) {
+            out.insert(related.to_string());
+        }
+    }
+    out
+}
+
+fn document_frequencies<'a>(
+    docs: impl Iterator<Item = &'a HashSet<String>>,
+) -> HashMap<String, usize> {
+    let mut freqs = HashMap::new();
+    for doc in docs {
+        for term in doc {
+            *freqs.entry(term.clone()).or_insert(0) += 1;
+        }
+    }
+    freqs
+}
+
+fn weighted_overlap_score(
+    query: &HashSet<String>,
+    record: &HashSet<String>,
+    doc_freq: &HashMap<String, usize>,
+    doc_count: f64,
+) -> f64 {
+    query
+        .intersection(record)
+        .map(|term| {
+            let df = *doc_freq.get(term.as_str()).unwrap_or(&1) as f64;
+            ((doc_count + 1.0) / (df + 1.0)).ln() + 1.0
+        })
+        .sum()
+}
+
+fn stem(token: &str) -> String {
+    let mut s = token.to_string();
+    if s.len() > 5 && s.ends_with("ing") {
+        s.truncate(s.len() - 3);
+    } else if s.len() > 4 && s.ends_with("ied") {
+        s.truncate(s.len() - 3);
+        s.push('y');
+    } else if s.len() > 4 && (s.ends_with("ed") || s.ends_with("es")) {
+        s.truncate(s.len() - 2);
+    } else if s.len() > 3 && s.ends_with('s') {
+        s.truncate(s.len() - 1);
+    }
+
+    if s.ends_with("nn") || s.ends_with("ll") || s.ends_with("tt") || s.ends_with("pp") {
+        s.pop();
+    }
+    if s.ends_with("ick") {
+        s.pop();
+    }
+    s
+}
+
+fn related_terms(term: &str) -> &'static [&'static str] {
+    match term {
+        "synchronou" | "sync" | "stall" | "wait" | "block" => {
+            &["block", "synchronou", "stall", "wait"]
+        }
+        "panic" | "crash" | "abort" => &["panic", "crash", "abort"],
+        "thread" | "task" | "worker" => &["concurrency"],
+        "async" | "concurrency" => &["concurrency"],
+        _ => &[],
+    }
+}
+
+fn is_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "for"
+            | "from"
+            | "has"
+            | "have"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "this"
+            | "to"
+            | "use"
+            | "with"
+            | "without"
+            | "code"
+            | "file"
+            | "implementation"
+            | "task"
+            | "worker"
+    )
 }
 
 /// Flatten a `MemoryRecord` to the text fields that should participate in
@@ -318,6 +428,54 @@ mod tests {
         // limit=1 returns a single ranked record.
         let capped = ms.query("alpha delta", 1).await.unwrap();
         assert_eq!(capped.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_matches_stemmed_and_related_terms() {
+        let ms = mem_store();
+        ms.record(MemoryRecord::Constraint {
+            statement: "Avoid thread blocking calls".into(),
+            rationale: "prevents hidden concurrency delays".into(),
+        })
+        .await
+        .unwrap();
+
+        let hits = ms
+            .query("synchronous stalls in async tasks", 5)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(hits.first(), Some(MemoryRecord::Constraint { statement, .. }) if statement.contains("blocking")),
+            "expected blocking-call constraint from stemmed/synonym query, got {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_downweights_common_words_against_specific_memory() {
+        let ms = mem_store();
+        ms.record(MemoryRecord::Convention {
+            rule: "Use the code in the worker task file for the task".into(),
+            scope: Some("general implementation wording".into()),
+        })
+        .await
+        .unwrap();
+        ms.record(MemoryRecord::Constraint {
+            statement: "Avoid thread blocking calls".into(),
+            rationale: "prevents hidden concurrency delays".into(),
+        })
+        .await
+        .unwrap();
+
+        let hits = ms
+            .query("the worker task has synchronous stalls in code", 2)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(hits.first(), Some(MemoryRecord::Constraint { .. })),
+            "specific concurrency record should outrank common wording, got {hits:?}"
+        );
     }
 
     #[tokio::test]

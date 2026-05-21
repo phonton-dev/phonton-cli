@@ -35,6 +35,14 @@ function Token-Total($Usage) {
     $inputValue + $outputValue
 }
 
+function Token-ClaimEligible($Usage) {
+    if ($null -eq $Usage) {
+        return $false
+    }
+    $property = $Usage.PSObject.Properties["token_claim_eligible"]
+    return ($null -ne $property -and [bool]$property.Value)
+}
+
 function Is-Verified($Review, $Metadata) {
     if ($null -ne $Review) {
         foreach ($name in @("verified", "success", "passed")) {
@@ -68,31 +76,42 @@ $runs = Get-ChildItem -LiteralPath $root -Recurse -Filter metadata.json | ForEac
     $usage = Read-JsonFile (Join-Path $runDir "token-usage.json")
     $review = Read-JsonFile (Join-Path $runDir "quality-review.json")
     $tool = if ($metadata -and $metadata.tool) { [string]$metadata.tool } else { Split-Path (Split-Path $runDir -Parent) -Leaf }
+    $tokens = Token-Total $usage
+    $tokenClaimEligible = Token-ClaimEligible $usage
+    $verified = Is-Verified $review $metadata
     [pscustomobject]@{
         tool = $tool
         task = if ($metadata -and $metadata.task_id) { [string]$metadata.task_id } else { Split-Path (Split-Path $runDir -Parent) -Leaf }
         run = Split-Path $runDir -Leaf
-        verified = Is-Verified $review $metadata
-        tokens = Token-Total $usage
+        verified = $verified
+        tokens = $tokens
+        token_claim_eligible = $tokenClaimEligible
+        claim_tokens = if ($tokenClaimEligible) { $tokens } else { 0 }
+        claim_verified = ($tokenClaimEligible -and $verified)
         path = $runDir
     }
 }
 
 $summary = $runs | Group-Object tool | ForEach-Object {
     $verified = @($_.Group | Where-Object { $_.verified }).Count
-    $tokens = ($_.Group | Measure-Object tokens -Sum).Sum
-    $score = if ($tokens -gt 0) { [math]::Round(($verified / ($tokens / 10000.0)), 3) } else { 0 }
+    $claimVerified = @($_.Group | Where-Object { $_.claim_verified }).Count
+    $claimEligibleRuns = @($_.Group | Where-Object { $_.token_claim_eligible }).Count
+    $tokens = ($_.Group | Measure-Object claim_tokens -Sum).Sum
+    $score = if ($tokens -gt 0) { [math]::Round(($claimVerified / ($tokens / 10000.0)), 3) } else { 0 }
     [pscustomobject]@{
         tool = $_.Name
         runs = $_.Count
         verified = $verified
-        total_tokens = [int64]$tokens
+        token_claim_eligible_runs = $claimEligibleRuns
+        claim_verified = $claimVerified
+        claim_eligible_tokens = [int64]$tokens
+        excluded_runs = $_.Count - $claimEligibleRuns
         verified_success_per_10k_tokens = $score
     }
 } | Sort-Object verified_success_per_10k_tokens -Descending
 
 $result = [pscustomobject]@{
-    metric = "verified_success_per_10k_tokens"
+    metric = "verified_success_per_10k_claim_eligible_tokens"
     runs_dir = $root.Path
     generated_at = (Get-Date).ToUniversalTime().ToString("o")
     summary = $summary
@@ -107,13 +126,14 @@ if ($OutMarkdown) {
     $lines = @(
         "# Benchmark Score",
         "",
-        "Primary metric: verified success per 10k provider-reported tokens.",
+        "Primary metric: verified success per 10k claim-eligible provider tokens.",
+        "Runs without `token_claim_eligible: true` are excluded from the token score.",
         "",
-        "| Tool | Runs | Verified | Total tokens | Verified success / 10k tokens |",
-        "|---|---:|---:|---:|---:|"
+        "| Tool | Runs | Verified | Claim-eligible runs | Claim verified | Claim tokens | Excluded runs | Verified success / 10k tokens |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|"
     )
     foreach ($row in $summary) {
-        $lines += "| $($row.tool) | $($row.runs) | $($row.verified) | $($row.total_tokens) | $($row.verified_success_per_10k_tokens) |"
+        $lines += "| $($row.tool) | $($row.runs) | $($row.verified) | $($row.token_claim_eligible_runs) | $($row.claim_verified) | $($row.claim_eligible_tokens) | $($row.excluded_runs) | $($row.verified_success_per_10k_tokens) |"
     }
     $lines | Set-Content -LiteralPath $OutMarkdown -Encoding UTF8
 }

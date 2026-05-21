@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.16.1</h1>
+<h1 align="center">Phonton CLI · v0.16.2</h1>
 
 <p align="center">
   <strong>Verified code changes with repo memory.</strong><br>
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.16.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.16.2-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="status" src="https://img.shields.io/badge/status-public_alpha-f97316">
 </p>
@@ -69,8 +69,11 @@ It walks through the evidence trail a real run should expose: GoalContract, plan
 ## What Works Today
 
 - Interactive Ratatui TUI with goal, task, ask, settings, git, and flight-log surfaces.
+- v0.16.2 hardens headless benchmark runs: `phonton goal --prompt-file <path> --json --yes` captures bounded baseline test evidence when prompts ask to run tests first, extracts prompt-mentioned files/APIs into the GoalContract, avoids parent-repo checkpoint escapes in nested work folders, and keeps mixed local-template/provider runs out of token-claim eligibility.
+- v0.16.1 adds `phonton goal --prompt-file <path>` for CI and benchmark runs that need the same goal execution spine without clipboard, paste, or PTY automation.
 - v0.16.1 adds `phonton extensions install <source>` for installing audited `.phonton` packs from GitHub or local paths, plus built-in open-source MCP catalog ids such as `context7`, `github`, `chrome-devtools`, `playwright`, `firecrawl`, `supabase`, `mongodb`, and `figma`.
 - v0.16.1 adds `phonton extensions catalog`, `phonton extensions new <path> [skill|steering|mcp-server|profile]`, and `phonton extensions validate` so extension discovery, scaffolding, and validation feel closer to Gemini CLI while preserving Phonton's local trust and approval model.
+- v0.16.1 hardens the local ADE spine: memory retrieval now uses light stemming, engineering-term synonyms, stopword filtering, and IDF-weighted overlap; cargo verification uses file-backed locks under `target/.phonton-locks`; Windows sandbox job-object fallback is reported explicitly.
 - v0.16.0 adds typed `@...` context mentions for files, directories, symbols, MCP servers, and MCP tools, with resolved/missing/approval-gated rows visible in `/context` and the Context focus surface.
 - v0.16.0 separates local prompt token estimates from provider-reported billing usage in `phonton why-tokens --by-source`; local-only runs now render as `no provider call`, and prompt manifests carry resolved `@...` mention rows plus attribution-only token totals instead of double-counting attachments or MCP/tool context.
 - v0.16.0 tightens extension and MCP diagnostics so `phonton extensions doctor` warns on networked or mutating MCP trust even when a server has not listed explicit permissions.
@@ -170,7 +173,7 @@ Windows PowerShell:
 Direct Cargo install:
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.1 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.2 phonton-cli --locked --force
 ```
 
 Check the install:
@@ -186,7 +189,7 @@ Phonton uses GitHub branches and releases as install channels:
 
 | Channel | Install | Use when |
 |---|---|---|
-| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.1 phonton-cli --locked --force` | You want the best validated public alpha |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.16.2 phonton-cli --locked --force` | You want the best validated public alpha |
 | Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | You want next-release integration changes |
 | Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | You want daily snapshots and can tolerate breakage |
 | Main | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch main phonton-cli --locked --force` | You want the current release branch tip |
@@ -270,6 +273,7 @@ phonton                 Launch the interactive TUI
 phonton -r              Resume the saved TUI session for this workspace
 phonton init            Create ~/.phonton/config.toml if it is missing
 phonton ask [flags] <q> Workspace-aware Q&A using the configured provider
+phonton goal [flags] <p> Execute one goal without launching the TUI
 phonton demo trust-loop Print the evidence-trail demo loop
 phonton doctor          Check config, store, trust, git, cargo, and Nexus
 phonton plan <goal>     Preview the task DAG and GoalContract without changing files
@@ -316,6 +320,17 @@ phonton plan --json "add input validation to config loading"
 
 The text preview shows the visible GoalContract, including acceptance criteria,
 likely files, verification plan, run plan, assumptions, and clarifications.
+
+Headless goal execution for CI and benchmark harnesses:
+
+```bash
+phonton goal --prompt-file prompt.md --yes --permission-mode full-access --timeout-seconds 900 --json
+```
+
+The headless command runs the same planner, worker, verifier, review receipt,
+memory, extension, MCP, and OutcomeLedger path used by the TUI. `--yes`
+records workspace trust for the current run, and `--permission-mode` keeps the
+automation posture explicit.
 
 Review latest completed task:
 
@@ -399,7 +414,7 @@ phonton context diff --indexed --non-indexed fixtures/context.json --format json
 phonton why-tokens --by-source
 ```
 
-Benchmark exports require provider-reported token usage. Estimated-token receipts remain useful for review, but they are not valid for public efficiency claims.
+Benchmark exports label token comparability explicitly: `token_usage_source`, `execution_mode`, `provider_call_count`, `token_claim_eligible`, and `benchmark_warnings`. Only verified provider runs with `token_claim_eligible: true` are valid for public token-efficiency claims. Estimated, local-template, mixed, unavailable, and failed runs remain useful product evidence, but they must stay out of headline token comparisons.
 
 Read the methodology in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 

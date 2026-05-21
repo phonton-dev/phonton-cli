@@ -9,6 +9,7 @@ integration-tests = []
 [dependencies]
 phonton-types     = { path = "../phonton-types" }
 phonton-memory    = { path = "../phonton-memory" }
+phonton-sandbox   = { path = "../phonton-sandbox" }
 anyhow            = { workspace = true }
 tokio             = { workspace = true }
 serde             = { workspace = true }

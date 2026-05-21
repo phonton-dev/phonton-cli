@@ -4,19 +4,48 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.16.2 - Benchmark-Honest Headless Runs
+
+### Added
+
+- Headless `phonton goal --prompt-file <path> --json --yes` runs now capture bounded baseline test evidence before editing when the prompt asks to run tests first. The evidence is appended to the dispatched goal as repair context without depending on TUI paste, clipboard, or PTY automation.
+- Goal contracts now extract prompt-mentioned source files and public API signatures such as `src/receipt.js` and `buildReceipt(run)` into likely files, expected artifacts, acceptance criteria, and concrete verify-plan commands when the prompt names test commands.
+
+### Fixed
+
+- Headless baseline capture now uses Windows command shims for Node package tools such as `npm.cmd`, preventing false "program not found" baseline evidence on Windows.
+- Verified diffs no longer discover and checkpoint a parent git repository when the current workspace folder is not itself a git root. In nested benchmark work folders, Phonton now falls back to direct workspace-local hunk application instead of staging unrelated parent-repo files.
+- Benchmark export now marks mixed local-template/provider runs as `token_claim_eligible: false` even when provider token usage is available. Mixed runs remain useful product evidence, but they are not provider-token efficiency wins.
+- Handoff verification summaries now prefer concrete planned commands such as `npm test passed` or `npm test failed` over trailing prompt prose when benchmark prompts are submitted through `--prompt-file`.
+
+### Notes
+
+- v0.16.2 is a benchmark reliability release. Do not claim Phonton beats Cursor, Claude Code, Codex, Gemini CLI, Hermes, BridgeSpace, or other ADEs unless the published artifact set is complete and each included run has `token_claim_eligible: true`.
+
 ## 0.16.1 - Extension Installer
 
 ### Added
 
+- Added `phonton goal [--prompt-file <path>|--stdin|<goal>]` for noninteractive goal execution through the same planner, worker, verifier, handoff, memory, extension, MCP, and OutcomeLedger path used by the TUI. It supports `--json`, `--yes`, `--permission-mode <mode>`, `--timeout-seconds <n>`, and `--task`.
 - Added `phonton extensions install <source>` for installing `.phonton` extension packs from GitHub, local paths, or built-in open-source MCP catalog ids. The installer supports `--scope workspace|user`, `--ref <ref>` for GitHub packs, `--dry-run`, `--force`, and `--json`.
 - Added `phonton extensions catalog` to list open-source MCP manifest recipes for GitHub, Context7, Chrome DevTools, Playwright, Firecrawl, Supabase, MongoDB, and Figma/Framelink.
 - Added `phonton extensions new <path> [skill|steering|mcp-server|profile]` for scaffolding small auditable `.phonton` extension packs.
 - Added `phonton extensions validate` as a Gemini-style alias for `phonton extensions doctor`.
 - Added `.phonton/mcp.d/*.toml` loading so catalog installs can write one MCP manifest per extension instead of overwriting a shared `mcp.toml`.
+- Added benchmark export comparability fields: `execution_mode`, `token_usage_source`, `provider_call_count`, `token_claim_eligible`, `benchmark_warnings`, and `cache_creation_tokens`.
+- Added file-backed cargo verification locking under `target/.phonton-locks` so concurrent Phonton processes share the same cargo-target guard instead of relying only on in-process mutexes.
+
+### Fixed
+
+- `phonton benchmark export` now preserves failed provider identity and local-template runs instead of dropping them or treating zero-token local-template successes as provider-token wins.
+- Memory retrieval now uses light stemming, engineering-term synonym expansion, stopword filtering, and IDF-weighted overlap instead of raw keyword intersection.
+- Windows sandbox job-object assignment failures now produce an explicit nested-job fallback warning while keeping direct-child `kill_on_drop` behavior.
 
 ### Notes
 
 - v0.16.1 keeps extension installs local and inspectable. Installing an MCP entry writes configuration only; MCP servers still require workspace trust and approval before tools can affect a run.
+- `phonton goal --prompt-file` is intended for benchmark and CI harnesses where exact multiline prompts must not depend on terminal paste behavior.
+- Public token-efficiency claims should only use verified provider runs with `token_claim_eligible: true`; estimated, local-template, mixed, unavailable, and failed runs are still useful evidence but not headline token comparisons.
 
 ## 0.16.0 - Addressable Context And Extension Evidence
 

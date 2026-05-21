@@ -153,6 +153,12 @@ pub enum OrchestratorEvent {
         subtask_id: SubtaskId,
         reason: String,
         attempt: u8,
+        #[serde(default)]
+        token_usage: TokenUsage,
+        #[serde(default)]
+        provider: Option<ProviderKind>,
+        #[serde(default)]
+        model_name: String,
     },
     /// `phonton-verify` returned `Pass` for a produced diff.
     VerifyPass {
@@ -455,6 +461,7 @@ impl EventRecord {
                 subtask_id,
                 reason,
                 attempt,
+                ..
             } => {
                 format!("fail {subtask_id} attempt={attempt}: {reason}")
             }
