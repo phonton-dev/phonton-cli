@@ -13,8 +13,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use phonton_sandbox::{ExecutionGuard, GuardDecision, ToolCall};
 use phonton_types::{
-    EventRecord, ExtensionId, McpServerDefinition, McpTransport, OrchestratorEvent, Permission,
-    TaskId, TrustLevel,
+    EventRecord, ExtensionId, McpCapabilitySnapshot, McpPermissionProposal, McpServerDefinition,
+    McpToolDescriptor, McpTransport, OrchestratorEvent, Permission, TaskId, TrustLevel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,6 +44,18 @@ pub struct McpTool {
     /// JSON schema for arguments.
     #[serde(default)]
     pub input_schema: Value,
+}
+
+impl From<McpTool> for McpToolDescriptor {
+    fn from(tool: McpTool) -> Self {
+        Self {
+            server_id: tool.server_id,
+            name: tool.name,
+            title: tool.title,
+            description: tool.description,
+            input_schema: tool.input_schema,
+        }
+    }
 }
 
 /// Result returned by `tools/call`.
@@ -121,6 +133,25 @@ pub struct McpRuntime {
     event_tx: Option<broadcast::Sender<EventRecord>>,
 }
 
+#[derive(Debug, Clone)]
+struct InitializeMetadata {
+    protocol_version: String,
+    server_name: Option<String>,
+    server_version: Option<String>,
+    capabilities: Value,
+}
+
+impl Default for InitializeMetadata {
+    fn default() -> Self {
+        Self {
+            protocol_version: MCP_PROTOCOL_VERSION.into(),
+            server_name: None,
+            server_version: None,
+            capabilities: Value::Object(Default::default()),
+        }
+    }
+}
+
 impl McpRuntime {
     /// Construct a runtime for active server definitions.
     pub fn new(servers: Vec<McpServerDefinition>, guard: ExecutionGuard) -> Self {
@@ -171,6 +202,43 @@ impl McpRuntime {
             .inspect_err(|_| self.emit_completed(server, "tools/list", false))?;
         self.emit_completed(server, "tools/list", true);
         parse_tools(server, result)
+    }
+
+    /// Discover server capabilities and exposed tools without calling a tool.
+    pub async fn capabilities(&self, server_id: &ExtensionId) -> Result<McpCapabilitySnapshot> {
+        let server = self.server(server_id)?;
+        self.authorize_operation(server, "capabilities").await?;
+        let (metadata, tools) = {
+            let mut sessions = self.sessions.lock().await;
+            if !sessions.contains_key(&server.id) {
+                self.authorize_start(server).await?;
+                let client =
+                    McpClient::connect(server, self.guard.project_root().to_path_buf()).await?;
+                sessions.insert(server.id.clone(), client);
+            }
+            let client = sessions
+                .get_mut(&server.id)
+                .expect("session was inserted or already present");
+            let metadata = client.metadata();
+            let tools_value = client.request("tools/list", json!({})).await?;
+            let tools = parse_tools(server, tools_value)?;
+            (metadata, tools)
+        };
+        let proposals = infer_permission_proposals(server, &tools);
+        self.emit(OrchestratorEvent::McpCapabilitiesDiscovered {
+            server_id: server.id.clone(),
+            tool_count: tools.len(),
+            proposal_count: proposals.len(),
+        });
+        Ok(McpCapabilitySnapshot {
+            server_id: server.id.clone(),
+            protocol_version: metadata.protocol_version,
+            server_name: metadata.server_name,
+            server_version: metadata.server_version,
+            capabilities: metadata.capabilities,
+            tools: tools.into_iter().map(Into::into).collect(),
+            permission_proposals: proposals,
+        })
     }
 
     /// Invoke one MCP tool.
@@ -366,6 +434,13 @@ impl McpClient {
             McpClient::Http(client) => client.request(method, params).await,
         }
     }
+
+    fn metadata(&self) -> InitializeMetadata {
+        match self {
+            McpClient::Stdio(client) => client.metadata.clone(),
+            McpClient::Http(client) => client.metadata.clone(),
+        }
+    }
 }
 
 struct StdioClient {
@@ -373,6 +448,7 @@ struct StdioClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    metadata: InitializeMetadata,
 }
 
 impl StdioClient {
@@ -417,13 +493,14 @@ impl StdioClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            metadata: InitializeMetadata::default(),
         };
-        client.initialize().await?;
+        client.metadata = client.initialize().await?;
         Ok(client)
     }
 
-    async fn initialize(&mut self) -> Result<()> {
-        let _ = self
+    async fn initialize(&mut self) -> Result<InitializeMetadata> {
+        let result = self
             .request(
                 "initialize",
                 json!({
@@ -437,7 +514,8 @@ impl StdioClient {
             )
             .await?;
         self.notification("notifications/initialized", json!({}))
-            .await
+            .await?;
+        Ok(metadata_from_initialize(result))
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -514,6 +592,7 @@ struct HttpClient {
     http: reqwest::Client,
     next_id: u64,
     protocol_version: String,
+    metadata: InitializeMetadata,
 }
 
 impl HttpClient {
@@ -526,6 +605,7 @@ impl HttpClient {
             http,
             next_id: 1,
             protocol_version: MCP_PROTOCOL_VERSION.into(),
+            metadata: InitializeMetadata::default(),
         };
         client.initialize().await?;
         Ok(client)
@@ -548,6 +628,8 @@ impl HttpClient {
         if let Some(version) = result.get("protocolVersion").and_then(Value::as_str) {
             self.protocol_version = version.to_string();
         }
+        self.metadata = metadata_from_initialize(result);
+        self.metadata.protocol_version = self.protocol_version.clone();
         self.notification("notifications/initialized", json!({}))
             .await
     }
@@ -671,6 +753,65 @@ fn trust_allows(trust: TrustLevel, permission: Permission) -> bool {
 
 fn permission_requires_approval(permission: &Permission) -> bool {
     !matches!(permission, Permission::FsReadWorkspace)
+}
+
+fn infer_permission_proposals(
+    server: &McpServerDefinition,
+    _tools: &[McpTool],
+) -> Vec<McpPermissionProposal> {
+    let mut proposals: Vec<McpPermissionProposal> = server
+        .permissions
+        .iter()
+        .copied()
+        .map(|permission| McpPermissionProposal {
+            permission,
+            reason: format!("declared by MCP manifest for server `{}`", server.id),
+            source: "manifest".into(),
+            auto_apply: false,
+        })
+        .collect();
+
+    if proposals.is_empty() && server.trust == TrustLevel::NetworkedTool {
+        proposals.push(McpPermissionProposal {
+            permission: Permission::NetworkRequest,
+            reason: format!(
+                "server `{}` is trusted as networked-tool but declares no explicit permissions",
+                server.id
+            ),
+            source: "trust-level".into(),
+            auto_apply: false,
+        });
+    }
+
+    proposals
+}
+
+fn metadata_from_initialize(result: Value) -> InitializeMetadata {
+    let protocol_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or(MCP_PROTOCOL_VERSION)
+        .to_string();
+    let server_name = result
+        .get("serverInfo")
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let server_version = result
+        .get("serverInfo")
+        .and_then(|v| v.get("version"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let capabilities = result
+        .get("capabilities")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    InitializeMetadata {
+        protocol_version,
+        server_name,
+        server_version,
+        capabilities,
+    }
 }
 
 fn parse_tools(server: &McpServerDefinition, result: Value) -> Result<Vec<McpTool>> {
@@ -827,6 +968,114 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "search");
         assert_eq!(tools[0].input_schema["type"], "object");
+    }
+
+    #[test]
+    fn capability_snapshot_infers_preview_only_permission_proposals() {
+        let s = server(TrustLevel::NetworkedTool, vec![Permission::NetworkRequest]);
+        let tools = parse_tools(
+            &s,
+            json!({
+                "tools": [{
+                    "name": "search_docs",
+                    "description": "Search remote documentation",
+                    "inputSchema": { "type": "object" }
+                }]
+            }),
+        )
+        .unwrap();
+
+        let proposals = infer_permission_proposals(&s, &tools);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].permission, Permission::NetworkRequest);
+        assert!(!proposals[0].auto_apply);
+        assert!(proposals[0].reason.contains("declared"));
+    }
+
+    #[tokio::test]
+    async fn stdio_capability_snapshot_captures_initialize_and_tools() {
+        if std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping MCP stdio test because node is not installed");
+            return;
+        }
+
+        let script =
+            std::env::temp_dir().join(format!("phonton-mcp-fake-{}.js", std::process::id()));
+        std::fs::write(
+            &script,
+            r#"
+const readline = require("readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: "2025-11-25",
+        serverInfo: { name: "fake-mcp", version: "1.2.3" },
+        capabilities: { tools: { listChanged: true } }
+      }
+    }));
+  } else if (msg.method === "tools/list") {
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        tools: [{
+          name: "search_docs",
+          description: "Search docs",
+          inputSchema: { type: "object" }
+        }]
+      }
+    }));
+  }
+});
+"#,
+        )
+        .unwrap();
+
+        let mut s = server(TrustLevel::ReadOnlyTool, vec![Permission::FsReadWorkspace]);
+        s.transport = McpTransport::Stdio {
+            command: "node".into(),
+            args: vec![script.display().to_string()],
+        };
+        let server_id = s.id.clone();
+        let runtime = McpRuntime::new(
+            vec![s],
+            ExecutionGuard::new(std::env::current_dir().unwrap()),
+        )
+        .with_approver(Arc::new(ExplicitApproveAll));
+
+        let snapshot = runtime.capabilities(&server_id).await.unwrap();
+        let _ = std::fs::remove_file(script);
+
+        assert_eq!(snapshot.protocol_version, "2025-11-25");
+        assert_eq!(snapshot.server_name.as_deref(), Some("fake-mcp"));
+        assert_eq!(snapshot.server_version.as_deref(), Some("1.2.3"));
+        assert_eq!(snapshot.capabilities["tools"]["listChanged"], true);
+        assert_eq!(snapshot.tools.len(), 1);
+        assert_eq!(snapshot.tools[0].name, "search_docs");
+        assert_eq!(snapshot.permission_proposals.len(), 1);
+        assert!(!snapshot.permission_proposals[0].auto_apply);
+    }
+
+    #[tokio::test]
+    async fn capabilities_preview_is_denied_without_approval_for_networked_server() {
+        let s = server(TrustLevel::NetworkedTool, vec![Permission::NetworkRequest]);
+        let server_id = s.id.clone();
+        let runtime = McpRuntime::new(
+            vec![s],
+            ExecutionGuard::new(std::env::current_dir().unwrap()),
+        );
+
+        let err = runtime.capabilities(&server_id).await.unwrap_err();
+        assert!(err.to_string().contains("approval required"));
     }
 
     #[test]

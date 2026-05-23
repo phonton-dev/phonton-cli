@@ -4,6 +4,29 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.0 - Swarm Plans, Index Backends & MCP Capability Preview
+
+### Added
+
+- Added typed swarm planning metadata to `PlannerOutput` through `PlanGraph`, `SubtaskAssignment`, and conflict-group records. Plan preview JSON now includes swarm mode, swarm reason, assignments, conflict groups, and the selected index backend.
+- Added broad-goal swarm activation. Provider-backed planning can emit swarm metadata for large goals; deterministic fallback planning records why swarm execution is disabled when no provider-backed decomposer is available.
+- Added conflict-aware dependency normalization in the orchestrator so subtasks with overlapping expected touch scopes are serialized while independent subtasks still run through the existing concurrent executor.
+- Added a `CodeRetriever` abstraction in `phonton-index`, preserving local HNSW as the default and adding an optional Qdrant HTTP backend for code and symbol retrieval.
+- Added `[index]` config with `backend = "local-hnsw"` by default and optional `backend = "qdrant"`, `qdrant_url`, and `qdrant_collection` fields.
+- Added `phonton mcp capabilities <server-id> [--json] [--yes]` to preview initialize metadata, tool descriptors, and proposed sandbox permission rules without invoking tools or writing config.
+- Added MCP capability discovery telemetry and shared typed records for `McpCapabilitySnapshot`, `McpToolDescriptor`, and `McpPermissionProposal`.
+
+### Changed
+
+- `phonton doctor` now reports the configured index backend and probes Qdrant connectivity when Qdrant is selected. Phonton does not start or manage Qdrant containers.
+- Outcome/context evidence now carries plan graph and selected index backend data where available. SQLite keyword memory remains the authoritative decision memory store; Qdrant is only a code retrieval backend.
+- README release language now describes v0.19.0 shipped commands only and avoids unbacked numeric or competitor benchmark claims.
+
+### Notes
+
+- v0.19.0 is an alpha slice of the swarm/index/MCP direction. It does not add branch racing, automatic Qdrant lifecycle management, external memory-record migration, or silent MCP permission scaffolding.
+- Public efficiency claims still require complete reproducible benchmark artifacts: pinned fixtures, exact prompts, tool versions, provider token usage where available, raw logs, final diffs, verification logs, and handoff evidence.
+
 ## 0.18.0 - Playwright Verification, Surgical Repairs & Memory Provenance
 
 ### Added

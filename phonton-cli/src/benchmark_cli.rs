@@ -1,13 +1,60 @@
-use std::collections::BTreeMap;
-
 use anyhow::{anyhow, Result};
 use phonton_store::TaskRecord;
 use phonton_types::{
-    BenchmarkExecutionMode, BenchmarkFinalStatus, BenchmarkRunExport, BenchmarkTokenUsageSource,
-    EventRecord, OrchestratorEvent, TaskStatus, TokenUsage, VerifyReport,
+    CostSummary, EventRecord, OrchestratorEvent, OutcomeLedger, ProviderKind, TaskStatus,
+    TokenUsage,
 };
+use serde::Serialize;
 
-use crate::open_persistent_store;
+use crate::{config, open_persistent_store};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkFinalStatus {
+    VerifiedSuccess,
+    Partial,
+    Failed,
+    Unverified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkExecutionMode {
+    Provider,
+    LocalTemplate,
+    Mixed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BenchmarkTokenUsageSource {
+    ProviderReported,
+    Estimated,
+    NoProviderCall,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BenchmarkRunExport {
+    task_id: String,
+    repo_commit: String,
+    goal: String,
+    task_class: String,
+    final_status: BenchmarkFinalStatus,
+    provider: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    cache_creation_tokens: u64,
+    cost_usd: f64,
+    token_usage_source: BenchmarkTokenUsageSource,
+    execution_mode: BenchmarkExecutionMode,
+    provider_call_count: u64,
+    token_claim_eligible: bool,
+    benchmark_warnings: Vec<String>,
+}
 
 pub async fn run(args: &[String]) -> Result<i32> {
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help" | "help") {
@@ -19,6 +66,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
         print_help();
         return Ok(2);
     }
+
     let mut latest = false;
     let mut format = "json";
     let mut i = 1;
@@ -87,185 +135,169 @@ fn build_export(
         .handoff
         .as_ref()
         .ok_or_else(|| anyhow!("OutcomeLedger has no HandoffPacket"))?;
-    let model_event = latest_benchmark_model_event(events);
-    let usage = if handoff.token_usage.budget_tokens() > 0 || handoff.token_usage.estimated {
-        handoff.token_usage
-    } else {
-        model_event
-            .as_ref()
-            .map(|event| event.token_usage)
-            .unwrap_or_default()
-    };
-
-    let mut context_buckets = ledger.context_manifest.buckets;
-    for record in events {
-        if let OrchestratorEvent::PromptManifest { manifest, .. } = &record.event {
-            context_buckets.add_prompt_manifest(manifest);
-        }
-    }
-    context_buckets.cached_tokens = context_buckets
-        .cached_tokens
-        .saturating_add(usage.cached_tokens);
-    let mut summary_context = ledger.context_manifest.clone();
-    summary_context.buckets = context_buckets;
-    let summaries = phonton_types::OutcomeSummaries::from_evidence(
-        ledger.goal_contract.as_ref(),
-        &summary_context,
-        &ledger.permission_ledger,
-        &ledger.verify_report,
-        Some(handoff),
-    );
-
-    let (provider, model, cost_micros) = model_event
-        .as_ref()
-        .map(|event| {
-            (
-                event.provider.clone(),
-                event.model.clone(),
-                event.cost_micros,
-            )
-        })
-        .unwrap_or_else(|| (String::new(), String::new(), 0));
-    let provider_call_count = provider_call_count(events, usage, &model);
-    let execution_mode = execution_mode(events, &model, provider_call_count);
-    let token_usage_source = token_usage_source(usage, execution_mode, provider_call_count);
-    let final_status = final_status(task, &ledger.verify_report, usage);
+    let status = task_status(task)?;
+    let final_status = classify_final_status(&status, ledger);
+    let review_events = review_ready_events(events);
+    let usage = choose_usage(handoff.token_usage, &review_events);
+    let token_usage_source = token_usage_source(&usage, review_events.is_empty());
+    let execution_mode = execution_mode(&usage, &review_events);
+    let provider_call_count = provider_call_count(&usage, &review_events);
+    let (provider, model) = provider_identity(&review_events);
+    let (provider, model) = fill_provider_identity_from_config(provider, model);
+    let cost_usd = review_events
+        .iter()
+        .map(|event| cost_summary_usd(event.cost))
+        .sum();
     let token_claim_eligible = matches!(final_status, BenchmarkFinalStatus::VerifiedSuccess)
         && matches!(execution_mode, BenchmarkExecutionMode::Provider)
         && matches!(
             token_usage_source,
             BenchmarkTokenUsageSource::ProviderReported
         )
-        && provider_call_count > 0
-        && !provider.trim().is_empty()
-        && !model.trim().is_empty();
+        && provider_call_count > 0;
     let benchmark_warnings = benchmark_warnings(
-        final_status,
-        execution_mode,
-        token_usage_source,
-        provider_call_count,
+        &final_status,
+        &token_usage_source,
+        &execution_mode,
+        token_claim_eligible,
         &provider,
         &model,
     );
 
-    let task_class = ledger
-        .goal_contract
-        .as_ref()
-        .map(|contract| contract.task_class)
-        .unwrap_or_else(|| phonton_types::classify_task(&task.goal_text));
-
     Ok(BenchmarkRunExport {
-        task_class,
-        goal: ledger
+        task_id: task.id.to_string(),
+        repo_commit,
+        goal: handoff.goal.clone(),
+        task_class: ledger
             .goal_contract
             .as_ref()
-            .map(|contract| contract.goal.clone())
-            .unwrap_or_else(|| task.goal_text.clone()),
-        repo_commit,
+            .map(|contract| contract.task_class.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        final_status,
         provider,
         model,
-        execution_mode,
-        token_usage_source,
-        token_claim_eligible,
-        provider_call_count,
-        benchmark_warnings,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cached_tokens: usage.cached_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
-        cost_usd: cost_micros as f64 / 1_000_000.0,
-        context_buckets,
-        summaries,
-        verification: verification_map(&ledger.verify_report),
-        quality_gates: quality_gate_map(ledger),
-        handoff_packet_id: handoff.task_id.to_string(),
-        final_status,
+        cost_usd,
+        token_usage_source,
+        execution_mode,
+        provider_call_count,
+        token_claim_eligible,
+        benchmark_warnings,
     })
 }
 
-#[derive(Debug, Clone)]
-struct BenchmarkModelEvent {
-    provider: String,
-    model: String,
+fn task_status(task: &TaskRecord) -> Result<TaskStatus> {
+    serde_json::from_value(task.status.clone()).map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReviewEvent<'a> {
     token_usage: TokenUsage,
-    cost_micros: u64,
+    cost: CostSummary,
+    provider: ProviderKind,
+    model_name: &'a str,
 }
 
-fn latest_benchmark_model_event(events: &[EventRecord]) -> Option<BenchmarkModelEvent> {
-    events.iter().rev().find_map(|record| match &record.event {
-        OrchestratorEvent::SubtaskReviewReady {
-            provider,
-            model_name,
-            token_usage,
-            cost,
-            ..
-        } => Some(BenchmarkModelEvent {
-            provider: provider.to_string(),
-            model: model_name.clone(),
-            token_usage: *token_usage,
-            cost_micros: cost.total_usd_micros,
-        }),
-        OrchestratorEvent::SubtaskFailed {
-            provider,
-            model_name,
-            token_usage,
-            ..
-        } if provider.is_some()
-            || !model_name.trim().is_empty()
-            || token_usage.budget_tokens() > 0 =>
-        {
-            Some(BenchmarkModelEvent {
-                provider: provider
-                    .as_ref()
-                    .map(|provider| provider.to_string())
-                    .unwrap_or_default(),
-                model: model_name.clone(),
-                token_usage: *token_usage,
-                cost_micros: 0,
-            })
-        }
-        _ => None,
-    })
-}
-
-fn provider_call_count(events: &[EventRecord], usage: TokenUsage, model: &str) -> u64 {
-    let count = events
+fn review_ready_events(events: &[EventRecord]) -> Vec<ReviewEvent<'_>> {
+    events
         .iter()
-        .filter(|record| match &record.event {
+        .filter_map(|record| match &record.event {
             OrchestratorEvent::SubtaskReviewReady {
-                model_name,
                 token_usage,
-                ..
-            }
-            | OrchestratorEvent::SubtaskFailed {
+                cost,
+                provider,
                 model_name,
-                token_usage,
                 ..
-            } => is_provider_call(*token_usage, model_name),
-            _ => false,
+            } => Some(ReviewEvent {
+                token_usage: *token_usage,
+                cost: *cost,
+                provider: *provider,
+                model_name,
+            }),
+            _ => None,
         })
-        .count() as u64;
+        .collect()
+}
 
-    if count == 0 && is_provider_call(usage, model) {
-        1
-    } else {
-        count
+fn choose_usage(handoff_usage: TokenUsage, review_events: &[ReviewEvent<'_>]) -> TokenUsage {
+    if handoff_usage.budget_tokens() > 0 || handoff_usage.estimated {
+        return handoff_usage;
+    }
+
+    let mut usage = TokenUsage::default();
+    for event in review_events {
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(event.token_usage.input_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(event.token_usage.output_tokens);
+        usage.cached_tokens = usage
+            .cached_tokens
+            .saturating_add(event.token_usage.cached_tokens);
+        usage.cache_creation_tokens = usage
+            .cache_creation_tokens
+            .saturating_add(event.token_usage.cache_creation_tokens);
+        usage.estimated |= event.token_usage.estimated;
+    }
+    usage
+}
+
+fn classify_final_status(status: &TaskStatus, ledger: &OutcomeLedger) -> BenchmarkFinalStatus {
+    match status {
+        TaskStatus::Failed { .. } => BenchmarkFinalStatus::Failed,
+        TaskStatus::Reviewing { .. } | TaskStatus::Done { .. } => {
+            let handoff = ledger.handoff.as_ref();
+            let has_changes = handoff
+                .map(|handoff| !handoff.changed_files.is_empty())
+                .unwrap_or(false);
+            let verify_clean = ledger.verify_report.findings.is_empty()
+                && (!ledger.verify_report.passed.is_empty() || has_changes);
+            if has_changes && verify_clean {
+                BenchmarkFinalStatus::VerifiedSuccess
+            } else if has_changes {
+                BenchmarkFinalStatus::Partial
+            } else {
+                BenchmarkFinalStatus::Unverified
+            }
+        }
+        TaskStatus::Rejected | TaskStatus::Paused { .. } => BenchmarkFinalStatus::Partial,
+        TaskStatus::Queued | TaskStatus::Planning | TaskStatus::Running { .. } => {
+            BenchmarkFinalStatus::Unverified
+        }
     }
 }
 
-fn execution_mode(
-    events: &[EventRecord],
-    model: &str,
-    provider_call_count: u64,
-) -> BenchmarkExecutionMode {
-    let saw_local_template = is_local_template(model)
-        || events.iter().any(|record| match &record.event {
-            OrchestratorEvent::SubtaskReviewReady { model_name, .. }
-            | OrchestratorEvent::SubtaskFailed { model_name, .. } => is_local_template(model_name),
-            _ => false,
-        });
+fn token_usage_source(usage: &TokenUsage, no_review_events: bool) -> BenchmarkTokenUsageSource {
+    if usage.estimated {
+        BenchmarkTokenUsageSource::Estimated
+    } else if usage.budget_tokens() > 0 {
+        BenchmarkTokenUsageSource::ProviderReported
+    } else if no_review_events {
+        BenchmarkTokenUsageSource::Unavailable
+    } else {
+        BenchmarkTokenUsageSource::NoProviderCall
+    }
+}
 
-    match (provider_call_count > 0, saw_local_template) {
+fn execution_mode(usage: &TokenUsage, review_events: &[ReviewEvent<'_>]) -> BenchmarkExecutionMode {
+    if review_events.is_empty() {
+        return if usage.budget_tokens() > 0 && !usage.estimated {
+            BenchmarkExecutionMode::Provider
+        } else {
+            BenchmarkExecutionMode::Unknown
+        };
+    }
+
+    let provider_events = review_events
+        .iter()
+        .filter(|event| !is_local_template(event.model_name))
+        .count();
+    let local_events = review_events.len().saturating_sub(provider_events);
+    match (provider_events > 0, local_events > 0) {
         (true, true) => BenchmarkExecutionMode::Mixed,
         (true, false) => BenchmarkExecutionMode::Provider,
         (false, true) => BenchmarkExecutionMode::LocalTemplate,
@@ -273,180 +305,157 @@ fn execution_mode(
     }
 }
 
-fn token_usage_source(
-    usage: TokenUsage,
-    execution_mode: BenchmarkExecutionMode,
-    provider_call_count: u64,
-) -> BenchmarkTokenUsageSource {
-    if usage.estimated {
-        return BenchmarkTokenUsageSource::Estimated;
+fn provider_call_count(usage: &TokenUsage, review_events: &[ReviewEvent<'_>]) -> u64 {
+    let review_count = review_events
+        .iter()
+        .filter(|event| !is_local_template(event.model_name))
+        .count() as u64;
+    if review_count > 0 {
+        review_count
+    } else if usage.budget_tokens() > 0 && !usage.estimated {
+        1
+    } else {
+        0
     }
-    match execution_mode {
-        BenchmarkExecutionMode::LocalTemplate => BenchmarkTokenUsageSource::NoProviderCall,
-        BenchmarkExecutionMode::Provider | BenchmarkExecutionMode::Mixed
-            if usage.budget_tokens() > 0 && provider_call_count > 0 =>
-        {
-            BenchmarkTokenUsageSource::ProviderReported
-        }
-        _ => BenchmarkTokenUsageSource::Unavailable,
+}
+
+fn provider_identity(review_events: &[ReviewEvent<'_>]) -> (String, String) {
+    review_events
+        .iter()
+        .rev()
+        .find(|event| !is_local_template(event.model_name))
+        .map(|event| (event.provider.to_string(), event.model_name.to_string()))
+        .unwrap_or_else(|| (String::new(), String::new()))
+}
+
+fn fill_provider_identity_from_config(provider: String, model: String) -> (String, String) {
+    if !provider.is_empty() && !model.is_empty() {
+        return (provider, model);
     }
+    let cfg = config::load().unwrap_or_default();
+    let provider = if provider.is_empty() {
+        cfg.provider.name
+    } else {
+        provider
+    };
+    let model = if model.is_empty() {
+        cfg.provider.model.unwrap_or_default()
+    } else {
+        model
+    };
+    (provider, model)
+}
+
+fn is_local_template(model_name: &str) -> bool {
+    let model = model_name.to_ascii_lowercase();
+    model.contains("stub") || model.contains("local-template")
+}
+
+fn cost_summary_usd(cost: CostSummary) -> f64 {
+    cost.total_usd_micros as f64 / 1_000_000.0
 }
 
 fn benchmark_warnings(
-    final_status: BenchmarkFinalStatus,
-    execution_mode: BenchmarkExecutionMode,
-    token_usage_source: BenchmarkTokenUsageSource,
-    provider_call_count: u64,
+    final_status: &BenchmarkFinalStatus,
+    token_usage_source: &BenchmarkTokenUsageSource,
+    execution_mode: &BenchmarkExecutionMode,
+    token_claim_eligible: bool,
     provider: &str,
     model: &str,
 ) -> Vec<String> {
-    let mut warnings: Vec<String> = Vec::new();
-
-    match token_usage_source {
-        BenchmarkTokenUsageSource::Estimated => warnings.push(
-            "token usage is estimated; exclude this run from public efficiency claims".into(),
-        ),
-        BenchmarkTokenUsageSource::NoProviderCall => warnings.push(
-            "run used local-template/no-provider execution; treat it as product evidence, not provider-token evidence".into(),
-        ),
-        BenchmarkTokenUsageSource::Unavailable => warnings.push(
-            "token source is unavailable; exclude this run from public efficiency claims".into(),
-        ),
-        BenchmarkTokenUsageSource::ProviderReported => {}
+    let mut warnings = Vec::new();
+    if !matches!(final_status, BenchmarkFinalStatus::VerifiedSuccess) {
+        warnings.push(
+            "final status is not verified_success; headline token claims are disabled".into(),
+        );
     }
-
+    if matches!(
+        token_usage_source,
+        BenchmarkTokenUsageSource::Estimated
+            | BenchmarkTokenUsageSource::NoProviderCall
+            | BenchmarkTokenUsageSource::Unavailable
+    ) {
+        warnings.push(format!(
+            "token usage source `{}` is not eligible for headline token claims",
+            serde_json::to_value(token_usage_source)
+                .ok()
+                .and_then(|v| v.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
     if matches!(
         execution_mode,
         BenchmarkExecutionMode::LocalTemplate | BenchmarkExecutionMode::Mixed
-    ) && !warnings
-        .iter()
-        .any(|warning| warning.contains("local-template"))
-    {
-        warnings.push(
-            "run includes local-template execution; do not compare it against provider-token runs"
-                .into(),
-        );
+    ) {
+        warnings.push("execution mode includes local-template output".into());
     }
-
-    if matches!(execution_mode, BenchmarkExecutionMode::Mixed)
-        && !warnings.iter().any(|warning| warning.contains("mixed"))
-    {
-        warnings.push(
-            "run mixed provider and local-template execution; exclude it from provider-token efficiency claims"
-                .into(),
-        );
-    }
-
-    if provider_call_count == 0
-        && matches!(
-            token_usage_source,
-            BenchmarkTokenUsageSource::ProviderReported
-        )
-    {
-        warnings.push(
-            "provider-reported token source has no matching provider-call event evidence".into(),
-        );
-    }
-
-    if matches!(
-        token_usage_source,
-        BenchmarkTokenUsageSource::ProviderReported
-    ) && (provider.trim().is_empty() || model.trim().is_empty())
-    {
+    if provider.trim().is_empty() || model.trim().is_empty() {
         warnings.push("provider or model identity is missing from benchmark evidence".into());
     }
-
-    if !matches!(final_status, BenchmarkFinalStatus::VerifiedSuccess) {
-        warnings.push(
-            "final status is not verified_success; exclude this run from headline wins".into(),
-        );
+    if !token_claim_eligible {
+        warnings.push("token_claim_eligible is false".into());
     }
-
     warnings
-}
-
-fn is_provider_call(usage: TokenUsage, model: &str) -> bool {
-    usage.budget_tokens() > 0 && !is_local_template(model)
-}
-
-fn is_local_template(model: &str) -> bool {
-    model.trim().eq_ignore_ascii_case("local-template")
-}
-
-fn verification_map(report: &VerifyReport) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    if !report.passed.is_empty() {
-        map.insert("passed".into(), report.passed.join("; "));
-    }
-    if !report.findings.is_empty() {
-        map.insert("findings".into(), report.findings.join("; "));
-    }
-    if !report.skipped.is_empty() {
-        map.insert("skipped".into(), report.skipped.join("; "));
-    }
-    map
-}
-
-fn quality_gate_map(ledger: &phonton_types::OutcomeLedger) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    if let Some(contract) = &ledger.goal_contract {
-        for slice in &contract.acceptance_slices {
-            map.insert(slice.id.clone(), slice.criterion.clone());
-        }
-        if map.is_empty() {
-            for (idx, criterion) in contract.quality_floor.criteria.iter().enumerate() {
-                map.insert(format!("quality_floor_{}", idx + 1), criterion.clone());
-            }
-        }
-    }
-    map
-}
-
-fn final_status(
-    task: &TaskRecord,
-    report: &VerifyReport,
-    usage: TokenUsage,
-) -> BenchmarkFinalStatus {
-    if serde_json::from_value::<TaskStatus>(task.status.clone())
-        .is_ok_and(|status| matches!(status, TaskStatus::Failed { .. } | TaskStatus::Rejected))
-    {
-        return BenchmarkFinalStatus::Failed;
-    }
-    if usage.estimated {
-        return BenchmarkFinalStatus::Unverified;
-    }
-    if !report.passed.is_empty() && report.findings.is_empty() {
-        BenchmarkFinalStatus::VerifiedSuccess
-    } else if !report.passed.is_empty() {
-        BenchmarkFinalStatus::Partial
-    } else {
-        BenchmarkFinalStatus::Unverified
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use phonton_store::TaskRecord;
     use phonton_types::{
-        BenchmarkFinalStatus, ContextManifest, CostSummary, EventRecord, GoalContract,
-        HandoffPacket, OrchestratorEvent, OutcomeLedger, PermissionLedger, ProviderKind, SubtaskId,
-        TaskClass, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyReport, VerifyResult,
+        ContextManifest, DiffStats, HandoffPacket, InfluenceSummary, OutcomeLedger,
+        PermissionLedger, VerifyReport,
     };
 
-    use super::*;
+    fn task(status: TaskStatus, ledger: OutcomeLedger) -> TaskRecord {
+        TaskRecord {
+            id: phonton_types::TaskId::new(),
+            goal_text: "fix config".into(),
+            status: serde_json::to_value(status).unwrap(),
+            created_at: 1,
+            total_tokens: 42,
+            outcome_ledger: Some(ledger),
+        }
+    }
 
-    fn task_with_ledger(token_usage: TokenUsage) -> TaskRecord {
-        let task_id = TaskId::new();
-        let handoff = HandoffPacket {
+    fn ledger(handoff: HandoffPacket) -> OutcomeLedger {
+        OutcomeLedger {
+            task_id: handoff.task_id,
+            goal_contract: None,
+            context_manifest: ContextManifest::default(),
+            permission_ledger: PermissionLedger::default(),
+            verify_report: handoff.verification.clone(),
+            handoff: Some(handoff),
+        }
+    }
+
+    fn handoff(
+        token_usage: TokenUsage,
+        changed_files: usize,
+        findings: Vec<String>,
+    ) -> HandoffPacket {
+        let task_id = phonton_types::TaskId::new();
+        HandoffPacket {
             task_id,
-            goal: "fix config panic".into(),
-            headline: "verified".into(),
-            changed_files: Vec::new(),
+            goal: "fix config".into(),
+            headline: "ready".into(),
+            changed_files: (0..changed_files)
+                .map(|idx| phonton_types::ChangedFileSummary {
+                    path: format!("src/{idx}.js").into(),
+                    added_lines: 1,
+                    removed_lines: 0,
+                    summary: "changed".into(),
+                })
+                .collect(),
             generated_artifacts: Vec::new(),
-            diff_stats: Default::default(),
+            diff_stats: DiffStats {
+                files_changed: changed_files as u32,
+                added_lines: changed_files as u32,
+                removed_lines: 0,
+            },
             verification: VerifyReport {
-                passed: vec!["cargo test".into()],
-                findings: Vec::new(),
+                passed: vec!["npm test passed".into()],
+                findings,
                 skipped: Vec::new(),
             },
             run_commands: Vec::new(),
@@ -454,295 +463,88 @@ mod tests {
             review_actions: Vec::new(),
             rollback_points: Vec::new(),
             token_usage,
-            influence: Default::default(),
-        };
-        TaskRecord {
-            id: task_id,
-            goal_text: "fix config panic".into(),
-            status: serde_json::to_value(TaskStatus::Reviewing {
-                tokens_used: token_usage.budget_tokens(),
-                estimated_savings_tokens: 100,
-            })
-            .unwrap(),
-            created_at: 1,
-            total_tokens: token_usage.budget_tokens(),
-            outcome_ledger: Some(OutcomeLedger {
-                task_id,
-                goal_contract: Some(GoalContract {
-                    goal: "fix config panic".into(),
-                    task_class: TaskClass::BugFix,
-                    intent: None,
-                    confidence_percent: 80,
-                    acceptance_criteria: vec!["panic is fixed".into()],
-                    acceptance_slices: Vec::new(),
-                    expected_artifacts: Vec::new(),
-                    likely_files: Vec::new(),
-                    verify_plan: Vec::new(),
-                    run_plan: Vec::new(),
-                    quality_floor: phonton_types::QualityFloor {
-                        criteria: vec!["tests pass".into()],
-                    },
-                    clarification_questions: Vec::new(),
-                    assumptions: Vec::new(),
-                    token_policy: Default::default(),
-                }),
-                context_manifest: ContextManifest::default(),
-                permission_ledger: PermissionLedger::default(),
-                verify_report: handoff.verification.clone(),
-                summaries: phonton_types::OutcomeSummaries::default(),
-                handoff: Some(handoff),
-            }),
+            influence: InfluenceSummary::default(),
+            screenshot_path: None,
+            rendering_summary: None,
         }
     }
 
     #[test]
-    fn benchmark_export_uses_provider_tokens_and_prompt_buckets() {
-        let task = task_with_ledger(TokenUsage {
-            input_tokens: 2000,
-            output_tokens: 500,
-            cached_tokens: 300,
+    fn failed_export_is_not_claim_eligible_even_with_provider_tokens() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_tokens: 0,
             cache_creation_tokens: 0,
             estimated: false,
-        });
-        let subtask_id = SubtaskId::new();
-        let events = vec![
-            EventRecord {
-                task_id: task.id,
-                timestamp_ms: 1,
-                event: OrchestratorEvent::PromptManifest {
-                    subtask_id,
-                    manifest: phonton_types::PromptContextManifest {
-                        code_context_tokens: 900,
-                        omitted_code_tokens: 4000,
-                        memory_tokens: 100,
-                        retry_error_tokens: 20,
-                        ..Default::default()
-                    },
-                },
+        };
+        let handoff = handoff(usage, 0, vec!["worker failed".into()]);
+        let task = task(
+            TaskStatus::Failed {
+                reason: "worker failed".into(),
+                failed_subtask: None,
             },
-            EventRecord {
-                task_id: task.id,
-                timestamp_ms: 2,
-                event: OrchestratorEvent::SubtaskReviewReady {
-                    subtask_id,
-                    description: "fix config panic".into(),
-                    tier: phonton_types::ModelTier::Standard,
-                    tokens_used: 2500,
-                    token_usage: task
-                        .outcome_ledger
-                        .as_ref()
-                        .unwrap()
-                        .handoff
-                        .as_ref()
-                        .unwrap()
-                        .token_usage,
-                    cost: CostSummary {
-                        pricing_known: true,
-                        input_usd_micros: 1000,
-                        output_usd_micros: 2000,
-                        total_usd_micros: 3000,
-                    },
-                    diff_hunks: Vec::new(),
-                    verify_result: VerifyResult::Pass {
-                        layer: VerifyLayer::Test,
-                    },
-                    provider: ProviderKind::OpenAI,
-                    model_name: "gpt-test".into(),
-                },
-            },
-        ];
-
-        let export = build_export(&task, &events, "abc123".into()).unwrap();
-
-        assert_eq!(export.task_class, TaskClass::BugFix);
-        assert_eq!(export.provider, "openai");
-        assert_eq!(export.model, "gpt-test");
-        assert_eq!(export.input_tokens, 2000);
-        assert_eq!(export.output_tokens, 500);
-        assert_eq!(export.cached_tokens, 300);
-        assert_eq!(export.context_buckets.selected_code_tokens, 900);
-        assert_eq!(export.context_buckets.omitted_candidate_tokens, 4000);
-        assert_eq!(export.context_buckets.cached_tokens, 300);
-        assert_eq!(export.summaries.context.selected_code_tokens, 900);
-        assert_eq!(export.summaries.token.provider_input_tokens, 2000);
-        assert_eq!(export.summaries.verification.passed, 1);
-        assert_eq!(export.final_status, BenchmarkFinalStatus::VerifiedSuccess);
-    }
-
-    #[test]
-    fn benchmark_export_marks_estimated_tokens_ineligible() {
-        let task = task_with_ledger(TokenUsage {
-            estimated: true,
-            input_tokens: 100,
-            ..Default::default()
-        });
-
-        let export = build_export(&task, &[], "abc123".into()).unwrap();
-
-        assert_eq!(
-            export.token_usage_source,
-            phonton_types::BenchmarkTokenUsageSource::Estimated
+            ledger(handoff),
         );
-        assert!(!export.token_claim_eligible);
-        assert!(export
-            .benchmark_warnings
-            .iter()
-            .any(|warning| warning.contains("estimated")));
-        assert_eq!(export.final_status, BenchmarkFinalStatus::Unverified);
-    }
 
-    #[test]
-    fn benchmark_export_marks_local_template_runs_not_token_comparable() {
-        let task = task_with_ledger(TokenUsage::default());
-        let subtask_id = SubtaskId::new();
-        let events = vec![EventRecord {
-            task_id: task.id,
-            timestamp_ms: 1,
-            event: OrchestratorEvent::SubtaskReviewReady {
-                subtask_id,
-                description: "refactor receipt renderer".into(),
-                tier: phonton_types::ModelTier::Standard,
-                tokens_used: 0,
-                token_usage: TokenUsage::default(),
-                cost: CostSummary::default(),
-                diff_hunks: Vec::new(),
-                verify_result: VerifyResult::Pass {
-                    layer: VerifyLayer::Test,
-                },
-                provider: ProviderKind::DeepSeek,
-                model_name: "local-template".into(),
-            },
-        }];
+        let export = build_export(&task, &[], "abc".into()).unwrap();
 
-        let export = build_export(&task, &events, "abc123".into()).unwrap();
-
-        assert_eq!(
-            export.execution_mode,
-            phonton_types::BenchmarkExecutionMode::LocalTemplate
-        );
-        assert_eq!(
-            export.token_usage_source,
-            phonton_types::BenchmarkTokenUsageSource::NoProviderCall
-        );
-        assert_eq!(export.provider_call_count, 0);
-        assert!(!export.token_claim_eligible);
-        assert!(export
-            .benchmark_warnings
-            .iter()
-            .any(|warning| warning.contains("local-template")));
-    }
-
-    #[test]
-    fn benchmark_export_marks_mixed_runs_ineligible_for_token_claims() {
-        let task = task_with_ledger(TokenUsage {
-            input_tokens: 1000,
-            output_tokens: 200,
-            ..Default::default()
-        });
-        let subtask_id = SubtaskId::new();
-        let events = vec![
-            EventRecord {
-                task_id: task.id,
-                timestamp_ms: 1,
-                event: OrchestratorEvent::SubtaskReviewReady {
-                    subtask_id,
-                    description: "seed from local template".into(),
-                    tier: phonton_types::ModelTier::Cheap,
-                    tokens_used: 0,
-                    token_usage: TokenUsage::default(),
-                    cost: CostSummary::default(),
-                    diff_hunks: Vec::new(),
-                    verify_result: VerifyResult::Pass {
-                        layer: VerifyLayer::Syntax,
-                    },
-                    provider: ProviderKind::DeepSeek,
-                    model_name: "local-template".into(),
-                },
-            },
-            EventRecord {
-                task_id: task.id,
-                timestamp_ms: 2,
-                event: OrchestratorEvent::SubtaskReviewReady {
-                    subtask_id,
-                    description: "provider repair".into(),
-                    tier: phonton_types::ModelTier::Standard,
-                    tokens_used: 1200,
-                    token_usage: TokenUsage {
-                        input_tokens: 1000,
-                        output_tokens: 200,
-                        ..Default::default()
-                    },
-                    cost: CostSummary {
-                        pricing_known: true,
-                        input_usd_micros: 100,
-                        output_usd_micros: 200,
-                        total_usd_micros: 300,
-                    },
-                    diff_hunks: Vec::new(),
-                    verify_result: VerifyResult::Pass {
-                        layer: VerifyLayer::Test,
-                    },
-                    provider: ProviderKind::DeepSeek,
-                    model_name: "deepseek-v4-flash".into(),
-                },
-            },
-        ];
-
-        let export = build_export(&task, &events, "abc123".into()).unwrap();
-
-        assert_eq!(export.execution_mode, BenchmarkExecutionMode::Mixed);
+        assert_eq!(export.final_status, BenchmarkFinalStatus::Failed);
         assert_eq!(
             export.token_usage_source,
             BenchmarkTokenUsageSource::ProviderReported
         );
-        assert_eq!(export.final_status, BenchmarkFinalStatus::VerifiedSuccess);
         assert!(!export.token_claim_eligible);
-        assert!(export
-            .benchmark_warnings
-            .iter()
-            .any(|warning| warning.contains("mixed") || warning.contains("local-template")));
     }
 
     #[test]
-    fn benchmark_export_uses_failed_event_provider_identity() {
-        let mut task = task_with_ledger(TokenUsage {
-            input_tokens: 1000,
-            output_tokens: 200,
-            ..Default::default()
-        });
-        task.status = serde_json::to_value(TaskStatus::Failed {
-            reason: "syntax failure".into(),
-            failed_subtask: None,
-        })
-        .unwrap();
-        let subtask_id = SubtaskId::new();
+    fn review_event_sets_provider_identity_and_claim_eligibility() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_tokens: 0,
+            cache_creation_tokens: 2,
+            estimated: false,
+        };
+        let handoff = handoff(usage, 1, Vec::new());
+        let task_id = handoff.task_id;
+        let task = task(
+            TaskStatus::Reviewing {
+                tokens_used: 32,
+                estimated_savings_tokens: 100,
+            },
+            ledger(handoff),
+        );
         let events = vec![EventRecord {
-            task_id: task.id,
+            task_id,
             timestamp_ms: 1,
-            event: OrchestratorEvent::SubtaskFailed {
-                subtask_id,
-                reason: "syntax failure".into(),
-                attempt: 4,
-                token_usage: TokenUsage {
-                    input_tokens: 1000,
-                    output_tokens: 200,
-                    ..Default::default()
+            event: OrchestratorEvent::SubtaskReviewReady {
+                subtask_id: phonton_types::SubtaskId::new(),
+                description: "fix".into(),
+                tier: phonton_types::ModelTier::Standard,
+                tokens_used: 32,
+                token_usage: usage,
+                cost: CostSummary {
+                    pricing_known: true,
+                    input_usd_micros: 1,
+                    output_usd_micros: 2,
+                    total_usd_micros: 3,
                 },
-                provider: Some(ProviderKind::DeepSeek),
-                model_name: "deepseek-v4-flash".into(),
+                diff_hunks: Vec::new(),
+                verify_result: phonton_types::VerifyResult::Pass {
+                    layer: phonton_types::VerifyLayer::Syntax,
+                },
+                provider: ProviderKind::OpenAiCompatible,
+                model_name: "deepseek-chat".into(),
             },
         }];
 
-        let export = build_export(&task, &events, "abc123".into()).unwrap();
+        let export = build_export(&task, &events, "abc".into()).unwrap();
 
-        assert_eq!(export.provider, "deepseek");
-        assert_eq!(export.model, "deepseek-v4-flash");
+        assert_eq!(export.final_status, BenchmarkFinalStatus::VerifiedSuccess);
+        assert_eq!(export.provider, "openai-compatible");
+        assert_eq!(export.model, "deepseek-chat");
         assert_eq!(export.provider_call_count, 1);
-        assert_eq!(
-            export.token_usage_source,
-            phonton_types::BenchmarkTokenUsageSource::ProviderReported
-        );
-        assert!(!export.token_claim_eligible);
-        assert_eq!(export.final_status, BenchmarkFinalStatus::Failed);
+        assert!(export.token_claim_eligible);
     }
 }

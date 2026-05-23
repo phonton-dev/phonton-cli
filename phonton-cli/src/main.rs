@@ -34,6 +34,7 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod benchmark_cli;
 mod config;
 mod doctor;
 mod extensions_cli;
@@ -64,7 +65,9 @@ use crossterm::terminal::{
 };
 use phonton_diff::DiffApplier;
 use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions, ExtensionSet};
-use phonton_mcp::{McpApprovalDecision, McpApprovalRequest, McpApprover};
+use phonton_mcp::{
+    DenyByDefaultApprover, ExplicitApproveAll, McpApprovalDecision, McpApprovalRequest, McpApprover,
+};
 use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
 use phonton_planner::{decompose_with_memory, Goal};
 use phonton_providers::{
@@ -698,11 +701,15 @@ impl Default for App {
                 model: None,
                 account_id: None,
                 base_url: None,
+                keys: Default::default(),
+                allow_unverified_model: None,
             },
             budget: crate::config::BudgetConfig {
                 max_tokens: None,
                 max_usd_cents: None,
             },
+            index: crate::config::IndexConfig::default(),
+            permissions: crate::config::PermissionsConfig::default(),
         };
         Self::new(&default_cfg)
     }
@@ -3120,6 +3127,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::McpToolApproved { .. } => (SUCCESS, "mcp-approve"),
         E::McpToolDenied { .. } => (DANGER, "mcp-denied"),
         E::McpToolCompleted { .. } => (SUCCESS, "mcp-done"),
+        E::McpCapabilitiesDiscovered { .. } => (ACCENT, "mcp-cap"),
         E::SubtaskCompleted { .. } => (SUCCESS, "subtask-done"),
         E::SubtaskReviewReady { .. } => (SUCCESS, "review-ready"),
         E::SubtaskFailed { .. } => (DANGER, "subtask-fail"),
@@ -3639,36 +3647,64 @@ fn detect_nexus_status(root: &std::path::Path) -> NexusStatus {
 
 async fn build_semantic_context(
     root: &std::path::Path,
+    cfg: &config::IndexConfig,
+) -> Option<Arc<phonton_worker::SemanticContext>> {
+    build_semantic_context_with_warnings(root, cfg, true).await
+}
+
+async fn build_semantic_context_with_warnings(
+    root: &std::path::Path,
+    cfg: &config::IndexConfig,
+    emit_warnings: bool,
 ) -> Option<Arc<phonton_worker::SemanticContext>> {
     let root = root.to_path_buf();
+    let index_cfg = cfg.clone();
     let build = async move {
-        let embedder = phonton_index::Embedder::new()?;
-        let index = match phonton_index::discover_nexus_config(&root) {
-            Ok(Some(cfg)) => {
-                phonton_index::index_workspace_with_nexus_using_embedder(&root, &cfg, &embedder)
-                    .await
-            }
-            Ok(None) => phonton_index::index_workspace_using_embedder(&root, &embedder).await,
-            Err(e) => Err(e),
-        }?;
-        anyhow::Ok(Arc::new(phonton_worker::SemanticContext {
-            embedder,
-            index,
-        }))
+        let retriever: Arc<dyn phonton_index::CodeRetriever> = if index_cfg.backend == "qdrant" {
+            let embedder = phonton_index::Embedder::new()?;
+            let url = index_cfg
+                .qdrant_url
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:6333".into());
+            let collection = index_cfg
+                .qdrant_collection
+                .clone()
+                .unwrap_or_else(|| "phonton-code".into());
+            Arc::new(phonton_index::QdrantCodeRetriever::new(
+                phonton_index::QdrantConfig::new(url, collection),
+                embedder,
+            ))
+        } else {
+            let embedder = phonton_index::Embedder::new()?;
+            let index = match phonton_index::discover_nexus_config(&root) {
+                Ok(Some(cfg)) => {
+                    phonton_index::index_workspace_with_nexus_using_embedder(&root, &cfg, &embedder)
+                        .await
+                }
+                Ok(None) => phonton_index::index_workspace_using_embedder(&root, &embedder).await,
+                Err(e) => Err(e),
+            }?;
+            Arc::new(phonton_index::LocalCodeRetriever::new(embedder, index))
+        };
+        anyhow::Ok(Arc::new(phonton_worker::SemanticContext { retriever }))
     };
 
     match tokio::time::timeout(Duration::from_secs(SEMANTIC_INDEX_TIMEOUT_SECS), build).await {
         Ok(Ok(ctx)) => Some(ctx),
         Ok(Err(e)) => {
-            eprintln!(
-                "phonton: semantic index unavailable ({e}); continuing without indexed context"
-            );
+            if emit_warnings {
+                eprintln!(
+                    "phonton: semantic index unavailable ({e}); continuing without indexed context"
+                );
+            }
             None
         }
         Err(_) => {
-            eprintln!(
-                "phonton: semantic index timed out after {SEMANTIC_INDEX_TIMEOUT_SECS}s; continuing without indexed context"
-            );
+            if emit_warnings {
+                eprintln!(
+                    "phonton: semantic index timed out after {SEMANTIC_INDEX_TIMEOUT_SECS}s; continuing without indexed context"
+                );
+            }
             None
         }
     }
@@ -4200,10 +4236,12 @@ fn print_help() {
          SUBCOMMANDS:\n  \
          (none)            Launch the interactive TUI (default)\n  \
          ask <question>    One-shot Q&A using the configured provider\n  \
-         doctor            Check config, store, trust, git, cargo, and Nexus\n  \
+         benchmark         Export benchmark evidence from the latest run\n  \
+         doctor            Check config, store, trust, git, cargo, Nexus, and index backend\n  \
          extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
          skills            Inspect loaded skills\n  \
          steering          Inspect loaded steering rules\n  \
+         goal <goal>       Run a noninteractive goal through plan/edit/verify/review\n  \
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
@@ -4225,6 +4263,13 @@ fn print_help() {
          DOCTOR:\n  \
          phonton doctor [--json] [--provider]\n\
          \n\
+         GOAL:\n  \
+         phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  \
+         phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n\
+         \n\
+         BENCHMARK:\n  \
+         phonton benchmark export --latest --format json\n\
+         \n\
          PLAN PREVIEW:\n  \
          phonton plan [--json] [--no-memory] [--no-tests] <goal>\n\
          \n\
@@ -4236,12 +4281,17 @@ fn print_help() {
          \n\
          MCP:\n  \
          phonton mcp list [--json]\n  \
+         phonton mcp capabilities <server-id> [--json] [--yes]\n  \
          phonton mcp tools <server-id> [--json] [--yes]\n  \
          phonton mcp call <server-id> <tool-name> [json-args] [--json] [--yes]\n\
          \n\
          EXTENSIONS:\n  \
          phonton extensions list [--json]\n  \
          phonton extensions doctor [--json]\n  \
+         phonton extensions skills [--json]\n  \
+         phonton extensions steering [--json]\n  \
+         phonton extensions mcp [--json]\n  \
+         phonton extensions profiles [--json]\n  \
          phonton skills list [--json]\n  \
          phonton steering list [--json]\n\
          \n\
@@ -4380,6 +4430,20 @@ async fn handle_cli_args() -> Result<bool> {
             }
             Ok(true)
         }
+        "goal" => {
+            let code = run_headless_goal(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "benchmark" => {
+            let code = benchmark_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
         "plan" => {
             let code = plan_preview::run(&args[1..]).await?;
             if code != 0 {
@@ -4438,6 +4502,512 @@ async fn handle_cli_args() -> Result<bool> {
             print_help();
             std::process::exit(2);
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeadlessGoalOptions {
+    goal_text: String,
+    display_text: String,
+    json: bool,
+    yes: bool,
+    direct_task: bool,
+    timeout_seconds: u64,
+}
+
+fn print_goal_help() {
+    println!(
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop."
+    );
+}
+
+fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
+    let mut json = false;
+    let mut yes = false;
+    let mut direct_task = false;
+    let mut timeout_seconds = 900;
+    let mut prompt_file: Option<PathBuf> = None;
+    let mut read_stdin = false;
+    let mut positionals = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--yes" | "-y" => yes = true,
+            "--task" => direct_task = true,
+            "--stdin" => read_stdin = true,
+            "--prompt-file" => {
+                i += 1;
+                let path = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--prompt-file requires a path"))?;
+                prompt_file = Some(PathBuf::from(path));
+            }
+            "--timeout-seconds" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--timeout-seconds requires a value"))?;
+                timeout_seconds = raw
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("--timeout-seconds must be a positive integer"))?;
+                if timeout_seconds == 0 {
+                    return Err(anyhow::anyhow!(
+                        "--timeout-seconds must be a positive integer"
+                    ));
+                }
+            }
+            "--permission-mode" => {
+                i += 1;
+                args.get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--permission-mode requires a value"))?;
+            }
+            "--" => {
+                positionals.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(anyhow::anyhow!("unknown phonton goal flag `{other}`"));
+            }
+            other => positionals.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let source_count = usize::from(prompt_file.is_some())
+        + usize::from(read_stdin)
+        + usize::from(!positionals.is_empty());
+    if source_count > 1 {
+        return Err(anyhow::anyhow!(
+            "choose only one goal source: --prompt-file, --stdin, or positional text"
+        ));
+    }
+
+    let goal_text = if let Some(path) = prompt_file {
+        std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?
+    } else if read_stdin {
+        let mut text = String::new();
+        use std::io::Read as _;
+        io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| anyhow::anyhow!("failed to read stdin: {e}"))?;
+        text
+    } else {
+        positionals.join(" ")
+    };
+
+    let goal_text = goal_text.trim().to_string();
+    if goal_text.is_empty() {
+        return Err(anyhow::anyhow!("goal text is empty"));
+    }
+
+    let display_text = summarize_goal_display(&goal_text);
+    Ok(HeadlessGoalOptions {
+        goal_text,
+        display_text,
+        json,
+        yes,
+        direct_task,
+        timeout_seconds,
+    })
+}
+
+fn summarize_goal_display(text: &str) -> String {
+    let first_line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("goal");
+    short(first_line, 96)
+}
+
+async fn run_headless_goal(args: &[String]) -> Result<i32> {
+    if args.is_empty() {
+        print_goal_help();
+        return Ok(2);
+    }
+    if matches!(args[0].as_str(), "-h" | "--help" | "help") {
+        print_goal_help();
+        return Ok(0);
+    }
+
+    let opts = match parse_headless_goal_options(args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("phonton goal: {e}");
+            print_goal_help();
+            return Ok(2);
+        }
+    };
+
+    let cfg = config::load().unwrap_or_default();
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if !opts.yes && !trust::prompt_if_needed(&working_dir)? {
+        return Ok(1);
+    }
+
+    let store = Arc::new(std::sync::Mutex::new(open_persistent_store()?));
+    let sandbox = Arc::new(Sandbox::new(
+        working_dir.clone(),
+        "phonton-cli-headless".to_string(),
+    ));
+    let task_id = TaskId::new();
+    let prompt = SubmittedPrompt {
+        description: opts.goal_text.clone(),
+        display_text: opts.display_text.clone(),
+        prompt_artifacts: Vec::new(),
+    };
+    let attachments = prepare_prompt_attachments(&prompt, &working_dir);
+
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(task_id, &opts.display_text, &TaskStatus::Planning, 0);
+    }
+
+    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(&store)).await;
+    let prompt_artifacts = prompt.prompt_artifacts.clone();
+    let plan_result = if opts.direct_task {
+        Ok(single_task_plan(
+            prompt.description.clone(),
+            attachments.clone(),
+            prompt_artifacts,
+        ))
+    } else {
+        let store_guard = match store.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return print_headless_failure(
+                    opts.json,
+                    task_id,
+                    &opts.display_text,
+                    "persistent store lock was poisoned",
+                    None,
+                    Some(cfg.index.backend.clone()),
+                    &store,
+                );
+            }
+        };
+        let goal = Goal::new(prompt.description.clone())
+            .with_attachments(attachments.clone())
+            .with_prompt_artifacts(prompt_artifacts);
+        let result = decompose_with_memory(&goal, &store_guard, load_ask_provider(&cfg)).await;
+        drop(store_guard);
+        result
+    };
+
+    let mut plan = match plan_result {
+        Ok(plan) => plan,
+        Err(e) => {
+            return print_headless_failure(
+                opts.json,
+                task_id,
+                &opts.display_text,
+                &format!("planning failed: {e}"),
+                None,
+                Some(cfg.index.backend.clone()),
+                &store,
+            );
+        }
+    };
+
+    let (state_tx, _state_rx) = watch::channel(GlobalState {
+        task_status: TaskStatus::Planning,
+        goal_contract: plan.goal_contract.clone(),
+        plan_graph: Some(plan.plan_graph.clone()),
+        index_backend: Some(cfg.index.backend.clone()),
+        handoff_packet: None,
+        active_workers: Vec::new(),
+        tokens_used: 0,
+        tokens_budget: None,
+        estimated_naive_tokens: plan.naive_baseline_tokens,
+        checkpoints: Vec::new(),
+    });
+
+    let (event_tx, _) = broadcast::channel::<EventRecord>(1024);
+    let mut event_rx_store = event_tx.subscribe();
+    let store_for_events = Arc::clone(&store);
+    let event_writer = tokio::spawn(async move {
+        loop {
+            match event_rx_store.recv().await {
+                Ok(rec) => {
+                    let store = Arc::clone(&store_for_events);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(g) = store.lock() {
+                            let _ = g.append_event(&rec);
+                        }
+                    })
+                    .await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(&working_dir));
+    apply_extension_context_to_plan(&mut plan, &extension_set);
+    publish_extension_events(task_id, &extension_set, &event_tx);
+
+    let naive = plan.naive_baseline_tokens;
+    let semantic_context =
+        build_semantic_context_with_warnings(&working_dir, &cfg.index, !opts.json).await;
+    let mcp_runtime = if extension_set.mcp_servers.is_empty() {
+        None
+    } else {
+        let approver: Arc<dyn McpApprover> = if opts.yes {
+            Arc::new(ExplicitApproveAll)
+        } else {
+            Arc::new(DenyByDefaultApprover)
+        };
+        Some(Arc::new(
+            phonton_mcp::McpRuntime::new(
+                extension_set.mcp_servers.clone(),
+                ExecutionGuard::new(working_dir.clone()),
+            )
+            .with_approver(approver)
+            .with_event_sink(task_id, event_tx.clone()),
+        ))
+    };
+
+    let dispatcher: Arc<dyn WorkerDispatcher> =
+        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
+            let provider_name = cfg.provider.name.clone();
+            let account_id = cfg.provider.account_id.clone();
+            let base_url = cfg.provider.base_url.clone();
+            let configured_model = cfg.provider.model.clone();
+
+            let factory = move |tier: phonton_types::ModelTier| {
+                let model = configured_model
+                    .clone()
+                    .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
+                let provider_cfg = make_api_provider_config(
+                    &provider_name,
+                    api_key.clone(),
+                    model,
+                    account_id.clone(),
+                    base_url.clone(),
+                )
+                .expect("unknown provider config");
+                provider_for(provider_cfg)
+            };
+
+            let guard = ExecutionGuard::new(working_dir.clone());
+            let mut dispatcher =
+                phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                    .with_task_id(task_id)
+                    .with_memory(memory_store.clone());
+            if let Some(ctx) = semantic_context.clone() {
+                dispatcher = dispatcher.with_semantic_context(ctx);
+            }
+            if let Some(runtime) = mcp_runtime.clone() {
+                dispatcher = dispatcher.with_mcp_runtime(runtime);
+            }
+            Arc::new(dispatcher)
+        } else {
+            Arc::new(StubDispatcher::new(sandbox.clone()))
+        };
+
+    let diff_applier = DiffApplier::open(&working_dir)
+        .ok()
+        .map(|d| Arc::new(std::sync::Mutex::new(d)));
+
+    let limits = BudgetLimits {
+        max_tokens: cfg.budget.max_tokens,
+        max_usd_micros: cfg.budget.max_usd_micros(),
+    };
+    let mut budget_guard = BudgetGuard::new(limits);
+    if let Some(model) = cfg.provider.model.as_deref() {
+        if cfg.provider.name == "ollama" {
+            budget_guard = budget_guard.with_price(
+                ProviderKind::Ollama,
+                model,
+                ModelPricing {
+                    input_usd_micros_per_mtok: 0,
+                    output_usd_micros_per_mtok: 0,
+                },
+            );
+        } else if cfg.provider.name == "cloudflare" && model == "@cf/moonshotai/kimi-k2.6" {
+            budget_guard = budget_guard.with_price(
+                ProviderKind::Cloudflare,
+                model,
+                ModelPricing {
+                    input_usd_micros_per_mtok: 950_000,
+                    output_usd_micros_per_mtok: 4_000_000,
+                },
+            );
+        }
+    }
+
+    let mut orchestrator = Orchestrator::new(dispatcher)
+        .with_naive_baseline(naive)
+        .with_budget_guard(budget_guard)
+        .with_working_dir(working_dir.clone())
+        .with_index_backend(cfg.index.backend.clone())
+        .with_memory(memory_store)
+        .with_event_sink(task_id, opts.display_text.clone(), event_tx.clone());
+    if let Some(diff_applier) = diff_applier {
+        orchestrator = orchestrator.with_diff_applier(diff_applier);
+    }
+
+    let run = orchestrator.run_task(plan, state_tx.clone());
+    let run_result = tokio::time::timeout(Duration::from_secs(opts.timeout_seconds), run).await;
+    let final_state = match run_result {
+        Ok(Ok(_)) => state_tx.borrow().clone(),
+        Ok(Err(e)) => mark_headless_goal_failed(&state_tx, format!("orchestrator failed: {e}")),
+        Err(_) => mark_headless_goal_failed(
+            &state_tx,
+            format!("timed out after {} seconds", opts.timeout_seconds),
+        ),
+    };
+
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(
+            task_id,
+            &opts.display_text,
+            &final_state.task_status,
+            final_state.tokens_used,
+        );
+        if let Some(ledger) = outcome_ledger_from_state(task_id, &final_state) {
+            let _ = g.upsert_outcome_ledger(&ledger);
+        }
+    }
+
+    drop(event_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), event_writer).await;
+
+    if opts.json {
+        print_headless_goal_json(task_id, &final_state)?;
+    } else {
+        println!(
+            "phonton goal: {} ({})",
+            headless_status_label(&final_state.task_status),
+            task_id
+        );
+    }
+
+    Ok(if headless_goal_succeeded(&final_state.task_status) {
+        0
+    } else {
+        1
+    })
+}
+
+fn print_headless_failure(
+    json: bool,
+    task_id: TaskId,
+    display_text: &str,
+    reason: &str,
+    plan_graph: Option<phonton_types::PlanGraph>,
+    index_backend: Option<String>,
+    store: &Arc<std::sync::Mutex<Store>>,
+) -> Result<i32> {
+    let state = GlobalState {
+        task_status: TaskStatus::Failed {
+            reason: reason.to_string(),
+            failed_subtask: None,
+        },
+        goal_contract: None,
+        plan_graph,
+        index_backend,
+        handoff_packet: Some(failed_handoff_packet(task_id, display_text, reason, 0)),
+        active_workers: Vec::new(),
+        tokens_used: 0,
+        tokens_budget: None,
+        estimated_naive_tokens: 0,
+        checkpoints: Vec::new(),
+    };
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(task_id, display_text, &state.task_status, 0);
+        if let Some(ledger) = outcome_ledger_from_state(task_id, &state) {
+            let _ = g.upsert_outcome_ledger(&ledger);
+        }
+    }
+    if json {
+        print_headless_goal_json(task_id, &state)?;
+    } else {
+        eprintln!("phonton goal: {reason}");
+    }
+    Ok(1)
+}
+
+fn failed_handoff_packet(
+    task_id: TaskId,
+    display_text: &str,
+    reason: &str,
+    tokens_used: u64,
+) -> HandoffPacket {
+    HandoffPacket {
+        task_id,
+        goal: display_text.to_string(),
+        headline: format!("Task failed before review: {}", short(reason, 120)),
+        changed_files: Vec::new(),
+        generated_artifacts: Vec::new(),
+        diff_stats: phonton_types::DiffStats::default(),
+        verification: phonton_types::VerifyReport {
+            passed: Vec::new(),
+            findings: vec![reason.to_string()],
+            skipped: vec!["No verification layer completed before this failure.".into()],
+        },
+        run_commands: Vec::new(),
+        known_gaps: vec![
+            "No changed files were recorded for this run.".into(),
+            "Review the failure reason before retrying.".into(),
+        ],
+        review_actions: vec![phonton_types::ReviewAction {
+            label: "Inspect failure".into(),
+            description: "Open the transcript and flight log for the failed run.".into(),
+        }],
+        rollback_points: Vec::new(),
+        token_usage: TokenUsage::estimated(tokens_used),
+        influence: phonton_types::InfluenceSummary::default(),
+        screenshot_path: None,
+        rendering_summary: None,
+    }
+}
+
+fn mark_headless_goal_failed(state_tx: &watch::Sender<GlobalState>, reason: String) -> GlobalState {
+    let mut state = state_tx.borrow().clone();
+    state.task_status = TaskStatus::Failed {
+        reason,
+        failed_subtask: None,
+    };
+    state.active_workers.clear();
+    let _ = state_tx.send(state.clone());
+    state
+}
+
+fn print_headless_goal_json(task_id: TaskId, state: &GlobalState) -> Result<()> {
+    let doc = serde_json::json!({
+        "task_id": task_id,
+        "status": &state.task_status,
+        "tokens_used": state.tokens_used,
+        "estimated_naive_tokens": state.estimated_naive_tokens,
+        "index_backend": &state.index_backend,
+        "plan_graph": &state.plan_graph,
+        "handoff_packet": &state.handoff_packet,
+    });
+    println!("{}", serde_json::to_string_pretty(&doc)?);
+    Ok(())
+}
+
+fn headless_goal_succeeded(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
+    )
+}
+
+fn headless_status_label(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Planning => "planning",
+        TaskStatus::Running { .. } => "running",
+        TaskStatus::Reviewing { .. } => "review-ready",
+        TaskStatus::Done { .. } => "done",
+        TaskStatus::Failed { .. } => "failed",
+        TaskStatus::Paused { .. } => "paused",
+        TaskStatus::Rejected => "rejected",
     }
 }
 
@@ -4735,6 +5305,8 @@ async fn run_app<B: Backend>(
                                         Some(app.settings.account_id.clone())
                                     },
                                     base_url: None,
+                                    keys: Default::default(),
+                                    allow_unverified_model: None,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -4789,6 +5361,8 @@ async fn run_app<B: Backend>(
                                         Some(app.settings.account_id.clone())
                                     },
                                     base_url: None,
+                                    keys: Default::default(),
+                                    allow_unverified_model: None,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -4893,6 +5467,8 @@ async fn run_app<B: Backend>(
                                             Some(app.settings.account_id.clone())
                                         },
                                         base_url: None,
+                                        keys: Default::default(),
+                                        allow_unverified_model: None,
                                     };
                                     provider_key_for_run(&stub).unwrap_or_default()
                                 } else {
@@ -5080,6 +5656,7 @@ fn single_task_plan(
         naive_baseline_tokens: 4_000,
         coverage_summary: CoverageSummary::default(),
         goal_contract: Some(goal_contract),
+        plan_graph: Default::default(),
     }
 }
 
@@ -5320,7 +5897,11 @@ fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<Out
     Some(OutcomeLedger {
         task_id,
         goal_contract: state.goal_contract.clone(),
-        context_manifest: ContextManifest::default(),
+        context_manifest: ContextManifest {
+            plan_graph: state.plan_graph.clone(),
+            index_backend: state.index_backend.clone(),
+            ..ContextManifest::default()
+        },
         permission_ledger: PermissionLedger::default(),
         verify_report: handoff.verification.clone(),
         handoff: Some(handoff),
@@ -5369,7 +5950,7 @@ async fn spawn_goal(
         let goal = Goal::new(text.clone())
             .with_attachments(attachments.clone())
             .with_prompt_artifacts(prompt_artifacts.clone());
-        let result = decompose_with_memory(&goal, &store_guard, None).await;
+        let result = decompose_with_memory(&goal, &store_guard, load_ask_provider(cfg)).await;
         drop(store_guard);
         result
     };
@@ -5381,6 +5962,8 @@ async fn spawn_goal(
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
         goal_contract: plan.goal_contract.clone(),
+        plan_graph: Some(plan.plan_graph.clone()),
+        index_backend: Some(cfg.index.backend.clone()),
         handoff_packet: None,
         active_workers: Vec::new(),
         tokens_used: 0,
@@ -5400,7 +5983,7 @@ async fn spawn_goal(
     publish_extension_events(task_id, &extension_set, &event_tx);
 
     let naive = plan.naive_baseline_tokens;
-    let semantic_context = build_semantic_context(working_dir).await;
+    let semantic_context = build_semantic_context(working_dir, &cfg.index).await;
     let mcp_runtime = if extension_set.mcp_servers.is_empty() {
         None
     } else {
@@ -5508,6 +6091,7 @@ async fn spawn_goal(
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
+        .with_index_backend(cfg.index.backend.clone())
         .with_memory(memory_store)
         .with_event_sink(task_id, display_text.clone(), event_tx)
         .with_control_channel(ctrl_rx);
@@ -5870,6 +6454,8 @@ fn extract_id(line: &str) -> Option<String> {
             model: Some("llama3.2:3b".into()),
             account_id: None,
             base_url: None,
+            keys: Default::default(),
+            allow_unverified_model: None,
         };
         assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
 
@@ -5879,6 +6465,8 @@ fn extract_id(line: &str) -> Option<String> {
             model: Some("local-model".into()),
             account_id: None,
             base_url: Some("http://localhost:1234/v1".into()),
+            keys: Default::default(),
+            allow_unverified_model: None,
         };
         assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
     }
@@ -6048,6 +6636,46 @@ fn extract_id(line: &str) -> Option<String> {
             .unwrap_or("")
             .contains("Notes"));
         Ok(())
+    }
+
+    #[test]
+    fn headless_goal_parser_accepts_benchmark_flags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let prompt_path = temp.path().join("prompt.md");
+        std::fs::write(&prompt_path, "Fix the fixture bug\n\nUse tests.")?;
+        let args = vec![
+            "--prompt-file".to_string(),
+            prompt_path.display().to_string(),
+            "--yes".to_string(),
+            "--permission-mode".to_string(),
+            "full-access".to_string(),
+            "--timeout-seconds".to_string(),
+            "900".to_string(),
+            "--json".to_string(),
+        ];
+
+        let opts = parse_headless_goal_options(&args)?;
+
+        assert_eq!(opts.goal_text, "Fix the fixture bug\n\nUse tests.");
+        assert_eq!(opts.display_text, "Fix the fixture bug");
+        assert!(opts.yes);
+        assert!(opts.json);
+        assert!(!opts.direct_task);
+        assert_eq!(opts.timeout_seconds, 900);
+        Ok(())
+    }
+
+    #[test]
+    fn headless_goal_parser_rejects_multiple_goal_sources() {
+        let args = vec![
+            "--prompt-file".to_string(),
+            "prompt.md".to_string(),
+            "also positional".to_string(),
+        ];
+
+        let err = parse_headless_goal_options(&args)
+            .expect_err("prompt-file and positional text should conflict");
+        assert!(err.to_string().contains("choose only one goal source"));
     }
 
     #[test]
@@ -6265,6 +6893,8 @@ fn extract_id(line: &str) -> Option<String> {
         let s = GlobalState {
             task_status: TaskStatus::Queued,
             goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
             handoff_packet: None,
             active_workers: Vec::new(),
             tokens_used: 200,
@@ -6384,6 +7014,8 @@ fn extract_id(line: &str) -> Option<String> {
                     estimated_savings_tokens: 760,
                 },
                 goal_contract: None,
+                plan_graph: None,
+                index_backend: None,
                 handoff_packet: Some(HandoffPacket {
                     task_id: TaskId::new(),
                     goal: "make chess".into(),
@@ -6446,6 +7078,8 @@ fn extract_id(line: &str) -> Option<String> {
                     total: 2,
                 },
                 goal_contract: None,
+                plan_graph: None,
+                index_backend: None,
                 handoff_packet: None,
                 active_workers: Vec::new(),
                 tokens_used: 150,

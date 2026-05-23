@@ -22,9 +22,9 @@ use phonton_memory::MemoryStore;
 use phonton_providers::Provider;
 use phonton_store::{MemoryKind, Store};
 use phonton_types::{
-    CoverageSummary, ExpectedArtifact, GoalContract, MemoryRecord, ModelTier, PlannerOutput,
-    PromptArtifact, PromptAttachment, QualityFloor, RunCommand, Subtask, SubtaskId, SubtaskStatus,
-    VerifyStepSpec,
+    CoverageSummary, ExpectedArtifact, GoalContract, MemoryRecord, ModelTier, PlanGraph,
+    PlannerOutput, PromptArtifact, PromptAttachment, QualityFloor, RunCommand, Subtask, SubtaskId,
+    SubtaskStatus, SwarmMode, VerifyStepSpec,
 };
 use regex::Regex;
 use serde::Deserialize;
@@ -219,7 +219,15 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
         }
     }
 
+    let swarm_mode = SwarmMode::Disabled;
+    let swarm_reason = if is_broad_goal(&goal.description) {
+        "broad goal detected; using deterministic fallback because no planner provider was configured"
+            .to_string()
+    } else {
+        "goal is narrow enough for standard DAG planning".to_string()
+    };
     PlannerOutput {
+        plan_graph: PlanGraph::from_subtasks(&subtasks, swarm_mode, swarm_reason),
         subtasks,
         estimated_total_tokens: estimate_tokens(&detections, goal),
         naive_baseline_tokens: estimate_naive_tokens(&detections, goal),
@@ -472,11 +480,22 @@ pub async fn decompose_with_memory(
         "planner consulted memory"
     );
 
-    // LLM path: when a provider is wired in, let the model do the
-    // decomposition with the prior-context preamble as its memory input.
-    // On any failure the helper itself falls back to the regex path, so
-    // there's no need to double-guard here.
-    if let Some(p) = provider {
+    let broad_goal = is_broad_goal(&goal.description);
+
+    // LLM path: broad goals can use the provider-backed decomposer to
+    // populate swarm metadata. Narrow goals stay on the deterministic
+    // planner even when a provider is configured so a focused one-file
+    // bugfix does not fragment into overlapping worker edits.
+    if broad_goal {
+        let Some(p) = provider else {
+            let mut plan = decompose(goal);
+            plan.plan_graph = PlanGraph::from_subtasks(
+                &plan.subtasks,
+                SwarmMode::Disabled,
+                "broad goal detected; using deterministic fallback because no planner provider was configured".into(),
+            );
+            return Ok(plan);
+        };
         let memory_context =
             render_memory_preamble(&rejected, &decisions, &constraints, &conventions);
 
@@ -518,6 +537,11 @@ pub async fn decompose_with_memory(
             subtask.prompt_artifacts = goal.prompt_artifacts.clone();
         }
         return Ok(PlannerOutput {
+            plan_graph: PlanGraph::from_subtasks(
+                &llm_plan.subtasks,
+                SwarmMode::Enabled,
+                "broad goal detected; LLM decomposer produced swarm plan metadata".into(),
+            ),
             subtasks: llm_plan.subtasks,
             estimated_total_tokens: llm_plan.estimated_total_tokens,
             naive_baseline_tokens: llm_plan.naive_baseline_tokens,
@@ -539,6 +563,7 @@ pub async fn decompose_with_memory(
                 _ => None,
             })
             .collect();
+        let original_subtasks = plan.subtasks.clone();
         let before = plan.subtasks.len();
         plan.subtasks.retain(|st| {
             !rejected_summaries
@@ -546,7 +571,13 @@ pub async fn decompose_with_memory(
                 .any(|s| s.contains(&extract_symbol_name(&st.description).to_lowercase()))
         });
         let removed = before - plan.subtasks.len();
-        if removed > 0 {
+        if before > 0 && plan.subtasks.is_empty() {
+            warn!(
+                removed,
+                "planner memory filter would remove every subtask; keeping original plan"
+            );
+            plan.subtasks = original_subtasks;
+        } else if removed > 0 {
             debug!(
                 removed,
                 "planner skipped subtasks matching rejected approaches"
@@ -566,6 +597,11 @@ pub async fn decompose_with_memory(
             first.description = format!("{preamble}\n\n{}", first.description);
         }
     }
+    plan.plan_graph = PlanGraph::from_subtasks(
+        &plan.subtasks,
+        plan.plan_graph.swarm_mode,
+        plan.plan_graph.swarm_reason.clone(),
+    );
 
     Ok(plan)
 }
@@ -598,6 +634,11 @@ pub async fn decompose_with_memory_store(
     if let Some(first) = plan.subtasks.first_mut() {
         first.description = format!("{preamble}\n{}", first.description);
     }
+    plan.plan_graph = PlanGraph::from_subtasks(
+        &plan.subtasks,
+        plan.plan_graph.swarm_mode,
+        plan.plan_graph.swarm_reason.clone(),
+    );
     Ok(plan)
 }
 
@@ -721,7 +762,11 @@ fn render_memory_preamble(
         out.push_str("\n## Do NOT repeat these rejected approaches\n");
         for r in rejected {
             if let MemoryRecord::RejectedApproach { summary, reason } = r {
-                out.push_str(&format!("- {summary} (rejected: {reason})\n"));
+                out.push_str(&format!(
+                    "- {} (rejected: {})\n",
+                    compact_memory_text(summary),
+                    compact_memory_text(reason)
+                ));
             }
         }
     }
@@ -729,7 +774,11 @@ fn render_memory_preamble(
         out.push_str("\n## Honour these prior decisions\n");
         for r in decisions {
             if let MemoryRecord::Decision { title, body, .. } = r {
-                out.push_str(&format!("- {title}: {body}\n"));
+                out.push_str(&format!(
+                    "- {}: {}\n",
+                    compact_memory_text(title),
+                    compact_memory_text(body)
+                ));
             }
         }
     }
@@ -741,7 +790,11 @@ fn render_memory_preamble(
                 rationale,
             } = r
             {
-                out.push_str(&format!("- {statement} (because {rationale})\n"));
+                out.push_str(&format!(
+                    "- {} (because {})\n",
+                    compact_memory_text(statement),
+                    compact_memory_text(rationale)
+                ));
             }
         }
     }
@@ -750,12 +803,27 @@ fn render_memory_preamble(
         for r in conventions {
             if let MemoryRecord::Convention { rule, scope } = r {
                 match scope {
-                    Some(s) => out.push_str(&format!("- convention ({s}): {rule}\n")),
-                    None => out.push_str(&format!("- convention: {rule}\n")),
+                    Some(s) => out.push_str(&format!(
+                        "- convention ({}): {}\n",
+                        compact_memory_text(s),
+                        compact_memory_text(rule)
+                    )),
+                    None => out.push_str(&format!("- convention: {}\n", compact_memory_text(rule))),
                 }
             }
         }
     }
+    out
+}
+
+fn compact_memory_text(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX_CHARS {
+        return one_line;
+    }
+    let mut out: String = one_line.chars().take(MAX_CHARS).collect();
+    out.push_str("...");
     out
 }
 
@@ -768,6 +836,45 @@ fn test_tier(impl_tier: ModelTier) -> ModelTier {
         ModelTier::Standard => ModelTier::Cheap,
         ModelTier::Cheap | ModelTier::Local => ModelTier::Local,
     }
+}
+
+fn is_broad_goal(description: &str) -> bool {
+    let d = description.to_ascii_lowercase();
+    let broad_phrase = [
+        "large changeset",
+        "large change",
+        "whole repo",
+        "whole codebase",
+        "entire repo",
+        "entire codebase",
+        "architecture",
+        "multi-agent",
+        "swarm",
+        "release",
+        "everything",
+        "next update",
+    ]
+    .iter()
+    .any(|needle| d.contains(needle));
+    if broad_phrase {
+        return true;
+    }
+
+    let areas = [
+        "planner",
+        "orchestrator",
+        "worker",
+        "memory",
+        "mcp",
+        "index",
+        "vector",
+        "qdrant",
+        "website",
+        "docs",
+        "config",
+    ];
+    let area_hits = areas.iter().filter(|area| d.contains(**area)).count();
+    area_hits >= 3 && d.split_whitespace().count() >= 18
 }
 
 /// Crude token estimate for the planner's headline number. Real
@@ -958,6 +1065,83 @@ mod tests {
     }
 
     #[test]
+    fn broad_goal_without_provider_records_swarm_fallback_reason() {
+        let plan = decompose(&Goal::new(
+            "implement swarm planning custom vector memory backends and dynamic MCP negotiation",
+        ));
+
+        assert_eq!(
+            plan.plan_graph.swarm_mode,
+            phonton_types::SwarmMode::Disabled
+        );
+        assert!(plan.plan_graph.swarm_reason.contains("broad goal"));
+        assert!(plan
+            .plan_graph
+            .swarm_reason
+            .contains("deterministic fallback"));
+        assert_eq!(plan.plan_graph.assignments.len(), plan.subtasks.len());
+    }
+
+    #[test]
+    fn focused_bugfix_prompt_is_not_broad_swarm_work() {
+        let prompt = "# Benchmark 02 Prompt: Fix Config Loader Bug
+Fix `src/config.js`.
+Keep the public function name `loadConfig(raw, env)`.
+Treat blank explicit provider or model values as invalid.
+Validate maxRetries as an integer from 0 through 10.";
+
+        assert!(
+            !is_broad_goal(prompt),
+            "single-file bugfix prompts should not activate swarm planning"
+        );
+    }
+
+    #[test]
+    fn release_architecture_prompt_is_broad_swarm_work() {
+        let prompt = "Plan the v0.19.0 release across orchestrator swarm planning, \
+                      vector index backends, dynamic MCP capability discovery, docs, \
+                      website updates, and release validation.";
+
+        assert!(is_broad_goal(prompt));
+    }
+
+    #[test]
+    fn plan_graph_groups_overlapping_touch_scopes() {
+        let first = Subtask {
+            id: SubtaskId::new(),
+            description: "update config handling".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let second = Subtask {
+            id: SubtaskId::new(),
+            description: "verify config handling".into(),
+            model_tier: ModelTier::Standard,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let graph = PlanGraph::from_subtasks(
+            &[first, second],
+            phonton_types::SwarmMode::Enabled,
+            "test".into(),
+        );
+
+        assert!(graph
+            .assignments
+            .iter()
+            .any(|a| !a.expected_touch_scope.is_empty()));
+        assert!(graph
+            .conflict_groups
+            .iter()
+            .any(|g| g.subtask_ids.len() >= 2));
+    }
+
+    #[test]
     fn coverage_summary_renders_honest_signal() {
         let plan = decompose(&Goal::new("add function a and add function b"));
         assert_eq!(
@@ -995,20 +1179,44 @@ mod tests {
             })
             .unwrap();
         let plan = decompose_with_memory(
-            &Goal::new("add a function parse_callsites via regex scan"),
+            &Goal::new(
+                "add a function parse_callsites via regex scan and add a function tokenize_callsites",
+            ),
             &store,
             None,
         )
         .await
         .unwrap();
         // The impl subtask for parse_callsites (whose name appears in the
-        // rejected summary) should be dropped; its paired test subtask is
-        // also dropped since we retain on the same predicate.
-        assert!(!plan
+        // rejected summary) should be dropped while unrelated work remains.
+        assert!(!plan.subtasks.iter().any(|s| s
+            .description
+            .trim_start()
+            .starts_with("Implement function `parse_callsites`")));
+        assert!(plan
             .subtasks
             .iter()
-            .any(|s| s.description.contains("parse_callsites")
-                && s.description.contains("Implement")));
+            .any(|s| s.description.contains("tokenize_callsites")));
+    }
+
+    #[tokio::test]
+    async fn rejected_approaches_cannot_remove_every_subtask() {
+        let store = Store::in_memory().unwrap();
+        store
+            .append_memory(&MemoryRecord::RejectedApproach {
+                summary: "fix config loader bug".into(),
+                reason: "previous provider run failed".into(),
+            })
+            .unwrap();
+
+        let plan = decompose_with_memory(&Goal::new("fix config loader bug"), &store, None)
+            .await
+            .unwrap();
+
+        assert_eq!(plan.subtasks.len(), 1);
+        assert!(plan.subtasks[0]
+            .description
+            .contains("fix config loader bug"));
     }
 
     #[tokio::test]
@@ -1033,6 +1241,27 @@ mod tests {
             classify_task("add unit-test for Provider"),
             TaskClass::Tests
         );
+    }
+
+    #[test]
+    fn classify_task_ignores_prior_context_preamble() {
+        let description = "# Prior context from memory
+
+## Do NOT repeat these rejected approaches
+- run tests and update docs (rejected: failed)
+
+Fix the config loader bug";
+
+        assert_eq!(classify_task(description), TaskClass::CoreLogic);
+    }
+
+    #[test]
+    fn classify_task_keeps_bugfix_prompts_with_test_requirements_as_core_logic() {
+        let description = "# Benchmark 02 Prompt: Fix Config Loader Bug
+Fix `src/config.js`.
+Make sure the existing tests pass.";
+
+        assert_eq!(classify_task(description), TaskClass::CoreLogic);
     }
 
     #[test]

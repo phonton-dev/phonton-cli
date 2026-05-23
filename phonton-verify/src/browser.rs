@@ -16,8 +16,8 @@ use tokio::process::Command;
 pub async fn verify_browser_check(working_dir: &Path) -> Result<Option<VerifyResult>> {
     // 1. Detect if this is a web/HTML project
     let has_html = working_dir.join("index.html").is_file();
-    let has_package_json = working_dir.join("package.json").is_file();
-    if !has_html && !has_package_json {
+    let package_json = working_dir.join("package.json");
+    if !has_html && !package_json_looks_browser_runnable(&package_json) {
         return Ok(None); // Skip if no web indicators are present
     }
 
@@ -242,14 +242,60 @@ const { chromium } = require('playwright');
 
     let url = format!("http://127.0.0.1:{port}");
 
+    // Construct robust NODE_PATH to resolve 'playwright' module
+    let mut node_paths = Vec::new();
+    node_paths.push(working_dir.join("node_modules"));
+
+    let mut current = working_dir;
+    while let Some(parent) = current.parent() {
+        node_paths.push(parent.join("node_modules"));
+        current = parent;
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur = cwd.as_path();
+        node_paths.push(cur.join("node_modules"));
+        while let Some(parent) = cur.parent() {
+            node_paths.push(parent.join("node_modules"));
+            cur = parent;
+        }
+    }
+
+    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
+        if let Some(parent) = Path::new(manifest_dir).parent() {
+            node_paths.push(parent.join("node_modules"));
+        }
+    }
+
+    let mut path_strings = Vec::new();
+    for p in node_paths {
+        if p.exists() {
+            if let Some(s) = p.to_str() {
+                path_strings.push(s.to_string());
+            }
+        }
+    }
+
+    if let Ok(val) = std::env::var("NODE_PATH") {
+        path_strings.push(val);
+    }
+
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let joined_paths = path_strings.join(separator);
+
     // 5. Run the Playwright verification script using `npx playwright test`
     // 5. Run the Playwright verification script using `node`
-    let playwright_cmd = Command::new("node")
-        .arg("phonton-playwright.js")
+    let mut cmd = Command::new("node");
+    cmd.arg("phonton-playwright.js")
         .env("PHONTON_URL", &url)
         .env("PHONTON_SCREENSHOT", screenshot_name)
-        .current_dir(working_dir)
-        .output();
+        .current_dir(working_dir);
+
+    if !joined_paths.is_empty() {
+        cmd.env("NODE_PATH", joined_paths);
+    }
+
+    let playwright_cmd = cmd.output();
 
     let playwright_output = tokio::time::timeout(Duration::from_secs(45), playwright_cmd).await;
 
@@ -342,4 +388,48 @@ const { chromium } = require('playwright');
             attempt: 1,
         }))
     }
+}
+
+fn package_json_looks_browser_runnable(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+
+    let frontend_names = [
+        "vite",
+        "next",
+        "react-scripts",
+        "webpack",
+        "parcel",
+        "@sveltejs/kit",
+        "astro",
+    ];
+    for section in ["dependencies", "devDependencies"] {
+        if let Some(deps) = value.get(section).and_then(|v| v.as_object()) {
+            if frontend_names.iter().any(|name| deps.contains_key(*name)) {
+                return true;
+            }
+        }
+    }
+
+    value
+        .get("scripts")
+        .and_then(|v| v.as_object())
+        .map(|scripts| {
+            scripts.iter().any(|(name, command)| {
+                matches!(name.as_str(), "dev" | "start" | "serve" | "preview")
+                    && command
+                        .as_str()
+                        .map(|cmd| {
+                            frontend_names
+                                .iter()
+                                .any(|needle| cmd.to_ascii_lowercase().contains(needle))
+                        })
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }

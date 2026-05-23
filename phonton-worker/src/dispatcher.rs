@@ -190,6 +190,10 @@ impl RealDispatcher {
             query.push_str("\nVerifier diagnostics:\n");
             query.push_str(&prior_errors.join("\n"));
         }
-        phonton_index::query_relevant_slices(&semantic.index, &semantic.embedder, &query, 5).await
+        semantic
+            .retriever
+            .query(&query, 5)
+            .await
+            .unwrap_or_default()
     }
 }

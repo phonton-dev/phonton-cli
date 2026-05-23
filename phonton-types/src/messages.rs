@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
+    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier, PlanGraph,
+    Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,12 @@ pub struct GlobalState {
     /// v0.4.0 definition of done when available.
     #[serde(default)]
     pub goal_contract: Option<GoalContract>,
+    /// Visible plan graph sidecar for swarm and conflict evidence.
+    #[serde(default)]
+    pub plan_graph: Option<PlanGraph>,
+    /// Selected semantic index backend.
+    #[serde(default)]
+    pub index_backend: Option<String>,
     /// v0.4.0 review receipt when available.
     #[serde(default)]
     pub handoff_packet: Option<HandoffPacket>,

@@ -39,6 +39,7 @@ pub async fn run(workspace: &Path, args: &[String]) -> Result<i32> {
 
     match command {
         "list" => list_servers(workspace, &args[1..]).await,
+        "capabilities" => capabilities(workspace, &args[1..]).await,
         "tools" => list_tools(workspace, &args[1..]).await,
         "call" => call_tool(workspace, &args[1..]).await,
         other => {
@@ -73,6 +74,57 @@ async fn list_servers(workspace: &Path, args: &[String]) -> Result<i32> {
             server.trust,
             render_permissions(&server.permissions)
         );
+    }
+    Ok(0)
+}
+
+async fn capabilities(workspace: &Path, args: &[String]) -> Result<i32> {
+    let (opts, positional) = parse_options_and_positionals(args)?;
+    let Some(server_id) = positional.first() else {
+        eprintln!("phonton mcp capabilities: missing <server-id>");
+        return Ok(2);
+    };
+
+    let runtime = build_runtime(workspace, opts)?;
+    let server_id = ExtensionId::new(server_id.clone());
+    let snapshot = match runtime.capabilities(&server_id).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            eprintln!("phonton mcp capabilities: {e}");
+            if !opts.yes {
+                eprintln!("      pass --yes to approve this one MCP preview operation");
+            }
+            return Ok(1);
+        }
+    };
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else {
+        println!(
+            "Capabilities from {} (protocol {})",
+            snapshot.server_id, snapshot.protocol_version
+        );
+        if snapshot.tools.is_empty() {
+            println!("- tools: none reported");
+        } else {
+            println!("- tools:");
+            for tool in &snapshot.tools {
+                let label = tool.title.as_deref().unwrap_or(&tool.name);
+                println!("  - {} ({})", tool.name, label);
+            }
+        }
+        if snapshot.permission_proposals.is_empty() {
+            println!("- permission proposals: none");
+        } else {
+            println!("- permission proposals (preview only):");
+            for proposal in &snapshot.permission_proposals {
+                println!(
+                    "  - {} from {}: {}",
+                    proposal.permission, proposal.source, proposal.reason
+                );
+            }
+        }
     }
     Ok(0)
 }
@@ -259,6 +311,7 @@ fn print_usage() {
     println!(
         "usage:\n  \
          phonton mcp list [--json]\n  \
+         phonton mcp capabilities <server-id> [--json] [--yes]\n  \
          phonton mcp tools <server-id> [--json] [--yes]\n  \
          phonton mcp call <server-id> <tool-name> [json-args] [--json] [--yes]\n\n  \
          `list` never starts servers. `tools` and `call` start the target server lazily.\n  \

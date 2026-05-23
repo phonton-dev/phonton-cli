@@ -81,11 +81,17 @@ impl DiffApplier {
 
         if !modified.is_empty() {
             let diff_text = build_unified_diff(&modified);
-            let diff = git2::Diff::from_buffer(diff_text.as_bytes())
-                .context("constructing git2::Diff from unified patch text")?;
-            self.repo
-                .apply(&diff, git2::ApplyLocation::WorkDir, None)
-                .context("git apply failed in worktree")?;
+            let apply_result = git2::Diff::from_buffer(diff_text.as_bytes())
+                .context("constructing git2::Diff from unified patch text")
+                .and_then(|diff| {
+                    self.repo
+                        .apply(&diff, git2::ApplyLocation::WorkDir, None)
+                        .context("git apply failed in worktree")
+                });
+            if apply_result.is_err() {
+                apply_modified_hunks_direct(&workdir, &modified)
+                    .with_context(|| apply_result.unwrap_err())?;
+            }
         }
 
         let mut index = self.repo.index()?;
@@ -343,12 +349,24 @@ fn build_unified_diff(by_file: &BTreeMap<PathBuf, Vec<&DiffHunk>>) -> String {
     let mut out = String::new();
     for (path, hunks) in by_file {
         let p = path.to_string_lossy().replace('\\', "/");
+        out.push_str(&format!("diff --git a/{0} b/{0}\n", p));
+        out.push_str("index 0000000..0000000 100644\n");
         out.push_str(&format!("--- a/{}\n", p));
         out.push_str(&format!("+++ b/{}\n", p));
         for h in hunks {
+            let old_count = h
+                .lines
+                .iter()
+                .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Removed(_)))
+                .count();
+            let new_count = h
+                .lines
+                .iter()
+                .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Added(_)))
+                .count();
             out.push_str(&format!(
                 "@@ -{},{} +{},{} @@\n",
-                h.old_start, h.old_count, h.new_start, h.new_count
+                h.old_start, old_count, h.new_start, new_count
             ));
             for line in &h.lines {
                 match line {
@@ -428,6 +446,101 @@ fn is_small_full_file_replacement(hunks: &[&DiffHunk], full_path: &Path) -> bool
         return false;
     };
     current.lines().count() <= MAX_DIRECT_REPLACE_LINES
+}
+
+fn apply_modified_hunks_direct(
+    workdir: &Path,
+    modified: &BTreeMap<PathBuf, Vec<&DiffHunk>>,
+) -> Result<()> {
+    for (path, hunks) in modified {
+        let full_path = workdir.join(path);
+        let original = std::fs::read_to_string(&full_path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let trailing_newline = original.ends_with('\n');
+        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+        let mut sorted = hunks.clone();
+        sorted.sort_by_key(|hunk| std::cmp::Reverse(hunk.old_start));
+
+        for hunk in sorted {
+            let start = hunk.old_start.saturating_sub(1) as usize;
+            let old_len = hunk_old_side_len(hunk);
+            if start + old_len > lines.len() {
+                anyhow::bail!(
+                    "{} hunk at old line {} spans past end of file",
+                    path.display(),
+                    hunk.old_start
+                );
+            }
+            let old_slice = &lines[start..start + old_len];
+            if !hunk_old_side_matches(old_slice, hunk) {
+                anyhow::bail!(
+                    "{} hunk at old line {} does not match worktree context",
+                    path.display(),
+                    hunk.old_start
+                );
+            }
+
+            let mut replacement = Vec::new();
+            let mut old_idx = 0usize;
+            for line in &hunk.lines {
+                match line {
+                    DiffLine::Context(_) => {
+                        replacement.push(old_slice[old_idx].clone());
+                        old_idx += 1;
+                    }
+                    DiffLine::Removed(_) => {
+                        old_idx += 1;
+                    }
+                    DiffLine::Added(s) => replacement.push(s.clone()),
+                }
+            }
+            lines.splice(start..start + old_len, replacement);
+        }
+
+        let mut out = lines.join("\n");
+        if trailing_newline {
+            out.push('\n');
+        }
+        std::fs::write(&full_path, out).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn hunk_old_side_len(hunk: &DiffHunk) -> usize {
+    hunk.lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Removed(_)))
+        .count()
+}
+
+fn hunk_old_side_matches(actual: &[String], hunk: &DiffHunk) -> bool {
+    let mut idx = 0usize;
+    for line in &hunk.lines {
+        let expected = match line {
+            DiffLine::Context(s) | DiffLine::Removed(s) => s,
+            DiffLine::Added(_) => continue,
+        };
+        let Some(actual_line) = actual.get(idx) else {
+            return false;
+        };
+        if !old_line_matches(actual_line, expected) {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
+
+fn old_line_matches(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let actual_trimmed = actual.trim_start();
+    let expected_trimmed = expected.trim_start();
+    actual_trimmed
+        .strip_prefix("export ")
+        .map(|rest| rest == expected_trimmed)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +642,92 @@ mod tests {
         assert_eq!(
             written.replace("\r\n", "\n"),
             "export function App() {\n  return <main>Chess</main>;\n}\n"
+        );
+    }
+
+    #[test]
+    fn apply_verified_hunks_applies_contextual_file_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _repo = init_repo_with_seed(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.js"),
+            "export function loadConfig(raw = {}, env = process.env) {\n  const provider = raw.provider || env.PROVIDER || \"openai\";\n  return provider.trim();\n}\n",
+        )
+        .unwrap();
+
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/config.js"),
+            old_start: 1,
+            old_count: 99,
+            new_start: 1,
+            new_count: 99,
+            lines: vec![
+                DiffLine::Context(
+                    "export function loadConfig(raw = {}, env = process.env) {".into(),
+                ),
+                DiffLine::Removed(
+                    "  const provider = raw.provider || env.PROVIDER || \"openai\";".into(),
+                ),
+                DiffLine::Added(
+                    "  const provider = raw.provider ?? env.PROVIDER ?? \"openai\";".into(),
+                ),
+                DiffLine::Added("  if (provider.trim() === \"\") {".into()),
+                DiffLine::Added("    throw new Error(\"provider is required\");".into()),
+                DiffLine::Added("  }".into()),
+                DiffLine::Context("  return provider.trim();".into()),
+                DiffLine::Context("}".into()),
+            ],
+        }];
+
+        applier.apply_verified_hunks(&hunks).unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join("src/config.js")).unwrap();
+        assert_eq!(
+            written.replace("\r\n", "\n"),
+            "export function loadConfig(raw = {}, env = process.env) {\n  const provider = raw.provider ?? env.PROVIDER ?? \"openai\";\n  if (provider.trim() === \"\") {\n    throw new Error(\"provider is required\");\n  }\n  return provider.trim();\n}\n"
+        );
+    }
+
+    #[test]
+    fn apply_verified_hunks_preserves_export_context_when_model_omits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _repo = init_repo_with_seed(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.js"),
+            "export function loadConfig(raw = {}, env = process.env) {\n  const maxRetries = Number(raw.maxRetries || env.MAX_RETRIES || 2);\n  return maxRetries;\n}\n",
+        )
+        .unwrap();
+
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/config.js"),
+            old_start: 1,
+            old_count: 4,
+            new_start: 1,
+            new_count: 7,
+            lines: vec![
+                DiffLine::Context("function loadConfig(raw = {}, env = process.env) {".into()),
+                DiffLine::Removed(
+                    "  const maxRetries = Number(raw.maxRetries || env.MAX_RETRIES || 2);".into(),
+                ),
+                DiffLine::Added(
+                    "  const maxRetriesRaw = raw.maxRetries ?? env.MAX_RETRIES ?? 2;".into(),
+                ),
+                DiffLine::Added("  const maxRetries = Number(maxRetriesRaw);".into()),
+                DiffLine::Context("  return maxRetries;".into()),
+                DiffLine::Context("}".into()),
+            ],
+        }];
+
+        applier.apply_verified_hunks(&hunks).unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join("src/config.js")).unwrap();
+        assert_eq!(
+            written.replace("\r\n", "\n"),
+            "export function loadConfig(raw = {}, env = process.env) {\n  const maxRetriesRaw = raw.maxRetries ?? env.MAX_RETRIES ?? 2;\n  const maxRetries = Number(maxRetriesRaw);\n  return maxRetries;\n}\n"
         );
     }
 }

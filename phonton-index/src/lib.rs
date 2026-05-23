@@ -2,6 +2,8 @@
 //! HNSW-based vector retrieval over extracted symbols.
 
 use anyhow::{Context, Result};
+#[cfg(feature = "semantic")]
+use async_trait::async_trait;
 use phonton_types::{CodeSlice, SliceOrigin};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -558,6 +560,147 @@ pub async fn query_relevant_slices(
     index.search(&query, k)
 }
 
+/// Common async retrieval interface used by workers regardless of backend.
+#[cfg(feature = "semantic")]
+#[async_trait]
+pub trait CodeRetriever: Send + Sync {
+    /// Stable backend label for diagnostics and plan evidence.
+    fn backend_name(&self) -> &str;
+
+    /// Return the top relevant code slices for `query`.
+    async fn query(&self, query: &str, k: usize) -> Result<Vec<CodeSlice>>;
+}
+
+/// Local HNSW retriever backed by fastembed + usearch.
+#[cfg(feature = "semantic")]
+pub struct LocalCodeRetriever {
+    embedder: Embedder,
+    index: SemanticIndex,
+}
+
+#[cfg(feature = "semantic")]
+impl LocalCodeRetriever {
+    /// Build a local retriever from caller-owned pieces.
+    pub fn new(embedder: Embedder, index: SemanticIndex) -> Self {
+        Self { embedder, index }
+    }
+}
+
+#[cfg(feature = "semantic")]
+#[async_trait]
+impl CodeRetriever for LocalCodeRetriever {
+    fn backend_name(&self) -> &str {
+        "local-hnsw"
+    }
+
+    async fn query(&self, query: &str, k: usize) -> Result<Vec<CodeSlice>> {
+        Ok(query_relevant_slices(&self.index, &self.embedder, query, k).await)
+    }
+}
+
+/// Qdrant HTTP backend configuration.
+#[cfg(feature = "semantic")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QdrantConfig {
+    /// Base URL with trailing slash removed.
+    pub base_url: String,
+    /// Collection containing Phonton code slices.
+    pub collection: String,
+}
+
+#[cfg(feature = "semantic")]
+impl QdrantConfig {
+    /// Create a config, normalizing the base URL for request construction.
+    pub fn new(base_url: impl Into<String>, collection: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            collection: collection.into(),
+        }
+    }
+}
+
+/// Qdrant-backed code retriever. Phonton owns embeddings; Qdrant stores vectors.
+#[cfg(feature = "semantic")]
+pub struct QdrantCodeRetriever {
+    cfg: QdrantConfig,
+    embedder: Embedder,
+    http: reqwest::Client,
+}
+
+#[cfg(feature = "semantic")]
+impl QdrantCodeRetriever {
+    /// Build a retriever for an existing Qdrant collection.
+    pub fn new(cfg: QdrantConfig, embedder: Embedder) -> Self {
+        Self {
+            cfg,
+            embedder,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn search_url(&self) -> String {
+        format!(
+            "{}/collections/{}/points/search",
+            self.cfg.base_url, self.cfg.collection
+        )
+    }
+}
+
+#[cfg(feature = "semantic")]
+#[async_trait]
+impl CodeRetriever for QdrantCodeRetriever {
+    fn backend_name(&self) -> &str {
+        "qdrant"
+    }
+
+    async fn query(&self, query: &str, k: usize) -> Result<Vec<CodeSlice>> {
+        let vector = self
+            .embedder
+            .embed(&[query])?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        query_qdrant_search(&self.http, self.search_url(), vector, k).await
+    }
+}
+
+#[cfg(feature = "semantic")]
+async fn query_qdrant_search(
+    http: &reqwest::Client,
+    search_url: String,
+    vector: Vec<f32>,
+    k: usize,
+) -> Result<Vec<CodeSlice>> {
+    let body = serde_json::json!({
+        "vector": vector,
+        "limit": k,
+        "with_payload": true
+    });
+    let value: serde_json::Value = http
+        .post(search_url)
+        .json(&body)
+        .send()
+        .await
+        .context("querying qdrant")?
+        .error_for_status()
+        .context("qdrant returned error status")?
+        .json()
+        .await
+        .context("parsing qdrant search response")?;
+
+    let mut out = Vec::new();
+    if let Some(rows) = value.get("result").and_then(|v| v.as_array()) {
+        for row in rows {
+            if let Some(payload) = row.get("payload") {
+                if let Ok(slice) = serde_json::from_value::<CodeSlice>(payload.clone()) {
+                    out.push(slice);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(any(feature = "semantic", test))]
 fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.exists() {
@@ -770,6 +913,73 @@ mod tests {
         assert_eq!(pairs[0].1, tmp.path().join("../sibling"));
         // Absolute path passes through unchanged.
         assert!(pairs[1].1.is_absolute());
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn qdrant_config_trims_url_and_keeps_collection() {
+        let cfg = QdrantConfig::new("http://127.0.0.1:6333/", "phonton-code");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:6333");
+        assert_eq!(cfg.collection, "phonton-code");
+    }
+
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn qdrant_search_posts_vector_and_decodes_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = synth("search_code", "pub fn search_code() {}");
+        let response_body = serde_json::json!({
+            "result": [
+                { "id": 1, "score": 0.99, "payload": expected }
+            ]
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if text.contains("\"with_payload\"") {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            assert!(text.contains("POST /collections/phonton-code/points/search HTTP/1.1"));
+            assert!(text.contains("\"limit\":2"));
+            assert!(text.contains("\"vector\""));
+            assert!(text.contains("\"with_payload\":true"));
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let slices = query_qdrant_search(
+            &reqwest::Client::new(),
+            format!("http://{addr}/collections/phonton-code/points/search"),
+            vec![0.1, 0.2],
+            2,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].symbol_name, "search_code");
     }
 
     #[test]

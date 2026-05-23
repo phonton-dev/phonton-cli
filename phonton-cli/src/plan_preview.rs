@@ -8,10 +8,12 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use phonton_planner::{decompose, decompose_with_memory, Goal};
-use phonton_types::{PlannerOutput, SubtaskId};
+use phonton_types::{
+    ConflictGroup, PlanGraph, PlannerOutput, SubtaskAssignment, SubtaskId, SwarmMode,
+};
 use serde::Serialize;
 
-use crate::open_persistent_store;
+use crate::{config, open_persistent_store};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanOptions {
@@ -42,6 +44,12 @@ struct PlanReport {
     memory_enabled: bool,
     memory_influence_count: usize,
     coverage_warnings: Vec<String>,
+    index_backend: String,
+    swarm_mode: SwarmMode,
+    swarm_reason: String,
+    assignments: Vec<SubtaskAssignment>,
+    conflict_groups: Vec<ConflictGroup>,
+    plan_graph: PlanGraph,
     subtasks: Vec<PlanSubtaskReport>,
     plan: PlannerOutput,
 }
@@ -107,7 +115,10 @@ pub async fn run(args: &[String]) -> Result<i32> {
 
     let plan = if request.options.use_memory {
         match open_persistent_store() {
-            Ok(store) => decompose_with_memory(&goal, &store, None).await?,
+            Ok(store) => {
+                let cfg = config::load().unwrap_or_default();
+                decompose_with_memory(&goal, &store, crate::load_ask_provider(&cfg)).await?
+            }
             Err(e) => {
                 eprintln!("phonton plan: memory unavailable ({e}); planning without memory");
                 decompose(&goal)
@@ -122,6 +133,14 @@ pub async fn run(args: &[String]) -> Result<i32> {
         memory_enabled: request.options.use_memory,
         memory_influence_count: memory_influence_count(&plan),
         coverage_warnings: coverage_warnings(&plan),
+        index_backend: config::load()
+            .map(|cfg| cfg.index.backend)
+            .unwrap_or_else(|_| "local-hnsw".into()),
+        swarm_mode: plan.plan_graph.swarm_mode,
+        swarm_reason: plan.plan_graph.swarm_reason.clone(),
+        assignments: plan.plan_graph.assignments.clone(),
+        conflict_groups: plan.plan_graph.conflict_groups.clone(),
+        plan_graph: plan.plan_graph.clone(),
         subtasks: subtask_reports(&plan),
         plan,
     };
@@ -154,6 +173,8 @@ fn print_text_report(report: &PlanReport) {
         "coverage: {} new functions, {} tests planned",
         report.plan.coverage_summary.new_functions, report.plan.coverage_summary.tests_planned
     );
+    println!("index: {}", report.index_backend);
+    println!("swarm: {:?} ({})", report.swarm_mode, report.swarm_reason);
     for warning in &report.coverage_warnings {
         println!("warning: {warning}");
     }

@@ -51,10 +51,10 @@ pub use phonton_sandbox::{ExecutionGuard, GuardDecision, ToolCall};
 pub mod dispatcher;
 
 /// Maximum verification attempts before escalating model tier.
-pub const MAX_ATTEMPTS: u8 = 2;
+pub const MAX_ATTEMPTS: u8 = 3;
 
 /// Stop before spending a third call on the same verifier signature.
-pub const SAME_DIAGNOSTIC_LIMIT: u8 = 2;
+pub const SAME_DIAGNOSTIC_LIMIT: u8 = 3;
 
 /// Maximum MCP tool calls a worker may make for one subtask.
 pub const MAX_MCP_CALLS_PER_SUBTASK: usize = 3;
@@ -96,10 +96,8 @@ pub struct Worker {
 /// Bundle of the embedder + prebuilt index used to surface relevant
 /// code slices in worker prompts.
 pub struct SemanticContext {
-    /// Embedding model shared across workers.
-    pub embedder: phonton_index::Embedder,
-    /// HNSW index of the current workspace.
-    pub index: phonton_index::SemanticIndex,
+    /// Pluggable code retriever shared across workers.
+    pub retriever: Arc<dyn phonton_index::CodeRetriever>,
 }
 
 impl Worker {
@@ -258,15 +256,11 @@ impl Worker {
 
         let relevant_slices: Vec<CodeSlice> = if prior_errors.is_empty() {
             match &self.semantic {
-                Some(ctx) => {
-                    phonton_index::query_relevant_slices(
-                        &ctx.index,
-                        &ctx.embedder,
-                        &subtask.description,
-                        5,
-                    )
+                Some(ctx) => ctx
+                    .retriever
+                    .query(&subtask.description, 5)
                     .await
-                }
+                    .unwrap_or_default(),
                 None => Vec::new(),
             }
         } else {
@@ -918,7 +912,8 @@ fn repair_guidance_for_errors(errors: &[String]) -> Vec<String> {
     vec![
         "Repair policy: the previous patch appears stale. Do not retry the same hunk. \
          For a small generated artifact, replace the whole file with one unified-diff hunk; \
-         otherwise use only exact current surrounding lines from the failing file."
+         otherwise use only exact current surrounding lines from the failing file, including \
+         unchanged blank lines prefixed with a single space."
             .into(),
     ]
 }
@@ -928,6 +923,7 @@ fn looks_like_stale_hunk_error(errors: &[String]) -> bool {
     joined.contains("removed-line mismatch")
         || joined.contains("could not reconstruct post-diff file")
         || joined.contains("hunk starts at old line")
+        || joined.contains("does not match worktree context")
         || joined.contains("git apply failed")
 }
 
@@ -1118,7 +1114,7 @@ fn build_surgical_repair_context(
             s.signature
         ));
     }
-    out.push_str("\n");
+    out.push('\n');
 
     // Include the exact errors causing verification failures
     if !prior_errors.is_empty() {

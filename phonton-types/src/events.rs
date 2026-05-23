@@ -141,6 +141,12 @@ pub enum OrchestratorEvent {
         tool_name: String,
         success: bool,
     },
+    /// MCP capability preview completed without invoking a tool.
+    McpCapabilitiesDiscovered {
+        server_id: ExtensionId,
+        tool_count: usize,
+        proposal_count: usize,
+    },
     /// A subtask hit terminal failure (retry + escalation budget exhausted).
     SubtaskFailed {
         subtask_id: SubtaskId,
@@ -251,6 +257,7 @@ impl EventRecord {
             OrchestratorEvent::McpToolApproved { .. } => "mcp-approved",
             OrchestratorEvent::McpToolDenied { .. } => "mcp-denied",
             OrchestratorEvent::McpToolCompleted { .. } => "mcp-completed",
+            OrchestratorEvent::McpCapabilitiesDiscovered { .. } => "mcp-capabilities",
             OrchestratorEvent::SubtaskCompleted { .. } => "subtask-done",
             OrchestratorEvent::SubtaskReviewReady { .. } => "review-ready",
             OrchestratorEvent::SubtaskFailed { .. } => "subtask-failed",
@@ -405,6 +412,15 @@ impl EventRecord {
                 success,
             } => {
                 format!("mcp tool completed {server_id}.{tool_name} success={success}")
+            }
+            OrchestratorEvent::McpCapabilitiesDiscovered {
+                server_id,
+                tool_count,
+                proposal_count,
+            } => {
+                format!(
+                    "mcp capabilities {server_id}: {tool_count} tools, {proposal_count} permission proposals"
+                )
             }
             OrchestratorEvent::SubtaskReviewReady {
                 subtask_id,

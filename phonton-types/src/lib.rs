@@ -16,8 +16,9 @@ pub mod providers;
 pub use events::{EventRecord, OrchestratorEvent, TOKEN_MILESTONE_INTERVAL};
 pub use extensions::{
     AppliesTo, ExtensionAction, ExtensionConflict, ExtensionId, ExtensionInfluence, ExtensionKind,
-    ExtensionManifest, ExtensionScope, ExtensionSource, McpServerDefinition, McpTransport,
-    Permission, ProfileDefinition, SkillDefinition, SteeringRule, SteeringSeverity, TrustLevel,
+    ExtensionManifest, ExtensionScope, ExtensionSource, McpCapabilitySnapshot,
+    McpPermissionProposal, McpServerDefinition, McpToolDescriptor, McpTransport, Permission,
+    ProfileDefinition, SkillDefinition, SteeringRule, SteeringSeverity, TrustLevel,
 };
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
@@ -115,13 +116,30 @@ pub enum ModelTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskClass {
     /// Generated docs, stubs, type aliases, trivial wiring.
+    #[serde(alias = "boilerplate")]
     Boilerplate,
     /// Unit/integration tests. Routine output, cheap models suffice.
+    #[serde(alias = "tests")]
     Tests,
     /// Documentation prose.
+    #[serde(alias = "docs")]
     Docs,
     /// Novel algorithmic or architectural work — the one tier that still
     /// justifies a frontier model.
+    #[serde(
+        alias = "core_logic",
+        alias = "core-logic",
+        alias = "refactor",
+        alias = "bugfix",
+        alias = "bug_fix",
+        alias = "feature",
+        alias = "implementation",
+        alias = "generated_app_game",
+        alias = "generated-app-game",
+        alias = "playable_program",
+        alias = "cli_feature",
+        alias = "ui_polish"
+    )]
     CoreLogic,
 }
 
@@ -148,9 +166,9 @@ impl fmt::Display for TaskClass {
 /// so the orchestrator can call it without pulling in the planner crate
 /// and its provider/memory dependencies.
 pub fn classify_task(description: &str) -> TaskClass {
-    let d = description.to_ascii_lowercase();
+    let d = task_description_without_prior_context(description).to_ascii_lowercase();
 
-    if d.contains("test") || d.contains("unit-test") || d.contains("integration test") {
+    if is_test_or_verification_task(&d) {
         return TaskClass::Tests;
     }
     if d.contains("docstring")
@@ -684,6 +702,9 @@ pub struct SubtaskResult {
 /// `01-architecture/failure-modes.md` Risk 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VerifyLayer {
+    /// Diff hunks can be located in the current worktree before any
+    /// syntax/build checks run.
+    PatchApply,
     /// Tree-sitter parse of the diff. Cheapest, runs first.
     Syntax,
     /// Layer 1.5 — diff is checked against `phonton-memory` decisions,
@@ -825,6 +846,148 @@ pub struct MemoryQuery {
     pub task_filter: Option<TaskId>,
 }
 
+/// Whether a plan is using Phonton's swarm planning layer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwarmMode {
+    /// Normal single-planner decomposition. The orchestrator may still run
+    /// independent DAG nodes concurrently.
+    #[default]
+    Disabled,
+    /// Broad-goal planner metadata is active and visible in the plan graph.
+    Enabled,
+}
+
+/// Role assigned to a subtask in the visible plan graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubtaskRole {
+    /// Planner/intake work that shapes the run.
+    Planner,
+    /// Code implementation worker.
+    #[default]
+    Implementer,
+    /// Verification or test worker.
+    Verifier,
+    /// Documentation/release-note worker.
+    Docs,
+    /// Review or handoff worker.
+    Reviewer,
+}
+
+/// Sidecar metadata for one planned subtask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtaskAssignment {
+    /// Subtask this assignment describes.
+    pub subtask_id: SubtaskId,
+    /// Role this subtask plays in the ADE loop.
+    pub role: SubtaskRole,
+    /// Expected files, directories, or logical scopes this subtask may touch.
+    #[serde(default)]
+    pub expected_touch_scope: Vec<PathBuf>,
+    /// Additional sidecar dependencies, beyond `Subtask::dependencies`.
+    #[serde(default)]
+    pub dependencies: Vec<SubtaskId>,
+    /// Conflict group id when multiple subtasks target overlapping scope.
+    #[serde(default)]
+    pub conflict_group: Option<String>,
+    /// Review-safe verification intent for this assignment.
+    #[serde(default)]
+    pub verification_intent: Vec<String>,
+}
+
+/// A group of subtasks expected to touch overlapping scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictGroup {
+    /// Stable group id, usually derived from the scope name.
+    pub id: String,
+    /// Subtasks serialized by this group, in planner order.
+    #[serde(default)]
+    pub subtask_ids: Vec<SubtaskId>,
+    /// Shared files/directories/logical scopes.
+    #[serde(default)]
+    pub touch_scope: Vec<PathBuf>,
+}
+
+/// Visible graph metadata around the executable subtask DAG.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanGraph {
+    /// Whether swarm planning is active for this plan.
+    pub swarm_mode: SwarmMode,
+    /// Human-readable reason the mode was selected or disabled.
+    pub swarm_reason: String,
+    /// One assignment per subtask.
+    #[serde(default)]
+    pub assignments: Vec<SubtaskAssignment>,
+    /// Scope-conflict groups the orchestrator must serialize.
+    #[serde(default)]
+    pub conflict_groups: Vec<ConflictGroup>,
+}
+
+impl PlanGraph {
+    /// Build a default graph sidecar from the current subtask descriptions.
+    pub fn from_subtasks(
+        subtasks: &[Subtask],
+        swarm_mode: SwarmMode,
+        swarm_reason: String,
+    ) -> Self {
+        let assignments: Vec<SubtaskAssignment> = subtasks
+            .iter()
+            .map(|subtask| SubtaskAssignment {
+                subtask_id: subtask.id,
+                role: role_for_description(&subtask.description),
+                expected_touch_scope: expected_touch_scope(&subtask.description),
+                dependencies: subtask.dependencies.clone(),
+                conflict_group: None,
+                verification_intent: verification_intent(&subtask.description),
+            })
+            .collect();
+
+        let mut graph = Self {
+            swarm_mode,
+            swarm_reason,
+            assignments,
+            conflict_groups: Vec::new(),
+        };
+        graph.rebuild_conflict_groups();
+        graph
+    }
+
+    /// Recompute conflict groups from assignment touch scopes.
+    pub fn rebuild_conflict_groups(&mut self) {
+        use std::collections::BTreeMap;
+
+        let mut by_scope: BTreeMap<String, Vec<SubtaskId>> = BTreeMap::new();
+        for assignment in &self.assignments {
+            for scope in &assignment.expected_touch_scope {
+                let key = scope.to_string_lossy().to_string();
+                by_scope.entry(key).or_default().push(assignment.subtask_id);
+            }
+        }
+
+        self.conflict_groups.clear();
+        for assignment in &mut self.assignments {
+            assignment.conflict_group = None;
+        }
+        for (scope, ids) in by_scope {
+            if ids.len() < 2 {
+                continue;
+            }
+            let group_id = format!("scope:{scope}");
+            for assignment in &mut self.assignments {
+                if ids.contains(&assignment.subtask_id) {
+                    assignment.conflict_group = Some(group_id.clone());
+                }
+            }
+            self.conflict_groups.push(ConflictGroup {
+                id: group_id,
+                subtask_ids: ids,
+                touch_scope: vec![PathBuf::from(scope)],
+            });
+        }
+    }
+}
+
 /// The full plan produced by `phonton-planner` for a single task.
 ///
 /// `subtasks` is topologically consistent: every `SubtaskId` referenced
@@ -846,6 +1009,108 @@ pub struct PlannerOutput {
     /// v0.4.0 first-slice definition of done for this goal.
     #[serde(default)]
     pub goal_contract: Option<GoalContract>,
+    /// Visible sidecar graph used for swarm planning, conflict isolation,
+    /// and review evidence.
+    #[serde(default)]
+    pub plan_graph: PlanGraph,
+}
+
+fn role_for_description(description: &str) -> SubtaskRole {
+    let d = task_description_without_prior_context(description).to_ascii_lowercase();
+    if is_test_or_verification_task(&d) {
+        SubtaskRole::Verifier
+    } else if d.contains("doc") || d.contains("readme") || d.contains("changelog") {
+        SubtaskRole::Docs
+    } else if d.contains("review") || d.contains("handoff") {
+        SubtaskRole::Reviewer
+    } else if d.contains("plan") {
+        SubtaskRole::Planner
+    } else {
+        SubtaskRole::Implementer
+    }
+}
+
+fn expected_touch_scope(description: &str) -> Vec<PathBuf> {
+    let d = task_description_without_prior_context(description).to_ascii_lowercase();
+    let mut scopes = Vec::new();
+    for (needle, scope) in [
+        ("config", "config"),
+        ("memory", "memory"),
+        ("mcp", "mcp"),
+        ("index", "index"),
+        ("vector", "index"),
+        ("qdrant", "index"),
+        ("planner", "planner"),
+        ("plan", "planner"),
+        ("orchestrator", "orchestrator"),
+        ("worker", "worker"),
+        ("verify", "verify"),
+        ("test", "tests"),
+        ("doc", "docs"),
+        ("readme", "docs"),
+        ("changelog", "docs"),
+    ] {
+        if d.contains(needle) {
+            let scope_path = PathBuf::from(scope);
+            if !scopes.iter().any(|p| p == &scope_path) {
+                scopes.push(scope_path);
+            }
+        }
+    }
+    scopes
+}
+
+fn verification_intent(description: &str) -> Vec<String> {
+    let role = role_for_description(description);
+    match role {
+        SubtaskRole::Docs => vec!["documentation review".into()],
+        SubtaskRole::Verifier => vec!["run relevant tests".into()],
+        _ => vec!["run configured Phonton verification layers".into()],
+    }
+}
+
+fn is_test_or_verification_task(description: &str) -> bool {
+    let d = description.trim_start();
+    let test_focused_prefix = [
+        "write test",
+        "write unit test",
+        "write integration test",
+        "add test",
+        "add unit test",
+        "add integration test",
+        "create test",
+        "create unit test",
+        "create integration test",
+        "run test",
+        "run the test",
+        "run existing test",
+        "run the existing test",
+        "verify test",
+        "verify the test",
+        "validate test",
+        "check test",
+        "test ",
+        "tests ",
+    ]
+    .iter()
+    .any(|prefix| d.starts_with(prefix));
+    test_focused_prefix
+        || d.starts_with("verify ")
+        || d.starts_with("validate ")
+        || d.starts_with("check ")
+        || d.contains("unit-test")
+}
+
+fn task_description_without_prior_context(description: &str) -> &str {
+    let trimmed = description.trim_start();
+    if !trimmed.starts_with("# Prior context") {
+        return description;
+    }
+    trimmed
+        .rsplit_once("\n\n")
+        .map(|(_, tail)| tail.trim())
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or(description)
 }
 
 /// Pre-execution coverage signal: how many new symbols the plan creates,
@@ -955,10 +1220,19 @@ pub struct ContextSource {
 }
 
 /// Manifest of what influenced the model during a task.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextManifest {
     /// Review-safe source list.
     pub sources: Vec<ContextSource>,
+    /// Plan graph that shaped worker dispatch, when available.
+    #[serde(default)]
+    pub plan_graph: Option<PlanGraph>,
+    /// Selected semantic index backend, when available.
+    #[serde(default)]
+    pub index_backend: Option<String>,
+    /// MCP capability snapshots that influenced the run.
+    #[serde(default)]
+    pub mcp_capabilities: Vec<McpCapabilitySnapshot>,
 }
 
 /// Record of one privileged action request.
@@ -1094,7 +1368,7 @@ pub struct HandoffPacket {
 }
 
 /// Durable evidence record for one task run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeLedger {
     /// Task id.
     pub task_id: TaskId,

@@ -51,6 +51,11 @@ pub async fn verify_diff_with_memory(
     working_dir: &Path,
     memory: Option<&MemoryStore>,
 ) -> Result<VerifyResult> {
+    if let Some(fail) = verify_patch_applies(hunks, working_dir) {
+        return Ok(fail);
+    }
+    let mut pass_layer = VerifyLayer::PatchApply;
+
     if let Some(fail) = verify_syntax(hunks) {
         return Ok(fail);
     }
@@ -75,13 +80,158 @@ pub async fn verify_diff_with_memory(
         return Ok(fail);
     }
 
-    if let Some(fail) = verify_browser_check(working_dir).await? {
-        return Ok(fail);
+    if let Some(node_result) = verify_node_test(working_dir).await? {
+        match node_result {
+            VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => return Ok(node_result),
+            VerifyResult::Pass { layer } => pass_layer = layer,
+        }
     }
 
-    Ok(VerifyResult::Pass {
-        layer: VerifyLayer::BrowserCheck,
-    })
+    if let Some(browser_result) = verify_browser_check(working_dir).await? {
+        match browser_result {
+            VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => {
+                return Ok(browser_result);
+            }
+            VerifyResult::Pass { layer } => pass_layer = layer,
+        }
+    }
+
+    Ok(VerifyResult::Pass { layer: pass_layer })
+}
+
+/// Layer 0: prove each modified-file hunk can be located in the current
+/// worktree before more expensive verification runs.
+pub fn verify_patch_applies(hunks: &[DiffHunk], working_dir: &Path) -> Option<VerifyResult> {
+    let mut errors = Vec::new();
+
+    for hunk in hunks {
+        let full_path = working_dir.join(&hunk.file_path);
+        if !full_path.exists() {
+            if hunk_old_side(hunk).is_empty() {
+                continue;
+            }
+            errors.push(format!(
+                "{} does not exist but hunk removes or matches existing lines",
+                hunk.file_path.display()
+            ));
+            continue;
+        }
+
+        let has_context = hunk
+            .lines
+            .iter()
+            .any(|line| matches!(line, DiffLine::Context(_)));
+        if !has_context && hunk.old_start <= 1 && has_added_and_removed(hunk) {
+            // Small full-file replacements are handled directly by the
+            // diff applier; they intentionally do not need exact old-side
+            // text because the model often summarizes the removed file.
+            continue;
+        }
+
+        let Ok(text) = std::fs::read_to_string(&full_path) else {
+            errors.push(format!("could not read {}", hunk.file_path.display()));
+            continue;
+        };
+        let file_lines: Vec<&str> = text.lines().collect();
+        let expected = hunk_old_side(hunk);
+        if expected.is_empty() {
+            continue;
+        }
+
+        let start = hunk.old_start.saturating_sub(1) as usize;
+        if start + expected.len() > file_lines.len() {
+            errors.push(format!(
+                "{} hunk at old line {} spans past end of file",
+                hunk.file_path.display(),
+                hunk.old_start
+            ));
+            continue;
+        }
+
+        let actual = &file_lines[start..start + expected.len()];
+        if actual
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| old_line_matches(actual, expected))
+        {
+            continue;
+        }
+
+        let mismatch_index = actual
+            .iter()
+            .zip(expected.iter())
+            .position(|(actual, expected)| !old_line_matches(actual, expected))
+            .unwrap_or(0);
+        errors.push(format!(
+            "{} hunk at old line {} does not match worktree context near line {}: expected `{}`, found `{}`",
+            hunk.file_path.display(),
+            hunk.old_start,
+            hunk.old_start as usize + mismatch_index,
+            truncate_for_diagnostic(expected[mismatch_index]),
+            truncate_for_diagnostic(actual[mismatch_index])
+        ));
+    }
+
+    if errors.is_empty() {
+        None
+    } else {
+        Some(VerifyResult::Fail {
+            layer: VerifyLayer::PatchApply,
+            errors,
+            attempt: 1,
+        })
+    }
+}
+
+/// Run `npm test` when the workspace is a Node package with an explicit
+/// test script.
+pub async fn verify_node_test(working_dir: &Path) -> Result<Option<VerifyResult>> {
+    let package_json = working_dir.join("package.json");
+    if !package_json_has_test_script(&package_json) {
+        return Ok(None);
+    }
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(600),
+        Command::new(npm_command())
+            .current_dir(working_dir)
+            .arg("test")
+            .output(),
+    )
+    .await;
+
+    match output {
+        Ok(Ok(out)) if out.status.success() => Ok(Some(VerifyResult::Pass {
+            layer: VerifyLayer::Test,
+        })),
+        Ok(Ok(out)) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok(Some(VerifyResult::Fail {
+                layer: VerifyLayer::Test,
+                errors: vec![last_lines(&combined, 30)],
+                attempt: 1,
+            }))
+        }
+        Ok(Err(e)) => Ok(Some(VerifyResult::Fail {
+            layer: VerifyLayer::Test,
+            errors: vec![format!("could not invoke npm test: {e}")],
+            attempt: 1,
+        })),
+        Err(_) => Ok(Some(VerifyResult::Fail {
+            layer: VerifyLayer::Test,
+            errors: vec!["npm test timed out after 600s".into()],
+            attempt: 1,
+        })),
+    }
+}
+
+fn npm_command() -> &'static str {
+    if cfg!(windows) {
+        "npm.cmd"
+    } else {
+        "npm"
+    }
 }
 
 /// Layer 1: tree-sitter parse of each hunk's post-diff view.
@@ -530,6 +680,65 @@ fn is_rust_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn hunk_old_side(hunk: &DiffHunk) -> Vec<&str> {
+    hunk.lines
+        .iter()
+        .filter_map(|line| match line {
+            DiffLine::Context(s) | DiffLine::Removed(s) => Some(s.as_str()),
+            DiffLine::Added(_) => None,
+        })
+        .collect()
+}
+
+fn has_added_and_removed(hunk: &DiffHunk) -> bool {
+    let has_added = hunk
+        .lines
+        .iter()
+        .any(|line| matches!(line, DiffLine::Added(_)));
+    let has_removed = hunk
+        .lines
+        .iter()
+        .any(|line| matches!(line, DiffLine::Removed(_)));
+    has_added && has_removed
+}
+
+fn package_json_has_test_script(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value
+        .get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .and_then(|script| script.as_str())
+        .map(|script| !script.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn old_line_matches(actual: &str, expected: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    let actual_trimmed = actual.trim_start();
+    let expected_trimmed = expected.trim_start();
+    actual_trimmed
+        .strip_prefix("export ")
+        .map(|rest| rest == expected_trimmed)
+        .unwrap_or(false)
+}
+
+fn truncate_for_diagnostic(text: &str) -> String {
+    const MAX: usize = 96;
+    if text.chars().count() <= MAX {
+        return text.into();
+    }
+    let mut out: String = text.chars().take(MAX).collect();
+    out.push_str("...");
+    out
+}
+
 fn reconstruct_new_side(hunk: &DiffHunk) -> String {
     let mut out = String::new();
     for line in &hunk.lines {
@@ -701,6 +910,146 @@ mod tests {
             }) => {}
             other => panic!("expected syntax fail, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn patch_apply_fails_when_context_does_not_match_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.js"),
+            "export function loadConfig() {\n  return {};\n}\n",
+        )
+        .unwrap();
+        let h = hunk(
+            "src/config.js",
+            vec![
+                DiffLine::Context("function loadSettings() {".into()),
+                DiffLine::Context("  return {};".into()),
+                DiffLine::Context("}".into()),
+            ],
+        );
+
+        match verify_patch_applies(&[h], tmp.path()) {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::PatchApply,
+                errors,
+                ..
+            }) => {
+                assert!(errors
+                    .join("\n")
+                    .contains("expected `function loadSettings"));
+            }
+            other => panic!("expected PatchApply failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn patch_apply_passes_when_context_matches_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.js"),
+            "export function loadConfig() {\n  return {};\n}\n",
+        )
+        .unwrap();
+        let h = hunk(
+            "src/config.js",
+            vec![
+                DiffLine::Context("export function loadConfig() {".into()),
+                DiffLine::Removed("  return {};".into()),
+                DiffLine::Added("  return { ok: true };".into()),
+                DiffLine::Context("}".into()),
+            ],
+        );
+
+        assert!(verify_patch_applies(&[h], tmp.path()).is_none());
+    }
+
+    #[test]
+    fn patch_apply_accepts_export_prefix_context_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.js"),
+            "export function loadConfig() {\n  return {};\n}\n",
+        )
+        .unwrap();
+        let h = hunk(
+            "src/config.js",
+            vec![
+                DiffLine::Context("function loadConfig() {".into()),
+                DiffLine::Removed("  return {};".into()),
+                DiffLine::Added("  return { ok: true };".into()),
+                DiffLine::Context("}".into()),
+            ],
+        );
+
+        assert!(verify_patch_applies(&[h], tmp.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn node_test_fails_plain_node_package_when_npm_test_fails() {
+        if std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        std::fs::write(
+            tmp.path().join("test").join("fail.test.js"),
+            "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('fails', () => assert.equal(1, 2));\n",
+        )
+        .unwrap();
+
+        match verify_node_test(tmp.path()).await.unwrap() {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::Test,
+                errors,
+                ..
+            }) => {
+                assert!(errors.join("\n").contains("fails"));
+            }
+            other => panic!("expected npm test failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_test_passes_plain_node_package_when_npm_test_passes() {
+        if std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        std::fs::write(
+            tmp.path().join("test").join("pass.test.js"),
+            "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('passes', () => assert.equal(1, 1));\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_node_test(tmp.path()).await.unwrap(),
+            Some(VerifyResult::Pass {
+                layer: VerifyLayer::Test
+            })
+        );
     }
 
     #[test]
@@ -915,5 +1264,23 @@ mod tests {
             }) => {}
             other => panic!("expected browser check pass, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn browser_check_skips_plain_node_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+
+        let res = super::verify_browser_check(dir).await.unwrap();
+
+        assert!(
+            res.is_none(),
+            "plain Node packages should use test/syntax layers, not browser checks"
+        );
     }
 }

@@ -14,6 +14,8 @@ tree-sitter-python = "0.21"
 regex = "1"
 anyhow    = { workspace = true }
 tokio     = { workspace = true }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 fastembed = { version = "4", optional = true }
 usearch   = { version = "2", optional = true }
 notify    = { version = "6", optional = true }

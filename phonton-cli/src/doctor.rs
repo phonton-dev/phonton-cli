@@ -126,6 +126,7 @@ pub async fn build_report(workspace: &Path, opts: DoctorOptions) -> DoctorReport
     );
     check_cargo_manifest(workspace, &mut checks);
     check_nexus(workspace, &mut checks);
+    check_index_backend(&mut checks).await;
     check_extensions(workspace, &mut checks);
 
     DoctorReport {
@@ -721,6 +722,90 @@ fn check_nexus(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
             "Nexus config is malformed",
             e.to_string(),
             Some("Fix nexus.json before relying on cross-repo context.".into()),
+        ),
+    }
+}
+
+async fn check_index_backend(checks: &mut Vec<DoctorCheck>) {
+    let Ok(cfg) = config::load() else {
+        return;
+    };
+    match cfg.index.backend.as_str() {
+        "local-hnsw" => push(
+            checks,
+            "index.backend",
+            Severity::Ok,
+            "Index backend",
+            "local-hnsw",
+            None,
+        ),
+        "qdrant" => {
+            let url = cfg
+                .index
+                .qdrant_url
+                .unwrap_or_else(|| "http://127.0.0.1:6333".into())
+                .trim_end_matches('/')
+                .to_string();
+            let collection = cfg
+                .index
+                .qdrant_collection
+                .unwrap_or_else(|| "phonton-code".into());
+            let endpoint = format!("{url}/collections/{collection}");
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    push(
+                        checks,
+                        "index.backend",
+                        Severity::Warn,
+                        "Index backend",
+                        format!("qdrant configured at {url}, collection {collection}; client init failed: {e}"),
+                        Some("Phonton will not start Qdrant. Start the configured service or switch to `local-hnsw`.".into()),
+                    );
+                    return;
+                }
+            };
+
+            match client.get(&endpoint).send().await {
+                Ok(response) if response.status().is_success() => push(
+                    checks,
+                    "index.backend",
+                    Severity::Ok,
+                    "Index backend",
+                    format!("qdrant reachable at {url}, collection {collection}"),
+                    Some("Phonton will use the external vector backend for code retrieval; memory records stay in SQLite.".into()),
+                ),
+                Ok(response) => push(
+                    checks,
+                    "index.backend",
+                    Severity::Warn,
+                    "Index backend",
+                    format!(
+                        "qdrant reached at {url}, but collection {collection} returned HTTP {}",
+                        response.status()
+                    ),
+                    Some("Create the collection or switch to `local-hnsw`. Phonton will not start a container.".into()),
+                ),
+                Err(e) => push(
+                    checks,
+                    "index.backend",
+                    Severity::Warn,
+                    "Index backend",
+                    format!("qdrant configured at {url}, collection {collection}; connectivity failed: {e}"),
+                    Some("Start the configured Qdrant service or switch to `local-hnsw`. Phonton will not start a container.".into()),
+                ),
+            }
+        }
+        other => push(
+            checks,
+            "index.backend",
+            Severity::Fail,
+            "Index backend is unknown",
+            other.to_string(),
+            Some("Use `local-hnsw` or `qdrant` in ~/.phonton/config.toml.".into()),
         ),
     }
 }

@@ -28,9 +28,9 @@ use phonton_types::{
     classify_task, effective_tier, BudgetDecision, BudgetLimits, ChangedFileSummary, Checkpoint,
     CostSummary, DiffHunk, DiffLine, DiffStats, EventRecord, GeneratedArtifact, GlobalState,
     GoalContract, HandoffPacket, InfluenceSummary, ModelPricing, ModelTier, OrchestratorEvent,
-    OrchestratorMessage, PlannerOutput, ProviderKind, ReviewAction, RollbackPoint, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer,
-    VerifyReport, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
+    OrchestratorMessage, PlanGraph, PlannerOutput, ProviderKind, ReviewAction, RollbackPoint,
+    Subtask, SubtaskId, SubtaskResult, SubtaskRole, SubtaskStatus, TaskId, TaskStatus, TokenUsage,
+    VerifyLayer, VerifyReport, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -301,6 +301,7 @@ pub struct Orchestrator<D: WorkerDispatcher + ?Sized> {
     diff_applier: Option<Arc<Mutex<phonton_diff::DiffApplier>>>,
     control_rx: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<OrchestratorMessage>>>>,
     working_dir: std::path::PathBuf,
+    index_backend: Option<String>,
     task_id: TaskId,
     goal_text: String,
     event_sink: Option<broadcast::Sender<EventRecord>>,
@@ -318,6 +319,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             diff_applier: None,
             control_rx: Arc::new(Mutex::new(None)),
             working_dir: std::path::PathBuf::from("."),
+            index_backend: None,
             task_id: TaskId::new(),
             goal_text: String::new(),
             event_sink: None,
@@ -345,6 +347,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
     /// `"."`. Typically set to the repo root or a scratch worktree path.
     pub fn with_working_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.working_dir = path.into();
+        self
+    }
+
+    /// Attach selected code-index backend evidence for state/handoff ledgers.
+    pub fn with_index_backend(mut self, backend: impl Into<String>) -> Self {
+        self.index_backend = Some(backend.into());
         self
     }
 
@@ -426,10 +434,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
     /// `state_tx` receives a fresh [`GlobalState`] on every transition.
     pub async fn run_task(
         &self,
-        plan: PlannerOutput,
+        mut plan: PlannerOutput,
         state_tx: watch::Sender<GlobalState>,
     ) -> Result<TaskStatus> {
         // 1. Build the DAG and the SubtaskId → NodeIndex lookup.
+        normalize_plan_dependencies(&mut plan);
         let (graph, mut runtimes) = build_graph(&plan)?;
 
         self.emit(OrchestratorEvent::TaskStarted {
@@ -479,6 +488,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 estimated_naive_tokens: self.estimated_naive_tokens,
                 checkpoints: &checkpoints,
                 goal_contract: plan.goal_contract.as_ref(),
+                plan_graph: Some(&plan.plan_graph),
+                index_backend: self.index_backend.as_deref(),
                 handoff_packet: None,
             },
         );
@@ -507,6 +518,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     estimated_naive_tokens: self.estimated_naive_tokens,
                     checkpoints: &checkpoints,
                     goal_contract: plan.goal_contract.as_ref(),
+                    plan_graph: Some(&plan.plan_graph),
+                    index_backend: self.index_backend.as_deref(),
                     handoff_packet: None,
                 },
             );
@@ -643,7 +656,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         let checkpoint = match diff.lock() {
                             Ok(mut d) => {
                                 if let Err(e) = d.apply_verified_hunks(&hunks) {
+                                    let reason = format!("apply verified diff failed: {e}");
                                     warn!(error = %e, subtask = %sid, "apply_verified_hunks failed");
+                                    fail_subtask(&mut runtimes, sid, reason.clone());
+                                    failure = Some((sid, reason));
+                                    checkpointed.insert(sid);
+                                    break;
                                 }
                                 match d.commit_checkpoint(self.task_id, sid, seq, &desc) {
                                     Ok(c) => Some(c),
@@ -807,6 +825,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 estimated_naive_tokens: self.estimated_naive_tokens,
                 checkpoints: &checkpoints,
                 goal_contract: plan.goal_contract.as_ref(),
+                plan_graph: Some(&plan.plan_graph),
+                index_backend: self.index_backend.as_deref(),
                 handoff_packet: Some(&handoff),
             },
         );
@@ -1511,6 +1531,7 @@ fn short_text(text: &str, max_chars: usize) -> String {
 
 fn verify_layer_name(layer: VerifyLayer) -> &'static str {
     match layer {
+        VerifyLayer::PatchApply => "patch apply",
         VerifyLayer::Syntax => "syntax",
         VerifyLayer::DecisionCheck => "decision check",
         VerifyLayer::CrateCheck => "crate check",
@@ -1648,6 +1669,176 @@ fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path
 // Graph construction
 // ---------------------------------------------------------------------------
 
+fn normalize_plan_dependencies(plan: &mut PlannerOutput) {
+    remove_observation_only_subtasks(plan);
+
+    let by_id: HashMap<SubtaskId, usize> = plan
+        .subtasks
+        .iter()
+        .enumerate()
+        .map(|(idx, subtask)| (subtask.id, idx))
+        .collect();
+    let role_by_id: HashMap<SubtaskId, SubtaskRole> = plan
+        .plan_graph
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.subtask_id, assignment.role))
+        .collect();
+    let producer_ids: Vec<SubtaskId> = plan
+        .subtasks
+        .iter()
+        .filter(|subtask| {
+            role_by_id
+                .get(&subtask.id)
+                .copied()
+                .map(is_producer_role)
+                .unwrap_or(true)
+        })
+        .map(|subtask| subtask.id)
+        .collect();
+    let verification_ids: HashSet<SubtaskId> = role_by_id
+        .iter()
+        .filter_map(|(id, role)| is_verification_role(*role).then_some(*id))
+        .collect();
+
+    for assignment in &plan.plan_graph.assignments {
+        let Some(&idx) = by_id.get(&assignment.subtask_id) else {
+            continue;
+        };
+        for dep in &assignment.dependencies {
+            if dep != &assignment.subtask_id && !plan.subtasks[idx].dependencies.contains(dep) {
+                plan.subtasks[idx].dependencies.push(*dep);
+            }
+        }
+    }
+
+    for group in &plan.plan_graph.conflict_groups {
+        for pair in group.subtask_ids.windows(2) {
+            let [left, right] = pair else {
+                continue;
+            };
+            let Some(&right_idx) = by_id.get(right) else {
+                continue;
+            };
+            if !by_id.contains_key(left) || plan.subtasks[right_idx].dependencies.contains(left) {
+                continue;
+            }
+            plan.subtasks[right_idx].dependencies.push(*left);
+        }
+    }
+
+    enforce_verification_dependency_order(plan, &role_by_id, &verification_ids, &producer_ids);
+
+    for subtask in &mut plan.subtasks {
+        subtask
+            .dependencies
+            .sort_by_key(|id| by_id.get(id).copied().unwrap_or(usize::MAX));
+        subtask.dependencies.dedup();
+    }
+
+    let deps_by_id: HashMap<SubtaskId, Vec<SubtaskId>> = plan
+        .subtasks
+        .iter()
+        .map(|subtask| (subtask.id, subtask.dependencies.clone()))
+        .collect();
+    for assignment in &mut plan.plan_graph.assignments {
+        if let Some(deps) = deps_by_id.get(&assignment.subtask_id) {
+            assignment.dependencies = deps.clone();
+        }
+    }
+}
+
+fn remove_observation_only_subtasks(plan: &mut PlannerOutput) {
+    let role_by_id: HashMap<SubtaskId, SubtaskRole> = plan
+        .plan_graph
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.subtask_id, assignment.role))
+        .collect();
+    let removable: HashSet<SubtaskId> = plan
+        .subtasks
+        .iter()
+        .filter(|subtask| {
+            let role = role_by_id
+                .get(&subtask.id)
+                .copied()
+                .unwrap_or(SubtaskRole::Implementer);
+            is_observation_only_subtask(role, &subtask.description)
+        })
+        .map(|subtask| subtask.id)
+        .collect();
+    if removable.is_empty() || removable.len() == plan.subtasks.len() {
+        return;
+    }
+
+    plan.subtasks
+        .retain(|subtask| !removable.contains(&subtask.id));
+    for subtask in &mut plan.subtasks {
+        subtask.dependencies.retain(|dep| !removable.contains(dep));
+    }
+}
+
+fn enforce_verification_dependency_order(
+    plan: &mut PlannerOutput,
+    role_by_id: &HashMap<SubtaskId, SubtaskRole>,
+    verification_ids: &HashSet<SubtaskId>,
+    producer_ids: &[SubtaskId],
+) {
+    for subtask in &mut plan.subtasks {
+        let role = role_by_id
+            .get(&subtask.id)
+            .copied()
+            .unwrap_or(SubtaskRole::Implementer);
+        if is_producer_role(role) {
+            subtask
+                .dependencies
+                .retain(|dep| !verification_ids.contains(dep));
+        } else if is_verification_role(role) {
+            for producer in producer_ids {
+                if producer != &subtask.id && !subtask.dependencies.contains(producer) {
+                    subtask.dependencies.push(*producer);
+                }
+            }
+        }
+    }
+}
+
+fn is_producer_role(role: SubtaskRole) -> bool {
+    matches!(role, SubtaskRole::Implementer | SubtaskRole::Docs)
+}
+
+fn is_verification_role(role: SubtaskRole) -> bool {
+    matches!(role, SubtaskRole::Verifier | SubtaskRole::Reviewer)
+}
+
+fn is_observation_only_subtask(role: SubtaskRole, description: &str) -> bool {
+    if !matches!(role, SubtaskRole::Verifier | SubtaskRole::Reviewer) {
+        return false;
+    }
+    let d = description.trim().to_ascii_lowercase();
+    let produces_tests_or_fixes = [
+        "write ",
+        "add ",
+        "create ",
+        "implement ",
+        "update ",
+        "fix ",
+        "repair ",
+    ]
+    .iter()
+    .any(|prefix| d.starts_with(prefix));
+    if produces_tests_or_fixes {
+        return false;
+    }
+    d.starts_with("run ")
+        || d.starts_with("verify ")
+        || d.starts_with("validate ")
+        || d.starts_with("check ")
+        || d.starts_with("review ")
+        || d.contains("run the existing test")
+        || d.contains("identify which tests fail")
+}
+
 /// Build the subtask DAG and runtime map from a planner output.
 ///
 /// Returns `Err` if a `dependencies` entry references an unknown subtask.
@@ -1709,6 +1900,8 @@ struct BroadcastExtras<'a> {
     estimated_naive_tokens: u64,
     checkpoints: &'a [Checkpoint],
     goal_contract: Option<&'a GoalContract>,
+    plan_graph: Option<&'a PlanGraph>,
+    index_backend: Option<&'a str>,
     handoff_packet: Option<&'a HandoffPacket>,
 }
 
@@ -1734,9 +1927,11 @@ fn broadcast(
 
     // send_replace never fails; if no receivers exist the update is still
     // recorded as the latest value, so a late-subscribing UI sees it.
-    let _ = tx.send(GlobalState {
+    let _ = tx.send_replace(GlobalState {
         task_status: task_status.clone(),
         goal_contract: extras.goal_contract.cloned(),
+        plan_graph: extras.plan_graph.cloned(),
+        index_backend: extras.index_backend.map(ToString::to_string),
         handoff_packet: extras.handoff_packet.cloned(),
         active_workers,
         tokens_used,
@@ -1855,6 +2050,8 @@ mod tests {
         let (tx, _rx) = watch::channel(GlobalState {
             task_status: TaskStatus::Queued,
             goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
             handoff_packet: None,
             active_workers: Vec::new(),
             tokens_used: 0,
@@ -1898,6 +2095,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -1921,10 +2119,13 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let (state_tx, state_rx) = watch::channel(GlobalState {
             task_status: TaskStatus::Queued,
             goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
             handoff_packet: None,
             active_workers: Vec::new(),
             tokens_used: 0,
@@ -1965,6 +2166,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -2026,6 +2228,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let dispatcher = Arc::new(BrokenDispatcher {
             calls: Mutex::new(Vec::new()),
@@ -2090,6 +2293,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let (events_tx, mut events_rx) = broadcast::channel(32);
         let tmp = temp_workspace();
@@ -2185,6 +2389,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let dispatcher = Arc::new(BarrierDispatcher {
             barrier: Arc::new(tokio::sync::Barrier::new(2)),
@@ -2200,6 +2405,135 @@ mod tests {
         assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
     }
 
+    #[test]
+    fn conflict_group_serializes_otherwise_independent_subtasks() {
+        let a = subtask("update config loader", vec![]);
+        let b = subtask("update config docs", vec![]);
+        let mut plan = PlannerOutput {
+            subtasks: vec![a.clone(), b.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+            plan_graph: phonton_types::PlanGraph {
+                swarm_mode: phonton_types::SwarmMode::Enabled,
+                swarm_reason: "test conflict group".into(),
+                assignments: vec![
+                    phonton_types::SubtaskAssignment {
+                        subtask_id: a.id,
+                        role: phonton_types::SubtaskRole::Implementer,
+                        expected_touch_scope: vec![PathBuf::from("config")],
+                        dependencies: Vec::new(),
+                        conflict_group: Some("scope:config".into()),
+                        verification_intent: vec!["cargo check".into()],
+                    },
+                    phonton_types::SubtaskAssignment {
+                        subtask_id: b.id,
+                        role: phonton_types::SubtaskRole::Docs,
+                        expected_touch_scope: vec![PathBuf::from("config")],
+                        dependencies: Vec::new(),
+                        conflict_group: Some("scope:config".into()),
+                        verification_intent: vec!["cargo check".into()],
+                    },
+                ],
+                conflict_groups: vec![phonton_types::ConflictGroup {
+                    id: "scope:config".into(),
+                    subtask_ids: vec![a.id, b.id],
+                    touch_scope: vec![PathBuf::from("config")],
+                }],
+            },
+        };
+
+        normalize_plan_dependencies(&mut plan);
+
+        assert_eq!(plan.subtasks[1].dependencies, vec![a.id]);
+    }
+
+    #[test]
+    fn observation_only_verifier_subtasks_are_not_executable_workers() {
+        let verify = subtask("Run the existing test suite", vec![]);
+        let implement = subtask("Fix the config loader", vec![verify.id]);
+        let mut plan = PlannerOutput {
+            subtasks: vec![verify.clone(), implement.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+            plan_graph: phonton_types::PlanGraph {
+                swarm_mode: phonton_types::SwarmMode::Enabled,
+                swarm_reason: "llm plan".into(),
+                assignments: vec![
+                    phonton_types::SubtaskAssignment {
+                        subtask_id: verify.id,
+                        role: phonton_types::SubtaskRole::Verifier,
+                        expected_touch_scope: vec![PathBuf::from("tests")],
+                        dependencies: Vec::new(),
+                        conflict_group: None,
+                        verification_intent: vec!["npm test".into()],
+                    },
+                    phonton_types::SubtaskAssignment {
+                        subtask_id: implement.id,
+                        role: phonton_types::SubtaskRole::Implementer,
+                        expected_touch_scope: vec![PathBuf::from("config")],
+                        dependencies: vec![verify.id],
+                        conflict_group: None,
+                        verification_intent: vec!["npm test".into()],
+                    },
+                ],
+                conflict_groups: Vec::new(),
+            },
+        };
+
+        normalize_plan_dependencies(&mut plan);
+
+        assert_eq!(plan.subtasks.len(), 1);
+        assert_eq!(plan.subtasks[0].id, implement.id);
+        assert!(plan.subtasks[0].dependencies.is_empty());
+        assert_eq!(plan.plan_graph.assignments.len(), 2);
+    }
+
+    #[test]
+    fn test_writing_subtasks_remain_executable_workers() {
+        let implement = subtask("Implement parser", vec![]);
+        let tests = subtask("Write integration tests for parser", vec![implement.id]);
+        let mut plan = PlannerOutput {
+            subtasks: vec![implement.clone(), tests.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+            plan_graph: phonton_types::PlanGraph {
+                swarm_mode: phonton_types::SwarmMode::Enabled,
+                swarm_reason: "test-writing plan".into(),
+                assignments: vec![
+                    phonton_types::SubtaskAssignment {
+                        subtask_id: implement.id,
+                        role: phonton_types::SubtaskRole::Implementer,
+                        expected_touch_scope: vec![PathBuf::from("parser")],
+                        dependencies: Vec::new(),
+                        conflict_group: None,
+                        verification_intent: vec!["cargo check".into()],
+                    },
+                    phonton_types::SubtaskAssignment {
+                        subtask_id: tests.id,
+                        role: phonton_types::SubtaskRole::Verifier,
+                        expected_touch_scope: vec![PathBuf::from("tests")],
+                        dependencies: vec![implement.id],
+                        conflict_group: None,
+                        verification_intent: vec!["cargo test".into()],
+                    },
+                ],
+                conflict_groups: Vec::new(),
+            },
+        };
+
+        normalize_plan_dependencies(&mut plan);
+
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[1].id, tests.id);
+        assert_eq!(plan.subtasks[1].dependencies, vec![implement.id]);
+    }
+
     #[tokio::test]
     async fn budget_guard_pauses_when_token_ceiling_crossed() {
         let a = subtask("first", vec![]);
@@ -2210,6 +2544,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         // TrivialDispatcher reports 100 tokens per call; ceiling at 50
         // must trip after the first completion.
@@ -2250,6 +2585,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -2311,6 +2647,7 @@ mod tests {
             naive_baseline_tokens: 0,
             coverage_summary: CoverageSummary::default(),
             goal_contract: None,
+            plan_graph: Default::default(),
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();

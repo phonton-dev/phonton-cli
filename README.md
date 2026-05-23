@@ -2,119 +2,112 @@
   <img src="assets/readme/phonton-cli-logo.png" width="112" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI · v0.17.1</h1>
+<h1 align="center">Phonton CLI - v0.19.0</h1>
 
 <p align="center">
-  <strong>Verified code changes with local repo memory.</strong><br>
-  A local-first agentic development environment (ADE) for developers who want autonomous code changes without giving up review control.
+  <strong>Local-first agentic development with visible plans, verified diffs, and inspectable memory.</strong><br>
+  Phonton is an agentic development environment (ADE) built around the loop: goal -> plan -> edit -> verify -> review -> remember.
 </p>
 
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.17.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.19.0-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
 ---
 
-Phonton plans the work, routes it through local repo context, verifies changes before handoff, and keeps the result reviewable. The goal is not to be the loudest coding agent. The goal is to make AI-assisted development reliable and transparent.
+Phonton plans work before broad edits, routes workers through bounded repo context, verifies changed files before review, and records typed handoff evidence. The v0.19.0 release is an alpha slice of the next architecture: typed swarm planning, selectable code-index backends, and preview-only MCP capability negotiation.
 
 <p align="center">
   <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI hero with terminal UI preview">
 </p>
 
-## ⚡ Quick Install
+## Quick Install
 
-The easiest install path is npm. This downloads a prebuilt GitHub Release binary during installation.
+The easiest install path is npm. The package downloads a prebuilt GitHub Release binary during installation.
 
 ```bash
-# Install globally via npm
 npm install -g phonton-cli
-
-# Or run directly without installing
 npx phonton-cli
 ```
 
-### Alternative Installation Methods
+Alternative installers:
 
-**macOS / Linux Shell Installer:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.sh | sh
 ```
 
-**Windows PowerShell Installer:**
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.ps1)))
 ```
 
-**Direct Cargo Install (Builds from Source):**
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.17.1 phonton-cli --locked --force
+cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.19.0 phonton-cli --locked --force
 ```
 
-Verify your installation:
+Verify the install:
+
 ```bash
 phonton version
 phonton doctor
 ```
 
----
-
-## 💡 Why Phonton
-
-Most coding agents start with chat. Phonton starts with the engineering loop:
+## ADE Loop
 
 ```mermaid
 flowchart LR
     A["Goal"] --> B["Plan preview"]
-    B --> C["Repo-aware worker"]
+    B --> C["Diff-only workers"]
     C --> D["Verification gate"]
-    D --> E["Reviewable diff"]
+    D --> E["Reviewable handoff"]
     E --> F["Memory and history"]
     F --> B
 ```
 
-This structural architecture gives Phonton a distinct advantage for serious code editing:
+Phonton is designed for context efficiency and auditability. Public token, cost, or benchmark claims should be backed by reproducible fixture repos, exact prompts, raw logs, provider usage, final diffs, verification logs, and handoff evidence.
 
-- **Review First:** Diffs are first-class, fully interactive terminal surfaces, not buried in a chat stream.
-- **Verification First:** Diffs are validated via Tree-sitter syntax checks and test suites before presentation.
-- **Local First:** Settings, session store, local history, and vector memory live entirely on your machine.
-- **AST Quality Gates:** In-process tree-sitter validators catch parsing issues across Rust, Python, TypeScript, and more in **under 50ms**.
-- **BYOK (Bring Your Own Key):** Connect directly to Anthropic, OpenAI, DeepSeek, Gemini, xAI, or local Ollama with zero server proxying.
+## What's New in v0.19.0
 
----
+- Typed swarm plan metadata: `PlannerOutput` includes a `PlanGraph` sidecar with subtask role, expected touch scope, dependencies, conflict group, and verification intent.
+- Broad-goal swarm activation: broad goals can use the configured provider-backed decomposer; when no provider is available, the plan preview records a deterministic fallback reason.
+- Conflict-aware worker scheduling: overlapping file scopes are serialized by dependency insertion, while isolated subtasks still run through the existing concurrent executor.
+- Code index backends: `phonton-index` now exposes a `CodeRetriever` abstraction with default `local-hnsw` retrieval and optional Qdrant HTTP retrieval for larger codebases.
+- MCP capability preview: `phonton mcp capabilities <server-id> [--json] [--yes]` captures initialize metadata, tool descriptors, and proposed permission rules without calling tools or writing config.
+- Evidence plumbing: plan preview JSON, flight-log events, context manifests, outcome ledgers, and doctor output now surface swarm, index, and MCP capability evidence where available.
 
-## 🏆 Benchmark Results
+## Core Commands
 
-Phonton prioritizes surgical context retrieval over massive, expensive whole-repo context dumps. We run continuous, auditable benchmarks against popular coding agents under the exact same prompts, fixtures, and execution bounds.
+```bash
+phonton
+phonton goal "<engineering goal>" --yes
+phonton plan --json "<engineering goal>"
+phonton ask "<workspace question>"
+phonton diff --stat
+phonton doctor --provider
+phonton review latest
+phonton run latest
+```
 
-### 1. Headline Benchmarking Comparison
+Extension and MCP inspection commands are read-only unless a tool call is explicitly approved:
 
-| Suite | Tool | Status | Elapsed Time | Input Tokens | Output Tokens | Cached Tokens | Total Tokens | Changed Paths |
-|---|---|---|---|---|---|---|---|---:|
-| **`02-bugfix`** | **Phonton v0.17.1** | **verified_success** | **38.6s** | **2,006** | **730** | **1,280** | **2,736** | **1** |
-| | Claude Code | completed | 58.0s | 212 | 3,261 | 163,137 | 203,018 | 1 |
-| | DeepSeek-TUI | completed | 88.2s | 28,490 | 1,210 | 22,400 | 52,100 | 1 |
-| | Gemini CLI | completed | 199.8s | 95,008 | 1,948 | 113,770 | 214,287 | 1 |
-| | Codex CLI | completed | 218.9s | 379,331 | 5,515 | 346,624 | 384,846 | 2 |
-| **`03-refactor`** | **Phonton v0.17.1** | **verified_success** | **50.6s** | **5,164** | **5,034** | **768** | **10,198** | **2** |
-| | Gemini CLI | completed | 118.4s | 76,079 | 5,092 | 453,239 | 536,583 | 2 |
-| | DeepSeek-TUI | completed | 112.5s | 42,300 | 4,890 | 55,600 | 102,790 | 2 |
-| | Claude Code | completed | 156.7s | 2,821 | 11,781 | 176,187 | 224,947 | 2 |
-| | Codex CLI | completed | 229.0s | 451,983 | 8,479 | 412,416 | 460,462 | 2 |
+```bash
+phonton extensions list
+phonton extensions doctor
+phonton extensions skills
+phonton extensions steering
+phonton extensions mcp
+phonton extensions profiles
+phonton mcp list
+phonton mcp capabilities <server-id> --yes
+phonton mcp tools <server-id> --yes
+phonton mcp call <server-id> <tool-name> '{"arg":"value"}' --yes
+```
 
-### 2. Core Takeaways
-* **98%+ Token Savings:** Swapping generic directory dumps for high-speed local semantic memories gives Phonton a massive token-usage saving.
-* **Microsecond Context Retrieval:** The concurrent HNSW vector index searches 1,000 architectural concepts in just **158.697µs**, yielding highly targeted model prompts.
-* **Grammar Quality Guard:** Preflight checks compile and verify AST structures locally before touching the git tree, guaranteeing syntax safety.
+## Configuration
 
----
-
-## ⚙️ Quick Start & Setup
-
-### 1. Configure a Provider
-Phonton looks for credentials inside `~/.phonton/config.toml`. Create it with a minimal configuration:
+Create `~/.phonton/config.toml`:
 
 ```toml
 [provider]
@@ -124,82 +117,47 @@ model = "deepseek-v4-flash"
 [provider.keys]
 deepseek = "sk-deepseek-api-key-here"
 anthropic = "sk-ant-api-key-here"
+
+[index]
+backend = "local-hnsw"
 ```
 
-### 2. Auto-Import Credentials
-Alternatively, automatically import API keys from standard environments:
-```bash
-export DEEPSEEK_API_KEY="sk-..."
-phonton providers import-opencode
+Optional Qdrant backend:
+
+```toml
+[index]
+backend = "qdrant"
+qdrant_url = "http://127.0.0.1:6333"
+qdrant_collection = "phonton-code"
 ```
 
-### 3. Verify Configuration
-Ensure everything is set up correctly:
-```bash
-phonton doctor --provider
-```
+Phonton does not start or manage Qdrant containers. SQLite keyword memory remains the authoritative decision memory store; Qdrant is only used for code and symbol retrieval.
 
-### 4. Run the Trust-Loop Demo
-Explore Phonton's evidence trail (GoalContract, AST checking, verification gates) locally without sending remote model calls:
-```bash
-phonton demo trust-loop
-```
+## Crate Map
 
----
+- `phonton-cli`: Ratatui terminal UI, headless commands, doctor, plan preview, and release surfaces.
+- `phonton-planner`: goal decomposition, memory-aware planning, and typed swarm plan metadata.
+- `phonton-orchestrator`: task DAG execution, conflict-aware dependency normalization, verification, retries, and handoff.
+- `phonton-worker`: diff-only worker call loops and context selection.
+- `phonton-index`: local HNSW retrieval and optional Qdrant code retrieval.
+- `phonton-mcp`: MCP manifest loading, approval-gated tool calls, and capability preview.
+- `phonton-memory`: local SQLite memory for conventions, constraints, and decisions.
+- `phonton-verify`: syntax, build, test, and browser/runtime verification gates.
 
-## 🛠️ CLI Command Reference
+## Release Channels
 
-Execute commands directly from your shell or use the interactive Ratatui TUI dashboard.
-
-* **`phonton`**: Starts the interactive Ratatui terminal UI dashboard for managing tasks, reviewing plans, and executing rollbacks.
-* **`phonton goal "<prompt>"`**: Submit a long-running, multi-step engineering goal in headless mode. Supports `--prompt-file <path>` and `--yes` for automated scripts.
-* **`phonton ask "<question>"`**: Ask a workspace-aware, semantic question. Mentions (e.g. `@src/lib.rs`) are automatically gathered into context.
-* **`phonton diff`**: Export verified unified diffs from completed subtasks in the task store. Supports `--stat` and `--name-only`.
-* **`phonton doctor`**: Run diagnostics on tool installations (git, cargo, npm) and provider key routing.
-* **`phonton extensions`**: Manage extension packs. Install MCP servers, custom profiles, or steering guides.
-  * Install an MCP recipe: `phonton extensions install github`
-
-### 🎹 Interactive TUI Keyboard Shortcuts
-
-| Shortcut | Description |
-|---|---|
-| **`Ctrl+C` / `Esc`** | Safe session quit (with resume receipt) |
-| **`Alt+F`** | Cycle focus panels (Receipt, Code, Problems, Commands, Log) |
-| **`Ctrl+↑` / `Ctrl+↓`** | Navigate checkpoints / time-travel rollback list |
-| **`r`** | Perform point-in-time rollback to the selected checkpoint |
-| **`Tab`** | Open autocomplete suggestions / command drawer |
-
----
-
-## 🏗️ Crate Architecture
-
-Phonton is structured as a modular workspace designed for local-first reliability:
-
-* **`phonton-cli`**: RATATUI-powered terminal dashboard.
-* **`phonton-planner`**: Decomposes user goals into structured subtask DAGs.
-* **`phonton-orchestrator`**: Execution engine, budget tracker, and parallel worker manager.
-* **`phonton-verify`**: Compilation, Tree-sitter syntax, memory checklist, and test gates.
-* **`phonton-worker`**: Patch-generation call loops and LLM tool execution policy.
-* **`phonton-index`**: HNSW-backed high-speed vector index for local code semantics.
-* **`phonton-memory`**: Local SQLite database storing conventions, constraints, and decisions.
-
----
-
-## 🏁 Release Channels
-
-| Channel | Install Command | Use Case |
+| Channel | Install command | Use case |
 |---|---|---|
-| **Stable** | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.17.1 phonton-cli --locked --force` | Best validated release |
-| **Dev** | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | Upcoming release features |
-| **Nightly** | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | Daily automated snapshots |
+| Stable | `cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.19.0 phonton-cli --locked --force` | Current validated release |
+| Dev | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch dev phonton-cli --locked --force` | Upcoming release features |
+| Nightly | `cargo install --git https://github.com/phonton-dev/phonton-cli --branch nightly phonton-cli --locked --force` | Daily automated snapshots |
 
----
-
-## 📄 License
+## License
 
 Licensed under either of:
-* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-* MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
 

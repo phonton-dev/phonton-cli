@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2312,6 +2312,7 @@ dependencies = [
  "phonton-verify",
  "phonton-worker",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2360,10 +2361,12 @@ name = "phonton-index"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "fastembed",
  "notify",
  "phonton-types",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2476,6 +2479,7 @@ name = "phonton-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]

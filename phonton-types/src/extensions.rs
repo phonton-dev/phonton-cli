@@ -344,6 +344,61 @@ pub struct McpServerDefinition {
     pub enabled: bool,
 }
 
+/// One tool exposed by one MCP server after runtime capability discovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpToolDescriptor {
+    /// Owning server id.
+    pub server_id: ExtensionId,
+    /// Programmatic tool name.
+    pub name: String,
+    /// Optional human-friendly title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Optional server-provided description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// JSON schema for arguments.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+}
+
+/// Preview-only permission proposal inferred during MCP capability discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPermissionProposal {
+    /// Permission involved.
+    pub permission: Permission,
+    /// Why this permission appears necessary or declared.
+    pub reason: String,
+    /// Source of the proposal, e.g. `manifest` or `trust-level`.
+    pub source: String,
+    /// Always false in v0.19.0. Proposals are never silently written.
+    pub auto_apply: bool,
+}
+
+/// Capability snapshot captured after MCP initialize/tools negotiation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpCapabilitySnapshot {
+    /// Server id.
+    pub server_id: ExtensionId,
+    /// Negotiated protocol version.
+    pub protocol_version: String,
+    /// Server-reported name when available.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Server-reported version when available.
+    #[serde(default)]
+    pub server_version: Option<String>,
+    /// Raw capabilities object returned by initialize.
+    #[serde(default)]
+    pub capabilities: serde_json::Value,
+    /// Tool descriptors returned by tools/list.
+    #[serde(default)]
+    pub tools: Vec<McpToolDescriptor>,
+    /// Preview-only sandbox permission proposals.
+    #[serde(default)]
+    pub permission_proposals: Vec<McpPermissionProposal>,
+}
+
 /// Activation bundle for extension records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileDefinition {

@@ -23,6 +23,7 @@
 //! key is never logged and never sent to any endpoint other than the
 //! configured provider.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -34,7 +35,6 @@ use serde::Deserialize;
 
 /// Top-level configuration loaded from `~/.phonton/config.toml`.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Provider selection and credentials.
     #[serde(default)]
@@ -43,11 +43,19 @@ pub struct Config {
     /// Spending / token limits.
     #[serde(default)]
     pub budget: BudgetConfig,
+
+    /// Semantic code-index backend selection.
+    #[serde(default)]
+    pub index: IndexConfig,
+
+    /// Runtime permission defaults. Kept tolerant so existing configs do not
+    /// fail to load when new permission modes are introduced.
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
 }
 
 /// `[provider]` table.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct ProviderConfig {
     /// Provider name, e.g. `"anthropic"`, `"openai"`, `"gemini"`,
@@ -72,6 +80,14 @@ pub struct ProviderConfig {
     /// `https://api.cloudflare.com/client/v4/accounts/<id>/ai/v1` base URL.
     /// A bare account ID is still accepted here for backward compatibility.
     pub base_url: Option<String>,
+
+    /// Named provider keys imported from other tools or managed manually.
+    #[serde(default)]
+    pub keys: BTreeMap<String, String>,
+
+    /// Backward-compatible opt-in used by older config files. Current
+    /// provider routing keeps unknown model handling in the provider layer.
+    pub allow_unverified_model: Option<bool>,
 }
 
 impl Default for ProviderConfig {
@@ -82,6 +98,8 @@ impl Default for ProviderConfig {
             model: None,
             account_id: None,
             base_url: None,
+            keys: BTreeMap::new(),
+            allow_unverified_model: None,
         }
     }
 }
@@ -92,7 +110,6 @@ fn default_provider_name() -> String {
 
 /// `[budget]` table.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
-#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct BudgetConfig {
     /// Hard stop at this many tokens per session (`None` = unlimited).
@@ -101,6 +118,41 @@ pub struct BudgetConfig {
     /// Hard stop at this many US cents per session (`None` = unlimited).
     /// Stored as cents so the TOML value is human-readable.
     pub max_usd_cents: Option<u64>,
+}
+
+/// `[index]` table.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[allow(dead_code)]
+pub struct IndexConfig {
+    /// `local-hnsw` or `qdrant`.
+    #[serde(default = "default_index_backend")]
+    pub backend: String,
+    /// Optional Qdrant base URL, e.g. `http://127.0.0.1:6333`.
+    pub qdrant_url: Option<String>,
+    /// Optional Qdrant collection name.
+    pub qdrant_collection: Option<String>,
+}
+
+/// `[permissions]` table.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
+#[allow(dead_code)]
+pub struct PermissionsConfig {
+    /// Default approval mode, e.g. `ask`.
+    pub mode: Option<String>,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_index_backend(),
+            qdrant_url: None,
+            qdrant_collection: None,
+        }
+    }
+}
+
+fn default_index_backend() -> String {
+    "local-hnsw".to_string()
 }
 
 #[allow(dead_code)]
@@ -165,6 +217,9 @@ pub fn save(cfg: &Config) -> Result<()> {
 /// Priority: config file `api_key` → environment variable.
 pub fn resolve_api_key(cfg: &ProviderConfig) -> Option<String> {
     if let Some(ref key) = cfg.api_key {
+        return Some(key.clone());
+    }
+    if let Some(key) = cfg.keys.get(&cfg.name) {
         return Some(key.clone());
     }
     // Each provider gets its own canonical env var so users with multiple
@@ -252,6 +307,56 @@ max_usd_cents = 50
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.provider.name, "gemini");
         assert!(cfg.budget.max_tokens.is_none());
+        assert_eq!(cfg.index.backend, "local-hnsw");
+    }
+
+    #[test]
+    fn parses_qdrant_index_config() {
+        let raw = r#"
+[index]
+backend = "qdrant"
+qdrant_url = "http://127.0.0.1:6333"
+qdrant_collection = "phonton-code"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.index.backend, "qdrant");
+        assert_eq!(
+            cfg.index.qdrant_url.as_deref(),
+            Some("http://127.0.0.1:6333")
+        );
+        assert_eq!(cfg.index.qdrant_collection.as_deref(), Some("phonton-code"));
+    }
+
+    #[test]
+    fn parses_existing_config_with_provider_keys_and_permissions() {
+        let raw = r#"
+[provider]
+name = "deepseek"
+model = "deepseek-v4-flash"
+allow_unverified_model = true
+
+[provider.keys]
+deepseek = "key-from-map"
+
+[permissions]
+mode = "ask"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.provider.name, "deepseek");
+        assert_eq!(
+            cfg.provider.allow_unverified_model,
+            Some(true),
+            "legacy config fields should remain parseable"
+        );
+        assert_eq!(
+            cfg.provider.keys.get("deepseek").map(String::as_str),
+            Some("key-from-map")
+        );
+        assert_eq!(cfg.permissions.mode.as_deref(), Some("ask"));
+        assert_eq!(
+            resolve_api_key(&cfg.provider).as_deref(),
+            Some("key-from-map")
+        );
     }
 
     #[test]
@@ -268,6 +373,8 @@ max_usd_cents = 50
             model: None,
             account_id: None,
             base_url: None,
+            keys: BTreeMap::new(),
+            allow_unverified_model: None,
         };
         // No env var set in test — should return None.
         // (In production the real key is present.)
@@ -282,6 +389,8 @@ max_usd_cents = 50
             model: None,
             account_id: None,
             base_url: None,
+            keys: BTreeMap::new(),
+            allow_unverified_model: None,
         };
         assert_eq!(resolve_api_key(&cfg).as_deref(), Some("from-config"));
     }
