@@ -357,3 +357,39 @@ pub enum ProviderError {
     #[error("provider transport error: {0}")]
     Transport(String),
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PricingEntry {
+    pub input_cost_per_million: f64,      // e.g., 3.00 for Frontier
+    pub output_cost_per_million: f64,     // e.g., 15.00 for Frontier
+    pub cache_read_cost_per_million: f64, // e.g., 0.30 for prompt cache hits
+}
+
+impl PricingEntry {
+    pub fn new(input: f64, output: f64, cache_read: f64) -> Self {
+        Self {
+            input_cost_per_million: input,
+            output_cost_per_million: output,
+            cache_read_cost_per_million: cache_read,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelPricingRegistry {
+    pub frontier: PricingEntry,
+    pub standard: PricingEntry,
+    pub cheap: PricingEntry,
+    pub local: PricingEntry,
+}
+
+impl Default for ModelPricingRegistry {
+    fn default() -> Self {
+        Self {
+            frontier: PricingEntry::new(3.00, 15.00, 0.30),
+            standard: PricingEntry::new(1.50, 6.00, 0.15),
+            cheap: PricingEntry::new(0.075, 0.30, 0.0075),
+            local: PricingEntry::new(0.0, 0.0, 0.0),
+        }
+    }
+}

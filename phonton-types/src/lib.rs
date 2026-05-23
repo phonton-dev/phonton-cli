@@ -23,7 +23,7 @@ pub use extensions::{
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
     BudgetDecision, BudgetLimits, CostSummary, LLMResponse, ModelMetricsSnapshot, ModelPricing,
-    ProviderConfig, ProviderError, ProviderKind, TokenUsage,
+    ModelPricingRegistry, PricingEntry, ProviderConfig, ProviderError, ProviderKind, TokenUsage,
 };
 
 // ---------------------------------------------------------------------------

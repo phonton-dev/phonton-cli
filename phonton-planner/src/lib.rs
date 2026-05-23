@@ -1143,17 +1143,35 @@ fn estimate_acceptance_slice_tokens(slice_count: usize) -> u64 {
 /// Crude naive baseline estimate. Assumes a stateless agent would load
 /// the entire relevant file set for every turn.
 fn estimate_naive_tokens(detections: &[Detection], goal: &Goal) -> u64 {
-    // 30k input tokens is a typical "whole file load" payload for a medium
-    // repo turn. 5k output for the inevitable narration and whole-file
-    // rewrites.
-    let per_turn = 35_000u64;
+    let mut total_chars = 0u64;
+
+    if goal.attachments.is_empty() {
+        total_chars = 16_000;
+    } else {
+        for attachment in &goal.attachments {
+            if let Ok(content) = std::fs::read_to_string(&attachment.path) {
+                total_chars += content.chars().count() as u64;
+            } else if let Some(ref text) = attachment.text {
+                total_chars += text.chars().count() as u64;
+            } else if attachment.size_bytes > 0 {
+                total_chars += attachment.size_bytes;
+            }
+        }
+    }
+
+    let base_file_tokens = (total_chars / 4).max(4_000);
     let turns = detections.len().max(1) as u64;
     let tests = if goal.no_tests {
         0
     } else {
         detections.len() as u64
     };
-    (turns + tests) * per_turn
+    let total_turns = turns + tests;
+
+    let naive_input = base_file_tokens * total_turns;
+    let naive_output = 1_500 * total_turns;
+
+    naive_input + naive_output
 }
 
 fn estimate_acceptance_slice_naive_tokens(slice_count: usize) -> u64 {
@@ -1670,5 +1688,28 @@ mod tests {
         // Should have fallen back to regex — which emits 2 subtasks for
         // "add a function foo" (impl + test).
         assert_eq!(plan.subtasks.len(), 2);
+    }
+
+    #[test]
+    fn test_estimate_naive_tokens_dynamic() {
+        use phonton_types::{PromptAttachment, PromptAttachmentKind};
+        use std::path::PathBuf;
+        let mut goal = Goal::new("add a function foo");
+        let dets = detect_new_symbols(&goal.description);
+        let tokens_empty = estimate_naive_tokens(&dets, &goal);
+        assert_eq!(tokens_empty, 11_000);
+
+        goal.attachments = vec![PromptAttachment {
+            path: PathBuf::from("mock.txt"),
+            kind: PromptAttachmentKind::Text,
+            mime_type: Some("text/plain".into()),
+            size_bytes: 100,
+            text: Some("a".repeat(40_000)),
+            data_base64: None,
+            truncated: false,
+            note: None,
+        }];
+        let tokens_attached = estimate_naive_tokens(&dets, &goal);
+        assert_eq!(tokens_attached, 23_000);
     }
 }

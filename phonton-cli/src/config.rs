@@ -72,6 +72,10 @@ pub struct ProviderConfig {
     /// environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …).
     pub api_key: Option<String>,
 
+    /// Map of provider-specific API keys for multiple providers.
+    #[serde(default)]
+    pub keys: std::collections::HashMap<String, String>,
+
     /// Model override. When absent, each provider picks its own default.
     pub model: Option<String>,
 
@@ -105,6 +109,7 @@ impl Default for ProviderConfig {
         Self {
             name: default_provider_name(),
             api_key: None,
+            keys: std::collections::HashMap::new(),
             model: None,
             account_id: None,
             base_url: None,
@@ -200,8 +205,14 @@ pub fn save(cfg: &Config) -> Result<()> {
 
 /// Resolve the effective API key for the configured provider.
 ///
-/// Priority: config file `api_key` → environment variable.
+/// Priority: keys map -> config file `api_key` → environment variable.
 pub fn resolve_api_key(cfg: &ProviderConfig) -> Option<String> {
+    if let Some(key) = cfg.keys.get(&cfg.name) {
+        if !key.trim().is_empty() {
+            return Some(key.clone());
+        }
+    }
+
     match cfg.api_key_source.as_deref() {
         Some("config") => return cfg.api_key.clone(),
         Some("env") => return resolve_env_api_key(cfg),
@@ -236,10 +247,19 @@ fn resolve_env_api_key(cfg: &ProviderConfig) -> Option<String> {
         "opencode" | "opencode-go" => &["OPENCODE_API_KEY"],
         "deepseek" => &["DEEPSEEK_API_KEY"],
         "xai" | "grok" => &["XAI_API_KEY", "GROK_API_KEY"],
+        "kimi" | "moonshot" => &["KIMI_API_KEY", "MOONSHOT_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "together" => &["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"],
         "ollama" | "custom" | "openai-compatible" => return None,
-        _ => return None,
+        _ => {
+            let var_name = format!("{}_API_KEY", cfg.name.to_uppercase().replace('-', "_"));
+            if let Ok(v) = std::env::var(&var_name) {
+                if !v.trim().is_empty() {
+                    return Some(v);
+                }
+            }
+            return None;
+        }
     };
     for var in candidates {
         if let Ok(v) = std::env::var(var) {
@@ -252,12 +272,77 @@ fn resolve_env_api_key(cfg: &ProviderConfig) -> Option<String> {
 }
 
 pub fn opencode_auth_path() -> Option<PathBuf> {
+    if let Some(local_data) = dirs::data_local_dir() {
+        let path = local_data.join("opencode").join("auth.json");
+        if path.exists() {
+            return Some(path);
+        }
+    }
     dirs::home_dir().map(|h| {
         h.join(".local")
             .join("share")
             .join("opencode")
             .join("auth.json")
     })
+}
+
+pub fn extract_all_opencode_keys() -> std::collections::HashMap<String, String> {
+    let mut keys = std::collections::HashMap::new();
+    let path = match opencode_auth_path() {
+        Some(p) => p,
+        None => return keys,
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(_) => return keys,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(val) => val,
+        Err(_) => return keys,
+    };
+
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj {
+            if k != "provider" && k != "providers" {
+                if let Some(key_str) = val
+                    .get("key")
+                    .or_else(|| val.get("api_key"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    keys.insert(k.clone(), key_str.trim().to_string());
+                } else if let Some(s) = val.as_str() {
+                    keys.insert(k.clone(), s.trim().to_string());
+                }
+            }
+        }
+    }
+    if let Some(provider_block) = v.get("provider").and_then(serde_json::Value::as_object) {
+        for (k, val) in provider_block {
+            if let Some(key_str) = val
+                .get("key")
+                .or_else(|| val.get("api_key"))
+                .and_then(serde_json::Value::as_str)
+            {
+                keys.insert(k.clone(), key_str.trim().to_string());
+            } else if let Some(s) = val.as_str() {
+                keys.insert(k.clone(), s.trim().to_string());
+            }
+        }
+    }
+    if let Some(providers_block) = v.get("providers").and_then(serde_json::Value::as_object) {
+        for (k, val) in providers_block {
+            if let Some(key_str) = val
+                .get("key")
+                .or_else(|| val.get("api_key"))
+                .and_then(serde_json::Value::as_str)
+            {
+                keys.insert(k.clone(), key_str.trim().to_string());
+            } else if let Some(s) = val.as_str() {
+                keys.insert(k.clone(), s.trim().to_string());
+            }
+        }
+    }
+    keys
 }
 
 pub fn resolve_opencode_api_key(provider: &str) -> Option<String> {
@@ -305,6 +390,8 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
     "agentrouter",
     "deepseek",
     "xai",
+    "grok",
+    "kimi",
     "groq",
     "together",
     "ollama",
@@ -388,6 +475,7 @@ mode = "workspace-write"
             catalog: None,
             api_key_source: None,
             allow_unverified_model: false,
+            keys: std::collections::HashMap::new(),
         };
         // No env var set in test — should return None.
         // (In production the real key is present.)
@@ -405,6 +493,7 @@ mode = "workspace-write"
             catalog: None,
             api_key_source: None,
             allow_unverified_model: false,
+            keys: std::collections::HashMap::new(),
         };
         assert_eq!(resolve_api_key(&cfg).as_deref(), Some("from-config"));
     }
@@ -424,5 +513,44 @@ mode = "workspace-write"
             opencode_api_key_from_value("opencode", &raw).as_deref(),
             Some("opencode-test-key")
         );
+    }
+
+    #[test]
+    fn parses_keys_map_and_resolves_key() {
+        let raw = r#"
+[provider]
+name = "deepseek"
+[provider.keys]
+deepseek = "sk-ds-123"
+kimi = "sk-kimi-456"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.provider.name, "deepseek");
+        assert_eq!(
+            cfg.provider.keys.get("deepseek").map(|s| s.as_str()),
+            Some("sk-ds-123")
+        );
+        assert_eq!(
+            cfg.provider.keys.get("kimi").map(|s| s.as_str()),
+            Some("sk-kimi-456")
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_checks_keys_map_first() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("deepseek".to_string(), "sk-keys-ds".to_string());
+        let cfg = ProviderConfig {
+            name: "deepseek".into(),
+            api_key: Some("from-api-key".into()),
+            keys,
+            model: None,
+            account_id: None,
+            base_url: None,
+            catalog: None,
+            api_key_source: None,
+            allow_unverified_model: false,
+        };
+        assert_eq!(resolve_api_key(&cfg).as_deref(), Some("sk-keys-ds"));
     }
 }

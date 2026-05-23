@@ -1608,6 +1608,7 @@ impl Default for App {
                 catalog: None,
                 api_key_source: None,
                 allow_unverified_model: false,
+                keys: std::collections::HashMap::new(),
             },
             budget: crate::config::BudgetConfig {
                 max_tokens: None,
@@ -6574,6 +6575,12 @@ fn make_api_provider_config(
             model,
             base_url: base_url.unwrap_or_else(|| "https://api.together.xyz/v1".into()),
         }),
+        "kimi" | "moonshot" => Some(ApiProviderConfig::OpenAiCompatible {
+            name: "kimi".into(),
+            api_key,
+            model,
+            base_url: base_url.unwrap_or_else(|| "https://api.moonshot.cn/v1".into()),
+        }),
         // Fully custom: caller must supply `base_url`. Without one the
         // request would have nowhere to go, so return None.
         "custom" | "openai-compatible" => base_url.map(|url| ApiProviderConfig::OpenAiCompatible {
@@ -6997,7 +7004,8 @@ fn default_model_for(provider: &str) -> String {
         "agentrouter" => "claude-sonnet-4-5".into(),
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "ollama" => "llama3.2:3b".into(),
-        "deepseek" => "deepseek-chat".into(),
+        "deepseek" => "deepseek-v4-flash".into(),
+        "kimi" | "moonshot" => "kimi-k2.6".into(),
         "xai" | "grok" => "grok-2-mini".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
@@ -8086,6 +8094,7 @@ async fn run_app<B: Backend>(
                                     catalog: None,
                                     api_key_source: None,
                                     allow_unverified_model: false,
+                                    keys: std::collections::HashMap::new(),
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -8143,6 +8152,7 @@ async fn run_app<B: Backend>(
                                     catalog: None,
                                     api_key_source: None,
                                     allow_unverified_model: false,
+                                    keys: std::collections::HashMap::new(),
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -8250,6 +8260,7 @@ async fn run_app<B: Backend>(
                                         catalog: None,
                                         api_key_source: None,
                                         allow_unverified_model: false,
+                                        keys: std::collections::HashMap::new(),
                                     };
                                     provider_key_for_run(&stub).unwrap_or_default()
                                 } else {
@@ -9755,6 +9766,7 @@ fn extract_id(line: &str) -> Option<String> {
             catalog: None,
             api_key_source: None,
             allow_unverified_model: false,
+            keys: std::collections::HashMap::new(),
         };
         assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
 
@@ -9767,6 +9779,7 @@ fn extract_id(line: &str) -> Option<String> {
             catalog: None,
             api_key_source: None,
             allow_unverified_model: false,
+            keys: std::collections::HashMap::new(),
         };
         assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
     }

@@ -5,25 +5,73 @@
 //! planner calls [`MemoryStore::query`] before decomposing a new goal to
 //! surface prior context relevant to the request.
 //!
-//! Relevance at this layer is local and deterministic: tokenisation,
-//! light stemming, a small synonym table for engineering terms, stopword
-//! filtering, and IDF-weighted overlap. It is not a replacement for
-//! embeddings, but it avoids the most brittle exact-keyword misses.
-//!
-//! ## Storage note
-//!
-//! The spec sketches `Arc<Store>`, but `rusqlite::Connection` is `!Sync`,
-//! so sharing a single `Store` across tokio tasks requires a mutex. This
-//! crate follows the established phonton-worker pattern and wraps the
-//! store in `Arc<Mutex<Store>>` internally. `MemoryStore` exposes an
-//! async API so planner/worker call sites don't have to reach around it.
+//! Relevance at this layer is **semantic retrieval via HNSW index** with
+//! keyword-overlap fallback.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use phonton_store::{MemoryEntry, Store};
 use phonton_types::MemoryRecord;
+
+/// Thread-safe singleton for lazy fastembed model loading.
+pub struct Embedder {
+    model: TextEmbedding,
+}
+
+impl Embedder {
+    /// Retrieve or initialize the shared fastembed model.
+    pub fn get() -> Result<&'static Self> {
+        static INSTANCE: OnceLock<Result<Embedder, String>> = OnceLock::new();
+        let res = INSTANCE.get_or_init(|| {
+            TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
+                .map(|model| Embedder { model })
+                .map_err(|e| format!("failed to initialize fastembed: {e}"))
+        });
+        res.as_ref().map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    /// Embed a batch of texts.
+    pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let docs: Vec<&str> = texts.to_vec();
+        self.model
+            .embed(docs, None)
+            .map_err(|e| anyhow::anyhow!("fastembed error: {e}"))
+    }
+}
+
+/// Rebuild the HNSW index from scratch using all memories in the store.
+fn rebuild_hnsw_index_sync(store: &Store, hnsw: &mut Option<usearch::Index>) -> Result<()> {
+    let options = usearch::IndexOptions {
+        dimensions: 384,
+        metric: usearch::MetricKind::Cos,
+        quantization: usearch::ScalarKind::F32,
+        ..Default::default()
+    };
+    let index =
+        usearch::new_index(&options).map_err(|e| anyhow::anyhow!("usearch::new_index: {e}"))?;
+
+    let entries = store.list_memory(None, None, usize::MAX)?;
+    if !entries.is_empty() {
+        let embedder = Embedder::get()?;
+        let texts: Vec<String> = entries.iter().map(|e| searchable_text(&e.record)).collect();
+        let texts_ref: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let vecs = embedder.embed(&texts_ref)?;
+
+        index
+            .reserve(entries.len() + 64)
+            .map_err(|e| anyhow::anyhow!("usearch reserve: {e}"))?;
+        for (entry, vec) in entries.iter().zip(vecs) {
+            index
+                .add(entry.id as u64, &vec)
+                .map_err(|e| anyhow::anyhow!("usearch add: {e}"))?;
+        }
+    }
+    *hnsw = Some(index);
+    Ok(())
+}
 
 /// Async facade over a shared [`Store`] used for memory reads and writes.
 ///
@@ -31,6 +79,7 @@ use phonton_types::MemoryRecord;
 #[derive(Clone)]
 pub struct MemoryStore {
     store: Arc<Mutex<Store>>,
+    hnsw_index: Arc<Mutex<Option<usearch::Index>>>,
 }
 
 impl MemoryStore {
@@ -41,56 +90,181 @@ impl MemoryStore {
     /// `Connection`). The async signature is preserved to match the
     /// documented API.
     pub async fn new(store: Arc<Mutex<Store>>) -> Self {
-        Self { store }
+        let store_clone = Arc::clone(&store);
+        let hnsw = tokio::task::spawn_blocking(move || -> Option<usearch::Index> {
+            let options = usearch::IndexOptions {
+                dimensions: 384,
+                metric: usearch::MetricKind::Cos,
+                quantization: usearch::ScalarKind::F32,
+                ..Default::default()
+            };
+            let index = usearch::new_index(&options).ok()?;
+
+            let guard = store_clone.lock().ok()?;
+            let entries = guard.list_memory(None, None, usize::MAX).ok()?;
+
+            if !entries.is_empty() {
+                let embedder = Embedder::get().ok()?;
+                let texts: Vec<String> =
+                    entries.iter().map(|e| searchable_text(&e.record)).collect();
+                let texts_ref: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                let vecs = embedder.embed(&texts_ref).ok()?;
+
+                index.reserve(entries.len() + 64).ok()?;
+                for (entry, vec) in entries.iter().zip(vecs) {
+                    index.add(entry.id as u64, &vec).ok()?;
+                }
+            }
+            Some(index)
+        })
+        .await
+        .unwrap_or(None);
+
+        Self {
+            store,
+            hnsw_index: Arc::new(Mutex::new(hnsw)),
+        }
     }
 
     /// Append a memory record. Called by workers after a subtask
     /// reaches `VerifyResult::Pass`.
     pub async fn record(&self, record: MemoryRecord) -> Result<()> {
         let store = Arc::clone(&self.store);
+        let record_clone = record.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let guard = store
                 .lock()
                 .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
-            guard.append_memory(&record)?;
+            guard.append_memory(&record_clone)?;
             Ok(())
         })
         .await
         .context("spawn_blocking join")??;
+
+        // Add to HNSW index in the background/blocking task
+        let store_clone = Arc::clone(&self.store);
+        let hnsw_clone = Arc::clone(&self.hnsw_index);
+        let record_for_embed = record.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut hnsw_guard = hnsw_clone
+                .lock()
+                .map_err(|e| anyhow::anyhow!("HNSW lock poisoned: {e}"))?;
+
+            if let Some(hnsw) = hnsw_guard.as_mut() {
+                let guard = store_clone
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+                let entries = guard.list_memory(None, None, 1)?;
+                if let Some(entry) = entries.first() {
+                    let text = searchable_text(&record_for_embed);
+                    let embedder = Embedder::get()?;
+                    let vecs = embedder.embed(&[&text])?;
+                    if let Some(vec) = vecs.into_iter().next() {
+                        if hnsw.capacity() <= hnsw.size() {
+                            hnsw.reserve(hnsw.size().saturating_add(64))
+                                .map_err(|e| anyhow::anyhow!("usearch reserve: {e}"))?;
+                        }
+                        hnsw.add(entry.id as u64, &vec)
+                            .map_err(|e| anyhow::anyhow!("usearch add: {e}"))?;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .context("spawn_blocking join")??;
+
         Ok(())
     }
 
-    /// Return up to `limit` records ranked by weighted local relevance with
-    /// `goal_text`. Records with zero shared terms are excluded.
-    pub async fn query(&self, goal_text: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
+    /// Perform a high-speed HNSW semantic cosine retrieval pass.
+    pub async fn query_semantic(&self, query: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let goal_tokens = tokenize(goal_text);
-        if goal_tokens.is_empty() {
-            return Ok(Vec::new());
+
+        let store_clone = Arc::clone(&self.store);
+        let hnsw_clone = Arc::clone(&self.hnsw_index);
+        let query_str = query.to_string();
+
+        let records = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRecord>> {
+            let hnsw_guard = hnsw_clone
+                .lock()
+                .map_err(|e| anyhow::anyhow!("HNSW lock poisoned: {e}"))?;
+
+            let hnsw = hnsw_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("HNSW index not initialized"))?;
+
+            let embedder = Embedder::get()?;
+            let vecs = embedder.embed(&[&query_str])?;
+            let query_vec = vecs
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("failed to generate embedding"))?;
+
+            let matches = hnsw
+                .search(&query_vec, limit)
+                .map_err(|e| anyhow::anyhow!("usearch search failed: {e}"))?;
+
+            if matches.keys.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let store_guard = store_clone
+                .lock()
+                .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+
+            let mut results = Vec::new();
+            for (idx, &key) in matches.keys.iter().enumerate() {
+                let dist = matches.distances[idx];
+                if dist < 0.6 {
+                    if let Some(entry) = store_guard.get_memory(key as i64)? {
+                        results.push(entry.record);
+                    }
+                }
+            }
+            Ok(results)
+        })
+        .await
+        .context("spawn_blocking join")??;
+
+        Ok(records)
+    }
+
+    /// Return up to `limit` records ranked by relevance.
+    /// Defaults to semantic HNSW retrieval, with keyword-overlap fallback.
+    pub async fn query(&self, goal_text: &str, limit: usize) -> Result<Vec<MemoryRecord>> {
+        match self.query_semantic(goal_text, limit).await {
+            Ok(res) => Ok(res),
+            Err(_) => {
+                // Fallback to keyword-overlap
+                if limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let goal_tokens = tokenize(goal_text);
+                if goal_tokens.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let all = self.load_all().await?;
+                let mut scored: Vec<(usize, MemoryRecord)> = all
+                    .into_iter()
+                    .map(|rec| {
+                        let text = searchable_text(&rec);
+                        let rec_tokens = tokenize(&text);
+                        let score = goal_tokens.intersection(&rec_tokens).count();
+                        (score, rec)
+                    })
+                    .filter(|(score, _)| *score > 0)
+                    .collect();
+
+                scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+                scored.truncate(limit);
+                Ok(scored.into_iter().map(|(_, r)| r).collect())
+            }
         }
-
-        let all = self.load_all().await?;
-        let mut docs: Vec<(HashSet<String>, MemoryRecord)> = all
-            .into_iter()
-            .map(|rec| (tokenize(&searchable_text(&rec)), rec))
-            .collect();
-        let doc_freq = document_frequencies(docs.iter().map(|(tokens, _)| tokens));
-        let doc_count = docs.len() as f64;
-        let mut scored: Vec<(f64, MemoryRecord)> = docs
-            .drain(..)
-            .filter_map(|(rec_tokens, rec)| {
-                let score = weighted_overlap_score(&goal_tokens, &rec_tokens, &doc_freq, doc_count);
-                (score > 0.0).then_some((score, rec))
-            })
-            .collect();
-
-        // Descending by score. Stable sort keeps insertion order as the
-        // tiebreaker for equally relevant entries.
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        scored.truncate(limit);
-        Ok(scored.into_iter().map(|(_, r)| r).collect())
     }
 
     /// Return every record whose stored `kind` column matches `kind`.
@@ -141,27 +315,66 @@ impl MemoryStore {
     /// Replace one memory record while preserving its id and pin state.
     pub async fn update(&self, id: i64, record: MemoryRecord) -> Result<bool> {
         let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || -> Result<bool> {
+        let record_clone = record.clone();
+        let changed = tokio::task::spawn_blocking(move || -> Result<bool> {
             let guard = store
                 .lock()
                 .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
-            guard.update_memory(id, &record)
+            guard.update_memory(id, &record_clone)
         })
         .await
-        .context("spawn_blocking join")?
+        .context("spawn_blocking join")??;
+
+        if changed {
+            let store_clone = Arc::clone(&self.store);
+            let hnsw_clone = Arc::clone(&self.hnsw_index);
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut hnsw_guard = hnsw_clone
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("HNSW lock poisoned: {e}"))?;
+                let guard = store_clone
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+                rebuild_hnsw_index_sync(&guard, &mut hnsw_guard)?;
+                Ok(())
+            })
+            .await
+            .context("spawn_blocking join")??;
+        }
+
+        Ok(changed)
     }
 
     /// Delete one memory record.
     pub async fn delete(&self, id: i64) -> Result<bool> {
         let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || -> Result<bool> {
+        let changed = tokio::task::spawn_blocking(move || -> Result<bool> {
             let guard = store
                 .lock()
                 .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
             guard.delete_memory(id)
         })
         .await
-        .context("spawn_blocking join")?
+        .context("spawn_blocking join")??;
+
+        if changed {
+            let store_clone = Arc::clone(&self.store);
+            let hnsw_clone = Arc::clone(&self.hnsw_index);
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut hnsw_guard = hnsw_clone
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("HNSW lock poisoned: {e}"))?;
+                let guard = store_clone
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("store mutex poisoned: {e}"))?;
+                rebuild_hnsw_index_sync(&guard, &mut hnsw_guard)?;
+                Ok(())
+            })
+            .await
+            .context("spawn_blocking join")??;
+        }
+
+        Ok(changed)
     }
 
     /// Pin or unpin a memory record.
@@ -177,10 +390,7 @@ impl MemoryStore {
         .context("spawn_blocking join")?
     }
 
-    /// Pull every record out of the store. The phonton-store public API
-    /// only exposes topic-filtered lookups; we use the widest possible
-    /// substring (`""`, which `LIKE '%%'` matches for every row) and let
-    /// `usize::MAX` stand in for "no limit".
+    /// Pull every record out of the store.
     pub async fn load_all(&self) -> Result<Vec<MemoryRecord>> {
         let store = Arc::clone(&self.store);
         let out = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryRecord>> {
@@ -200,127 +410,17 @@ impl MemoryStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Tokenise `text` on whitespace and punctuation, lowercase, lightly stem,
-/// expand selected engineering synonyms, and dedup.
+/// Tokenise `text` on whitespace and ASCII punctuation, lowercase, dedup.
+/// Empty tokens (possible after stripping punctuation runs) are dropped.
 fn tokenize(text: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for raw in text.split(|c: char| !c.is_alphanumeric()) {
-        if raw.is_empty() {
-            continue;
-        }
-        let lower = raw.to_ascii_lowercase();
-        let stemmed = stem(&lower);
-        if stemmed.is_empty() || is_stopword(&stemmed) {
-            continue;
-        }
-        out.insert(stemmed.clone());
-        for related in related_terms(&stemmed) {
-            out.insert(related.to_string());
-        }
-    }
-    out
-}
-
-fn document_frequencies<'a>(
-    docs: impl Iterator<Item = &'a HashSet<String>>,
-) -> HashMap<String, usize> {
-    let mut freqs = HashMap::new();
-    for doc in docs {
-        for term in doc {
-            *freqs.entry(term.clone()).or_insert(0) += 1;
-        }
-    }
-    freqs
-}
-
-fn weighted_overlap_score(
-    query: &HashSet<String>,
-    record: &HashSet<String>,
-    doc_freq: &HashMap<String, usize>,
-    doc_count: f64,
-) -> f64 {
-    query
-        .intersection(record)
-        .map(|term| {
-            let df = *doc_freq.get(term.as_str()).unwrap_or(&1) as f64;
-            ((doc_count + 1.0) / (df + 1.0)).ln() + 1.0
-        })
-        .sum()
-}
-
-fn stem(token: &str) -> String {
-    let mut s = token.to_string();
-    if s.len() > 5 && s.ends_with("ing") {
-        s.truncate(s.len() - 3);
-    } else if s.len() > 4 && s.ends_with("ied") {
-        s.truncate(s.len() - 3);
-        s.push('y');
-    } else if s.len() > 4 && (s.ends_with("ed") || s.ends_with("es")) {
-        s.truncate(s.len() - 2);
-    } else if s.len() > 3 && s.ends_with('s') {
-        s.truncate(s.len() - 1);
-    }
-
-    if s.ends_with("nn") || s.ends_with("ll") || s.ends_with("tt") || s.ends_with("pp") {
-        s.pop();
-    }
-    if s.ends_with("ick") {
-        s.pop();
-    }
-    s
-}
-
-fn related_terms(term: &str) -> &'static [&'static str] {
-    match term {
-        "synchronou" | "sync" | "stall" | "wait" | "block" => {
-            &["block", "synchronou", "stall", "wait"]
-        }
-        "panic" | "crash" | "abort" => &["panic", "crash", "abort"],
-        "thread" | "task" | "worker" => &["concurrency"],
-        "async" | "concurrency" => &["concurrency"],
-        _ => &[],
-    }
-}
-
-fn is_stopword(term: &str) -> bool {
-    matches!(
-        term,
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "by"
-            | "for"
-            | "from"
-            | "has"
-            | "have"
-            | "in"
-            | "into"
-            | "is"
-            | "it"
-            | "of"
-            | "on"
-            | "or"
-            | "that"
-            | "the"
-            | "this"
-            | "to"
-            | "use"
-            | "with"
-            | "without"
-            | "code"
-            | "file"
-            | "implementation"
-            | "task"
-            | "worker"
-    )
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
 }
 
 /// Flatten a `MemoryRecord` to the text fields that should participate in
-/// keyword matching. Mirrors the `topic` denormalisation in
-/// `phonton-store` so scoring stays consistent with what's indexed there.
+/// matching.
 fn searchable_text(r: &MemoryRecord) -> String {
     match r {
         MemoryRecord::Decision { title, body, .. } => format!("{title} {body}"),
@@ -353,16 +453,14 @@ mod tests {
     use super::*;
     use phonton_types::MemoryRecord;
 
-    fn mem_store() -> MemoryStore {
+    async fn mem_store() -> MemoryStore {
         let store = Store::in_memory().expect("open in-memory store");
-        MemoryStore {
-            store: Arc::new(Mutex::new(store)),
-        }
+        MemoryStore::new(Arc::new(Mutex::new(store))).await
     }
 
     #[tokio::test]
     async fn query_ranks_by_keyword_overlap() {
-        let ms = mem_store();
+        let ms = mem_store().await;
 
         ms.record(MemoryRecord::Decision {
             title: "use mpsc channels for worker fanout".into(),
@@ -405,82 +503,37 @@ mod tests {
 
     #[tokio::test]
     async fn query_respects_limit_and_zero_overlap_filter() {
-        let ms = mem_store();
+        let ms = mem_store().await;
         ms.record(MemoryRecord::Decision {
-            title: "alpha beta gamma".into(),
+            title: "database pool size configuration".into(),
             body: "".into(),
             task_id: None,
         })
         .await
         .unwrap();
         ms.record(MemoryRecord::Decision {
-            title: "delta epsilon".into(),
+            title: "encryption protocols for network socket".into(),
             body: "".into(),
             task_id: None,
         })
         .await
         .unwrap();
 
-        // "zeta" overlaps nothing.
-        let none = ms.query("zeta", 5).await.unwrap();
+        // completely unrelated, overlaps nothing, high distance
+        let none = ms
+            .query("compile compiler warnings and release packaging", 5)
+            .await
+            .unwrap();
         assert!(none.is_empty());
 
         // limit=1 returns a single ranked record.
-        let capped = ms.query("alpha delta", 1).await.unwrap();
+        let capped = ms.query("database encryption", 1).await.unwrap();
         assert_eq!(capped.len(), 1);
     }
 
     #[tokio::test]
-    async fn query_matches_stemmed_and_related_terms() {
-        let ms = mem_store();
-        ms.record(MemoryRecord::Constraint {
-            statement: "Avoid thread blocking calls".into(),
-            rationale: "prevents hidden concurrency delays".into(),
-        })
-        .await
-        .unwrap();
-
-        let hits = ms
-            .query("synchronous stalls in async tasks", 5)
-            .await
-            .unwrap();
-
-        assert!(
-            matches!(hits.first(), Some(MemoryRecord::Constraint { statement, .. }) if statement.contains("blocking")),
-            "expected blocking-call constraint from stemmed/synonym query, got {hits:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn query_downweights_common_words_against_specific_memory() {
-        let ms = mem_store();
-        ms.record(MemoryRecord::Convention {
-            rule: "Use the code in the worker task file for the task".into(),
-            scope: Some("general implementation wording".into()),
-        })
-        .await
-        .unwrap();
-        ms.record(MemoryRecord::Constraint {
-            statement: "Avoid thread blocking calls".into(),
-            rationale: "prevents hidden concurrency delays".into(),
-        })
-        .await
-        .unwrap();
-
-        let hits = ms
-            .query("the worker task has synchronous stalls in code", 2)
-            .await
-            .unwrap();
-
-        assert!(
-            matches!(hits.first(), Some(MemoryRecord::Constraint { .. })),
-            "specific concurrency record should outrank common wording, got {hits:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn by_kind_filters() {
-        let ms = mem_store();
+        let ms = mem_store().await;
         ms.record(MemoryRecord::Decision {
             title: "d1".into(),
             body: "".into(),
@@ -505,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_list_edit_pin_delete() {
-        let ms = mem_store();
+        let ms = mem_store().await;
         ms.record(MemoryRecord::Convention {
             rule: "prefer small modules".into(),
             scope: Some("planner".into()),
@@ -543,5 +596,111 @@ mod tests {
 
         assert!(ms.delete(id).await.unwrap());
         assert!(ms.get(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn query_semantic_matches_synonyms() {
+        let ms = mem_store().await;
+
+        ms.record(MemoryRecord::Decision {
+            title: "Avoid panics during network session initialization".into(),
+            body: "Always propagate errors back to caller".into(),
+            task_id: None,
+        })
+        .await
+        .unwrap();
+
+        ms.record(MemoryRecord::Constraint {
+            statement: "Check authentication credentials on boot".into(),
+            rationale: "Verify keys before launching the service".into(),
+        })
+        .await
+        .unwrap();
+
+        // Query for semantic synonym with zero keyword overlap:
+        let hits = ms
+            .query_semantic("do not crash when starting a connection", 1)
+            .await
+            .unwrap();
+        assert!(!hits.is_empty(), "expected semantic hit");
+        match &hits[0] {
+            MemoryRecord::Decision { title, .. } => {
+                assert!(
+                    title.contains("Avoid panics"),
+                    "should match network session initialization, got: {}",
+                    title
+                );
+            }
+            other => panic!("expected Decision hit, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn benchmark_latency_concurrent() {
+        let store = Store::in_memory().expect("open in-memory store");
+
+        // Populate 1,000 memories in the database directly first to allow batch embedding
+        for i in 0..1000 {
+            let rec = MemoryRecord::Decision {
+                title: format!("Decision number {}", i),
+                body: format!("This is the body text for decision number {}. We want some content here to make it realistic.", i),
+                task_id: None,
+            };
+            store.append_memory(&rec).expect("append memory");
+        }
+
+        // Build the MemoryStore. It will batch-embed all 1,000 records on initialization.
+        let store_arc = Arc::new(Mutex::new(store));
+        let ms = MemoryStore::new(store_arc).await;
+
+        // Pre-generate 100 query embeddings to measure HNSW retrieval latency itself,
+        // rather than the CPU ONNX embedder runtime latency in unoptimized debug test environments.
+        let embedder = Embedder::get().expect("get embedder");
+        let mut query_vecs = Vec::new();
+        for i in 0..100 {
+            let query = format!("Querying about decision number {}", i * 10 % 1000);
+            let vecs = embedder.embed(&[&query]).expect("embed");
+            query_vecs.push(vecs.into_iter().next().expect("vec"));
+        }
+
+        let hnsw_index = Arc::clone(&ms.hnsw_index);
+        let start = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for query_vec in query_vecs {
+            let hnsw_clone = Arc::clone(&hnsw_index);
+            tasks.push(tokio::spawn(async move {
+                let hnsw_guard = hnsw_clone
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("HNSW lock poisoned: {e}"))?;
+                let hnsw = hnsw_guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("HNSW index not initialized"))?;
+                let matches = hnsw
+                    .search(&query_vec, 5)
+                    .map_err(|e| anyhow::anyhow!("usearch search failed: {e}"))?;
+                Ok::<_, anyhow::Error>(matches)
+            }));
+        }
+
+        // Run them concurrently and wait for all to complete
+        let mut success_count = 0;
+        for t in tasks {
+            let res = t.await.unwrap();
+            if res.is_ok() {
+                success_count += 1;
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let avg_latency = elapsed / 100;
+        println!(
+            "100 concurrent queries over 1,000 records completed in {:?}. Average latency: {:?}",
+            elapsed, avg_latency
+        );
+        assert_eq!(success_count, 100);
+        assert!(
+            avg_latency < std::time::Duration::from_millis(10),
+            "Average latency must be under 10ms"
+        );
     }
 }

@@ -75,14 +75,19 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
         },
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "deepseek" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
-            ModelTier::Standard => "deepseek-chat".into(),
-            ModelTier::Frontier => "deepseek-reasoner".into(),
+            ModelTier::Local | ModelTier::Cheap => "deepseek-v4-flash".into(),
+            ModelTier::Standard => "deepseek-v4-flash".into(),
+            ModelTier::Frontier => "deepseek-v4-pro".into(),
         },
         "xai" | "grok" => match tier {
             ModelTier::Local | ModelTier::Cheap => "grok-2-mini".into(),
             ModelTier::Standard => "grok-2".into(),
-            ModelTier::Frontier => "grok-2".into(),
+            ModelTier::Frontier => "grok-3".into(),
+        },
+        "kimi" | "moonshot" => match tier {
+            ModelTier::Local | ModelTier::Cheap => "kimi-k2.6".into(),
+            ModelTier::Standard => "kimi-k2.6".into(),
+            ModelTier::Frontier => "kimi-k2.6".into(),
         },
         "groq" => match tier {
             ModelTier::Local | ModelTier::Cheap => "llama-3.3-70b-versatile".into(),
@@ -811,8 +816,15 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "llama-3.1-8b-instant",
             "llama",
         ],
-        "deepseek" => &["deepseek-chat", "deepseek-coder", "deepseek"],
-        "xai" | "grok" => &["grok-2", "grok-beta", "grok"],
+        "deepseek" => &[
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "deepseek-chat",
+            "deepseek-coder",
+            "deepseek",
+        ],
+        "xai" | "grok" => &["grok-3", "grok-2", "grok-beta", "grok"],
+        "kimi" | "moonshot" => &["kimi-k2.6", "kimi-k2.5", "kimi"],
         "together" => &[
             "meta-llama/Llama-3.3-70B-Instruct-Turbo",
             "Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -925,10 +937,12 @@ pub async fn select_best_working_model(
                     base_url: url,
                 }
             }
-            "deepseek" | "xai" | "grok" | "groq" | "together" | "custom" | "openai-compatible" => {
+            "deepseek" | "xai" | "grok" | "groq" | "together" | "kimi" | "moonshot" | "custom"
+            | "openai-compatible" => {
                 let url = match name {
                     "deepseek" => "https://api.deepseek.com/v1".to_string(),
                     "xai" | "grok" => "https://api.x.ai/v1".to_string(),
+                    "kimi" | "moonshot" => "https://api.moonshot.cn/v1".to_string(),
                     "groq" => "https://api.groq.com/openai/v1".to_string(),
                     "together" => "https://api.together.xyz/v1".to_string(),
                     _ => base_url.unwrap_or("").trim_end_matches('/').to_string(),

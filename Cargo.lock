@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.16.2"
+version = "0.17.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2379,11 +2379,13 @@ name = "phonton-memory"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fastembed",
  "phonton-store",
  "phonton-types",
  "serde",
  "serde_json",
  "tokio",
+ "usearch",
 ]
 
 [[package]]

@@ -127,26 +127,43 @@ async fn doctor(args: &[String]) -> Result<i32> {
 
 fn import_opencode(args: &[String]) -> Result<i32> {
     let dry_run = args.iter().any(|a| a == "--dry-run");
-    if !dry_run {
-        return Err(anyhow!(
-            "import-opencode is read-only in v0.12.5; pass --dry-run to inspect available keys"
-        ));
-    }
     let path = config::opencode_auth_path()
         .ok_or_else(|| anyhow!("could not determine OpenCode auth path"))?;
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow!("could not read {}: {e}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)?;
-    let providers = ["opencode", "opencode-go"];
-    println!("OpenCode auth: {}", path.display());
-    for provider in providers {
-        let present = config::opencode_api_key_from_value(provider, &v).is_some();
+
+    if !path.exists() {
+        return Err(anyhow!(
+            "OpenCode auth file not found at {}",
+            path.display()
+        ));
+    }
+
+    println!("OpenCode auth file found: {}", path.display());
+    let extracted_keys = config::extract_all_opencode_keys();
+    if extracted_keys.is_empty() {
+        println!("No credentials found inside OpenCode auth file.");
+        return Ok(0);
+    }
+
+    if dry_run {
+        println!("Available keys in OpenCode (dry-run):");
+        for k in extracted_keys.keys() {
+            println!("  - {}: key found (hidden)", k);
+        }
+        println!("\nTo import these keys into Phonton's config.toml, run:\n  phonton providers import-opencode");
+    } else {
+        let mut cfg = config::load()?;
+        println!("Importing credentials into ~/.phonton/config.toml...");
+        let before_count = cfg.provider.keys.len();
+        for (k, v) in extracted_keys {
+            cfg.provider.keys.insert(k, v);
+        }
+        let after_count = cfg.provider.keys.len();
+        config::save(&cfg)?;
         println!(
-            "{provider}: {}",
-            if present { "key found" } else { "not found" }
+            "Successfully imported keys! Merged keys into provider.keys (total keys: {} -> {}).",
+            before_count, after_count
         );
     }
-    println!("No secrets were copied or printed.");
     Ok(0)
 }
 
@@ -157,6 +174,6 @@ fn print_help() {
          phonton providers list [--json]\n  \
          phonton providers sync\n  \
          phonton providers doctor [--configured] [--canary diff]\n  \
-         phonton providers import-opencode --dry-run"
+         phonton providers import-opencode [--dry-run]"
     );
 }

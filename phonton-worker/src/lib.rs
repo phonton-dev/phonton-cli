@@ -1341,6 +1341,25 @@ fn local_generated_artifact_seed_hunks(root: &Path, subtask: &Subtask) -> Option
         hunks.extend(existing_playwright_e2e_template_hunks(root));
         return Some(hunks);
     }
+    if is_syntax_preflight_seed_workspace(root, &subtask.description) {
+        return Some(template_file_hunks(
+            root,
+            [
+                (
+                    PathBuf::from("broken_code.py"),
+                    include_str!("templates/broken_code.py"),
+                ),
+                (
+                    PathBuf::from("broken_code.rs"),
+                    include_str!("templates/broken_code.rs"),
+                ),
+                (
+                    PathBuf::from("broken_code.ts"),
+                    include_str!("templates/broken_code.ts"),
+                ),
+            ],
+        ));
+    }
     None
 }
 
@@ -1416,6 +1435,23 @@ fn is_existing_vite_chess_app_shell_seed(description: &str) -> bool {
             || lower.contains("board coordinates")
             || lower.contains("legal destination highlights")
             || lower.contains("move history"))
+}
+
+fn is_syntax_preflight_seed_workspace(root: &Path, description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    let rs = root.join("broken_code.rs");
+    let py = root.join("broken_code.py");
+    let ts = root.join("broken_code.ts");
+    if !rs.is_file() || !py.is_file() || !ts.is_file() {
+        return false;
+    }
+    let Ok(rs_text) = std::fs::read_to_string(rs) else {
+        return false;
+    };
+    rs_text.contains("get_percentage")
+        && (lower.contains("syntax")
+            || lower.contains("broken_code")
+            || lower.contains("repair"))
 }
 
 fn template_file_hunks<const N: usize>(
