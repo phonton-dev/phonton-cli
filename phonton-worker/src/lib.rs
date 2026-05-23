@@ -1449,9 +1449,7 @@ fn is_syntax_preflight_seed_workspace(root: &Path, description: &str) -> bool {
         return false;
     };
     rs_text.contains("get_percentage")
-        && (lower.contains("syntax")
-            || lower.contains("broken_code")
-            || lower.contains("repair"))
+        && (lower.contains("syntax") || lower.contains("broken_code") || lower.contains("repair"))
 }
 
 fn template_file_hunks<const N: usize>(
