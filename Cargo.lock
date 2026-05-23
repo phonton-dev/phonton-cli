@@ -347,6 +347,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clipboard-win"
+version = "5.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+dependencies = [
+ "error-code",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -744,7 +753,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -814,6 +823,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "error-code"
+version = "3.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "esaxx-rs"
@@ -2274,15 +2289,15 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.17.1"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "clipboard-win",
  "crossterm",
  "dirs 5.0.1",
  "git2",
- "phonton-context",
  "phonton-diff",
  "phonton-extensions",
  "phonton-index",
@@ -2379,13 +2394,11 @@ name = "phonton-memory"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fastembed",
  "phonton-store",
  "phonton-types",
  "serde",
  "serde_json",
  "tokio",
- "usearch",
 ]
 
 [[package]]
@@ -2440,7 +2453,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nix",
- "phonton-types",
  "tokio",
  "tracing",
  "windows",
@@ -2464,7 +2476,6 @@ name = "phonton-types"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -2475,20 +2486,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "phonton-memory",
- "phonton-sandbox",
  "phonton-store",
  "phonton-types",
  "serde",
  "serde_json",
- "serde_yaml",
  "tempfile",
  "tokio",
- "toml",
  "tree-sitter",
- "tree-sitter-html",
- "tree-sitter-python",
  "tree-sitter-rust",
- "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -3036,7 +3041,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3208,19 +3213,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -3778,16 +3770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-html"
-version = "0.20.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8766b5ad3721517f8259e6394aefda9c686aebf7a8c74ab8624f2c3b46902fd5"
-dependencies = [
- "cc",
- "tree-sitter",
-]
-
-[[package]]
 name = "tree-sitter-python"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3884,12 +3866,6 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

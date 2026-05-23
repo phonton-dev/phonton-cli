@@ -122,11 +122,6 @@ impl RealDispatcher {
 
 #[async_trait]
 impl WorkerDispatcher for RealDispatcher {
-    async fn compact_context(&self) -> Result<bool> {
-        let mut context = self.context.lock().await;
-        context.compress_frames().await
-    }
-
     async fn dispatch(
         &self,
         subtask: Subtask,
@@ -195,12 +190,6 @@ impl RealDispatcher {
             query.push_str("\nVerifier diagnostics:\n");
             query.push_str(&prior_errors.join("\n"));
         }
-        phonton_index::query_relevant_slices(
-            &semantic.index,
-            &semantic.embedder,
-            &query,
-            super::semantic_slice_limit(subtask),
-        )
-        .await
+        phonton_index::query_relevant_slices(&semantic.index, &semantic.embedder, &query, 5).await
     }
 }

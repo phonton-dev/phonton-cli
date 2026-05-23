@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.18.0 - Playwright Verification, Surgical Repairs & Memory Provenance
+
+### Added
+- **Playwright Verification Integration:** Spawns a zero-dependency non-interactive background Node static server and headless browser script to assert rendering, console errors, and simulate DOM interactions (e.g. counter click, chess pieces click) with screenshot-evidence summaries.
+- **Surgical Missing-Criteria Repair (Low-Token Guard):** Engineer a sub-1k token target-exceeded repair prompt feeding only exact failing files, line numbers, verifier diagnostics, and failed criteria on retry to avoid expensive full-context repairs.
+- **Memory Rules & Provenance:** SQLite active enforcement of custom constraints and conventions during verification (`verify_decisions`) and planning (`decompose_with_memory` system prompt) with task ID provenance.
+- **Widen SubtaskResult Cost Tracking:** Model and provider token usage tracked end-to-end to align BudgetGuard USD calculations with actual EWMA model metrics.
+
 ## 0.17.1 - DeepSeek-TUI Benchmark Enrolment
 
 ### Added

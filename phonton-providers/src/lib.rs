@@ -23,7 +23,6 @@ use phonton_types::{
     ProviderKind, SliceOrigin,
 };
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Maps a provider name and a requested [`ModelTier`] to a concrete model
@@ -48,21 +47,6 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
             ModelTier::Standard => "openai/gpt-4o".into(),
             ModelTier::Frontier => "anthropic/claude-sonnet-4.5".into(),
         },
-        "opencode" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "big-pickle".into(),
-            ModelTier::Standard => "claude-sonnet-4-6".into(),
-            ModelTier::Frontier => "claude-opus-4-7".into(),
-        },
-        "opencode-go" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "deepseek-v4-flash".into(),
-            ModelTier::Standard => "kimi-k2.6".into(),
-            ModelTier::Frontier => "deepseek-v4-pro".into(),
-        },
-        "google" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "gemini-flash-latest".into(),
-            ModelTier::Standard => "gemini-2.5-flash".into(),
-            ModelTier::Frontier => "gemini-2.5-pro".into(),
-        },
         "gemini" => match tier {
             ModelTier::Local | ModelTier::Cheap => "gemini-2.0-flash".into(),
             ModelTier::Standard => "gemini-2.5-flash".into(),
@@ -75,19 +59,14 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
         },
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "deepseek" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "deepseek-v4-flash".into(),
-            ModelTier::Standard => "deepseek-v4-flash".into(),
-            ModelTier::Frontier => "deepseek-v4-pro".into(),
+            ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
+            ModelTier::Standard => "deepseek-chat".into(),
+            ModelTier::Frontier => "deepseek-reasoner".into(),
         },
         "xai" | "grok" => match tier {
             ModelTier::Local | ModelTier::Cheap => "grok-2-mini".into(),
             ModelTier::Standard => "grok-2".into(),
-            ModelTier::Frontier => "grok-3".into(),
-        },
-        "kimi" | "moonshot" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "kimi-k2.6".into(),
-            ModelTier::Standard => "kimi-k2.6".into(),
-            ModelTier::Frontier => "kimi-k2.6".into(),
+            ModelTier::Frontier => "grok-2".into(),
         },
         "groq" => match tier {
             ModelTier::Local | ModelTier::Cheap => "llama-3.3-70b-versatile".into(),
@@ -102,274 +81,6 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
         "ollama" => "llama3.2:3b".into(),
         _ => "unknown".into(),
     }
-}
-
-/// Models.dev public catalog endpoint, used by OpenCode and now by Phonton
-/// to avoid hand-maintaining a stale provider/model list.
-pub const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
-
-/// How Phonton can execute a Models.dev provider entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CatalogRouteKind {
-    /// Phonton has a first-class native adaptor for this provider.
-    Native,
-    /// Phonton can call the provider through `/v1/chat/completions`.
-    OpenAiCompatible,
-    /// The provider is visible in the catalog but needs an adaptor Phonton
-    /// does not ship yet, so it must not be offered as runnable.
-    CatalogOnly,
-}
-
-/// Provider metadata normalized from Models.dev.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CatalogProvider {
-    pub id: String,
-    pub name: String,
-    pub env: Vec<String>,
-    pub api: Option<String>,
-    pub npm: Option<String>,
-    pub doc: Option<String>,
-    pub route_kind: CatalogRouteKind,
-    pub models: Vec<CatalogModel>,
-}
-
-/// Model metadata normalized from Models.dev.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CatalogModel {
-    pub id: String,
-    pub name: String,
-    pub family: Option<String>,
-    pub attachment: bool,
-    pub reasoning: bool,
-    pub tool_call: bool,
-    pub temperature: bool,
-    pub open_weights: bool,
-    pub context_limit: Option<u64>,
-    pub output_limit: Option<u64>,
-    pub input_cost_per_million: Option<f64>,
-    pub output_cost_per_million: Option<f64>,
-    pub input_modalities: Vec<String>,
-    pub output_modalities: Vec<String>,
-}
-
-impl CatalogProvider {
-    /// True when Phonton has enough information to attempt a live call.
-    pub fn is_runnable(&self) -> bool {
-        matches!(
-            self.route_kind,
-            CatalogRouteKind::Native | CatalogRouteKind::OpenAiCompatible
-        )
-    }
-}
-
-/// Fetch and parse the live Models.dev catalog.
-pub async fn fetch_models_dev_catalog() -> Result<Vec<CatalogProvider>> {
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_default();
-    let v: Value = http
-        .get(MODELS_DEV_API_URL)
-        .send()
-        .await
-        .context("connecting to Models.dev")?
-        .error_for_status()
-        .context("fetching Models.dev catalog")?
-        .json()
-        .await
-        .context("parsing Models.dev catalog JSON")?;
-    models_dev_catalog_from_value(v)
-}
-
-/// Parse a Models.dev catalog JSON string.
-pub fn models_dev_catalog_from_str(raw: &str) -> Result<Vec<CatalogProvider>> {
-    models_dev_catalog_from_value(serde_json::from_str(raw).context("parsing catalog JSON")?)
-}
-
-/// Parse a Models.dev catalog value into stable Phonton types.
-pub fn models_dev_catalog_from_value(v: Value) -> Result<Vec<CatalogProvider>> {
-    let obj = v
-        .as_object()
-        .ok_or_else(|| anyhow!("Models.dev catalog root must be an object"))?;
-    let mut providers = Vec::with_capacity(obj.len());
-    for (id, provider) in obj {
-        let models_obj = provider
-            .get("models")
-            .and_then(Value::as_object)
-            .ok_or_else(|| anyhow!("Models.dev provider `{id}` missing models object"))?;
-        let env = provider
-            .get("env")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let api = provider
-            .get("api")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let npm = provider
-            .get("npm")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let route_kind = catalog_route_kind(id, api.as_deref(), npm.as_deref());
-        let mut models = Vec::with_capacity(models_obj.len());
-        for (model_id, model) in models_obj {
-            let limit = model.get("limit").unwrap_or(&Value::Null);
-            let cost = model.get("cost").unwrap_or(&Value::Null);
-            let modalities = model.get("modalities").unwrap_or(&Value::Null);
-            models.push(CatalogModel {
-                id: model
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or(model_id)
-                    .to_string(),
-                name: model
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(model_id)
-                    .to_string(),
-                family: model
-                    .get("family")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                attachment: model
-                    .get("attachment")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                reasoning: model
-                    .get("reasoning")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                tool_call: model
-                    .get("tool_call")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                temperature: model
-                    .get("temperature")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                open_weights: model
-                    .get("open_weights")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                context_limit: limit.get("context").and_then(Value::as_u64),
-                output_limit: limit.get("output").and_then(Value::as_u64),
-                input_cost_per_million: cost.get("input").and_then(Value::as_f64),
-                output_cost_per_million: cost.get("output").and_then(Value::as_f64),
-                input_modalities: modality_list(modalities, "input"),
-                output_modalities: modality_list(modalities, "output"),
-            });
-        }
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        providers.push(CatalogProvider {
-            id: id.to_string(),
-            name: provider
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(id)
-                .to_string(),
-            env,
-            api,
-            npm,
-            doc: provider
-                .get("doc")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            route_kind,
-            models,
-        });
-    }
-    providers.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(providers)
-}
-
-fn modality_list(modalities: &Value, key: &str) -> Vec<String> {
-    modalities
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn catalog_route_kind(id: &str, api: Option<&str>, npm: Option<&str>) -> CatalogRouteKind {
-    match id {
-        "anthropic" | "openai" | "openrouter" | "google" | "gemini" | "ollama" | "agentrouter" => {
-            CatalogRouteKind::Native
-        }
-        _ if npm == Some("@ai-sdk/openai-compatible") && api.is_some() => {
-            CatalogRouteKind::OpenAiCompatible
-        }
-        _ => CatalogRouteKind::CatalogOnly,
-    }
-}
-
-/// Find one provider in a parsed Models.dev catalog.
-pub fn catalog_provider<'a>(
-    catalog: &'a [CatalogProvider],
-    provider_id: &str,
-) -> Option<&'a CatalogProvider> {
-    catalog.iter().find(|p| p.id == provider_id)
-}
-
-/// Normalize a Models.dev OpenAI-compatible API base into the `/v1` base
-/// shape used by [`ProviderConfig::OpenAiCompatible`].
-pub fn normalize_openai_compatible_base_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.ends_with("/v1") || trimmed.ends_with("/openai/v1") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/v1")
-    }
-}
-
-/// Build a runnable provider config from a parsed Models.dev catalog entry.
-pub fn provider_config_from_catalog(
-    provider_id: &str,
-    api_key: String,
-    model: String,
-    base_url_override: Option<String>,
-    catalog: &[CatalogProvider],
-) -> Option<ProviderConfig> {
-    match provider_id {
-        "anthropic" => return Some(ProviderConfig::Anthropic { api_key, model }),
-        "openai" => return Some(ProviderConfig::OpenAI { api_key, model }),
-        "openrouter" => return Some(ProviderConfig::OpenRouter { api_key, model }),
-        "google" | "gemini" => return Some(ProviderConfig::Gemini { api_key, model }),
-        "ollama" => {
-            return Some(ProviderConfig::Ollama {
-                base_url: base_url_override.unwrap_or_else(|| "http://localhost:11434".into()),
-                model,
-            })
-        }
-        "agentrouter" => return Some(ProviderConfig::AgentRouter { api_key, model }),
-        _ => {}
-    }
-
-    let provider = catalog_provider(catalog, provider_id)?;
-    if provider.route_kind != CatalogRouteKind::OpenAiCompatible {
-        return None;
-    }
-    let base_url = base_url_override.or_else(|| provider.api.clone())?;
-    Some(ProviderConfig::OpenAiCompatible {
-        name: provider_id.to_string(),
-        api_key,
-        model,
-        base_url: normalize_openai_compatible_base_url(&base_url),
-    })
 }
 
 /// Discover the list of models a given API key has access to. Returns
@@ -398,7 +109,6 @@ pub async fn discover_models(
             // including the key scopes the list to what the account can call.
             discover_openrouter(&http, api_key).await
         }
-        "opencode" | "opencode-go" => discover_models_dev_provider(name).await,
         "agentrouter" => {
             // AgentRouter doesn't expose a /v1/models endpoint.
             // Validate the key with a tiny probe then return the static
@@ -435,24 +145,8 @@ pub async fn discover_models(
             let url = format!("{base}/models");
             discover_openai_bearer(&http, api_key, &url).await
         }
-        _ => discover_models_dev_provider(name).await,
+        _ => Err(anyhow!("unknown provider `{name}`")),
     }
-}
-
-async fn discover_models_dev_provider(name: &str) -> Result<Vec<String>> {
-    let catalog = fetch_models_dev_catalog().await?;
-    let provider =
-        catalog_provider(&catalog, name).ok_or_else(|| anyhow!("unknown provider `{name}`"))?;
-    if !provider.is_runnable() {
-        return Err(anyhow!(
-            "provider `{name}` is listed by Models.dev but needs unsupported adaptor `{}`",
-            provider.npm.as_deref().unwrap_or("unknown")
-        ));
-    }
-    let mut out: Vec<String> = provider.models.iter().map(|m| m.id.clone()).collect();
-    out.sort();
-    out.dedup();
-    Ok(out)
 }
 
 /// Classify a non-2xx status into a user-readable sentence.
@@ -796,19 +490,6 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "openai/gpt-4o-mini",
             "anthropic/claude-haiku",
         ],
-        "opencode" => &[
-            "claude-sonnet",
-            "gpt-5.3-codex",
-            "kimi-k2.5",
-            "big-pickle",
-            "deepseek-v4-flash",
-        ],
-        "opencode-go" => &[
-            "kimi-k2.6",
-            "deepseek-v4-pro",
-            "deepseek-v4-flash",
-            "qwen3.6-plus",
-        ],
         "groq" => &[
             "llama-3.3-70b-versatile",
             "llama-3.1-70b",
@@ -816,15 +497,8 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "llama-3.1-8b-instant",
             "llama",
         ],
-        "deepseek" => &[
-            "deepseek-v4-pro",
-            "deepseek-v4-flash",
-            "deepseek-chat",
-            "deepseek-coder",
-            "deepseek",
-        ],
-        "xai" | "grok" => &["grok-3", "grok-2", "grok-beta", "grok"],
-        "kimi" | "moonshot" => &["kimi-k2.6", "kimi-k2.5", "kimi"],
+        "deepseek" => &["deepseek-chat", "deepseek-coder", "deepseek"],
+        "xai" | "grok" => &["grok-2", "grok-beta", "grok"],
         "together" => &[
             "meta-llama/Llama-3.3-70B-Instruct-Turbo",
             "Qwen/Qwen2.5-Coder-32B-Instruct",
@@ -834,7 +508,6 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
         ],
         "agentrouter" => &["claude-sonnet", "gpt-4o", "claude-haiku"],
         "cloudflare" => &["@cf/moonshotai/kimi-k2.6", "kimi-k2.6", "gpt-oss", "llama"],
-        "google" => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-flash"],
         _ => &[],
     };
     for needle in preferences {
@@ -902,22 +575,6 @@ pub async fn select_best_working_model(
                 api_key: api_key.into(),
                 model: cand.clone(),
             },
-            "opencode" => ProviderConfig::OpenAiCompatible {
-                name: "opencode".into(),
-                api_key: api_key.into(),
-                model: cand.clone(),
-                base_url: "https://opencode.ai/zen/v1".into(),
-            },
-            "opencode-go" => ProviderConfig::OpenAiCompatible {
-                name: "opencode-go".into(),
-                api_key: api_key.into(),
-                model: cand.clone(),
-                base_url: "https://opencode.ai/zen/go/v1".into(),
-            },
-            "google" => ProviderConfig::Gemini {
-                api_key: api_key.into(),
-                model: cand.clone(),
-            },
             "gemini" => ProviderConfig::Gemini {
                 api_key: api_key.into(),
                 model: cand.clone(),
@@ -937,12 +594,10 @@ pub async fn select_best_working_model(
                     base_url: url,
                 }
             }
-            "deepseek" | "xai" | "grok" | "groq" | "together" | "kimi" | "moonshot" | "custom"
-            | "openai-compatible" => {
+            "deepseek" | "xai" | "grok" | "groq" | "together" | "custom" | "openai-compatible" => {
                 let url = match name {
                     "deepseek" => "https://api.deepseek.com/v1".to_string(),
                     "xai" | "grok" => "https://api.x.ai/v1".to_string(),
-                    "kimi" | "moonshot" => "https://api.moonshot.cn/v1".to_string(),
                     "groq" => "https://api.groq.com/openai/v1".to_string(),
                     "together" => "https://api.together.xyz/v1".to_string(),
                     _ => base_url.unwrap_or("").trim_end_matches('/').to_string(),
@@ -962,13 +617,13 @@ pub async fn select_best_working_model(
         let provider = provider_for(cfg);
         // Tight, single-token-ish probe. We don't care about the content,
         // only that the call returns Ok.
-        if probe_diff_contract(provider.as_ref()).await.is_ok() {
+        if provider.call("ping", "ok", &[]).await.is_ok() {
             return Ok(Some(cand.clone()));
         }
     }
     // Nothing answered — fall back to the heuristic pick so the user
     // sees *something* in the Model field rather than silence.
-    Ok(None)
+    Ok(pick_default_from_list(name, &models))
 }
 
 /// System-prompt length threshold above which the Anthropic adaptor attaches
@@ -1008,7 +663,6 @@ fn annotate_http_error(provider: &str, status: StatusCode, body: &str) -> anyhow
                 .or_else(|| v.pointer("/message"))
                 .or_else(|| v.pointer("/error"))
                 .and_then(|x| x.as_str().map(String::from))
-                .or_else(|| provider_error_detail(&v))
                 .or_else(|| Some(v.to_string()))
         })
         .unwrap_or_else(|| body.to_string());
@@ -1188,66 +842,11 @@ pub fn provider_for(config: ProviderConfig) -> Box<dyn Provider> {
                     &endpoint,
                     ProviderKind::Cloudflare,
                 ))
-            } else if name == "deepseek" {
-                Box::new(OpenAiCompatibleProvider::new(
-                    api_key,
-                    model,
-                    &endpoint,
-                    ProviderKind::DeepSeek,
-                ))
             } else {
                 Box::new(OpenAiCompatibleProvider::custom(api_key, model, &endpoint))
             }
         }
     }
-}
-
-/// Tiny worker-contract probe. Passing this is stronger than a generic
-/// completion check: the route must return a parseable unified diff, which is
-/// the only output Phonton workers can safely apply and verify.
-pub async fn probe_diff_contract(provider: &dyn Provider) -> Result<LLMResponse> {
-    let resp = provider
-        .call(
-            "You are a Phonton provider readiness probe. Reply with only a unified diff.",
-            "Return exactly this unified diff and no prose:\n--- a/probe.txt\n+++ b/probe.txt\n@@ -0,0 +1 @@\n+ok\n",
-            &[],
-        )
-        .await?;
-    validate_diff_contract_output(&resp.content)?;
-    Ok(resp)
-}
-
-/// Validate that a model response satisfies the minimal Phonton worker diff
-/// contract. This intentionally stays lighter than `phonton-worker`'s parser
-/// so provider readiness does not need a dependency on worker internals.
-pub fn validate_diff_contract_output(content: &str) -> Result<()> {
-    let body = unfence_text(content).trim();
-    if body.is_empty() {
-        return Err(anyhow!("provider returned empty output"));
-    }
-    let has_old = body.contains("--- a/") || body.contains("--- /dev/null");
-    let has_new = body.contains("+++ b/");
-    let has_hunk = body.contains("@@");
-    if has_old && has_new && has_hunk {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "model output did not satisfy Phonton diff contract (expected `--- a/`, `+++ b/`, and `@@` markers)"
-        ))
-    }
-}
-
-fn unfence_text(content: &str) -> &str {
-    let trimmed = content.trim();
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        if let Some(newline) = rest.find('\n') {
-            let after_header = &rest[newline + 1..];
-            if let Some(end) = after_header.rfind("```") {
-                return &after_header[..end];
-            }
-        }
-    }
-    trimmed
 }
 
 /// Build the effective system prompt, prepending a low-confidence banner
@@ -1270,32 +869,6 @@ ground truth: prefer asking for a Read of the underlying file before \
 emitting a diff that depends on exact symbol shape.
 ";
     format!("{banner}\n{base}")
-}
-
-fn max_output_tokens_for_prompt(system: &str, user: &str) -> u64 {
-    let text = format!("{system}\n{user}").to_ascii_lowercase();
-    let repair = text.contains("previous verification failed")
-        || text.contains("verifier")
-        || text.contains("repair");
-    let generated_app = text.contains("playable")
-        || text.contains("game")
-        || text.contains("chess")
-        || text.contains("html")
-        || text.contains("web app")
-        || text.contains("terminal game")
-        || text.contains("full app")
-        || text.contains("create a")
-        || text.contains("build a")
-        || text.contains("make ");
-    if repair && generated_app {
-        1_024
-    } else if repair {
-        768
-    } else if generated_app {
-        2_048
-    } else {
-        1_536
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,10 +1147,13 @@ impl Provider for AnthropicProvider {
         } else {
             json!({ "type": "text", "text": system })
         };
-        let max_tokens = max_output_tokens_for_prompt(&system, user);
+        // 8192 is the highest `max_tokens` value every current Claude model
+        // accepts (haiku 3.5 caps here; sonnet 4.x/opus go higher). Going
+        // above this would 400 on haiku, going below this throws away
+        // headroom on the bigger models for normal-length completions.
         let body = json!({
             "model": self.model,
-            "max_tokens": max_tokens,
+            "max_tokens": 8192,
             "system": [system_block],
             "messages": [{ "role": "user", "content": anthropic_user_content(user, attachments) }],
         });
@@ -1655,10 +1231,8 @@ impl Provider for AnthropicProvider {
 
 /// Adaptor for APIs that expose OpenAI-style `/chat/completions`.
 ///
-/// OpenAI and OpenRouter share the strict wire shape: Bearer auth, a
-/// `messages` array, and `choices[0].message.content` in the response.
-/// Some compatible providers, notably Cloudflare Workers AI, may wrap that
-/// shape in a provider envelope, so response parsing stays tolerant here.
+/// OpenAI and OpenRouter share this wire shape: Bearer auth, a `messages`
+/// array, and `choices[0].message.content` in the response.
 #[derive(Clone)]
 pub struct OpenAiCompatibleProvider {
     api_key: String,
@@ -1724,142 +1298,6 @@ impl OpenAiCompatibleProvider {
                 .unwrap_or_default(),
         }
     }
-
-    fn should_disable_deepseek_thinking(&self) -> bool {
-        self.kind == ProviderKind::DeepSeek
-            && (self.model.contains("v4") || self.model.contains("reasoner"))
-    }
-}
-
-fn chat_content_at_path(resp: &Value, pointer: &str) -> Option<String> {
-    match resp.pointer(pointer)? {
-        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-        Value::String(_) => None,
-        Value::Array(parts) => {
-            let mut out = String::new();
-            for part in parts {
-                if let Some(text) = part
-                    .get("text")
-                    .or_else(|| part.get("content"))
-                    .and_then(Value::as_str)
-                {
-                    out.push_str(text);
-                }
-            }
-            if out.trim().is_empty() {
-                None
-            } else {
-                Some(out)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn json_object_keys(value: &Value) -> String {
-    value
-        .as_object()
-        .map(|obj| {
-            obj.keys()
-                .take(8)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|keys| !keys.is_empty())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn provider_error_detail(resp: &Value) -> Option<String> {
-    if let Some(message) = resp.pointer("/error/message").and_then(Value::as_str) {
-        return Some(message.to_string());
-    }
-    if let Some(message) = resp.get("message").and_then(Value::as_str) {
-        return Some(message.to_string());
-    }
-    if let Some(error) = resp.get("error").and_then(Value::as_str) {
-        return Some(error.to_string());
-    }
-
-    let errors = resp.get("errors")?.as_array()?;
-    let messages = errors
-        .iter()
-        .filter_map(|err| {
-            let message = err
-                .get("message")
-                .or_else(|| err.get("detail"))
-                .and_then(Value::as_str)?;
-            let code = err.get("code").and_then(Value::as_i64);
-            Some(match code {
-                Some(code) => format!("{code}: {message}"),
-                None => message.to_string(),
-            })
-        })
-        .collect::<Vec<_>>();
-    if messages.is_empty() {
-        None
-    } else {
-        Some(messages.join("; "))
-    }
-}
-
-fn parse_openai_compatible_chat_response(
-    kind: ProviderKind,
-    resp: &Value,
-) -> Result<(String, &Value)> {
-    if let Some(false) = resp.get("success").and_then(Value::as_bool) {
-        let detail = provider_error_detail(resp).unwrap_or_else(|| resp.to_string());
-        return Err(anyhow!("{kind} response error: {detail}"));
-    }
-
-    let checked_paths = [
-        "/choices/0/message/content",
-        "/choices/0/text",
-        "/choices/0/delta/content",
-        "/result/choices/0/message/content",
-        "/result/choices/0/text",
-        "/result/response",
-        "/result/output_text",
-        "/response",
-        "/output_text",
-    ];
-
-    for path in checked_paths {
-        if let Some(content) = chat_content_at_path(resp, path) {
-            let usage = resp
-                .get("usage")
-                .or_else(|| resp.pointer("/result/usage"))
-                .unwrap_or(&Value::Null);
-            return Ok((content, usage));
-        }
-    }
-
-    if let Some(detail) = provider_error_detail(resp) {
-        return Err(anyhow!("{kind} response error: {detail}"));
-    }
-
-    let reasoning_present = resp
-        .pointer("/choices/0/message/reasoning_content")
-        .or_else(|| resp.pointer("/result/choices/0/message/reasoning_content"))
-        .and_then(Value::as_str)
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if reasoning_present {
-        return Err(anyhow!(
-            "{kind} response contained reasoning_content but no final text content; disable provider thinking or choose a non-reasoning route for diff-only workers"
-        ));
-    }
-
-    let result_keys = resp
-        .get("result")
-        .map(json_object_keys)
-        .unwrap_or_else(|| "none".to_string());
-    Err(anyhow!(
-        "{kind} response missing model text content (checked {}; top-level keys: {}; result keys: {})",
-        checked_paths.join(", "),
-        json_object_keys(resp),
-        result_keys
-    ))
 }
 
 #[async_trait]
@@ -1882,13 +1320,14 @@ impl Provider for OpenAiCompatibleProvider {
         attachments: &[PromptAttachment],
     ) -> Result<LLMResponse> {
         let system = build_system_prompt(system, slice_origins);
-        // OpenAI's current spec uses `max_completion_tokens` and o1/o3/o4
-        // reject `max_tokens` outright. Cloudflare's current Workers AI
-        // schema also prefers `max_completion_tokens` for chat completions.
-        // Most other OpenAI-compat providers were built against the original
-        // spec and either ignore `max_completion_tokens` or reject it.
-        // Picking the right key per back-end is what makes BYOK work.
-        let token_key = if matches!(self.kind, ProviderKind::OpenAI | ProviderKind::Cloudflare) {
+        // OpenAI's *current* spec uses `max_completion_tokens` and o1/o3/o4
+        // *reject* `max_tokens` outright. Every other OpenAI-compat provider
+        // (DeepSeek, xAI, Together, Groq's deprecated path, OpenRouter,
+        // AgentRouter, vLLM, LM Studio, …) was built against the original
+        // spec and either ignores `max_completion_tokens` (silently truncating
+        // to a tiny default) or rejects it as an unknown field. Picking the
+        // right key per back-end is what makes "BYOK" actually work.
+        let token_key = if self.kind == ProviderKind::OpenAI {
             "max_completion_tokens"
         } else {
             "max_tokens"
@@ -1898,24 +1337,14 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             json!(user)
         };
-        let max_tokens = max_output_tokens_for_prompt(&system, user);
-        let mut body = json!({
+        let body = json!({
             "model": self.model,
-            token_key: max_tokens,
+            token_key: 4096,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user_content },
             ],
         });
-        if self.kind == ProviderKind::Cloudflare {
-            body["chat_template_kwargs"] = json!({
-                "thinking": false,
-                "clear_thinking": true,
-            });
-        }
-        if self.should_disable_deepseek_thinking() {
-            body["thinking"] = json!({ "type": "disabled" });
-        }
 
         let mut req = self
             .http
@@ -1955,7 +1384,12 @@ impl Provider for OpenAiCompatibleProvider {
             .await
             .map_err(|e| ProviderError::ParseFail(e.to_string()))?;
 
-        let (content, usage) = parse_openai_compatible_chat_response(self.kind, &resp)?;
+        let content = resp
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{} response missing choices[0].message.content", self.kind))?
+            .to_string();
+        let usage = resp.get("usage").unwrap_or(&Value::Null);
 
         Ok(LLMResponse {
             content,
@@ -2160,7 +1594,6 @@ impl Provider for GeminiProvider {
             "generationConfig": {
                 "temperature": 0.1,
                 "topP": 0.95,
-                "maxOutputTokens": max_output_tokens_for_prompt(&system_full, user),
                 "responseMimeType": if is_json { "application/json" } else { "text/plain" },
             }
         });
@@ -2278,9 +1711,6 @@ impl Provider for OllamaProvider {
         let body = json!({
             "model": self.model,
             "stream": false,
-            "options": {
-                "num_predict": max_output_tokens_for_prompt(&system, user),
-            },
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user",   "content": user   },
@@ -2358,29 +1788,6 @@ mod tests {
     fn empty_origins_no_banner() {
         let s = build_system_prompt("base", &[]);
         assert_eq!(s, "base");
-    }
-
-    #[test]
-    fn output_token_ceiling_tracks_prompt_shape() {
-        assert_eq!(
-            max_output_tokens_for_prompt("sys", "repair verifier failure"),
-            768
-        );
-        assert_eq!(
-            max_output_tokens_for_prompt("sys", "create a playable game"),
-            2_048
-        );
-        assert_eq!(
-            max_output_tokens_for_prompt(
-                "sys",
-                "make chess in html\nprevious verification failed: missing reset behavior"
-            ),
-            1_024
-        );
-        assert_eq!(
-            max_output_tokens_for_prompt("sys", "rename config field"),
-            1_536
-        );
     }
 
     #[test]
@@ -2483,10 +1890,7 @@ mod tests {
             "anthropic",
             "openai",
             "openrouter",
-            "opencode",
-            "opencode-go",
             "gemini",
-            "google",
             "agentrouter",
             "cloudflare",
             "deepseek",
@@ -2502,222 +1906,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn models_dev_catalog_parser_marks_runnable_and_catalog_only() {
-        let raw = r#"{
-            "opencode": {
-                "id": "opencode",
-                "name": "OpenCode Zen",
-                "env": ["OPENCODE_API_KEY"],
-                "npm": "@ai-sdk/openai-compatible",
-                "api": "https://opencode.ai/zen/v1",
-                "models": {
-                    "big-pickle": {
-                        "id": "big-pickle",
-                        "name": "big-pickle",
-                        "family": "pickle",
-                        "attachment": false,
-                        "reasoning": false,
-                        "tool_call": true,
-                        "temperature": true,
-                        "open_weights": false,
-                        "limit": { "context": 128000, "output": 8192 },
-                        "cost": { "input": 0.1, "output": 0.2 },
-                        "modalities": { "input": ["text"], "output": ["text"] }
-                    }
-                }
-            },
-            "cerebras": {
-                "id": "cerebras",
-                "name": "Cerebras",
-                "env": ["CEREBRAS_API_KEY"],
-                "npm": "@ai-sdk/cerebras",
-                "models": {
-                    "qwen": { "id": "qwen", "name": "qwen" }
-                }
-            }
-        }"#;
-
-        let catalog = models_dev_catalog_from_str(raw).unwrap();
-        let opencode = catalog_provider(&catalog, "opencode").unwrap();
-        assert_eq!(opencode.route_kind, CatalogRouteKind::OpenAiCompatible);
-        assert!(opencode.is_runnable());
-        assert_eq!(opencode.models[0].context_limit, Some(128000));
-
-        let cerebras = catalog_provider(&catalog, "cerebras").unwrap();
-        assert_eq!(cerebras.route_kind, CatalogRouteKind::CatalogOnly);
-        assert!(!cerebras.is_runnable());
-    }
-
-    #[test]
-    fn catalog_only_provider_cannot_build_runnable_config() {
-        let catalog = models_dev_catalog_from_str(
-            r#"{
-                "cerebras": {
-                    "id": "cerebras",
-                    "name": "Cerebras",
-                    "npm": "@ai-sdk/cerebras",
-                    "models": { "qwen": { "id": "qwen", "name": "qwen" } }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert!(provider_config_from_catalog(
-            "cerebras",
-            "key".into(),
-            "qwen".into(),
-            None,
-            &catalog
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn diff_contract_rejects_empty_and_accepts_unified_diff() {
-        assert!(validate_diff_contract_output("").is_err());
-        assert!(validate_diff_contract_output(
-            "--- a/probe.txt\n+++ b/probe.txt\n@@ -0,0 +1 @@\n+ok\n"
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn openai_compat_parses_top_level_chat_response() {
-        let resp = json!({
-            "choices": [{ "message": { "content": "diff --git a/a b/a" } }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 3,
-                "prompt_tokens_details": { "cached_tokens": 2 }
-            }
-        });
-
-        let (content, usage) =
-            parse_openai_compatible_chat_response(ProviderKind::OpenAI, &resp).unwrap();
-
-        assert_eq!(content, "diff --git a/a b/a");
-        assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(10));
-        assert_eq!(
-            usage
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_u64),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn openai_compat_rejects_empty_content() {
-        let resp = json!({
-            "choices": [{ "message": { "content": "" } }],
-            "usage": { "prompt_tokens": 1, "completion_tokens": 0 }
-        });
-
-        let err = parse_openai_compatible_chat_response(ProviderKind::OpenAI, &resp)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("missing model text content"));
-    }
-
-    #[test]
-    fn openai_compat_rejects_reasoning_only_content() {
-        let resp = json!({
-            "choices": [{
-                "message": {
-                    "content": null,
-                    "reasoning_content": "--- a/probe.txt\n+++ b/probe.txt\n@@ -0,0 +1 @@\n+ok\n"
-                }
-            }],
-            "usage": { "prompt_tokens": 1, "completion_tokens": 12 }
-        });
-
-        let err = parse_openai_compatible_chat_response(ProviderKind::DeepSeek, &resp)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("reasoning_content"));
-        assert!(err.contains("no final text content"));
-    }
-
-    #[test]
-    fn cloudflare_parses_workers_ai_response_envelope() {
-        let resp = json!({
-            "success": true,
-            "result": {
-                "response": "diff --git a/chess.c b/chess.c",
-                "usage": {
-                    "prompt_tokens": 21,
-                    "completion_tokens": 8
-                }
-            },
-            "errors": [],
-            "messages": []
-        });
-
-        let (content, usage) =
-            parse_openai_compatible_chat_response(ProviderKind::Cloudflare, &resp).unwrap();
-
-        assert_eq!(content, "diff --git a/chess.c b/chess.c");
-        assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(21));
-        assert_eq!(
-            usage.get("completion_tokens").and_then(Value::as_u64),
-            Some(8)
-        );
-    }
-
-    #[test]
-    fn cloudflare_parses_wrapped_chat_completion_envelope() {
-        let resp = json!({
-            "success": true,
-            "result": {
-                "choices": [{
-                    "message": {
-                        "content": "diff --git a/Makefile b/Makefile"
-                    }
-                }],
-                "usage": {
-                    "prompt_tokens": 34,
-                    "completion_tokens": 13
-                }
-            }
-        });
-
-        let (content, usage) =
-            parse_openai_compatible_chat_response(ProviderKind::Cloudflare, &resp).unwrap();
-
-        assert_eq!(content, "diff --git a/Makefile b/Makefile");
-        assert_eq!(usage.get("prompt_tokens").and_then(Value::as_u64), Some(34));
-    }
-
-    #[test]
-    fn cloudflare_error_envelope_reports_upstream_message() {
-        let resp = json!({
-            "success": false,
-            "errors": [{
-                "code": 7003,
-                "message": "Could not route to the requested model"
-            }],
-            "messages": [],
-            "result": null
-        });
-
-        let err = parse_openai_compatible_chat_response(ProviderKind::Cloudflare, &resp)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("cloudflare response error"));
-        assert!(err.contains("7003: Could not route"));
-        assert!(
-            !err.contains("missing choices[0].message.content"),
-            "must not hide Cloudflare's real error behind the old parser fallback"
-        );
-    }
-
-    /// Regression: OpenAI's current chat-completions spec and Cloudflare's
-    /// current Workers AI schema use `max_completion_tokens`; most other
-    /// OpenAI-compat back-ends still expect `max_tokens`. This test pins the
-    /// per-kind branching so a refactor can't quietly regress BYOK providers.
+    /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`
+    /// (and o1/o3/o4 *reject* `max_tokens`); every other OpenAI-compat
+    /// back-end (DeepSeek, xAI, Together, Groq, OpenRouter, AgentRouter,
+    /// vLLM, LM Studio) was built against the original spec and either
+    /// ignores `max_completion_tokens` (silently truncating to a tiny
+    /// default) or rejects it as unknown. This test pins the per-kind
+    /// branching so a refactor can't quietly regress every non-OpenAI
+    /// provider.
     #[tokio::test]
     async fn openai_compat_uses_max_tokens_for_non_openai() {
         use std::net::SocketAddr;
@@ -2727,8 +1923,6 @@ mod tests {
         async fn body_capture_server(
             saw_max_tokens: Arc<AtomicBool>,
             saw_max_completion: Arc<AtomicBool>,
-            saw_cloudflare_no_thinking: Arc<AtomicBool>,
-            saw_deepseek_no_thinking: Arc<AtomicBool>,
         ) -> SocketAddr {
             // Tiny TCP listener that reads one HTTP request, records which
             // token field the caller sent, and answers a valid chat shape.
@@ -2746,15 +1940,6 @@ mod tests {
                     if raw.contains("\"max_completion_tokens\"") {
                         saw_max_completion.store(true, Ordering::SeqCst);
                     }
-                    if raw.contains("\"chat_template_kwargs\"")
-                        && raw.contains("\"thinking\":false")
-                        && raw.contains("\"clear_thinking\":true")
-                    {
-                        saw_cloudflare_no_thinking.store(true, Ordering::SeqCst);
-                    }
-                    if raw.contains("\"thinking\":{\"type\":\"disabled\"}") {
-                        saw_deepseek_no_thinking.store(true, Ordering::SeqCst);
-                    }
                     let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -2769,15 +1954,7 @@ mod tests {
         // Non-OpenAI compat (e.g. DeepSeek / xAI / Together) → must send `max_tokens`.
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
-        let saw_ct = Arc::new(AtomicBool::new(false));
-        let saw_dt = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(
-            saw_mt.clone(),
-            saw_mc.clone(),
-            saw_ct.clone(),
-            saw_dt.clone(),
-        )
-        .await;
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
         let _ = p.call("sys", "u", &[]).await;
@@ -2793,15 +1970,7 @@ mod tests {
         // OpenAI proper → must send `max_completion_tokens`.
         let saw_mt = Arc::new(AtomicBool::new(false));
         let saw_mc = Arc::new(AtomicBool::new(false));
-        let saw_ct = Arc::new(AtomicBool::new(false));
-        let saw_dt = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(
-            saw_mt.clone(),
-            saw_mc.clone(),
-            saw_ct.clone(),
-            saw_dt.clone(),
-        )
-        .await;
+        let addr = body_capture_server(saw_mt.clone(), saw_mc.clone()).await;
         let endpoint = format!("http://{}/chat/completions", addr);
         let p =
             OpenAiCompatibleProvider::new("k".into(), "m".into(), &endpoint, ProviderKind::OpenAI);
@@ -2813,69 +1982,6 @@ mod tests {
         assert!(
             !saw_mt.load(Ordering::SeqCst),
             "OpenAI proper must NOT send max_tokens (rejected by o-series)"
-        );
-
-        // Cloudflare Workers AI current schema also prefers `max_completion_tokens`.
-        let saw_mt = Arc::new(AtomicBool::new(false));
-        let saw_mc = Arc::new(AtomicBool::new(false));
-        let saw_ct = Arc::new(AtomicBool::new(false));
-        let saw_dt = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(
-            saw_mt.clone(),
-            saw_mc.clone(),
-            saw_ct.clone(),
-            saw_dt.clone(),
-        )
-        .await;
-        let endpoint = format!("http://{}/chat/completions", addr);
-        let p = OpenAiCompatibleProvider::new(
-            "k".into(),
-            "m".into(),
-            &endpoint,
-            ProviderKind::Cloudflare,
-        );
-        let _ = p.call("sys", "u", &[]).await;
-        assert!(
-            saw_mc.load(Ordering::SeqCst),
-            "Cloudflare must send max_completion_tokens"
-        );
-        assert!(
-            !saw_mt.load(Ordering::SeqCst),
-            "Cloudflare must NOT send deprecated max_tokens"
-        );
-        assert!(
-            saw_ct.load(Ordering::SeqCst),
-            "Cloudflare must disable provider-side thinking for diff-only worker calls"
-        );
-
-        // DeepSeek V4 defaults to thinking mode; disable it so diff workers
-        // receive final `message.content` instead of reasoning-only output.
-        let saw_mt = Arc::new(AtomicBool::new(false));
-        let saw_mc = Arc::new(AtomicBool::new(false));
-        let saw_ct = Arc::new(AtomicBool::new(false));
-        let saw_dt = Arc::new(AtomicBool::new(false));
-        let addr = body_capture_server(
-            saw_mt.clone(),
-            saw_mc.clone(),
-            saw_ct.clone(),
-            saw_dt.clone(),
-        )
-        .await;
-        let endpoint = format!("http://{}/chat/completions", addr);
-        let p = OpenAiCompatibleProvider::new(
-            "k".into(),
-            "deepseek-v4-flash".into(),
-            &endpoint,
-            ProviderKind::DeepSeek,
-        );
-        let _ = p.call("sys", "u", &[]).await;
-        assert!(
-            saw_mt.load(Ordering::SeqCst),
-            "DeepSeek still uses max_tokens"
-        );
-        assert!(
-            saw_dt.load(Ordering::SeqCst),
-            "DeepSeek V4 must disable thinking for diff-only worker calls"
         );
     }
 

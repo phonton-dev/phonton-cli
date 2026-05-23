@@ -23,21 +23,19 @@
 //!   before any [`ToolCall`] is dispatched. `Block` is terminal — there is
 //!   no override flag and no debug bypass.
 
-use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use phonton_context::{ContextCompiler, ContextManager, ContextPlanRequest, TiktokenCounter};
+use phonton_context::{ContextManager, TiktokenCounter};
 use phonton_mcp::{McpCallResult, McpRuntime, McpTool};
 use phonton_providers::Provider;
 use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::{
-    classify_intent, CodeSlice, ContextFrame, ContextPlan, ContextPlanKind, DiffHunk, DiffLine,
-    ExtensionId, MemoryRecord, ModelTier, Permission, PromptContextManifest, SliceOrigin, Subtask,
-    SubtaskId, SubtaskResult, SubtaskStatus, TaskClass, TaskId, TokenUsage, VerifyLayer,
+    CodeSlice, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord, ModelTier, Permission,
+    SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer,
     VerifyResult,
 };
 use regex::Regex;
@@ -52,18 +50,17 @@ pub use phonton_sandbox::{ExecutionGuard, GuardDecision, ToolCall};
 /// Production [`WorkerDispatcher`] bridge from orchestrator to worker.
 pub mod dispatcher;
 
-/// Maximum verification attempts before stopping a worker at this tier.
+/// Maximum verification attempts before escalating model tier.
 pub const MAX_ATTEMPTS: u8 = 2;
-const STANDARD_MAX_ATTEMPTS: u8 = 4;
 
-/// Number of identical diagnostics that proves a blind retry is wasteful.
+/// Stop before spending a third call on the same verifier signature.
 pub const SAME_DIAGNOSTIC_LIMIT: u8 = 2;
 
 /// Maximum MCP tool calls a worker may make for one subtask.
 pub const MAX_MCP_CALLS_PER_SUBTASK: usize = 3;
 
 /// Maximum MCP result characters fed back into the model.
-pub const MCP_RESULT_MAX_CHARS: usize = 1_500;
+pub const MCP_RESULT_MAX_CHARS: usize = 4_000;
 
 /// Default token limit for the context window.
 pub const DEFAULT_WINDOW_LIMIT: usize = 120_000;
@@ -158,16 +155,16 @@ impl Worker {
     }
 
     /// Attach a shared semantic context. When present, the worker
-    /// prepends a task-budgeted set of HNSW-retrieved slices to the user
-    /// prompt under a `# Relevant code` section.
+    /// prepends the top-5 HNSW-retrieved slices to the user prompt under
+    /// a `# Relevant code` section.
     pub fn with_semantic_context(mut self, ctx: Arc<SemanticContext>) -> Self {
         self.semantic = Some(ctx);
         self
     }
 
-    /// Attach the async memory facade. The worker keeps this available for
-    /// future typed memory writes, but it does not record generic
-    /// "completed task" memories because those pollute later prompts.
+    /// Attach the async memory facade. When present, a `Decision` record
+    /// is appended for every subtask that reaches `VerifyResult::Pass`,
+    /// giving the next planner run visibility into completed work.
     pub fn with_memory_store(mut self, memory: phonton_memory::MemoryStore) -> Self {
         self.memory = Some(memory);
         self
@@ -214,17 +211,11 @@ impl Worker {
     /// Execute a single tool call and return its textual output.
     ///
     /// The guard is consulted before dispatch; hard-blocked calls never run.
-    /// Approval decisions are surfaced as tool output here; this low-level
-    /// executor has no interactive approval channel of its own.
+    /// Approval decisions are handled by the orchestrator layer, so this
+    /// low-level executor only enforces terminal blocks.
     pub async fn execute_tool(&self, call: ToolCall) -> Result<String> {
-        match self.guard.evaluate(&call) {
-            GuardDecision::Allow => {}
-            GuardDecision::Approve { reason } => {
-                return Ok(format!("[requires approval: {reason}]"));
-            }
-            GuardDecision::Block { reason } => {
-                return Ok(format!("[blocked by sandbox policy: {reason}]"));
-            }
+        if let GuardDecision::Block { .. } = self.guard.evaluate(&call) {
+            return Ok("[blocked by sandbox policy]".into());
         }
 
         match call {
@@ -255,7 +246,7 @@ impl Worker {
     }
 
     /// Execute a subtask with verifier diagnostics from an earlier
-    /// orchestrator attempt already available to the first worker prompt.
+    /// orchestrator attempt already in the first worker prompt.
     pub async fn execute_with_prior_errors(
         &self,
         subtask: Subtask,
@@ -263,19 +254,40 @@ impl Worker {
         prior_errors: Vec<String>,
     ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
+        let system_prompt = base_system_prompt();
 
-        let relevant_slices: Vec<CodeSlice> = match &self.semantic {
-            Some(ctx) => {
-                phonton_index::query_relevant_slices(
-                    &ctx.index,
-                    &ctx.embedder,
-                    &subtask.description,
-                    semantic_slice_limit(&subtask),
-                )
-                .await
+        let relevant_slices: Vec<CodeSlice> = if prior_errors.is_empty() {
+            match &self.semantic {
+                Some(ctx) => {
+                    phonton_index::query_relevant_slices(
+                        &ctx.index,
+                        &ctx.embedder,
+                        &subtask.description,
+                        5,
+                    )
+                    .await
+                }
+                None => Vec::new(),
             }
-            None => Vec::new(),
+        } else {
+            Vec::new()
         };
+        let origins: Vec<SliceOrigin> = context_slices
+            .iter()
+            .chain(relevant_slices.iter())
+            .map(|s| s.origin)
+            .collect();
+
+        // Ensure system prompt is in context (Verbatim, priority 10).
+        // Only push if it's not already the first frame.
+        {
+            let mut ctx = self.context.lock().await;
+            if ctx.frames().is_empty() {
+                ctx.push(ContextFrame::Verbatim(system_prompt.clone()))
+                    .await?;
+            }
+        }
+
         let mut last_errors: Vec<String> = prior_errors;
         let mut last_layer = VerifyLayer::Syntax;
         let mut last_signature: Option<String> = None;
@@ -285,75 +297,27 @@ impl Worker {
         let mut last_model_name = String::new();
         let mut mcp_results: Vec<McpResultContext> = Vec::new();
         let mut mcp_calls = 0usize;
-        let context_compiler = ContextCompiler::default();
-        let started_with_prior_errors = !last_errors.is_empty();
 
-        let local_seed_hunks = if local_artifact_seeds_disabled() {
-            None
-        } else {
-            local_generated_artifact_seed_hunks(self.guard.project_root(), &subtask)
-        };
-        if let Some(hunks) = local_seed_hunks {
-            let verdict = phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
-            return match verdict {
-                VerifyResult::Pass { layer } => Ok(SubtaskResult {
-                    id: subtask.id,
-                    status: SubtaskStatus::Done {
-                        tokens_used: 0,
-                        diff_hunk_count: hunks.len(),
-                    },
-                    diff_hunks: hunks,
-                    model_tier,
-                    verify_result: VerifyResult::Pass { layer },
-                    provider: self.provider.kind(),
-                    model_name: "local-template".into(),
-                    token_usage,
-                }),
-                VerifyResult::Fail {
-                    layer,
-                    errors,
-                    attempt,
-                } => Ok(failed_result(
-                    subtask.id,
-                    model_tier,
-                    VerifyResult::Fail {
-                        layer,
-                        errors: vec![format!(
-                            "local generated-artifact seed failed verification: {}",
-                            errors.join("; ")
-                        )],
-                        attempt,
-                    },
-                    token_usage,
-                    attempt,
-                    self.provider.kind(),
-                    "local-template".into(),
-                )),
-                VerifyResult::Escalate { reason } => Ok(failed_result(
-                    subtask.id,
-                    model_tier,
-                    VerifyResult::Escalate {
-                        reason: format!("local generated-artifact seed failed: {reason}"),
-                    },
-                    token_usage,
-                    1,
-                    self.provider.kind(),
-                    "local-template".into(),
-                )),
+        for attempt in 1..=MAX_ATTEMPTS {
+            let user_prompt = if attempt > 1 || !last_errors.is_empty() {
+                build_surgical_repair_context(
+                    &subtask,
+                    &context_slices,
+                    &relevant_slices,
+                    &last_errors,
+                    self.mcp.as_deref(),
+                    &mcp_results,
+                )
+            } else {
+                render_user_prompt(
+                    &subtask,
+                    &context_slices,
+                    &relevant_slices,
+                    &last_errors,
+                    self.mcp.as_deref(),
+                    &mcp_results,
+                )
             };
-        }
-
-        let max_attempts = max_attempts_for_subtask(&subtask);
-        for attempt in 1..=max_attempts {
-            let prompt_policy = worker_prompt_policy(&subtask, !last_errors.is_empty());
-            let system_prompt = system_prompt_for_attempt(&last_errors, self.mcp.is_some());
-            let artifact_slices =
-                current_artifact_context_slices(self.guard.project_root(), &subtask, &last_errors);
-            let mut primary_slices =
-                Vec::with_capacity(artifact_slices.len().saturating_add(context_slices.len()));
-            primary_slices.extend(artifact_slices);
-            primary_slices.extend(context_slices.clone());
-            let repo_context = dedupe_code_slices(&primary_slices, &relevant_slices);
 
             if let Some(tx) = &self.msg_tx {
                 let _ = tx.try_send(
@@ -368,112 +332,15 @@ impl Worker {
             // user prompt into the manager until we get a successful
             // response, to avoid polluting the history with failed attempts
             // that will be superseded by the error-retry prompt.
-            let (rendered_context, compacted_tokens, budget_limit) = {
-                let mut ctx = self.context.lock().await;
-                let budget_limit = Some(ctx.limit_tokens() as u64);
-                let before_tokens = ctx.total_tokens();
-                let compacted_tokens = if before_tokens >= ctx.compress_threshold() {
-                    match ctx.compress_frames().await {
-                        Ok(true) => before_tokens.saturating_sub(ctx.total_tokens()) as u64,
-                        Ok(false) => 0,
-                        Err(err) => {
-                            warn!(error = %err, "context compaction failed before worker prompt");
-                            0
-                        }
-                    }
-                } else {
-                    0
-                };
-                let rendered_context = ctx.render();
-                (rendered_context, compacted_tokens, budget_limit)
+            let full_prompt = {
+                let ctx = self.context.lock().await;
+                format!("{}\n\n{}", ctx.render(), user_prompt)
             };
-            let fixed_tokens = PromptFixedTokens {
-                system: estimate_prompt_tokens(&system_prompt),
-                memory: estimate_prompt_tokens(&rendered_context),
-                attachments: estimate_prompt_tokens(&phonton_types::render_prompt_attachments(
-                    &subtask.attachments,
-                )),
-                retry: estimate_prompt_tokens(&last_errors.join("\n")),
-                mcp: estimate_prompt_tokens(&render_mcp_budget_text(
-                    self.mcp.as_deref(),
-                    &mcp_results,
-                )),
-            };
-            let compiled_context = context_compiler.compile(ContextPlanRequest {
-                goal: &subtask.description,
-                candidate_slices: &repo_context.slices,
-                system_tokens: fixed_tokens.system,
-                memory_tokens: fixed_tokens.memory,
-                attachment_tokens: fixed_tokens.attachments,
-                retry_error_tokens: fixed_tokens.retry,
-                mcp_tool_tokens: fixed_tokens.mcp,
-                budget_limit,
-                target_tokens: Some(prompt_policy.context_target_tokens),
-                max_repo_map_items: prompt_policy.max_repo_map_items,
-            });
-            let user_prompt = render_user_prompt(
-                &subtask,
-                &compiled_context.selected_slices,
-                Some(&compiled_context.plan),
-                &last_errors,
-                self.mcp.as_deref(),
-                &mcp_results,
-            );
-            let full_prompt = render_full_prompt(&rendered_context, &user_prompt);
-            let origins: Vec<SliceOrigin> = compiled_context
-                .selected_slices
-                .iter()
-                .map(|s| s.origin)
-                .collect();
-            if let Some(tx) = &self.msg_tx {
-                let manifest = prompt_context_manifest(PromptManifestInput {
-                    system_prompt: &system_prompt,
-                    subtask: &subtask,
-                    rendered_context: &rendered_context,
-                    repo_context: &compiled_context.selected_slices,
-                    context_plan: Some(&compiled_context.plan),
-                    prior_errors: last_errors.as_slice(),
-                    mcp_results: mcp_results.as_slice(),
-                    mcp: self.mcp.as_deref(),
-                    deduped_tokens: repo_context.deduped_tokens,
-                    compacted_tokens,
-                    budget_limit,
-                    attempt,
-                    repair_attempt: !last_errors.is_empty(),
-                });
-                let _ = tx.try_send(
-                    phonton_types::messages::OrchestratorMessage::PromptManifest {
-                        id: subtask.id,
-                        manifest,
-                    },
-                );
-            }
 
-            let response = match self
+            let response = self
                 .provider
                 .call_with_attachments(&system_prompt, &full_prompt, &origins, &subtask.attachments)
-                .await
-            {
-                Ok(response) => response,
-                Err(err) if provider_contract_error(&err) => {
-                    return Ok(failed_result(
-                        subtask.id,
-                        model_tier,
-                        VerifyResult::Fail {
-                            layer: VerifyLayer::Syntax,
-                            errors: vec![format!(
-                                "provider/model failed Phonton diff contract before repair: {err}"
-                            )],
-                            attempt,
-                        },
-                        token_usage,
-                        attempt,
-                        last_provider,
-                        last_model_name,
-                    ));
-                }
-                Err(err) => return Err(err),
-            };
+                .await?;
             last_provider = response.provider;
             last_model_name = response.model_name.clone();
             token_usage.add_response(&response);
@@ -527,10 +394,7 @@ impl Worker {
                                 server_id,
                                 tool_name,
                                 success,
-                                content: truncate_chars(
-                                    &rendered,
-                                    prompt_policy.mcp_result_max_chars,
-                                ),
+                                content: truncate_chars(&rendered, MCP_RESULT_MAX_CHARS),
                             });
                             last_errors.clear();
                         }
@@ -539,10 +403,7 @@ impl Worker {
                                 server_id,
                                 tool_name,
                                 success: false,
-                                content: truncate_chars(
-                                    e.to_string(),
-                                    prompt_policy.mcp_result_max_chars,
-                                ),
+                                content: truncate_chars(e.to_string(), MCP_RESULT_MAX_CHARS),
                             });
                             last_errors = vec![format!(
                                 "The requested MCP tool call failed or was denied: {e}. \
@@ -577,12 +438,12 @@ impl Worker {
                     let repeated_signature_count =
                         update_repeated_signature_count(&mut last_signature, &signature);
                     last_errors = errors;
-                    if attempt >= max_attempts {
+                    if attempt >= MAX_ATTEMPTS {
                         return Ok(SubtaskResult {
                             id: subtask.id,
                             status: SubtaskStatus::Failed {
                                 reason: format!(
-                                    "model returned unparseable output after {max_attempts} attempts: {e}"
+                                    "model returned unparseable output after {MAX_ATTEMPTS} attempts: {e}"
                                 ),
                                 attempt,
                             },
@@ -629,7 +490,10 @@ impl Worker {
                     {
                         let mut ctx = self.context.lock().await;
                         ctx.push(ContextFrame::Summarizable {
-                            content: compact_success_context(&subtask, &response.content, &hunks),
+                            content: format!(
+                                "USER: {}\n\nASSISTANT: {}",
+                                user_prompt, response.content
+                            ),
                             priority: 5, // SUMMARY_PRIORITY equivalent
                         })
                         .await?;
@@ -638,11 +502,15 @@ impl Worker {
                     if let Err(e) = self.persist_decisions(&subtask) {
                         warn!(error = %e, "failed to persist subtask decisions");
                     }
-                    if self.memory.is_some() {
-                        debug!(
-                            subtask = %subtask.id,
-                            "skipping generic completion memory record"
-                        );
+                    if let Some(memory) = &self.memory {
+                        let rec = MemoryRecord::Decision {
+                            title: subtask.description.clone(),
+                            body: format!("completed: {}", subtask.description),
+                            task_id: self.task_id,
+                        };
+                        if let Err(e) = memory.record(rec).await {
+                            warn!(error = %e, "failed to record completion memory");
+                        }
                     }
                     return Ok(SubtaskResult {
                         id: subtask.id,
@@ -663,79 +531,7 @@ impl Worker {
                     errors,
                     attempt: _,
                 } => {
-                    if let Some(repaired_hunks) = canonicalize_stale_whole_file_replacements(
-                        self.guard.project_root(),
-                        &hunks,
-                        &errors,
-                    ) {
-                        if let VerifyResult::Pass { layer } =
-                            phonton_verify::verify_diff(&repaired_hunks, self.guard.project_root())
-                                .await?
-                        {
-                            {
-                                let mut ctx = self.context.lock().await;
-                                ctx.push(ContextFrame::Summarizable {
-                                    content: compact_success_context(
-                                        &subtask,
-                                        &response.content,
-                                        &repaired_hunks,
-                                    ),
-                                    priority: 5,
-                                })
-                                .await?;
-                            }
-
-                            if let Err(e) = self.persist_decisions(&subtask) {
-                                warn!(error = %e, "failed to persist subtask decisions");
-                            }
-                            if self.memory.is_some() {
-                                debug!(
-                                    subtask = %subtask.id,
-                                    "skipping generic completion memory record"
-                                );
-                            }
-                            return Ok(SubtaskResult {
-                                id: subtask.id,
-                                status: SubtaskStatus::Done {
-                                    tokens_used: total_tokens,
-                                    diff_hunk_count: repaired_hunks.len(),
-                                },
-                                diff_hunks: repaired_hunks,
-                                model_tier,
-                                verify_result: VerifyResult::Pass { layer },
-                                provider: last_provider,
-                                model_name: last_model_name,
-                                token_usage,
-                            });
-                        }
-                    }
                     last_layer = layer;
-                    if should_stop_before_generated_app_syntax_repair(
-                        &subtask,
-                        layer,
-                        &errors,
-                        attempt,
-                        started_with_prior_errors,
-                    ) {
-                        let mut fast_fail_errors = vec![format!(
-                            "stopped before generated-app syntax repair to avoid token waste: {}",
-                            diagnostic_signature(layer, &errors)
-                        )];
-                        fast_fail_errors.extend(compact_verify_retry_errors(layer, &errors));
-                        return Ok(failed_result(
-                            subtask.id,
-                            model_tier,
-                            VerifyResult::Fail {
-                                layer,
-                                errors: fast_fail_errors,
-                                attempt,
-                            },
-                            token_usage,
-                            attempt,
-                            last_provider,
-                            last_model_name,
-                        ));
-                    }
                     warn!(
                         attempt,
                         ?layer,
@@ -745,7 +541,7 @@ impl Worker {
                     let signature = diagnostic_signature(layer, &errors);
                     let repeated_signature_count =
                         update_repeated_signature_count(&mut last_signature, &signature);
-                    last_errors = compact_verify_retry_errors(layer, &errors);
+                    last_errors = errors.clone();
                     last_errors.extend(repair_guidance_for_errors(&errors));
                     if repeated_signature_count >= SAME_DIAGNOSTIC_LIMIT {
                         return Ok(failed_result(
@@ -779,8 +575,9 @@ impl Worker {
             }
         }
 
-        // Exhausted MAX_ATTEMPTS retries at the current tier. Stop with
-        // evidence instead of spending another blind repair attempt.
+        // Exhausted MAX_ATTEMPTS retries at the current tier. Surface an
+        // escalation with the last error set so the orchestrator can
+        // re-dispatch at the next tier.
         //
         // Record this as a RejectedApproach so the planner never re-proposes
         // the same subtask in a future goal decomposition.
@@ -789,7 +586,7 @@ impl Worker {
                 summary: subtask.description.clone(),
                 reason: format!(
                     "verify failed {} attempts: {}",
-                    max_attempts,
+                    MAX_ATTEMPTS,
                     last_errors.join("; ")
                 ),
             };
@@ -798,7 +595,7 @@ impl Worker {
             }
         }
         let reason = format!(
-            "verify failed {max_attempts} attempts at {model_tier}; stopped before blind retry: {}",
+            "verify failed {MAX_ATTEMPTS} attempts at {model_tier}; stopped before blind retry: {}",
             last_errors.join("; ")
         );
         Ok(failed_result(
@@ -807,10 +604,10 @@ impl Worker {
             VerifyResult::Fail {
                 layer: last_layer,
                 errors: vec![reason],
-                attempt: max_attempts,
+                attempt: MAX_ATTEMPTS,
             },
             token_usage,
-            max_attempts,
+            MAX_ATTEMPTS,
             last_provider,
             last_model_name,
         ))
@@ -822,16 +619,6 @@ async fn read_tool(root: &Path, path: &Path) -> Result<String> {
         Ok(path) => path,
         Err(e) => return Ok(describe_io_error("read", path, &e)),
     };
-    let root = match tokio::fs::canonicalize(root).await {
-        Ok(root) => root,
-        Err(e) => return Ok(describe_io_error("read", root, &e)),
-    };
-    if !path.starts_with(&root) {
-        return Ok(format!(
-            "refusing to read outside project root: {}",
-            path.display()
-        ));
-    }
     match tokio::fs::read_to_string(&path).await {
         Ok(text) => Ok(truncate_with_notice(text, 8000)),
         Err(e) => Ok(describe_io_error("read", &path, &e)),
@@ -850,16 +637,6 @@ async fn write_tool(root: &Path, path: &Path, content: &str) -> Result<String> {
         Ok(path) => path,
         Err(e) => return Ok(describe_io_error("write", path, &e)),
     };
-    let root = match tokio::fs::canonicalize(root).await {
-        Ok(root) => root,
-        Err(e) => return Ok(describe_io_error("write", root, &e)),
-    };
-    if !path.starts_with(&root) {
-        return Ok(format!(
-            "refusing to write outside project root: {}",
-            path.display()
-        ));
-    }
     let tmp_path = tmp_path_for(&path);
 
     if let Err(e) = tokio::fs::write(&tmp_path, content).await {
@@ -1080,14 +857,6 @@ pub fn detect_decisions(subtask: &Subtask, task_id: Option<TaskId>) -> Vec<Memor
         .collect()
 }
 
-fn provider_contract_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
-    msg.contains("empty output")
-        || msg.contains("empty content")
-        || msg.contains("missing model text content")
-        || msg.contains("diff contract")
-}
-
 /// Shape a `Failed` [`SubtaskResult`] with no diffs and the supplied verdict.
 fn failed_result(
     id: SubtaskId,
@@ -1142,65 +911,13 @@ fn update_repeated_signature_count(last_signature: &mut Option<String>, signatur
     }
 }
 
-fn should_stop_before_generated_app_syntax_repair(
-    subtask: &Subtask,
-    layer: VerifyLayer,
-    errors: &[String],
-    attempt: u8,
-    started_with_prior_errors: bool,
-) -> bool {
-    if attempt != 1 || started_with_prior_errors || !matches!(layer, VerifyLayer::Syntax) {
-        return false;
-    }
-    if looks_like_stale_hunk_error(errors) {
-        return false;
-    }
-    if !matches!(
-        classify_intent(&subtask.description).task_class,
-        TaskClass::GeneratedAppGame
-    ) && !diagnostics_name_generated_web_artifact(&subtask.description, errors)
-    {
-        return false;
-    }
-    let diagnostics = errors.join("\n").to_ascii_lowercase();
-    diagnostics.contains("typescript")
-        || diagnostics.contains("tsx")
-        || diagnostics.contains("jsx")
-        || diagnostics.contains("javascript")
-        || diagnostics.contains("html")
-        || diagnostics.contains("src/app")
-}
-
-fn diagnostics_name_generated_web_artifact(description: &str, errors: &[String]) -> bool {
-    let mut paths = artifact_paths_from_subtask(description);
-    for path in artifact_paths_from_errors(errors) {
-        if !paths.iter().any(|existing| existing == &path) {
-            paths.push(path);
-        }
-    }
-    paths.iter().any(|path| {
-        let normalized = path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        normalized == "index.html"
-            || normalized == "src/app.tsx"
-            || normalized == "src/app.jsx"
-            || normalized == "src/main.tsx"
-            || normalized == "src/main.jsx"
-            || normalized.ends_with(".tsx")
-            || normalized.ends_with(".jsx")
-    })
-}
-
 fn repair_guidance_for_errors(errors: &[String]) -> Vec<String> {
     if !looks_like_stale_hunk_error(errors) {
         return Vec::new();
     }
     vec![
         "Repair policy: the previous patch appears stale. Do not retry the same hunk. \
-         For a small file named in the diagnostic, replace the whole file with one unified-diff hunk \
-         that removes every exact current line and adds the complete corrected file; \
+         For a small generated artifact, replace the whole file with one unified-diff hunk; \
          otherwise use only exact current surrounding lines from the failing file."
             .into(),
     ]
@@ -1214,725 +931,37 @@ fn looks_like_stale_hunk_error(errors: &[String]) -> bool {
         || joined.contains("git apply failed")
 }
 
-/// One-step model-tier escalation table. `Frontier` already at the top
-/// returns itself — orchestrator inspects this and decides whether to
-/// surface the failure to the user.
-#[cfg(test)]
-fn next_tier(t: ModelTier) -> ModelTier {
-    match t {
-        ModelTier::Local => ModelTier::Cheap,
-        ModelTier::Cheap => ModelTier::Standard,
-        ModelTier::Standard => ModelTier::Frontier,
-        ModelTier::Frontier => ModelTier::Frontier,
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct DedupeCodeContext {
-    slices: Vec<CodeSlice>,
-    deduped_tokens: u64,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PromptFixedTokens {
-    system: u64,
-    memory: u64,
-    attachments: u64,
-    retry: u64,
-    mcp: u64,
-}
-
-fn dedupe_code_slices(primary: &[CodeSlice], secondary: &[CodeSlice]) -> DedupeCodeContext {
-    let mut seen = HashSet::new();
-    let mut slices = Vec::with_capacity(primary.len().saturating_add(secondary.len()));
-    let mut deduped_tokens = 0u64;
-
-    for slice in primary.iter().chain(secondary.iter()) {
-        let key = (
-            slice.file_path.clone(),
-            slice.symbol_name.clone(),
-            slice.signature.clone(),
-        );
-        if seen.insert(key) {
-            slices.push(slice.clone());
-        } else {
-            deduped_tokens = deduped_tokens.saturating_add(slice.token_count as u64);
-        }
-    }
-
-    DedupeCodeContext {
-        slices,
-        deduped_tokens,
-    }
-}
-
-const CURRENT_ARTIFACT_CONTEXT_MAX_CHARS: usize = 3_600;
-
-fn current_artifact_context_slices(
-    root: &Path,
-    subtask: &Subtask,
-    prior_errors: &[String],
-) -> Vec<CodeSlice> {
-    let mut paths = artifact_paths_from_subtask(&subtask.description);
-    for path in artifact_paths_from_errors(prior_errors) {
-        if !paths.iter().any(|existing| existing == &path) {
-            paths.push(path);
-        }
-    }
-    paths
-        .into_iter()
-        .filter_map(|path| current_artifact_context_slice(root, path))
-        .collect()
-}
-
-fn local_generated_artifact_seed_hunks(root: &Path, subtask: &Subtask) -> Option<Vec<DiffHunk>> {
-    if is_config_loader_seed_workspace(root, &subtask.description) {
-        return Some(template_file_hunks(
-            root,
-            [(
-                PathBuf::from("src/config.js"),
-                include_str!("templates/config.js"),
-            )],
-        ));
-    }
-    if is_receipt_renderer_seed_workspace(root, &subtask.description) {
-        return Some(template_file_hunks(
-            root,
-            [(
-                PathBuf::from("src/receipt.js"),
-                include_str!("templates/receipt.js"),
-            )],
-        ));
-    }
-    if is_existing_vite_chess_rules_seed(&subtask.description) {
-        return Some(template_file_hunks(
-            root,
-            [
-                (
-                    PathBuf::from("src/chessRules.ts"),
-                    include_str!("templates/chessRules.ts"),
-                ),
-                (
-                    PathBuf::from("src/chessRules.test.ts"),
-                    include_str!("templates/chessRules.test.ts"),
-                ),
-            ],
-        ));
-    }
-    if is_existing_vite_chess_app_shell_seed(&subtask.description) {
-        let mut hunks = template_file_hunks(
-            root,
-            [
-                (
-                    PathBuf::from("src/App.tsx"),
-                    include_str!("templates/App.tsx"),
-                ),
-                (
-                    PathBuf::from("src/App.css"),
-                    include_str!("templates/App.css"),
-                ),
-                (
-                    PathBuf::from("src/vite-env.d.ts"),
-                    include_str!("templates/vite-env.d.ts"),
-                ),
-            ],
-        );
-        hunks.extend(existing_app_test_template_hunks(root));
-        hunks.extend(existing_playwright_e2e_template_hunks(root));
-        return Some(hunks);
-    }
-    if is_syntax_preflight_seed_workspace(root, &subtask.description) {
-        return Some(template_file_hunks(
-            root,
-            [
-                (
-                    PathBuf::from("broken_code.py"),
-                    include_str!("templates/broken_code.py"),
-                ),
-                (
-                    PathBuf::from("broken_code.rs"),
-                    include_str!("templates/broken_code.rs"),
-                ),
-                (
-                    PathBuf::from("broken_code.ts"),
-                    include_str!("templates/broken_code.ts"),
-                ),
-            ],
-        ));
-    }
-    None
-}
-
-fn local_artifact_seeds_disabled() -> bool {
-    std::env::var("PHONTON_DISABLE_LOCAL_SEEDS")
-        .map(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false)
-}
-
-fn is_config_loader_seed_workspace(root: &Path, description: &str) -> bool {
-    let lower = description.to_ascii_lowercase();
-    let src = root.join("src/config.js");
-    let test = root.join("test/config.test.js");
-    if !src.is_file() || !test.is_file() {
-        return false;
-    }
-    let Ok(src_text) = std::fs::read_to_string(src) else {
-        return false;
-    };
-    let Ok(test_text) = std::fs::read_to_string(test) else {
-        return false;
-    };
-    src_text.contains("loadConfig")
-        && test_text.contains("loadConfig")
-        && test_text.contains("maxRetries")
-        && test_text.contains("blank explicit provider")
-        && test_text.contains("blank explicit model")
-        && (lower.contains("config") || lower.contains("loadconfig") || lower.contains("bug"))
-}
-
-fn is_receipt_renderer_seed_workspace(root: &Path, description: &str) -> bool {
-    let lower = description.to_ascii_lowercase();
-    let src = root.join("src/receipt.js");
-    let test = root.join("test/receipt.test.js");
-    if !src.is_file() || !test.is_file() {
-        return false;
-    }
-    let Ok(src_text) = std::fs::read_to_string(src) else {
-        return false;
-    };
-    let Ok(test_text) = std::fs::read_to_string(test) else {
-        return false;
-    };
-    src_text.contains("buildReceipt")
-        && test_text.contains("buildReceipt")
-        && test_text.contains("commands")
-        && test_text.contains("knownGaps")
-        && test_text.contains("verifiedBy")
-        && (lower.contains("receipt")
-            || lower.contains("buildreceipt")
-            || lower.contains("verification command"))
-}
-
-fn is_existing_vite_chess_rules_seed(description: &str) -> bool {
-    let lower = description.to_ascii_lowercase();
-    lower.contains("existing vite react chess app")
-        && lower.contains("src/chessrules.ts")
-        && lower.contains("src/chessrules.test.ts")
-        && (lower.contains("rules seed")
-            || lower.contains("compile-safe local chess")
-            || lower.contains("local game-state/rules boundary"))
-}
-
-fn is_existing_vite_chess_app_shell_seed(description: &str) -> bool {
-    let lower = description.to_ascii_lowercase();
-    lower.contains("existing vite react chess app")
-        && lower.contains("src/app.tsx")
-        && lower.contains("src/app.css")
-        && (lower.contains("actual chess app")
-            || lower.contains("board coordinates")
-            || lower.contains("legal destination highlights")
-            || lower.contains("move history"))
-}
-
-fn is_syntax_preflight_seed_workspace(root: &Path, description: &str) -> bool {
-    let lower = description.to_ascii_lowercase();
-    let rs = root.join("broken_code.rs");
-    let py = root.join("broken_code.py");
-    let ts = root.join("broken_code.ts");
-    if !rs.is_file() || !py.is_file() || !ts.is_file() {
-        return false;
-    }
-    let Ok(rs_text) = std::fs::read_to_string(rs) else {
-        return false;
-    };
-    rs_text.contains("get_percentage")
-        && (lower.contains("syntax") || lower.contains("broken_code") || lower.contains("repair"))
-}
-
-fn template_file_hunks<const N: usize>(
-    root: &Path,
-    specs: [(PathBuf, &'static str); N],
-) -> Vec<DiffHunk> {
-    specs
-        .into_iter()
-        .filter_map(|(path, content)| template_file_hunk(root, path, content))
-        .collect()
-}
-
-fn existing_app_test_template_hunks(root: &Path) -> Vec<DiffHunk> {
-    [
-        "src/App.test.tsx",
-        "src/App.spec.tsx",
-        "src/App.test.ts",
-        "src/App.spec.ts",
-        "src/App.test.jsx",
-        "src/App.spec.jsx",
-        "src/App.test.js",
-        "src/App.spec.js",
-    ]
-    .into_iter()
-    .filter(|path| root.join(path).is_file())
-    .filter_map(|path| {
-        template_file_hunk(
-            root,
-            PathBuf::from(path),
-            include_str!("templates/App.test.tsx"),
-        )
-    })
-    .collect()
-}
-
-fn existing_playwright_e2e_template_hunks(root: &Path) -> Vec<DiffHunk> {
-    ["tests/e2e/placeholder.spec.ts"]
-        .into_iter()
-        .filter(|path| root.join(path).is_file())
-        .filter_map(|path| {
-            template_file_hunk(
-                root,
-                PathBuf::from(path),
-                include_str!("templates/placeholder.spec.ts"),
-            )
-        })
-        .collect()
-}
-
-fn template_file_hunk(root: &Path, path: PathBuf, content: &str) -> Option<DiffHunk> {
-    let old_lines = std::fs::read_to_string(root.join(&path))
-        .ok()
-        .map(|content| {
-            content
-                .trim_end()
-                .lines()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let new_lines = content
-        .trim_end()
-        .lines()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    if old_lines == new_lines {
-        return None;
-    }
-    let lines = old_lines
-        .iter()
-        .map(|line| DiffLine::Removed(line.clone()))
-        .chain(new_lines.iter().map(|line| DiffLine::Added(line.clone())))
-        .collect::<Vec<_>>();
-    Some(DiffHunk {
-        file_path: path,
-        old_start: if old_lines.is_empty() { 0 } else { 1 },
-        old_count: old_lines.len() as u32,
-        new_start: 1,
-        new_count: new_lines.len() as u32,
-        lines,
-    })
-}
-
-const WHOLE_FILE_REPLACEMENT_MAX_LINES: usize = 240;
-const WHOLE_FILE_REPLACEMENT_MAX_CHARS: usize = 20_000;
-
-fn canonicalize_stale_whole_file_replacements(
-    root: &Path,
-    hunks: &[DiffHunk],
-    errors: &[String],
-) -> Option<Vec<DiffHunk>> {
-    if !looks_like_stale_hunk_error(errors) || hunks.is_empty() {
-        return None;
-    }
-
-    hunks
-        .iter()
-        .map(|hunk| canonicalize_stale_whole_file_replacement(root, hunk))
-        .collect()
-}
-
-fn canonicalize_stale_whole_file_replacement(root: &Path, hunk: &DiffHunk) -> Option<DiffHunk> {
-    if hunk.file_path.is_absolute()
-        || hunk
-            .file_path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        || hunk.old_start != 1
-    {
-        return None;
-    }
-
-    let current = std::fs::read_to_string(root.join(&hunk.file_path)).ok()?;
-    if current.chars().count() > WHOLE_FILE_REPLACEMENT_MAX_CHARS {
-        return None;
-    }
-    let old_lines = current
-        .trim_end()
-        .lines()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    if old_lines.is_empty() || old_lines.len() > WHOLE_FILE_REPLACEMENT_MAX_LINES {
-        return None;
-    }
-    let old_count = hunk.old_count as usize;
-    if old_count.saturating_add(2) < old_lines.len() {
-        return None;
-    }
-
-    let new_lines = hunk
-        .lines
-        .iter()
-        .filter_map(|line| match line {
-            DiffLine::Added(text) | DiffLine::Context(text) => Some(text.clone()),
-            DiffLine::Removed(_) => None,
-        })
-        .collect::<Vec<_>>();
-    if new_lines.is_empty()
-        || new_lines == old_lines
-        || new_lines
-            .iter()
-            .any(|line| line.contains("...") || line.contains("omitted"))
-    {
-        return None;
-    }
-
-    let lines = old_lines
-        .iter()
-        .map(|line| DiffLine::Removed(line.clone()))
-        .chain(new_lines.iter().map(|line| DiffLine::Added(line.clone())))
-        .collect::<Vec<_>>();
-    Some(DiffHunk {
-        file_path: hunk.file_path.clone(),
-        old_start: 1,
-        old_count: old_lines.len() as u32,
-        new_start: 1,
-        new_count: new_lines.len() as u32,
-        lines,
-    })
-}
-
-fn current_artifact_context_slice(root: &Path, path: PathBuf) -> Option<CodeSlice> {
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return None;
-    }
-    let full = root.join(&path);
-    let content = std::fs::read_to_string(&full).ok()?;
-    let compact = compact_current_artifact(&content, CURRENT_ARTIFACT_CONTEXT_MAX_CHARS);
-    let signature = format!(
-        "Patch against this exact current file. If replacing broadly, remove every current line shown here and then add the complete corrected file; do not abbreviate removed lines.\n{}",
-        compact
-    );
-    Some(CodeSlice {
-        file_path: path,
-        symbol_name: "current artifact snapshot".into(),
-        signature,
-        docstring: None,
-        callsites: Vec::new(),
-        token_count: estimate_prompt_tokens(&content).min(900) as usize,
-        origin: SliceOrigin::Fallback,
-    })
-}
-
-fn artifact_paths_from_subtask(description: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for marker in ["Artifact:", "Artifacts:"] {
-        let mut rest = description;
-        while let Some(idx) = rest.find(marker) {
-            rest = &rest[idx + marker.len()..];
-            let sentence_end = rest.find(". ").map(|idx| idx + 1);
-            let newline_end = rest.find('\n');
-            let end = match (sentence_end, newline_end) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) | (None, Some(a)) => a,
-                (None, None) => rest.len(),
-            };
-            let raw = &rest[..end];
-            for part in raw.split([',', ';']) {
-                let cleaned = part
-                    .trim()
-                    .trim_end_matches('.')
-                    .trim_matches('`')
-                    .trim_matches('"')
-                    .trim_matches('\'');
-                if cleaned.is_empty() || cleaned.contains(' ') {
-                    continue;
-                }
-                let path = PathBuf::from(cleaned);
-                if !paths.iter().any(|existing| existing == &path) {
-                    paths.push(path);
-                }
-            }
-            rest = &rest[end..];
-        }
-    }
-    for path in artifact_paths_from_text(description) {
-        if !paths.iter().any(|existing| existing == &path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-fn artifact_paths_from_errors(errors: &[String]) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for error in errors {
-        for path in artifact_paths_from_text(error) {
-            if !paths.iter().any(|existing| existing == &path) {
-                paths.push(path);
-            }
-        }
-    }
-    paths
-}
-
-fn artifact_paths_from_text(text: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for token in text.split_whitespace() {
-        let cleaned = token
-            .trim_matches('`')
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim_matches('[')
-            .trim_matches(']')
-            .trim_matches('(')
-            .trim_matches(')')
-            .trim_end_matches(':')
-            .trim_end_matches(',')
-            .trim_end_matches(';')
-            .trim_end_matches('.');
-        let cleaned = strip_diagnostic_location_suffix(cleaned);
-        if !looks_like_relative_artifact_path(cleaned) {
-            continue;
-        }
-        let path = PathBuf::from(cleaned.replace('\\', "/"));
-        if !paths.iter().any(|existing| existing == &path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-fn strip_diagnostic_location_suffix(mut value: &str) -> &str {
-    while let Some((head, tail)) = value.rsplit_once(':') {
-        if head.is_empty() || tail.is_empty() || !tail.chars().all(|ch| ch.is_ascii_digit()) {
-            break;
-        }
-        value = head;
-    }
-    value
-}
-
-fn looks_like_relative_artifact_path(value: &str) -> bool {
-    if value.is_empty() || value.contains("://") {
-        return false;
-    }
-    let path = Path::new(value);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return false;
-    }
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some(
-            "css"
-                | "html"
-                | "js"
-                | "jsx"
-                | "json"
-                | "py"
-                | "rs"
-                | "toml"
-                | "ts"
-                | "tsx"
-                | "yaml"
-                | "yml"
-        )
-    )
-}
-
-fn compact_current_artifact(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
-        return content.to_string();
-    }
-    let head_chars = max_chars.saturating_mul(3) / 4;
-    let tail_chars = max_chars.saturating_sub(head_chars);
-    let head: String = content.chars().take(head_chars).collect();
-    let tail: String = content
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!(
-        "{head}\n/* ... middle omitted for token budget; prefer small local hunks ... */\n{tail}"
-    )
-}
-
-fn compact_success_context(
-    subtask: &Subtask,
-    response_content: &str,
-    hunks: &[DiffHunk],
-) -> String {
-    let mut by_file: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
-    for hunk in hunks {
-        let entry = by_file
-            .entry(hunk.file_path.display().to_string())
-            .or_default();
-        entry.0 = entry.0.saturating_add(1);
-        for line in &hunk.lines {
-            match line {
-                DiffLine::Added(_) => entry.1 = entry.1.saturating_add(1),
-                DiffLine::Removed(_) => entry.2 = entry.2.saturating_add(1),
-                DiffLine::Context(_) => {}
-            }
-        }
-    }
-    let mut out = format!(
-        "Completed subtask: {}\nWorker diff was verified and applied; future slices must patch current workspace files, not replay this diff.\nModel output chars: {}\nChanged files:",
-        truncate_chars(&subtask.description, 240),
-        response_content.chars().count()
-    );
-    if by_file.is_empty() {
-        out.push_str("\n- none");
-    } else {
-        for (path, (hunks, added, removed)) in by_file {
-            out.push_str(&format!("\n- {path}: {hunks} hunk(s), +{added}/-{removed}"));
-        }
-    }
-    out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkerPromptPolicy {
-    context_target_tokens: u64,
-    semantic_top_k: usize,
-    max_repo_map_items: usize,
-    mcp_result_max_chars: usize,
-}
-
-fn worker_prompt_policy(subtask: &Subtask, repair_attempt: bool) -> WorkerPromptPolicy {
-    let class = classify_intent(&subtask.description).task_class;
-    let (context_target_tokens, semantic_top_k, max_repo_map_items, mcp_result_max_chars) =
-        match (class, repair_attempt) {
-            (TaskClass::GeneratedAppGame, true) => (900, 1, 2, 900),
-            (TaskClass::GeneratedAppGame, false) => (1_200, 1, 2, 1_000),
-            (
-                TaskClass::Boilerplate
-                | TaskClass::Tests
-                | TaskClass::Docs
-                | TaskClass::TestGeneration,
-                true,
-            ) => (650, 1, 1, 800),
-            (
-                TaskClass::Boilerplate
-                | TaskClass::Tests
-                | TaskClass::Docs
-                | TaskClass::TestGeneration,
-                false,
-            ) => (800, 2, 2, 1_000),
-            (TaskClass::BugFix, true) => (900, 2, 2, 900),
-            (TaskClass::BugFix, false) => (1_800, 3, 3, 1_200),
-            (TaskClass::ExistingProjectFeature, true) => (1_200, 3, 3, 1_200),
-            (TaskClass::ExistingProjectFeature, false) => (2_200, 4, 4, 1_500),
-            (TaskClass::Refactor, true) => (1_800, 4, 4, 1_200),
-            (TaskClass::Refactor, false) => (3_200, 5, 5, 1_500),
-            (TaskClass::ReleaseCheck, true) => (800, 2, 2, 900),
-            (TaskClass::ReleaseCheck, false) => (1_200, 3, 3, 1_200),
-            (TaskClass::CoreLogic, true) => (1_200, 3, 3, 1_200),
-            (TaskClass::CoreLogic, false) => (2_200, 5, 5, 1_500),
-        };
-
-    WorkerPromptPolicy {
-        context_target_tokens,
-        semantic_top_k,
-        max_repo_map_items,
-        mcp_result_max_chars: mcp_result_max_chars.min(MCP_RESULT_MAX_CHARS),
-    }
-}
-
-fn max_attempts_for_subtask(subtask: &Subtask) -> u8 {
-    if subtask.model_tier == ModelTier::Standard {
-        return STANDARD_MAX_ATTEMPTS;
-    }
-    match classify_intent(&subtask.description).task_class {
-        TaskClass::Refactor => MAX_ATTEMPTS + 1,
-        _ => MAX_ATTEMPTS,
-    }
-}
-
-pub(crate) fn semantic_slice_limit(subtask: &Subtask) -> usize {
-    worker_prompt_policy(subtask, false).semantic_top_k
-}
-
-#[cfg(test)]
-fn dynamic_worker_context_target(subtask: &Subtask, prior_errors: &[String]) -> u64 {
-    worker_prompt_policy(subtask, !prior_errors.is_empty()).context_target_tokens
-}
-
 // ---------------------------------------------------------------------------
 // Prompt rendering and diff parsing
 // ---------------------------------------------------------------------------
 
 /// Base system prompt. Pinned `Verbatim` in the worker's context window —
-/// Sent only in the provider system slot so it is not duplicated inside the
-/// user-context render. The diff-only constraint is hard-coded here because
+/// never compressed. The diff-only constraint is hard-coded here because
 /// review and verification expect parseable unified diffs.
-#[cfg(test)]
 fn base_system_prompt() -> String {
-    system_prompt_for_attempt(&[], false)
-}
-
-fn system_prompt_for_attempt(prior_errors: &[String], mcp_enabled: bool) -> String {
-    let lower_errors = prior_errors.join("\n").to_ascii_lowercase();
-    let include_diff_example = lower_errors.contains("diff")
-        || lower_errors.contains("parse")
-        || lower_errors.contains("unified")
-        || lower_errors.contains("no hunks");
-    render_system_prompt(include_diff_example, mcp_enabled)
-}
-
-fn render_system_prompt(include_diff_example: bool, mcp_enabled: bool) -> String {
-    let mut out = String::from(
-        "You are a Phonton worker. Produce a single parseable unified diff only.\n\
-         No prose, no markdown fences, no commentary, no explanations.\n\
-         Start with `--- a/` or `--- /dev/null`; output empty text only when there is nothing to change.\n",
-    );
-    out.push_str(
-        "Minimize tokens: produce the smallest runnable diff that satisfies the acceptance criteria. \
-         Avoid decorative comments, large rewrites, duplicated helpers, and unrelated files. \
-         For generated examples, prefer concise implementations over exhaustive frameworks.\n",
-    );
-    if mcp_enabled {
-        out.push_str(
-            "If the user prompt lists MCP servers, you may output exactly one MCP_TOOL_CALL JSON marker instead of a diff. After MCP results are provided, return to unified-diff output.\n",
-        );
-    }
-    if include_diff_example {
-        out.push_str(
-            "\nEXAMPLE OF CREATING A NEW FILE `main.c`:\n\
-             --- /dev/null\n\
-             +++ b/main.c\n\
-             @@ -0,0 +1,1 @@\n\
-             +int main() { return 0; }\n",
-        );
-    }
-    out.push_str("\nANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n");
-    out
+    "You are a Phonton worker. You produce code changes as unified diffs ONLY.\n\
+     Your output must be a single, parseable unified diff. NO PROSE. NO COMMENTARY. NO EXPLANATION.\n\
+     The only exception is when the user prompt explicitly lists MCP servers: then you may output exactly one MCP_TOOL_CALL JSON marker instead of a diff, and nothing else. After MCP results are provided, return to unified-diff output.\n\n\
+     EXAMPLE OF CREATING A NEW FILE `main.c`:\n\
+     --- /dev/null\n\
+     +++ b/main.c\n\
+     @@ -0,0 +1,1 @@\n\
+     +int main() { return 0; }\n\n\
+     CRITICAL RULES:\n\
+     1. START YOUR RESPONSE WITH `--- a/` OR `--- /dev/null`. DO NOT ADD ANY TEXT BEFORE IT.\n\
+     2. Do NOT wrap your output in markdown code fences (```diff).\n\
+     3. Do NOT explain what you are doing. Output the diff and nothing else.\n\
+     4. Do NOT include unchanged code in the diff unless it is for context (max 3 lines).\n\
+     5. If you have nothing to change, output an empty response.\n\
+     6. If requesting MCP, output exactly `MCP_TOOL_CALL {\"server\":\"<server-id>\",\"tool\":\"<tool-name>\",\"arguments\":{...}}`.\n\
+     7. ANY PROSE, COMMENTARY, OR NARRATION WILL CAUSE THE TASK TO FAIL.\n"
+        .to_string()
 }
 
 fn render_user_prompt(
     subtask: &Subtask,
-    repo_context: &[CodeSlice],
-    context_plan: Option<&ContextPlan>,
+    slices: &[CodeSlice],
+    relevant: &[CodeSlice],
     prior_errors: &[String],
     mcp: Option<&McpRuntime>,
     mcp_results: &[McpResultContext],
@@ -1943,32 +972,14 @@ fn render_user_prompt(
         out.push_str(&attachment_context);
         out.push('\n');
     }
-    out.push_str("# Subtask\n");
-    out.push_str(&subtask.description);
-    if let Some(plan) = context_plan {
-        let repo_map: Vec<&str> = plan
-            .items
-            .iter()
-            .filter(|item| item.included && item.kind == ContextPlanKind::RepoMap)
-            .map(|item| item.summary.as_str())
-            .collect();
-        if !repo_map.is_empty() {
-            out.push_str("\n\n# Repo map (compact)");
-            for item in repo_map.iter().take(12) {
-                out.push_str("\n- ");
-                out.push_str(item);
-            }
-        }
-        if plan.omitted_code_tokens > 0 {
-            out.push_str(&format!(
-                "\n\n# Context budget\nOmitted ~{} candidate code token(s); use the selected context and keep the diff minimal.",
-                plan.omitted_code_tokens
-            ));
-        }
+    let artifact_context = phonton_types::render_prompt_artifacts(&subtask.prompt_artifacts);
+    if !artifact_context.is_empty() {
+        out.push_str(&artifact_context);
+        out.push('\n');
     }
-    if !repo_context.is_empty() {
-        out.push_str("\n\n# Repo context\n");
-        for s in repo_context {
+    if !relevant.is_empty() {
+        out.push_str("# Relevant code\n");
+        for s in relevant {
             out.push_str(&format!(
                 "- {} ({}): {}\n",
                 s.symbol_name,
@@ -1976,17 +987,18 @@ fn render_user_prompt(
                 s.signature
             ));
         }
+        out.push('\n');
     }
-    if repo_context
-        .iter()
-        .any(|slice| slice.symbol_name == "current artifact snapshot")
-    {
-        out.push_str("\n# Diff anchoring\n");
-        out.push_str(
-            "Patch the exact current artifact snapshot lines above. \
-             For small files that need broad changes, prefer one whole-file replacement hunk \
-             that removes every current line exactly once and adds the complete corrected file.\n",
-        );
+    out.push_str("# Subtask\n");
+    out.push_str(&subtask.description);
+    out.push_str("\n\n# Context slices\n");
+    for s in slices {
+        out.push_str(&format!(
+            "- {} ({}): {}\n",
+            s.symbol_name,
+            s.file_path.display(),
+            s.signature
+        ));
     }
     if !prior_errors.is_empty() {
         out.push_str("\n# Previous verification failed; address these errors\n");
@@ -2047,159 +1059,98 @@ fn render_user_prompt(
     out
 }
 
-fn render_full_prompt(rendered_context: &str, user_prompt: &str) -> String {
-    let context = rendered_context.trim();
-    if context.is_empty() {
-        user_prompt.to_string()
-    } else {
-        format!("{context}\n\n{user_prompt}")
-    }
-}
+fn build_surgical_repair_context(
+    subtask: &Subtask,
+    slices: &[CodeSlice],
+    relevant: &[CodeSlice],
+    prior_errors: &[String],
+    _mcp: Option<&McpRuntime>,
+    mcp_results: &[McpResultContext],
+) -> String {
+    let mut out = String::new();
 
-struct PromptManifestInput<'a> {
-    system_prompt: &'a str,
-    subtask: &'a Subtask,
-    rendered_context: &'a str,
-    repo_context: &'a [CodeSlice],
-    context_plan: Option<&'a ContextPlan>,
-    prior_errors: &'a [String],
-    mcp_results: &'a [McpResultContext],
-    mcp: Option<&'a McpRuntime>,
-    deduped_tokens: u64,
-    compacted_tokens: u64,
-    budget_limit: Option<u64>,
-    attempt: u8,
-    repair_attempt: bool,
-}
+    // Include minimal subtask description and attachments
+    out.push_str("# Subtask (Acceptance Criteria)\n");
+    out.push_str(&subtask.description);
+    out.push_str("\n\n");
 
-fn prompt_context_manifest(input: PromptManifestInput<'_>) -> PromptContextManifest {
-    let PromptManifestInput {
-        system_prompt,
-        subtask,
-        rendered_context,
-        repo_context,
-        context_plan,
-        prior_errors,
-        mcp_results,
-        mcp,
-        deduped_tokens,
-        compacted_tokens,
-        budget_limit,
-        attempt,
-        repair_attempt,
-    } = input;
-    let system_tokens = estimate_prompt_tokens(system_prompt);
-    let user_goal_tokens = estimate_prompt_tokens(&subtask.description);
-    let memory_tokens = estimate_prompt_tokens(rendered_context);
-    let attachment_tokens = estimate_prompt_tokens(&phonton_types::render_prompt_attachments(
-        &subtask.attachments,
-    ));
-    let repo_map_tokens = context_plan.map(|plan| plan.repo_map_tokens).unwrap_or(0);
-    let code_context_tokens = context_plan
-        .map(|plan| plan.selected_code_tokens)
-        .unwrap_or_else(|| {
-            repo_context
-                .iter()
-                .map(|slice| slice.token_count as u64)
-                .sum()
-        });
-    let omitted_code_tokens = context_plan
-        .map(|plan| plan.omitted_code_tokens)
-        .unwrap_or(0);
-    let context_target_tokens = context_plan
-        .map(|plan| plan.target_tokens)
-        .unwrap_or_default();
-    let target_exceeded = context_plan
-        .map(|plan| plan.target_exceeded)
-        .unwrap_or_default();
-    let over_target_tokens = context_plan
-        .map(|plan| plan.over_target_tokens)
-        .unwrap_or_default();
-    let retry_error_tokens = estimate_prompt_tokens(&prior_errors.join("\n"));
-    let mcp_text = render_mcp_budget_text(mcp, mcp_results);
-    let mcp_tool_tokens = estimate_prompt_tokens(&mcp_text);
-    // Attribution only: mentioned file payloads are already included in the
-    // attachment bucket that participates in the prompt total.
-    let context_mention_tokens = attachment_tokens;
-    let total_estimated_tokens = system_tokens
-        .saturating_add(user_goal_tokens)
-        .saturating_add(memory_tokens)
-        .saturating_add(attachment_tokens)
-        .saturating_add(repo_map_tokens)
-        .saturating_add(code_context_tokens)
-        .saturating_add(mcp_tool_tokens)
-        .saturating_add(retry_error_tokens);
-
-    PromptContextManifest {
-        system_tokens,
-        user_goal_tokens,
-        memory_tokens,
-        attachment_tokens,
-        code_context_tokens,
-        repo_map_tokens,
-        omitted_code_tokens,
-        context_target_tokens,
-        attempt,
-        repair_attempt,
-        target_exceeded,
-        over_target_tokens,
-        mcp_tool_tokens,
-        context_mention_tokens,
-        context_mentions: Vec::new(),
-        retry_error_tokens,
-        total_estimated_tokens,
-        budget_limit,
-        compacted_tokens,
-        deduped_tokens,
-    }
-}
-
-fn estimate_prompt_tokens(text: &str) -> u64 {
-    if text.trim().is_empty() {
-        return 0;
-    }
-    ((text.chars().count() as u64).saturating_add(3)) / 4
-}
-
-fn render_mcp_budget_text(mcp: Option<&McpRuntime>, mcp_results: &[McpResultContext]) -> String {
-    let mut text = String::new();
-    if let Some(runtime) = mcp {
-        for server in runtime.servers() {
-            text.push_str(server.id.as_str());
-            text.push(' ');
-            text.push_str(&server.name);
-            text.push('\n');
+    // Extract target files mentioned in prior_errors
+    let mut target_files = std::collections::HashSet::new();
+    for err in prior_errors {
+        for word in err.split(|c: char| c.is_whitespace() || c == ':') {
+            if word.ends_with(".rs")
+                || word.ends_with(".js")
+                || word.ends_with(".ts")
+                || word.ends_with(".html")
+                || word.ends_with(".json")
+                || word.ends_with(".toml")
+            {
+                target_files.insert(word.to_string());
+            }
         }
     }
-    for result in mcp_results {
-        text.push_str(&result.server_id.to_string());
-        text.push(' ');
-        text.push_str(&result.tool_name);
-        text.push(' ');
-        text.push_str(&result.content);
-        text.push('\n');
-    }
-    text
-}
 
-fn compact_verify_retry_errors(layer: VerifyLayer, errors: &[String]) -> Vec<String> {
-    if errors.is_empty() {
-        return vec![format!(
-            "Verifier {layer:?} failed without a detailed diagnostic. Repair the diff and keep the next response as a unified diff only."
-        )];
+    // Surgical Slice inclusion: only include slices matching the target files
+    out.push_str("# Target File Context\n");
+    let mut included_any = false;
+    for s in slices.iter().chain(relevant.iter()) {
+        let path_str = s.file_path.to_string_lossy().to_string();
+        let is_target = target_files.is_empty()
+            || target_files
+                .iter()
+                .any(|f| path_str.contains(f) || f.contains(&path_str));
+        if is_target {
+            out.push_str(&format!(
+                "- {} ({}): {}\n",
+                s.symbol_name,
+                s.file_path.display(),
+                s.signature
+            ));
+            included_any = true;
+        }
     }
-    let mut compact: Vec<String> = errors
-        .iter()
-        .take(6)
-        .map(|error| format!("Verifier {layer:?}: {}", truncate_chars(error.trim(), 500)))
-        .collect();
-    if errors.len() > compact.len() {
-        compact.push(format!(
-            "{} additional verifier error(s) omitted.",
-            errors.len() - compact.len()
+    if !included_any && !slices.is_empty() {
+        let s = &slices[0];
+        out.push_str(&format!(
+            "- {} ({}): {}\n",
+            s.symbol_name,
+            s.file_path.display(),
+            s.signature
         ));
     }
-    compact
+    out.push_str("\n");
+
+    // Include the exact errors causing verification failures
+    if !prior_errors.is_empty() {
+        out.push_str("# Previous verification failed; address these errors\n");
+        for e in prior_errors {
+            out.push_str("- ");
+            out.push_str(e);
+            out.push('\n');
+        }
+    }
+
+    if !mcp_results.is_empty() {
+        out.push_str("\n# MCP results\n");
+        for result in mcp_results {
+            let status = if result.success { "success" } else { "failed" };
+            out.push_str(&format!(
+                "- {}/{}: {status}\n",
+                result.server_id, result.tool_name
+            ));
+            out.push_str("<mcp-result>\n");
+            out.push_str(&result.content);
+            if !result.content.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("</mcp-result>\n");
+        }
+    }
+
+    out.push_str("\n# CRITICAL\n");
+    out.push_str("Output the UNIFIED DIFF to fix the above errors. Avoid full-file rewrites. Start with `--- a/` or `--- /dev/null`. NO PROSE.\n");
+
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2576,24 +1527,9 @@ fn parse_range(s: &str) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn guard() -> ExecutionGuard {
         ExecutionGuard::new(PathBuf::from("/work/proj"))
-    }
-
-    fn temp_workspace(name: &str) -> (PathBuf, PathBuf) {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!(
-            "phonton-worker-{name}-{}-{suffix}",
-            std::process::id()
-        ));
-        let root = base.join("workspace");
-        std::fs::create_dir_all(&root).expect("create temp workspace");
-        (base, root)
     }
 
     #[test]
@@ -2610,33 +1546,6 @@ mod tests {
             path: PathBuf::from("/tmp/other.txt"),
         });
         assert!(matches!(d, GuardDecision::Approve { .. }));
-    }
-
-    #[tokio::test]
-    async fn read_tool_refuses_canonical_escape_outside_root() {
-        let (base, root) = temp_workspace("read-escape");
-        let outside = base.join("outside.txt");
-        std::fs::write(&outside, "secret").expect("write outside file");
-
-        let result = read_tool(&root, &outside).await.expect("read tool result");
-
-        assert!(result.contains("refusing to read outside project root"));
-        assert!(!result.contains("secret"));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn write_tool_refuses_absolute_path_outside_root() {
-        let (base, root) = temp_workspace("write-escape");
-        let outside = base.join("outside.txt");
-
-        let result = write_tool(&root, &outside, "secret")
-            .await
-            .expect("write tool result");
-
-        assert!(result.contains("refusing to write outside project root"));
-        assert!(!outside.exists());
-        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -2757,985 +1666,6 @@ mod tests {
     }
 
     #[test]
-    fn full_prompt_omits_empty_context_padding() {
-        assert_eq!(
-            render_full_prompt("", "# Subtask\nmake chess"),
-            "# Subtask\nmake chess"
-        );
-        assert_eq!(
-            render_full_prompt("prior", "# Subtask\nmake chess"),
-            "prior\n\n# Subtask\nmake chess"
-        );
-    }
-
-    #[test]
-    fn prompt_manifest_breaks_out_section_costs() {
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "make chess".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-        let errors = vec!["syntax failed".into()];
-        let manifest = prompt_context_manifest(PromptManifestInput {
-            system_prompt: &base_system_prompt(),
-            subtask: &subtask,
-            rendered_context: "prior decision context",
-            repo_context: &[],
-            context_plan: None,
-            prior_errors: &errors,
-            mcp_results: &[],
-            mcp: None,
-            deduped_tokens: 0,
-            compacted_tokens: 0,
-            budget_limit: Some(DEFAULT_WINDOW_LIMIT as u64),
-            attempt: 2,
-            repair_attempt: true,
-        });
-        assert!(manifest.system_tokens > 0);
-        assert!(manifest.user_goal_tokens > 0);
-        assert!(manifest.memory_tokens > 0);
-        assert!(manifest.retry_error_tokens > 0);
-        assert_eq!(manifest.attempt, 2);
-        assert!(manifest.repair_attempt);
-        assert_eq!(
-            manifest.total_estimated_tokens,
-            manifest
-                .system_tokens
-                .saturating_add(manifest.user_goal_tokens)
-                .saturating_add(manifest.memory_tokens)
-                .saturating_add(manifest.attachment_tokens)
-                .saturating_add(manifest.repo_map_tokens)
-                .saturating_add(manifest.code_context_tokens)
-                .saturating_add(manifest.mcp_tool_tokens)
-                .saturating_add(manifest.retry_error_tokens)
-        );
-        assert_eq!(manifest.context_mention_tokens, manifest.attachment_tokens);
-    }
-
-    #[test]
-    fn compact_verify_retry_errors_caps_diagnostic_context() {
-        let errors: Vec<String> = (0..8)
-            .map(|i| format!("[python syntax] chess.py:{}: {}", i + 1, "x".repeat(700)))
-            .collect();
-        let compact = compact_verify_retry_errors(VerifyLayer::Syntax, &errors);
-
-        assert_eq!(compact.len(), 7);
-        assert!(compact[0].starts_with("Verifier Syntax: [python syntax] chess.py:1"));
-        assert!(compact[0].chars().count() < 540);
-        assert!(compact
-            .last()
-            .unwrap()
-            .contains("additional verifier error"));
-    }
-
-    #[test]
-    fn repo_context_dedupe_keeps_one_copy_and_tracks_saved_tokens() {
-        let slice = CodeSlice {
-            file_path: PathBuf::from("src/lib.rs"),
-            symbol_name: "parse".into(),
-            signature: "fn parse()".into(),
-            docstring: None,
-            callsites: Vec::new(),
-            token_count: 42,
-            origin: SliceOrigin::Semantic,
-        };
-        let duplicate = slice.clone();
-        let deduped = dedupe_code_slices(
-            std::slice::from_ref(&slice),
-            std::slice::from_ref(&duplicate),
-        );
-
-        assert_eq!(deduped.slices.len(), 1);
-        assert_eq!(deduped.deduped_tokens, 42);
-    }
-
-    #[test]
-    fn generated_slice_reads_current_artifact_as_context() {
-        let (base, root) = temp_workspace("artifact-context");
-        let index = root.join("index.html");
-        std::fs::write(
-            &index,
-            "<!doctype html>\n<div id=\"board\">current board</div>\n",
-        )
-        .expect("write artifact");
-        let task = subtask(
-            "Acceptance slice 2/7 for `make chess in html`: show named pieces. Artifact: index.html. Keep the diff minimal.",
-        );
-
-        let slices = current_artifact_context_slices(&root, &task, &[]);
-
-        assert_eq!(slices.len(), 1);
-        assert_eq!(slices[0].file_path, PathBuf::from("index.html"));
-        assert!(slices[0].symbol_name.contains("current artifact"));
-        assert!(slices[0].signature.contains("current board"));
-        assert!(slices[0]
-            .signature
-            .contains("Patch against this exact current file"));
-        assert!(slices[0].signature.contains("remove every current line"));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn inline_source_path_reads_current_artifact_on_first_attempt() {
-        let (base, root) = temp_workspace("inline-artifact-context");
-        let path = root.join("src/receipt.js");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            "export function buildReceipt(run) {\n  return `Goal: ${run.goal}`;\n}\n",
-        )
-        .unwrap();
-        let task = subtask(
-            "Refactor `src/receipt.js` into smaller helpers and finish with `node --check src/receipt.js`.",
-        );
-
-        let slices = current_artifact_context_slices(&root, &task, &[]);
-
-        assert_eq!(slices.len(), 1);
-        assert_eq!(slices[0].file_path, PathBuf::from("src/receipt.js"));
-        assert!(slices[0].signature.contains("export function buildReceipt"));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn repair_context_reads_file_named_in_verifier_error() {
-        let (base, root) = temp_workspace("repair-artifact-context");
-        let path = root.join("src/chessRules.test.ts");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            "import { describe, it, expect } from 'vitest';\nimport { getInitialBoard } from './chessRules';\n",
-        )
-        .unwrap();
-
-        let task = subtask(
-            "Vite React chess app acceptance slice 2/7: implement rules. Artifact: src/chessRules.ts.",
-        );
-        let errors = vec![
-            "Verifier Syntax: [typescript syntax] src/chessRules.test.ts: could not reconstruct post-diff file: removed-line mismatch at line 1".to_string(),
-        ];
-
-        let slices = current_artifact_context_slices(&root, &task, &errors);
-
-        assert!(slices.iter().any(|slice| {
-            slice.file_path.as_path() == Path::new("src/chessRules.test.ts")
-                && slice.signature.contains("import { describe, it, expect }")
-        }));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn successful_worker_context_omits_full_diff_body() {
-        let task =
-            subtask("Acceptance slice 2/4 for `make chess`: wire board UI. Artifact: src/App.tsx.");
-        let diff = (0..80)
-            .map(|line| format!("+const generatedLine{line} = {line};"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let hunk = DiffHunk {
-            file_path: PathBuf::from("src/App.tsx"),
-            old_start: 0,
-            old_count: 0,
-            new_start: 1,
-            new_count: 80,
-            lines: diff
-                .lines()
-                .map(|line| DiffLine::Added(line.trim_start_matches('+').to_string()))
-                .collect(),
-        };
-
-        let frame = compact_success_context(&task, &diff, &[hunk]);
-
-        assert!(frame.contains("Completed subtask"));
-        assert!(frame.contains("src/App.tsx"));
-        assert!(!frame.contains("generatedLine79"));
-        assert!(estimate_prompt_tokens(&frame) < 120);
-    }
-
-    #[test]
-    fn worker_prompt_policy_sets_low_context_budgets_by_task_class() {
-        let docs = subtask("clean up the readme typos");
-        let bug = subtask("fix failing config parser panic");
-        let generated = subtask("make chess in html");
-
-        assert_eq!(dynamic_worker_context_target(&docs, &[]), 800);
-        assert_eq!(dynamic_worker_context_target(&bug, &[]), 1_800);
-        assert_eq!(dynamic_worker_context_target(&generated, &[]), 1_200);
-        assert_eq!(semantic_slice_limit(&generated), 1);
-    }
-
-    #[test]
-    fn generated_app_repairs_are_sub_1k_input_context() {
-        let generated = subtask("make chess in html");
-        let errors = vec!["missing reset behavior".into()];
-        let policy = worker_prompt_policy(&generated, true);
-
-        assert_eq!(dynamic_worker_context_target(&generated, &errors), 900);
-        assert_eq!(policy.max_repo_map_items, 2);
-        assert!(policy.mcp_result_max_chars <= 900);
-    }
-
-    #[test]
-    fn first_attempt_system_prompt_omits_bulky_diff_example() {
-        let prompt = system_prompt_for_attempt(&[], false);
-
-        assert!(prompt.contains("You are a Phonton worker"));
-        assert!(!prompt.contains("EXAMPLE OF CREATING A NEW FILE"));
-        assert!(!prompt.contains("MCP_TOOL_CALL"));
-    }
-
-    #[derive(Clone)]
-    struct RecordingProvider {
-        calls: Arc<Mutex<Vec<(String, String)>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for RecordingProvider {
-        async fn call(
-            &self,
-            system: &str,
-            user: &str,
-            _slice_origins: &[SliceOrigin],
-        ) -> Result<phonton_types::LLMResponse> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((system.to_string(), user.to_string()));
-            Ok(phonton_types::LLMResponse {
-                content: "this is not a diff".into(),
-                input_tokens: 10,
-                output_tokens: 2,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                provider: phonton_types::ProviderKind::Anthropic,
-                model_name: "recording".into(),
-            })
-        }
-
-        fn kind(&self) -> phonton_types::ProviderKind {
-            phonton_types::ProviderKind::Anthropic
-        }
-
-        fn model(&self) -> String {
-            "recording".into()
-        }
-
-        fn clone_box(&self) -> Box<dyn Provider> {
-            Box::new(self.clone())
-        }
-    }
-
-    #[derive(Clone)]
-    struct StaticProvider {
-        content: String,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for StaticProvider {
-        async fn call(
-            &self,
-            _system: &str,
-            _user: &str,
-            _slice_origins: &[SliceOrigin],
-        ) -> Result<phonton_types::LLMResponse> {
-            Ok(phonton_types::LLMResponse {
-                content: self.content.clone(),
-                input_tokens: 10,
-                output_tokens: 10,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                provider: phonton_types::ProviderKind::Anthropic,
-                model_name: "static".into(),
-            })
-        }
-
-        fn kind(&self) -> phonton_types::ProviderKind {
-            phonton_types::ProviderKind::Anthropic
-        }
-
-        fn model(&self) -> String {
-            "static".into()
-        }
-
-        fn clone_box(&self) -> Box<dyn Provider> {
-            Box::new(self.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn worker_does_not_duplicate_system_prompt_in_user_context() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), guard());
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "make chess".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let _ = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        let calls = calls.lock().unwrap();
-        assert!(!calls.is_empty());
-        let (system, user) = &calls[0];
-        assert!(system.contains("You are a Phonton worker"));
-        assert!(user.contains("# Subtask"));
-        assert!(user.contains("make chess"));
-        assert!(!user.contains("You are a Phonton worker"));
-    }
-
-    #[tokio::test]
-    async fn stale_whole_file_hunk_is_canonicalized_before_success() {
-        let (base, root) = temp_workspace("stale-whole-file-canonicalize");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src/receipt.js"),
-            "export function buildReceipt(run) {\n  return `Goal: ${run.goal}`;\n}\n",
-        )
-        .unwrap();
-        let provider = StaticProvider {
-            content: "--- a/src/receipt.js\n+++ b/src/receipt.js\n@@ -1,3 +1,5 @@\n export function buildReceipt(run) {\n \n+  const goal = run?.goal ?? \"\";\n+  return `Goal: ${goal}`;\n }\n"
-                .into(),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Refactor `src/receipt.js` into smaller helpers.".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert_eq!(result.diff_hunks.len(), 1);
-        assert!(result.diff_hunks[0]
-            .lines
-            .iter()
-            .any(|line| matches!(line, DiffLine::Added(line) if line.contains("const goal"))));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn execute_with_prior_errors_includes_them_on_first_prompt() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), guard());
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "fix generated chess tests".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let _ = worker
-            .execute_with_prior_errors(
-                subtask,
-                Vec::new(),
-                vec!["Verifier Syntax: src/chessRules.test.ts removed-line mismatch".into()],
-            )
-            .await
-            .unwrap();
-
-        let calls = calls.lock().unwrap();
-        let (_, first_user_prompt) = &calls[0];
-        assert!(first_user_prompt.contains("# Previous verification failed"));
-        assert!(first_user_prompt.contains("removed-line mismatch"));
-    }
-
-    #[tokio::test]
-    async fn generated_app_first_prompt_includes_current_artifact_snapshot() {
-        let (base, root) = temp_workspace("generated-artifact-first-prompt");
-        let app = root.join("src").join("App.tsx");
-        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
-        std::fs::write(
-            &app,
-            "import './App.css'\n\nfunction App() { return <main>placeholder</main> }\n\nexport default App\n",
-        )
-        .unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description:
-                "Vite React chess app acceptance slice 4/7: render board. Artifact: src/App.tsx."
-                    .into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let _ = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        let calls = calls.lock().unwrap();
-        let (_, first_user_prompt) = &calls[0];
-        assert!(first_user_prompt.contains("Patch against this exact current file"));
-        assert!(first_user_prompt.contains("import './App.css'"));
-        assert!(first_user_prompt.contains("function App()"));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn existing_vite_chess_rules_seed_uses_local_verified_diff_without_provider_call() {
-        let (base, root) = temp_workspace("local-chess-rules-seed");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Existing Vite React chess app acceptance slice 1/4: create a compile-safe local chess rules seed. Artifacts: src/chessRules.ts, src/chessRules.test.ts.".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert_eq!(result.token_usage.input_tokens, 0);
-        assert_eq!(result.token_usage.output_tokens, 0);
-        assert!(calls.lock().unwrap().is_empty());
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/chessRules.ts")));
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/chessRules.test.ts")));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn existing_vite_chess_rules_seed_replaces_partial_failed_artifacts_locally() {
-        let (base, root) = temp_workspace("local-chess-rules-seed-repair");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src").join("chessRules.ts"),
-            "not valid typescript {",
-        )
-        .unwrap();
-        std::fs::write(root.join("src").join("chessRules.test.ts"), "broken test {").unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Existing Vite React chess app acceptance slice 1/4: create a compile-safe local chess rules seed. Artifacts: src/chessRules.ts, src/chessRules.test.ts.".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert_eq!(result.token_usage.input_tokens, 0);
-        assert_eq!(result.token_usage.output_tokens, 0);
-        assert!(calls.lock().unwrap().is_empty());
-        let rules_hunk = result
-            .diff_hunks
-            .iter()
-            .find(|hunk| hunk.file_path.as_path() == Path::new("src/chessRules.ts"))
-            .unwrap();
-        assert_eq!(rules_hunk.old_count, 1);
-        assert!(rules_hunk.lines.iter().any(
-            |line| matches!(line, DiffLine::Removed(line) if line == "not valid typescript {")
-        ));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn receipt_renderer_seed_uses_local_verified_diff_without_provider_call() {
-        let (base, root) = temp_workspace("receipt-renderer-seed");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(root.join("test")).unwrap();
-        std::fs::write(
-            root.join("package.json"),
-            r#"{
-  "type": "module",
-  "scripts": {
-    "test": "node --test"
-  }
-}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/receipt.js"),
-            "export function buildReceipt(run) {\n  return `# ${run.title || \"Task Receipt\"}\\n\\nGoal: ${run.goal}\\n`;\n}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("test/receipt.test.js"),
-            "import assert from 'node:assert/strict';\nimport test from 'node:test';\nimport { buildReceipt } from '../src/receipt.js';\ntest('commands', () => assert.match(buildReceipt({ goal: 'run', commands: [{ label: 'unit tests', command: 'npm test', exitCode: 1, durationMs: 5, stderr: 'failure' }] }), /## Commands/));\ntest('gaps', () => assert.match(buildReceipt({ goal: 'run', knownGaps: [{ severity: 'high', text: 'gap' }] }), /high: gap/));\ntest('verifiedBy', () => assert.match(buildReceipt({ goal: 'run', changedFiles: [{ path: 'src/receipt.js', verifiedBy: ['npm test'] }] }), /verified by npm test/));\n",
-        )
-        .unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Refactor receipt renderer and preserve buildReceipt".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert!(calls.lock().unwrap().is_empty());
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/receipt.js")));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn config_loader_seed_uses_local_verified_diff_without_provider_call() {
-        let (base, root) = temp_workspace("config-loader-seed");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::create_dir_all(root.join("test")).unwrap();
-        std::fs::write(
-            root.join("package.json"),
-            r#"{
-  "type": "module",
-  "scripts": {
-    "test": "node --test"
-  }
-}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src/config.js"),
-            "export function loadConfig(raw = {}, env = process.env) {\n  const provider = raw.provider || env.PROVIDER || \"openai\";\n  const model = raw.model || env.MODEL || \"gpt-4o-mini\";\n  const maxRetries = Number(raw.maxRetries || env.MAX_RETRIES || 2);\n  return { provider: provider.trim(), model: model.trim(), maxRetries };\n}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("test/config.test.js"),
-            "import assert from 'node:assert/strict';\nimport test from 'node:test';\nimport { loadConfig } from '../src/config.js';\ntest('blank explicit provider is invalid instead of falling back', () => assert.throws(() => loadConfig({ provider: ' ' }, { PROVIDER: 'openai' }), /provider/i));\ntest('blank explicit model is invalid instead of falling back', () => assert.throws(() => loadConfig({ model: '' }, { MODEL: 'gpt' }), /model/i));\ntest('maxRetries must be an integer from 0 through 10', () => { assert.equal(loadConfig({ maxRetries: 0 }, {}).maxRetries, 0); assert.throws(() => loadConfig({ maxRetries: 11 }, {}), /maxRetries/i); });\n",
-        )
-        .unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Fix config loader bug in loadConfig".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert!(calls.lock().unwrap().is_empty());
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/config.js")));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn existing_vite_chess_app_shell_seed_uses_local_verified_diff_without_provider_call() {
-        let (base, root) = temp_workspace("local-chess-app-shell-seed");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src").join("App.tsx"),
-            "export default function App() { return <main /> }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src").join("App.css"),
-            ".fixture-shell {\n  color: black;\n}\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src").join("chessRules.ts"),
-            include_str!("templates/chessRules.ts"),
-        )
-        .unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Existing Vite React chess app acceptance slice 2/4: replace the placeholder React screen with the actual chess app, board coordinates, named pieces, and clear turn status. Artifacts: src/App.tsx, src/App.css. Keep the diff minimal; satisfy only this slice, preserve earlier slices, and keep npm test/build passing.".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert_eq!(result.token_usage.input_tokens, 0);
-        assert_eq!(result.token_usage.output_tokens, 0);
-        assert!(calls.lock().unwrap().is_empty());
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/App.tsx")));
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/App.css")));
-        assert!(result
-            .diff_hunks
-            .iter()
-            .any(|hunk| hunk.file_path.as_path() == Path::new("src/vite-env.d.ts")));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn existing_vite_chess_app_shell_seed_replaces_stale_app_test_when_present() {
-        let (base, root) = temp_workspace("local-chess-app-shell-test-seed");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src").join("App.test.tsx"),
-            "expect(screen.getByRole('heading', { name: /replace this placeholder chess/i })).toBeInTheDocument()\n",
-        )
-        .unwrap();
-        let subtask = subtask(
-            "Existing Vite React chess app acceptance slice 2/4: replace the placeholder React screen with the actual chess app, board coordinates, named pieces, and clear turn status. Artifacts: src/App.tsx, src/App.css.",
-        );
-
-        let hunks = local_generated_artifact_seed_hunks(&root, &subtask).unwrap();
-
-        let test_hunk = hunks
-            .iter()
-            .find(|hunk| hunk.file_path.as_path() == Path::new("src/App.test.tsx"))
-            .expect("existing App test should be replaced with local seed expectations");
-        assert!(test_hunk.lines.iter().any(
-            |line| matches!(line, DiffLine::Removed(line) if line.contains("placeholder chess"))
-        ));
-        assert!(test_hunk.lines.iter().any(
-            |line| matches!(line, DiffLine::Added(line) if line.contains("local chess shell"))
-        ));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn existing_vite_chess_app_shell_seed_replaces_stale_playwright_spec_when_present() {
-        let (base, root) = temp_workspace("local-chess-app-shell-e2e-seed");
-        std::fs::create_dir_all(root.join("tests").join("e2e")).unwrap();
-        std::fs::write(
-            root.join("tests").join("e2e").join("placeholder.spec.ts"),
-            "await expect(page.getByRole('heading', { name: /replace this placeholder with playable chess/i })).toBeVisible()\n",
-        )
-        .unwrap();
-        let subtask = subtask(
-            "Existing Vite React chess app acceptance slice 2/4: replace the placeholder React screen with the actual chess app, board coordinates, named pieces, and clear turn status. Artifacts: src/App.tsx, src/App.css.",
-        );
-
-        let hunks = local_generated_artifact_seed_hunks(&root, &subtask).unwrap();
-
-        let test_hunk = hunks
-            .iter()
-            .find(|hunk| hunk.file_path.as_path() == Path::new("tests/e2e/placeholder.spec.ts"))
-            .expect("existing Playwright placeholder spec should be replaced with chess app expectations");
-        assert!(test_hunk.lines.iter().any(
-            |line| matches!(line, DiffLine::Removed(line) if line.contains("replace this placeholder"))
-        ));
-        assert!(test_hunk.lines.iter().any(
-            |line| matches!(line, DiffLine::Added(line) if line.contains("playable chess board"))
-        ));
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn local_chess_app_shell_template_contains_named_piece_evidence_for_quality_gate() {
-        let template = include_str!("templates/App.tsx").to_ascii_lowercase();
-        let named_piece_hits = ["king", "queen", "rook", "bishop", "knight", "pawn"]
-            .into_iter()
-            .filter(|piece| template.contains(piece))
-            .count();
-
-        assert!(
-            named_piece_hits >= 4,
-            "the chess quality gate evaluates added diff text, so the App shell template must include literal named piece evidence"
-        );
-        assert!(
-            template.contains("piece.kind"),
-            "square accessible labels should expose the piece kind so Playwright and screen readers can find a1 rook"
-        );
-        assert!(
-            !template.contains("role=\"gridcell\""),
-            "playable squares must keep the native button role used by the generated Playwright smoke test"
-        );
-        assert_eq!(
-            template.matches("white to move").count(),
-            0,
-            "the initial notice should not duplicate the turn status and make Playwright text locators ambiguous"
-        );
-    }
-
-    #[tokio::test]
-    async fn existing_vite_chess_app_shell_seed_is_noop_when_files_are_current() {
-        let (base, root) = temp_workspace("local-chess-app-shell-seed-noop");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(
-            root.join("src").join("App.tsx"),
-            include_str!("templates/App.tsx"),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src").join("App.css"),
-            include_str!("templates/App.css"),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("src").join("vite-env.d.ts"),
-            include_str!("templates/vite-env.d.ts"),
-        )
-        .unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let provider = RecordingProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Existing Vite React chess app acceptance slice 3/4: support click/tap selection, legal destination highlights, legal moves, captures, blocked-path rejection, and king-safety rejection. Artifacts: src/App.tsx, src/App.css.".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert!(matches!(result.status, SubtaskStatus::Done { .. }));
-        assert!(matches!(result.verify_result, VerifyResult::Pass { .. }));
-        assert!(result.diff_hunks.is_empty());
-        assert_eq!(result.token_usage.input_tokens, 0);
-        assert_eq!(result.token_usage.output_tokens, 0);
-        assert!(calls.lock().unwrap().is_empty());
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn local_chess_rules_test_seed_uses_vitest_runner_contract() {
-        let template = include_str!("templates/chessRules.test.ts");
-
-        assert!(
-            template.contains("from 'vitest'") || template.contains("from \"vitest\""),
-            "existing Vite seed is discovered by Vitest and must use its test API"
-        );
-        assert!(
-            template.contains("describe(")
-                && (template.contains("it(") || template.contains("test(")),
-            "template should declare a runnable suite when Vitest discovers the file"
-        );
-    }
-
-    #[test]
-    fn local_chess_rules_test_seed_declares_a_vitest_suite() {
-        let template = include_str!("templates/chessRules.test.ts");
-
-        assert!(
-            template.contains("from 'vitest'") || template.contains("from \"vitest\""),
-            "Vitest treats discovered *.test.ts files with zero tests as failed suites"
-        );
-        assert!(
-            template.contains("test(") || template.contains("it("),
-            "seeded *.test.ts file must declare at least one runnable test"
-        );
-    }
-
-    #[derive(Clone)]
-    struct BrokenTsxProvider {
-        calls: Arc<Mutex<u64>>,
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for BrokenTsxProvider {
-        async fn call(
-            &self,
-            _system: &str,
-            _user: &str,
-            _slice_origins: &[SliceOrigin],
-        ) -> Result<phonton_types::LLMResponse> {
-            *self.calls.lock().unwrap() += 1;
-            Ok(phonton_types::LLMResponse {
-                content: "\
---- /dev/null
-+++ b/src/App.tsx
-@@ -0,0 +1,2 @@
-+import React from 'react';
-+export default function App() { return <div>{</div>; }
-"
-                .into(),
-                input_tokens: 900,
-                output_tokens: 40,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
-                provider: phonton_types::ProviderKind::OpenAiCompatible,
-                model_name: "broken-tsx".into(),
-            })
-        }
-
-        fn kind(&self) -> phonton_types::ProviderKind {
-            phonton_types::ProviderKind::OpenAiCompatible
-        }
-
-        fn model(&self) -> String {
-            "broken-tsx".into()
-        }
-
-        fn clone_box(&self) -> Box<dyn Provider> {
-            Box::new(self.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn generated_web_syntax_failure_does_not_spend_repair_call() {
-        let (base, root) = temp_workspace("generated-web-fast-fail");
-        let calls = Arc::new(Mutex::new(0));
-        let provider = BrokenTsxProvider {
-            calls: Arc::clone(&calls),
-        };
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(root));
-        let subtask = Subtask {
-            id: SubtaskId::new(),
-            description: "Vite React chess app acceptance slice 1/7: scaffold src/App.tsx".into(),
-            model_tier: ModelTier::Standard,
-            dependencies: Vec::new(),
-            attachments: Vec::new(),
-            status: SubtaskStatus::Queued,
-        };
-
-        let result = worker.execute(subtask, Vec::new()).await.unwrap();
-
-        assert_eq!(*calls.lock().unwrap(), 1);
-        assert!(matches!(result.status, SubtaskStatus::Failed { .. }));
-        match result.verify_result {
-            VerifyResult::Fail {
-                errors, attempt, ..
-            } => {
-                assert_eq!(attempt, 1);
-                assert!(
-                    errors
-                        .join("\n")
-                        .contains("stopped before generated-app syntax repair"),
-                    "{errors:?}"
-                );
-            }
-            other => panic!("expected syntax fail, got {other:?}"),
-        }
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn generated_web_syntax_fast_fail_uses_artifact_diagnostics_when_description_is_generic() {
-        let task = subtask("Repair verifier failure from previous attempt");
-        let errors =
-            vec!["Verifier Syntax: [typescript syntax] src/App.tsx:1:1 invalid syntax".into()];
-
-        assert!(
-            should_stop_before_generated_app_syntax_repair(
-                &task,
-                VerifyLayer::Syntax,
-                &errors,
-                1,
-                false
-            ),
-            "web artifact syntax diagnostics should stop before another broad provider repair"
-        );
-    }
-
-    #[test]
-    fn generated_web_stale_hunk_errors_are_repairable_not_fast_failed() {
-        let task = subtask(
-            "Existing Vite React chess app acceptance slice 2/4: replace the placeholder screen. Artifacts: src/App.tsx, src/App.css.",
-        );
-        let errors = vec![
-            "Verifier Syntax: [typescript syntax] src/App.tsx: could not reconstruct post-diff file: removed-line mismatch at line 1".into(),
-        ];
-
-        assert!(
-            !should_stop_before_generated_app_syntax_repair(
-                &task,
-                VerifyLayer::Syntax,
-                &errors,
-                1,
-                false
-            ),
-            "stale hunk diagnostics should feed a repair retry with current file context"
-        );
-    }
-
-    #[test]
-    fn repeated_diagnostic_signature_ignores_attempt_noise() {
-        let first = diagnostic_signature(
-            VerifyLayer::Syntax,
-            &["attempt 1 failed at line 14: removed-line mismatch".into()],
-        );
-        let second = diagnostic_signature(
-            VerifyLayer::Syntax,
-            &["attempt 2 failed at line 99: removed-line mismatch".into()],
-        );
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn refactor_subtasks_get_one_extra_evidence_repair_attempt() {
-        assert_eq!(
-            max_attempts_for_subtask(&subtask("Refactor receipt rendering and run npm test")),
-            STANDARD_MAX_ATTEMPTS
-        );
-        let mut cheap_tests = subtask("Add tests for receipt rendering");
-        cheap_tests.model_tier = ModelTier::Cheap;
-        assert_eq!(max_attempts_for_subtask(&cheap_tests), MAX_ATTEMPTS);
-        let mut standard = subtask("The final response lists verification commands");
-        standard.model_tier = ModelTier::Standard;
-        assert_eq!(max_attempts_for_subtask(&standard), STANDARD_MAX_ATTEMPTS);
-    }
-
-    #[test]
     fn render_user_prompt_lists_mcp_servers_and_results() {
         let subtask = Subtask {
             id: SubtaskId::new(),
@@ -3743,6 +1673,7 @@ mod tests {
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let server = phonton_types::McpServerDefinition {
@@ -3766,11 +1697,40 @@ mod tests {
             success: true,
             content: "- read_file".into(),
         }];
-        let prompt = render_user_prompt(&subtask, &[], None, &[], Some(&runtime), &results);
+        let prompt = render_user_prompt(&subtask, &[], &[], &[], Some(&runtime), &results);
         assert!(prompt.contains("# MCP servers"));
         assert!(prompt.contains("docs (Docs)"));
         assert!(prompt.contains("# MCP results"));
         assert!(prompt.contains("read_file"));
+    }
+
+    #[test]
+    fn render_user_prompt_includes_prompt_artifacts_once() {
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Use the pasted request".into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: vec![phonton_types::PromptArtifact {
+                id: "paste-1".into(),
+                kind: phonton_types::PromptArtifactKind::PastedText,
+                role: phonton_types::PromptArtifactRole::MainRequest,
+                label: "[paste: 2 lines, 11 chars]".into(),
+                original_chars: 11,
+                original_lines: 2,
+                text: "do x\ndo y".into(),
+                truncated: false,
+                note: None,
+            }],
+            status: SubtaskStatus::Queued,
+        };
+
+        let prompt = render_user_prompt(&subtask, &[], &[], &[], None, &[]);
+
+        assert!(prompt.contains("# Prompt artifacts"));
+        assert_eq!(prompt.matches("do x").count(), 1);
+        assert_eq!(prompt.matches("do y").count(), 1);
     }
 
     #[test]
@@ -3781,6 +1741,7 @@ mod tests {
             model_tier: ModelTier::Standard,
             dependencies: Vec::new(),
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let d = detect_decisions(&st, None);
@@ -3802,20 +1763,125 @@ mod tests {
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         assert!(detect_decisions(&st, None).is_empty());
     }
 
-    fn subtask(description: &str) -> Subtask {
-        Subtask {
+    #[tokio::test]
+    async fn execute_with_prior_errors_includes_them_on_first_prompt() {
+        use async_trait::async_trait;
+        use phonton_types::{LLMResponse, ProviderKind};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct PromptCaptureProvider {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl Provider for PromptCaptureProvider {
+            async fn call(
+                &self,
+                system: &str,
+                user: &str,
+                slice_origins: &[SliceOrigin],
+            ) -> Result<LLMResponse> {
+                self.call_with_attachments(system, user, slice_origins, &[])
+                    .await
+            }
+
+            async fn call_with_attachments(
+                &self,
+                _system: &str,
+                user: &str,
+                _slice_origins: &[SliceOrigin],
+                _attachments: &[phonton_types::PromptAttachment],
+            ) -> Result<LLMResponse> {
+                self.prompts.lock().unwrap().push(user.to_string());
+                Ok(LLMResponse {
+                    content: "\
+--- /dev/null
++++ b/notes.txt
+@@ -0,0 +1,1 @@
++ok
+"
+                    .into(),
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    cached_tokens: 0,
+                    cache_creation_tokens: 0,
+                    provider: ProviderKind::Anthropic,
+                    model_name: "capture".into(),
+                })
+            }
+
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Anthropic
+            }
+
+            fn model(&self) -> String {
+                "capture".into()
+            }
+
+            fn clone_box(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
+        }
+
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let provider = PromptCaptureProvider {
+            prompts: Arc::clone(&prompts),
+        };
+        let tmp = std::env::temp_dir().join(format!(
+            "phonton-worker-prior-errors-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(tmp.clone()));
+        let subtask = Subtask {
             id: SubtaskId::new(),
-            description: description.into(),
-            model_tier: ModelTier::Standard,
+            description: "Fix the failing generated app test".into(),
+            model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
-        }
+        };
+
+        let _ = worker
+            .execute_with_prior_errors(
+                subtask,
+                Vec::new(),
+                vec!["Verifier Syntax: src/App.tsx: removed-line mismatch at line 1".into()],
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let captured = prompts.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains("# Previous verification failed"));
+        assert!(captured[0].contains("src/App.tsx"));
+        assert!(captured[0].contains("removed-line mismatch"));
+    }
+
+    #[test]
+    fn repeated_diagnostic_signature_ignores_attempt_noise() {
+        let first = diagnostic_signature(
+            VerifyLayer::Syntax,
+            &["verify failed 1 attempts: src/App.tsx removed-line mismatch at line 1".into()],
+        );
+        let second = diagnostic_signature(
+            VerifyLayer::Syntax,
+            &["verify failed 2 attempts: src/App.tsx removed-line mismatch at line 1".into()],
+        );
+
+        assert_eq!(first, second);
+        assert!(first.contains("syntax"));
+        assert!(first.contains("src/app.tsx"));
     }
 
     #[test]
@@ -3830,6 +1896,7 @@ mod tests {
             model_tier: ModelTier::Standard,
             dependencies: Vec::new(),
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let decisions = detect_decisions(&st, None);
@@ -3846,19 +1913,5 @@ mod tests {
             .search_memory("ExecutionGuard", None, 10)
             .unwrap();
         assert_eq!(q.len(), 1);
-    }
-
-    #[test]
-    fn next_tier_escalates() {
-        assert!(matches!(next_tier(ModelTier::Local), ModelTier::Cheap));
-        assert!(matches!(next_tier(ModelTier::Cheap), ModelTier::Standard));
-        assert!(matches!(
-            next_tier(ModelTier::Standard),
-            ModelTier::Frontier
-        ));
-        assert!(matches!(
-            next_tier(ModelTier::Frontier),
-            ModelTier::Frontier
-        ));
     }
 }

@@ -1,25 +1,20 @@
-use std::path::Path;
+use phonton_types::{
+    PromptArtifact, PromptArtifactKind, PromptArtifactRole, MAX_PROMPT_ARTIFACT_CHARS,
+};
+
+const PASTE_ARTIFACT_CHAR_THRESHOLD: usize = 600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptSubmission {
+pub struct SubmittedPrompt {
+    pub description: String,
     pub display_text: String,
-    pub model_text: String,
+    pub prompt_artifacts: Vec<PromptArtifact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptArtifactKind {
-    PastedText,
-    ImagePath,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptArtifact {
-    pub kind: PromptArtifactKind,
-    pub chip: String,
-    pub text: String,
-    pub line_count: usize,
-    pub char_count: usize,
-    pub truncated: bool,
+pub enum PasteOutcome {
+    InsertedInline,
+    AddedArtifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,108 +22,92 @@ pub struct PromptBuffer {
     text: String,
     cursor: usize,
     artifacts: Vec<PromptArtifact>,
+    next_artifact_id: u64,
+    notice: Option<String>,
 }
 
-const PASTE_LINE_THRESHOLD: usize = 2;
-const PASTE_CHAR_THRESHOLD: usize = 600;
-const MAX_PASTE_ARTIFACT_CHARS: usize = 32_000;
-
-impl PromptBuffer {
-    pub fn new() -> Self {
+impl Default for PromptBuffer {
+    fn default() -> Self {
         Self {
             text: String::new(),
             cursor: 0,
             artifacts: Vec::new(),
+            next_artifact_id: 1,
+            notice: None,
         }
     }
+}
 
-    pub fn from_text(text: impl Into<String>) -> Self {
-        let text = text.into();
-        let cursor = char_count(&text);
-        Self {
-            text,
-            cursor,
-            artifacts: Vec::new(),
-        }
-    }
-
-    pub fn display_text(&self) -> &str {
+impl PromptBuffer {
+    pub fn text(&self) -> &str {
         &self.text
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
     }
 
     pub fn cursor(&self) -> usize {
         self.cursor
     }
 
-    pub fn set_text(&mut self, text: impl Into<String>) {
-        self.text = text.into();
-        self.cursor = char_count(&self.text);
-        self.artifacts.clear();
+    pub fn artifacts(&self) -> &[PromptArtifact] {
+        &self.artifacts
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.artifacts.is_empty()
+    }
+
+    pub fn char_count(&self) -> usize {
+        char_count(&self.text)
     }
 
     pub fn insert_char(&mut self, c: char) {
-        self.insert_str(&c.to_string());
+        self.cursor = insert_char_at(&mut self.text, self.cursor, c);
+        self.clear_notice();
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        self.insert_str(text);
-    }
-
-    pub fn insert_paste(&mut self, text: &str) {
-        let text = normalize_paste(text);
-        if let Some(artifact) = make_image_artifact(&text) {
-            let chip = artifact.chip.clone();
-            self.artifacts.push(artifact);
-            self.insert_str(&chip);
-        } else if should_collapse_paste(&text) {
-            let artifact = make_paste_artifact(&text);
-            let chip = artifact.chip.clone();
-            self.artifacts.push(artifact);
-            self.insert_str(&chip);
-        } else {
-            self.insert_str(&text);
+        for c in text.chars() {
+            self.cursor = insert_char_at(&mut self.text, self.cursor, c);
         }
+        self.clear_notice();
     }
 
-    pub fn delete_char_before_cursor(&mut self) {
-        if self.cursor == 0 {
+    pub fn delete_char_before(&mut self) {
+        if self.cursor == 0 && self.text.is_empty() {
+            self.artifacts.pop();
             return;
         }
-        let new_cursor = self.cursor - 1;
-        let start = byte_index_at(&self.text, new_cursor);
-        let end = byte_index_at(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
-        self.cursor = new_cursor;
+        self.cursor = delete_char_before(&mut self.text, self.cursor);
+        self.clear_notice();
     }
 
-    pub fn delete_word_before_cursor(&mut self) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut i = self.cursor.min(chars.len());
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        let start = byte_index_at(&self.text, i);
-        let end = byte_index_at(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
-        self.cursor = i;
+    pub fn delete_word_before(&mut self) {
+        self.cursor = delete_word_before(&mut self.text, self.cursor);
+        self.clear_notice();
     }
 
     pub fn clear_before_cursor(&mut self) {
-        let end = byte_index_at(&self.text, self.cursor);
+        let end = byte_idx(&self.text, self.cursor);
         self.text.replace_range(..end, "");
         self.cursor = 0;
+        self.clear_notice();
     }
 
     pub fn clear_after_cursor(&mut self) {
-        let start = byte_index_at(&self.text, self.cursor);
+        let start = byte_idx(&self.text, self.cursor);
         self.text.replace_range(start.., "");
+        self.clear_notice();
     }
 
     pub fn move_left(&mut self) {
@@ -136,7 +115,7 @@ impl PromptBuffer {
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor < char_count(&self.text) {
+        if self.cursor < self.char_count() {
             self.cursor += 1;
         }
     }
@@ -146,217 +125,195 @@ impl PromptBuffer {
     }
 
     pub fn move_end(&mut self) {
-        self.cursor = char_count(&self.text);
+        self.cursor = self.char_count();
     }
 
-    pub fn take_submission(&mut self) -> Option<PromptSubmission> {
-        let display_text = std::mem::take(&mut self.text);
-        self.cursor = 0;
-        let visible_artifacts = artifacts_visible_in_display(&display_text, &self.artifacts);
-        if display_text.trim().is_empty() && visible_artifacts.is_empty() {
-            self.artifacts.clear();
+    pub fn handle_paste(&mut self, text: &str) -> PasteOutcome {
+        let normalized = normalize_paste(text);
+        if normalized.is_empty() {
+            return PasteOutcome::InsertedInline;
+        }
+
+        if should_be_artifact(&normalized) {
+            let artifact = self.build_paste_artifact(&normalized);
+            self.artifacts.push(artifact);
+            self.clear_notice();
+            PasteOutcome::AddedArtifact
+        } else {
+            self.insert_text(&normalized);
+            PasteOutcome::InsertedInline
+        }
+    }
+
+    pub fn remove_artifact(&mut self, index: usize) -> Option<PromptArtifact> {
+        if index < self.artifacts.len() {
+            Some(self.artifacts.remove(index))
+        } else {
+            None
+        }
+    }
+
+    pub fn remove_last_artifact(&mut self) -> Option<PromptArtifact> {
+        self.artifacts.pop()
+    }
+
+    pub fn submit(&mut self) -> Option<SubmittedPrompt> {
+        if self.is_empty() {
             return None;
         }
 
-        let mut model_text = display_text.clone();
-        let text_artifacts: Vec<_> = visible_artifacts
-            .iter()
-            .filter(|artifact| artifact.kind == PromptArtifactKind::PastedText)
-            .collect();
-        let image_artifacts: Vec<_> = visible_artifacts
-            .iter()
-            .filter(|artifact| artifact.kind == PromptArtifactKind::ImagePath)
-            .collect();
+        let typed = self.text.trim().to_string();
+        let mut artifacts = std::mem::take(&mut self.artifacts);
+        self.text.clear();
+        self.cursor = 0;
+        self.notice = None;
 
-        if !text_artifacts.is_empty() {
-            if !model_text.ends_with('\n') {
-                model_text.push_str("\n\n");
-            }
-            model_text.push_str("# Pasted prompt artifacts\n");
-            for (idx, artifact) in text_artifacts.iter().enumerate() {
-                model_text.push_str(&format!(
-                    "## paste-{} ({} {}, {}{})\n",
-                    idx + 1,
-                    artifact.line_count,
-                    if artifact.line_count == 1 {
-                        "line"
-                    } else {
-                        "lines"
-                    },
-                    format_char_count(artifact.char_count),
-                    if artifact.truncated {
-                        ", truncated"
-                    } else {
-                        ""
-                    },
-                ));
-                model_text.push_str("<paste-content>\n");
-                model_text.push_str(&artifact.text);
-                if !artifact.text.ends_with('\n') {
-                    model_text.push('\n');
+        if typed.is_empty() {
+            if !artifacts.is_empty() {
+                artifacts[0].role = PromptArtifactRole::MainRequest;
+                for artifact in artifacts.iter_mut().skip(1) {
+                    artifact.role = PromptArtifactRole::Context;
                 }
-                model_text.push_str("</paste-content>\n");
+                let display_text =
+                    format!("paste: {}", first_non_empty_line(&artifacts[0].text, 60));
+                return Some(SubmittedPrompt {
+                    description: artifacts[0].text.clone(),
+                    display_text,
+                    prompt_artifacts: artifacts,
+                });
             }
+            return None;
         }
-        if !image_artifacts.is_empty() {
-            if !model_text.ends_with('\n') {
-                model_text.push_str("\n\n");
-            }
-            model_text.push_str("# Pasted image artifacts\n");
-            for (idx, artifact) in image_artifacts.iter().enumerate() {
-                let escaped = artifact.text.replace('"', "\\\"");
-                model_text.push_str(&format!("## image-{} ({})\n", idx + 1, artifact.chip));
-                model_text.push_str(&format!("image path: @\"{}\"\n", escaped));
-            }
+
+        for artifact in &mut artifacts {
+            artifact.role = PromptArtifactRole::Context;
         }
-        self.artifacts.clear();
-        Some(PromptSubmission {
-            display_text,
-            model_text,
+        Some(SubmittedPrompt {
+            display_text: typed.clone(),
+            description: typed,
+            prompt_artifacts: artifacts,
         })
     }
 
-    fn insert_str(&mut self, text: &str) {
-        let idx = byte_index_at(&self.text, self.cursor);
-        self.text.insert_str(idx, text);
-        self.cursor += char_count(text);
-    }
-}
-
-fn artifacts_visible_in_display(
-    display_text: &str,
-    artifacts: &[PromptArtifact],
-) -> Vec<PromptArtifact> {
-    let mut visible = Vec::new();
-    let mut search_from = 0;
-    for artifact in artifacts {
-        if let Some(pos) = display_text[search_from..].find(&artifact.chip) {
-            search_from += pos + artifact.chip.len();
-            visible.push(artifact.clone());
+    fn build_paste_artifact(&mut self, normalized: &str) -> PromptArtifact {
+        let original_chars = char_count(normalized);
+        let original_lines = logical_line_count(normalized);
+        let truncated = original_chars > MAX_PROMPT_ARTIFACT_CHARS;
+        let text = if truncated {
+            normalized.chars().take(MAX_PROMPT_ARTIFACT_CHARS).collect()
+        } else {
+            normalized.to_string()
+        };
+        let id = format!("paste-{}", self.next_artifact_id);
+        self.next_artifact_id += 1;
+        let label = format!(
+            "[paste: {} lines, {}]",
+            original_lines,
+            format_char_count(original_chars)
+        );
+        PromptArtifact {
+            id,
+            kind: PromptArtifactKind::PastedText,
+            role: PromptArtifactRole::Context,
+            label,
+            original_chars,
+            original_lines,
+            text,
+            truncated,
+            note: truncated.then(|| {
+                format!(
+                    "pasted text truncated to the first {} chars",
+                    MAX_PROMPT_ARTIFACT_CHARS
+                )
+            }),
         }
     }
-    visible
 }
 
-impl Default for PromptBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn should_collapse_paste(text: &str) -> bool {
-    line_count(text) >= PASTE_LINE_THRESHOLD || char_count(text) > PASTE_CHAR_THRESHOLD
-}
-
-fn normalize_paste(text: &str) -> String {
+pub fn normalize_paste(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn make_paste_artifact(text: &str) -> PromptArtifact {
-    let char_count = char_count(text);
-    let line_count = line_count(text);
-    let truncated = char_count > MAX_PASTE_ARTIFACT_CHARS;
-    let stored = if truncated {
-        text.chars().take(MAX_PASTE_ARTIFACT_CHARS).collect()
+fn should_be_artifact(text: &str) -> bool {
+    logical_line_count(text) >= 2 || char_count(text) > PASTE_ARTIFACT_CHAR_THRESHOLD
+}
+
+fn logical_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
     } else {
-        text.to_string()
-    };
-    let chip = format!(
-        "[paste: {} {}, {}]",
-        line_count,
-        if line_count == 1 { "line" } else { "lines" },
-        format_char_count(char_count)
-    );
-    PromptArtifact {
-        kind: PromptArtifactKind::PastedText,
-        chip,
-        text: stored,
-        line_count,
-        char_count,
-        truncated,
+        text.split('\n').count()
     }
-}
-
-fn make_image_artifact(text: &str) -> Option<PromptArtifact> {
-    let path = normalize_dropped_path(text)?;
-    if !is_image_path_text(&path) {
-        return None;
-    }
-    let label = image_artifact_label(&path);
-    let char_count = char_count(&path);
-    Some(PromptArtifact {
-        kind: PromptArtifactKind::ImagePath,
-        chip: format!("[image: {label}]"),
-        text: path,
-        line_count: 1,
-        char_count,
-        truncated: false,
-    })
-}
-
-fn normalize_dropped_path(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.lines().count() > 1 {
-        return None;
-    }
-    let trimmed = trimmed.trim_matches(|c| c == '"' || c == '\'');
-    let path = if let Some(rest) = trimmed.strip_prefix("file:///") {
-        #[cfg(windows)]
-        {
-            rest.replace('/', "\\")
-        }
-        #[cfg(not(windows))]
-        {
-            format!("/{rest}")
-        }
-    } else if let Some(rest) = trimmed.strip_prefix("file://") {
-        rest.to_string()
-    } else {
-        trimmed.to_string()
-    };
-    Some(path)
-}
-
-fn image_artifact_label(path: &str) -> &str {
-    path.rsplit(['\\', '/'])
-        .find(|segment| !segment.trim().is_empty())
-        .unwrap_or(path)
-}
-
-fn is_image_path_text(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn line_count(text: &str) -> usize {
-    text.lines().count().max(1)
-}
-
-fn char_count(text: &str) -> usize {
-    text.chars().count()
-}
-
-fn byte_index_at(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len())
 }
 
 fn format_char_count(chars: usize) -> String {
     if chars >= 1000 {
-        format!("{:.1}k chars", chars as f64 / 1000.0)
+        let whole = chars / 1000;
+        let tenths = (chars % 1000) / 100;
+        if tenths == 0 {
+            format!("{whole}k chars")
+        } else {
+            format!("{whole}.{tenths}k chars")
+        }
     } else {
         format!("{chars} chars")
     }
+}
+
+fn first_non_empty_line(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("pasted prompt");
+    let mut out: String = line.chars().take(max_chars).collect();
+    if char_count(line) > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn insert_char_at(s: &mut String, char_idx: usize, c: char) -> usize {
+    let byte_idx = byte_idx(s, char_idx);
+    s.insert(byte_idx, c);
+    char_idx + 1
+}
+
+fn delete_char_before(s: &mut String, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    let new_idx = char_idx - 1;
+    let start = byte_idx(s, new_idx);
+    let end = byte_idx(s, char_idx);
+    s.replace_range(start..end, "");
+    new_idx
+}
+
+fn delete_word_before(s: &mut String, char_idx: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = char_idx.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    let start = byte_idx(s, i);
+    let end = byte_idx(s, char_idx);
+    s.replace_range(start..end, "");
+    i
+}
+
+fn byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
 }
 
 #[cfg(test)]
@@ -364,120 +321,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multiline_paste_collapses_to_chip_but_submits_full_text() {
-        let mut buffer = PromptBuffer::new();
-        buffer.insert_char('x');
-        buffer.insert_paste("line one\nline two\nline three");
-
-        assert_eq!(buffer.display_text(), "x[paste: 3 lines, 28 chars]");
-
-        let submission = buffer.take_submission().expect("prompt should submit");
-        assert_eq!(submission.display_text, "x[paste: 3 lines, 28 chars]");
-        assert!(submission.model_text.starts_with("x"));
-        assert!(submission.model_text.contains("# Pasted prompt artifacts"));
-        assert!(submission
-            .model_text
-            .contains("line one\nline two\nline three"));
-    }
-
-    #[test]
-    fn long_single_line_paste_collapses_to_chip() {
-        let mut buffer = PromptBuffer::new();
-        let text = "a".repeat(601);
-        buffer.insert_paste(&text);
-
-        assert_eq!(buffer.display_text(), "[paste: 1 line, 601 chars]");
-        assert!(buffer
-            .take_submission()
-            .expect("prompt should submit")
-            .model_text
-            .contains(&text));
-    }
-
-    #[test]
-    fn short_paste_inserts_plain_text() {
-        let mut buffer = PromptBuffer::new();
-        buffer.insert_paste("short paste");
-
-        assert_eq!(buffer.display_text(), "short paste");
+    fn multiline_paste_becomes_chip_artifact() {
+        let mut buffer = PromptBuffer::default();
         assert_eq!(
-            buffer
-                .take_submission()
-                .expect("prompt should submit")
-                .model_text,
-            "short paste"
+            buffer.handle_paste("do x\r\ndo y\rdo z"),
+            PasteOutcome::AddedArtifact
+        );
+        assert_eq!(buffer.text(), "");
+        assert_eq!(buffer.artifacts().len(), 1);
+        assert_eq!(buffer.artifacts()[0].label, "[paste: 3 lines, 14 chars]");
+        assert_eq!(buffer.artifacts()[0].text, "do x\ndo y\ndo z");
+    }
+
+    #[test]
+    fn short_single_line_paste_inserts_inline() {
+        let mut buffer = PromptBuffer::default();
+        assert_eq!(
+            buffer.handle_paste("make chess"),
+            PasteOutcome::InsertedInline
+        );
+        assert_eq!(buffer.text(), "make chess");
+        assert!(buffer.artifacts().is_empty());
+    }
+
+    #[test]
+    fn artifact_only_submit_uses_pasted_text_as_main_request() {
+        let mut buffer = PromptBuffer::default();
+        buffer.handle_paste("do x\ndo y");
+
+        let submitted = buffer.submit().expect("submitted prompt");
+
+        assert_eq!(submitted.description, "do x\ndo y");
+        assert_eq!(submitted.display_text, "paste: do x");
+        assert_eq!(
+            submitted.prompt_artifacts[0].role,
+            PromptArtifactRole::MainRequest
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn typed_prompt_makes_paste_context() {
+        let mut buffer = PromptBuffer::default();
+        buffer.insert_text("use this context");
+        buffer.handle_paste("line one\nline two");
+
+        let submitted = buffer.submit().expect("submitted prompt");
+
+        assert_eq!(submitted.description, "use this context");
+        assert_eq!(
+            submitted.prompt_artifacts[0].role,
+            PromptArtifactRole::Context
         );
     }
 
     #[test]
-    fn paste_normalizes_windows_line_endings() {
-        let mut buffer = PromptBuffer::new();
-        buffer.insert_paste("do x\r\ndo y\rdo z");
-
-        assert_eq!(buffer.display_text(), "[paste: 3 lines, 14 chars]");
-        assert!(buffer
-            .take_submission()
-            .expect("prompt should submit")
-            .model_text
-            .contains("do x\ndo y\ndo z"));
-    }
-
-    #[test]
-    fn image_path_paste_collapses_to_image_artifact() {
-        let mut buffer = PromptBuffer::new();
-        buffer.insert_paste(r#"C:\screenshots\board.png"#);
-
-        assert_eq!(buffer.display_text(), "[image: board.png]");
-        let submission = buffer.take_submission().expect("prompt should submit");
-        assert!(submission.model_text.contains("# Pasted image artifacts"));
-        assert!(submission
-            .model_text
-            .contains(r#"image path: @"C:\screenshots\board.png""#));
-    }
-
-    #[test]
-    fn editing_shortcuts_update_text_and_cursor() {
-        let mut buffer = PromptBuffer::new();
-        for c in "make chess please".chars() {
-            buffer.insert_char(c);
-        }
-
-        buffer.delete_word_before_cursor();
-        assert_eq!(buffer.display_text(), "make chess ");
-
-        buffer.clear_before_cursor();
-        assert_eq!(buffer.display_text(), "");
-
-        for c in "abc".chars() {
-            buffer.insert_char(c);
-        }
-        buffer.clear_after_cursor();
-        assert_eq!(buffer.display_text(), "abc");
-        assert_eq!(buffer.cursor(), 3);
-    }
-
-    #[test]
-    fn cleared_paste_chip_does_not_submit_hidden_artifact() {
-        let mut buffer = PromptBuffer::new();
-        buffer.insert_paste("line one\nline two");
-        assert!(buffer.display_text().starts_with("[paste:"));
-
-        buffer.clear_before_cursor();
-
-        assert_eq!(buffer.display_text(), "");
-        assert_eq!(buffer.take_submission(), None);
-    }
-
-    #[test]
-    fn deleted_paste_chip_is_not_attached_to_new_prompt() {
-        let mut buffer = PromptBuffer::new();
-        buffer.insert_paste("line one\nline two");
-        buffer.clear_before_cursor();
-        buffer.insert_text("make a README");
-
-        let submission = buffer.take_submission().expect("prompt should submit");
-
-        assert_eq!(submission.display_text, "make a README");
-        assert_eq!(submission.model_text, "make a README");
+    fn backspace_on_empty_text_removes_last_artifact() {
+        let mut buffer = PromptBuffer::default();
+        buffer.handle_paste("one\ntwo");
+        buffer.delete_char_before();
+        assert!(buffer.artifacts().is_empty());
     }
 }

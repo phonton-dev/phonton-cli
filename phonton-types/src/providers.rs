@@ -33,8 +33,6 @@ pub enum ProviderKind {
     AgentRouter,
     /// Cloudflare Workers AI OpenAI-compatible endpoint.
     Cloudflare,
-    /// DeepSeek OpenAI-compatible endpoint.
-    DeepSeek,
     /// Generic OpenAI-compatible endpoint (DeepSeek, xAI, Groq, vLLM, …).
     OpenAiCompatible,
 }
@@ -49,7 +47,6 @@ impl fmt::Display for ProviderKind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::AgentRouter => "agentrouter",
             ProviderKind::Cloudflare => "cloudflare",
-            ProviderKind::DeepSeek => "deepseek",
             ProviderKind::OpenAiCompatible => "openai-compatible",
         };
         f.write_str(s)
@@ -151,9 +148,6 @@ impl ProviderConfig {
             ProviderConfig::AgentRouter { .. } => ProviderKind::AgentRouter,
             ProviderConfig::OpenAiCompatible { name, .. } if name == "cloudflare" => {
                 ProviderKind::Cloudflare
-            }
-            ProviderConfig::OpenAiCompatible { name, .. } if name == "deepseek" => {
-                ProviderKind::DeepSeek
             }
             ProviderConfig::OpenAiCompatible { .. } => ProviderKind::OpenAiCompatible,
         }
@@ -356,40 +350,4 @@ pub enum ProviderError {
     /// Transport-level failure (DNS, TLS, connection reset).
     #[error("provider transport error: {0}")]
     Transport(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PricingEntry {
-    pub input_cost_per_million: f64,      // e.g., 3.00 for Frontier
-    pub output_cost_per_million: f64,     // e.g., 15.00 for Frontier
-    pub cache_read_cost_per_million: f64, // e.g., 0.30 for prompt cache hits
-}
-
-impl PricingEntry {
-    pub fn new(input: f64, output: f64, cache_read: f64) -> Self {
-        Self {
-            input_cost_per_million: input,
-            output_cost_per_million: output,
-            cache_read_cost_per_million: cache_read,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelPricingRegistry {
-    pub frontier: PricingEntry,
-    pub standard: PricingEntry,
-    pub cheap: PricingEntry,
-    pub local: PricingEntry,
-}
-
-impl Default for ModelPricingRegistry {
-    fn default() -> Self {
-        Self {
-            frontier: PricingEntry::new(3.00, 15.00, 0.30),
-            standard: PricingEntry::new(1.50, 6.00, 0.15),
-            cheap: PricingEntry::new(0.075, 0.30, 0.0075),
-            local: PricingEntry::new(0.0, 0.0, 0.0),
-        }
-    }
 }

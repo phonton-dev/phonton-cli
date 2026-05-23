@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier,
-    PromptContextManifest, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
+    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier, Subtask,
+    SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -52,13 +52,6 @@ pub enum OrchestratorMessage {
         /// Sum of slice token counts where known.
         total_token_count: usize,
     },
-    /// Worker built a provider prompt and estimated the section costs.
-    PromptManifest {
-        /// Subtask receiving the prompt.
-        id: SubtaskId,
-        /// Approximate prompt section token counts.
-        manifest: PromptContextManifest,
-    },
     /// Worker finished a subtask successfully.
     SubtaskDone {
         /// Subtask that completed.
@@ -84,8 +77,6 @@ pub enum OrchestratorMessage {
     },
     /// User aborted the task from the UI.
     UserCancelled,
-    /// User requested an explicit context-compression pass for the active task.
-    CompactContext,
     /// Token budget exhausted — orchestrator must cancel all workers.
     BudgetExceeded {
         /// Configured token limit.
@@ -141,7 +132,7 @@ pub enum WorkerMessage {
 ///
 /// The TUI, desktop UI, and any external observer consume this instead of
 /// subscribing to the mpsc message stream directly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalState {
     /// High-level lifecycle state of the task.
     pub task_status: TaskStatus,
@@ -168,7 +159,7 @@ pub struct GlobalState {
 }
 
 /// Live snapshot of a single worker, included in [`GlobalState`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerState {
     /// Subtask this worker is currently executing.
     pub subtask_id: SubtaskId,

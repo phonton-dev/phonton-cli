@@ -10,10 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use phonton_types::{
-    EventRecord, MemoryRecord, OutcomeLedger, SessionSnapshot, TaskId, TaskStatus,
-    WorkspaceTrustRecord,
-};
+use phonton_types::{EventRecord, MemoryRecord, OutcomeLedger, TaskId, TaskStatus};
 use rusqlite::{params, Connection, OptionalExtension};
 
 // ---------------------------------------------------------------------------
@@ -65,19 +62,6 @@ CREATE TABLE IF NOT EXISTS warm_crates (
     last_checked_at   INTEGER NOT NULL,  -- unix seconds
     last_files_hash   TEXT NOT NULL      -- caller-supplied hash of crate sources
 );
-
-CREATE TABLE IF NOT EXISTS session_snapshots (
-    workspace     TEXT PRIMARY KEY,
-    body_json     TEXT NOT NULL,
-    saved_at      INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS workspace_trust (
-    workspace     TEXT PRIMARY KEY,
-    body_json     TEXT NOT NULL,
-    trusted_at    INTEGER NOT NULL,
-    last_seen_at  INTEGER NOT NULL
-);
 ";
 
 /// How long a `warm_crates` row stays valid. See
@@ -125,82 +109,6 @@ impl Store {
     /// Filesystem path the store was opened with (or `:memory:`).
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    // -----------------------------------------------------------------
-    // Session snapshots
-    // -----------------------------------------------------------------
-
-    /// Insert or replace the saved interactive session for one workspace.
-    pub fn save_session_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
-        let body = serde_json::to_string(snapshot)?;
-        self.conn.execute(
-            "INSERT INTO session_snapshots (workspace, body_json, saved_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(workspace) DO UPDATE SET
-                 body_json = excluded.body_json,
-                 saved_at  = excluded.saved_at",
-            params![snapshot.workspace.as_str(), body, snapshot.saved_at as i64],
-        )?;
-        Ok(())
-    }
-
-    /// Load the saved interactive session for `workspace`, if one exists.
-    pub fn load_session_snapshot(&self, workspace: &str) -> Result<Option<SessionSnapshot>> {
-        let body: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT body_json FROM session_snapshots WHERE workspace = ?1",
-                params![workspace],
-                |r| r.get(0),
-            )
-            .optional()?;
-        body.map(|s| serde_json::from_str::<SessionSnapshot>(&s).map_err(Into::into))
-            .transpose()
-    }
-
-    /// Insert or replace a structured workspace trust record.
-    pub fn upsert_workspace_trust(&self, record: &WorkspaceTrustRecord) -> Result<()> {
-        let body = serde_json::to_string(record)?;
-        self.conn.execute(
-            "INSERT INTO workspace_trust (workspace, body_json, trusted_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(workspace) DO UPDATE SET
-                 body_json    = excluded.body_json,
-                 last_seen_at = excluded.last_seen_at",
-            params![
-                record.canonical_path.as_str(),
-                body,
-                record.trusted_at as i64,
-                record.last_seen_at as i64
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// List structured workspace trust records, newest-seen first.
-    pub fn list_workspace_trust(&self, limit: usize) -> Result<Vec<WorkspaceTrustRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT body_json FROM workspace_trust
-             ORDER BY last_seen_at DESC, trusted_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|s| serde_json::from_str::<WorkspaceTrustRecord>(&s).map_err(Into::into))
-            .collect()
-    }
-
-    /// Remove one workspace trust mirror row. The JSON trust file remains
-    /// canonical for launch gating; callers should revoke both when needed.
-    pub fn delete_workspace_trust(&self, workspace: &str) -> Result<bool> {
-        let changed = self.conn.execute(
-            "DELETE FROM workspace_trust WHERE workspace = ?1",
-            params![workspace],
-        )?;
-        Ok(changed > 0)
     }
 
     // -----------------------------------------------------------------
@@ -788,10 +696,7 @@ fn ensure_memory_columns(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phonton_types::{
-        MemoryRecord, PermissionMode, SessionGoalSnapshot, SessionSnapshot, SessionTotals,
-        WorkspaceTrustRecord, WorkspaceTrustSource,
-    };
+    use phonton_types::MemoryRecord;
 
     #[test]
     fn open_creates_schema() {
@@ -917,75 +822,6 @@ mod tests {
     }
 
     #[test]
-    fn session_snapshot_round_trips_by_workspace() {
-        let s = Store::in_memory().unwrap();
-        let task_id = TaskId::new();
-        let snapshot = SessionSnapshot {
-            workspace: "C:\\work\\phonton".into(),
-            saved_at: 1_777_777,
-            selected_goal: 0,
-            goal_input: "finish docs".into(),
-            ask_input: "what changed?".into(),
-            ask_answer: Some("the CLI now resumes sessions".into()),
-            prompt_history: vec!["add resume support".into()],
-            best_savings_pct: Some(71),
-            goals: vec![SessionGoalSnapshot {
-                description: "add resume support".into(),
-                status: TaskStatus::Reviewing {
-                    tokens_used: 320,
-                    estimated_savings_tokens: 680,
-                },
-                state: None,
-                task_id,
-                flight_log: Vec::new(),
-            }],
-            totals: SessionTotals {
-                goals: 1,
-                completed: 0,
-                failed: 0,
-                reviewing: 1,
-                tokens_used: 320,
-                naive_baseline_tokens: 1_000,
-                estimated_tokens_saved: 680,
-                best_savings_pct: Some(71),
-            },
-        };
-
-        s.save_session_snapshot(&snapshot).unwrap();
-
-        let loaded = s
-            .load_session_snapshot("C:\\work\\phonton")
-            .unwrap()
-            .expect("snapshot exists");
-        assert_eq!(loaded, snapshot);
-        assert!(s.load_session_snapshot("C:\\other").unwrap().is_none());
-    }
-
-    #[test]
-    fn workspace_trust_round_trips_and_updates_last_seen() {
-        let s = Store::in_memory().unwrap();
-        let mut record = WorkspaceTrustRecord {
-            canonical_path: "C:\\work\\repo".into(),
-            display_name: "repo".into(),
-            trusted_at: 10,
-            last_seen_at: 10,
-            permission_mode: PermissionMode::Ask,
-            source: WorkspaceTrustSource::JsonRecord,
-        };
-
-        s.upsert_workspace_trust(&record).unwrap();
-        record.last_seen_at = 20;
-        record.permission_mode = PermissionMode::WorkspaceWrite;
-        s.upsert_workspace_trust(&record).unwrap();
-
-        let rows = s.list_workspace_trust(10).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].last_seen_at, 20);
-        assert_eq!(rows[0].permission_mode, PermissionMode::WorkspaceWrite);
-        assert!(s.delete_workspace_trust("C:\\work\\repo").unwrap());
-    }
-
-    #[test]
     fn warm_crate_round_trip() {
         let s = Store::in_memory().unwrap();
         assert!(!s.is_crate_warm_sync("phonton-types", "h1").unwrap());
@@ -1041,7 +877,6 @@ mod tests {
                 findings: Vec::new(),
                 skipped: Vec::new(),
             },
-            summaries: phonton_types::OutcomeSummaries::default(),
             handoff: None,
         };
         s.upsert_outcome_ledger(&ledger).unwrap();

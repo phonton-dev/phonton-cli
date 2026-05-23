@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ContextAttribution, CostSummary, DiffHunk, ExtensionId, ExtensionKind, ExtensionSource,
-    ModelTier, Permission, PromptContextManifest, ProviderKind, SteeringSeverity, SubtaskId,
-    TaskId, TokenUsage, VerifyResult,
+    ModelTier, Permission, ProviderKind, SteeringSeverity, SubtaskId, TaskId, TokenUsage,
+    VerifyResult,
 };
 
 /// Token threshold between successive [`OrchestratorEvent::TokenMilestone`]
@@ -80,13 +80,6 @@ pub enum OrchestratorEvent {
         slices: Vec<ContextAttribution>,
         total_token_count: usize,
     },
-    /// Approximate prompt section token costs for one provider call.
-    PromptManifest {
-        subtask_id: SubtaskId,
-        manifest: PromptContextManifest,
-    },
-    /// A user requested explicit context compaction for the active task.
-    ContextCompacted { task_id: TaskId, compacted: bool },
     /// An extension manifest was loaded by the resolver.
     ExtensionLoaded {
         extension_id: ExtensionId,
@@ -153,12 +146,6 @@ pub enum OrchestratorEvent {
         subtask_id: SubtaskId,
         reason: String,
         attempt: u8,
-        #[serde(default)]
-        token_usage: TokenUsage,
-        #[serde(default)]
-        provider: Option<ProviderKind>,
-        #[serde(default)]
-        model_name: String,
     },
     /// `phonton-verify` returned `Pass` for a produced diff.
     VerifyPass {
@@ -172,8 +159,18 @@ pub enum OrchestratorEvent {
         errors: Vec<String>,
         attempt: u8,
     },
-    /// The orchestrator is about to retry with verifier diagnostics instead
-    /// of spending a blind provider call.
+    /// Playwright browser check passed.
+    VerifyBrowserCheckPass {
+        subtask_id: SubtaskId,
+        screenshot_path: std::path::PathBuf,
+    },
+    /// Playwright browser check failed.
+    VerifyBrowserCheckFail {
+        subtask_id: SubtaskId,
+        errors: Vec<String>,
+    },
+    /// A failed subtask is being redispatched with verifier evidence
+    /// threaded into the next prompt/context selection.
     RepairPlanned {
         subtask_id: SubtaskId,
         attempt: u8,
@@ -244,8 +241,6 @@ impl EventRecord {
             OrchestratorEvent::TaskCompleted { .. } => "task-done",
             OrchestratorEvent::SubtaskDispatched { .. } => "dispatch",
             OrchestratorEvent::ContextSelected { .. } => "context",
-            OrchestratorEvent::PromptManifest { .. } => "prompt",
-            OrchestratorEvent::ContextCompacted { .. } => "compact",
             OrchestratorEvent::ExtensionLoaded { .. } => "extension-loaded",
             OrchestratorEvent::ExtensionSkipped { .. } => "extension-skipped",
             OrchestratorEvent::ExtensionConflict { .. } => "extension-conflict",
@@ -261,6 +256,8 @@ impl EventRecord {
             OrchestratorEvent::SubtaskFailed { .. } => "subtask-failed",
             OrchestratorEvent::VerifyPass { .. } => "verify-pass",
             OrchestratorEvent::VerifyFail { .. } => "verify-fail",
+            OrchestratorEvent::VerifyBrowserCheckPass { .. } => "browser-pass",
+            OrchestratorEvent::VerifyBrowserCheckFail { .. } => "browser-fail",
             OrchestratorEvent::RepairPlanned { .. } => "repair",
             OrchestratorEvent::VerifyEscalated { .. } => "escalate",
             OrchestratorEvent::TokenMilestone { .. } => "tokens",
@@ -315,43 +312,6 @@ impl EventRecord {
                     slices.len(),
                     total_token_count
                 )
-            }
-            OrchestratorEvent::PromptManifest {
-                subtask_id,
-                manifest,
-            } => {
-                let target_note = if manifest.target_exceeded {
-                    format!(" over_target={}", manifest.over_target_tokens)
-                } else {
-                    String::new()
-                };
-                format!(
-                    "prompt {subtask_id}: attempt={}{} target={}{} system={} goal={} memory={} map={} code={} omitted={} attachments={} mcp={} mentions={} retry={} compacted={} deduped={} total~{}",
-                    manifest.attempt,
-                    if manifest.repair_attempt { " repair" } else { "" },
-                    manifest.context_target_tokens,
-                    target_note,
-                    manifest.system_tokens,
-                    manifest.user_goal_tokens,
-                    manifest.memory_tokens,
-                    manifest.repo_map_tokens,
-                    manifest.code_context_tokens,
-                    manifest.omitted_code_tokens,
-                    manifest.attachment_tokens,
-                    manifest.mcp_tool_tokens,
-                    manifest.context_mention_tokens,
-                    manifest.retry_error_tokens,
-                    manifest.compacted_tokens,
-                    manifest.deduped_tokens,
-                    manifest.total_estimated_tokens
-                )
-            }
-            OrchestratorEvent::ContextCompacted { compacted, .. } => {
-                if *compacted {
-                    "context compaction completed".to_string()
-                } else {
-                    "context compaction skipped: no compressible frames".to_string()
-                }
             }
             OrchestratorEvent::ExtensionLoaded {
                 extension_id,
@@ -461,7 +421,6 @@ impl EventRecord {
                 subtask_id,
                 reason,
                 attempt,
-                ..
             } => {
                 format!("fail {subtask_id} attempt={attempt}: {reason}")
             }
@@ -476,6 +435,19 @@ impl EventRecord {
             } => {
                 let diagnostics = compact_error_list(errors, 160);
                 format!("verify fail {subtask_id} layer={layer:?} attempt={attempt}: {diagnostics}")
+            }
+            OrchestratorEvent::VerifyBrowserCheckPass {
+                subtask_id,
+                screenshot_path,
+            } => {
+                format!(
+                    "browser check pass {subtask_id} screenshot={}",
+                    screenshot_path.display()
+                )
+            }
+            OrchestratorEvent::VerifyBrowserCheckFail { subtask_id, errors } => {
+                let diagnostics = compact_error_list(errors, 160);
+                format!("browser check fail {subtask_id}: {diagnostics}")
             }
             OrchestratorEvent::RepairPlanned {
                 subtask_id,

@@ -36,16 +36,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        if: runner.os != 'Windows'
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
 
       - name: Build CLI
         run: cargo build --locked --release -p phonton-cli
@@ -69,7 +66,7 @@ jobs:
           Compress-Archive -Path dist/package/* -DestinationPath "dist/${{ matrix.asset }}" -Force
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
@@ -80,10 +77,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true

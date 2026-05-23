@@ -21,8 +21,8 @@
 //! Modes:
 //! - **Goal** (default): Enter queues the typed goal for planning + running.
 //! - **Task**: single-subtask fast path — reuses the same orchestration spine.
-//! - **Ask**: `Ctrl+;` toggles a side panel for read-only workspace Q&A that
-//!   never dispatches edits. (The spec calls for `Cmd+;`; on
+//! - **Ask**: `Ctrl+;` toggles a side panel for stateless Q&A that does
+//!   *not* touch active-goal context. (The spec calls for `Cmd+;`; on
 //!   POSIX terminals we bind the equivalent Ctrl chord, which most
 //!   keymaps surface the same way.)
 //!
@@ -34,93 +34,60 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
-mod ask_context;
-mod benchmark_cli;
-mod command_runner;
 mod config;
-mod context_cli;
-mod context_mentions;
-mod contract_preflight;
-mod demo;
-mod diff_cli;
 mod doctor;
 mod extensions_cli;
-mod focus;
 mod mcp_cli;
 mod memory_cli;
 mod plan_preview;
 mod prompt_buffer;
-mod proof_cli;
-mod providers_cli;
 mod review;
-mod run_command;
-mod tokens_cli;
 mod trust;
-mod tui_commands;
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use command_runner::{parse_prompt_command, summarize_output_with_duration, CommandRunSummary};
-use context_mentions::{render_context_mentions, ContextMentionResolver, MentionCapabilityCatalog};
-use contract_preflight::apply_workspace_preflight;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use focus::{
-    append_code_focus_lines, append_command_run_lines, append_focus_tabs, append_log_focus_lines,
-    append_problems_focus_lines, code_focus_text, commands_focus_text, compact_problem_diagnostics,
-    context_focus_text, focused_file_count, goal_failure_kind, log_focus_text, plan_focus_text,
-    problem_diagnostics, problems_focus_text, receipt_focus_text, tokens_focus_text,
-};
 use phonton_diff::DiffApplier;
 use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions, ExtensionSet};
 use phonton_mcp::{McpApprovalDecision, McpApprovalRequest, McpApprover};
 use phonton_orchestrator::{BudgetGuard, Orchestrator, WorkerDispatcher};
-use phonton_planner::{decompose_with_memory_store, Goal};
+use phonton_planner::{decompose_with_memory, Goal};
 use phonton_providers::{
-    discover_models, models_dev_catalog_from_str, pick_default_from_list, probe_diff_contract,
-    provider_config_from_catalog, provider_for, select_best_working_model, CatalogProvider,
-    Provider,
+    discover_models, pick_default_from_list, provider_for, select_best_working_model, Provider,
 };
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
-    BudgetLimits, ContextManifest, ContextMention, ContextSource, CoverageSummary, DiffHunk,
-    DiffLine, EventRecord, ExtensionId, GlobalState, HandoffPacket, MemoryRecord, ModelPricing,
-    ModelTier, OrchestratorEvent, OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger,
-    PermissionMode, PermissionRecord, PlannerOutput, PromptAttachment, PromptAttachmentKind,
-    PromptContextManifest, ProviderConfig as ApiProviderConfig, ProviderKind, SessionGoalSnapshot,
-    SessionSnapshot, SessionTotals, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
-    TaskStatus, TokenUsage, VerifyLayer, VerifyResult, WorkspaceTrustSource,
+    BudgetLimits, ContextManifest, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId,
+    GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
+    OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
+    PromptArtifact, PromptArtifactRole, PromptAttachment, PromptAttachmentKind,
+    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
-use prompt_buffer::PromptBuffer;
+use prompt_buffer::{PromptBuffer, SubmittedPrompt};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tui_commands::{
-    command_suggestions, complete_command_prefix, parse_slash_command, render_command_label,
-    unknown_command_message, FocusView, SlashAction, SlashParse,
-};
 
 // ---------------------------------------------------------------------------
 // Visual identity
@@ -149,30 +116,21 @@ const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
 const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
 const UI_TICK_MS: u64 = 80;
-const LOGO_SHIMMER_SPEED: f32 = 0.026;
-const LOGO_ROW_PHASE: f32 = 0.11;
-const PROVIDER_HEALTH_CONTRACT_VERSION: &str = "diff-canary-v2-disable-thinking";
+const LOGO_SHIMMER_SPEED: f32 = 0.018;
+const LOGO_ROW_PHASE: f32 = 0.085;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
-    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
-    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
-    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
-    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
-    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
-    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
+    "█████░  █   █░  ████░  █   █░ █████░  ████░  █   █░",
+    "█   █░  █   █░ █    █░ ██  █░   █  ░ █    █░ ██  █░",
+    "█████░  █████░ █    █░ █ █ █░   █  ░ █    █░ █ █ █░",
+    "█    ░  █   █░ █    █░ █  ██░   █  ░ █    █░ █  ██░",
+    "█    ░  █   █░  ████░  █   █░   █  ░  ████░  █   █░",
+    " ░░░░    ░   ░   ░░░░    ░   ░    ░     ░░░░    ░   ░",
 ];
 
-const LOGO_WIDTH_THRESHOLD: u16 = 70;
+const LOGO_WIDTH_THRESHOLD: u16 = 72;
 static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Options that control interactive TUI launch behavior.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LaunchOptions {
-    /// Resume the latest saved session snapshot for the current workspace.
-    pub resume_last_session: bool,
-}
 
 // ---------------------------------------------------------------------------
 // Visual helpers — gradient + pill primitives
@@ -203,14 +161,17 @@ fn grad3(t: f32) -> Color {
     }
 }
 
-/// Four-stop animated logo palette: violet -> pink -> electric blue -> cyan,
-/// looping back to violet so the cycle is seamless.
+/// Four-stop animated logo palette. Starts in violet/pink like the splash
+/// mock, then travels through electric blue and cyan before looping.
 fn logo_grad(t: f32) -> Color {
     let t = t - t.floor();
-    let stops = [GRAD_B, GRAD_C, GRAD_D, GRAD_A, GRAD_B];
-    let seg = t * 4.0;
-    let i = (seg as usize).min(3);
-    grad(stops[i], stops[i + 1], seg - i as f32)
+    if t < 0.33 {
+        grad(GRAD_B, GRAD_C, t / 0.33)
+    } else if t < 0.66 {
+        grad(GRAD_C, GRAD_D, (t - 0.33) / 0.33)
+    } else {
+        grad(GRAD_D, GRAD_A, (t - 0.66) / 0.34)
+    }
 }
 
 /// Build a horizontally-gradient-colored line from `text`. `phase` shifts the
@@ -244,8 +205,7 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
-    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
+    let wave = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
 
     for (i, ch) in chars.into_iter().enumerate() {
         if ch == ' ' {
@@ -254,65 +214,31 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
-        let base_color = base_rgb(base);
-        let dist = |w: f32| -> f32 {
-            let raw = (x - w).abs();
-            raw.min(1.0 - raw)
-        };
-        let d_a = dist(wave_a);
-        let d_b = dist(wave_b);
-
-        let style = match ch {
-            '░' | '▒' | '▓' => {
-                let body = match ch {
-                    '▓' => 0.55,
-                    '▒' => 0.32,
-                    _ => 0.16,
-                };
-                let glow = if d_a < 0.14 {
-                    (1.0 - d_a / 0.14) * 0.45
-                } else {
-                    0.0
-                };
-                Style::default().fg(grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9)))
-            }
-            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
-                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
-                let lift = if d_a < 0.07 {
-                    (1.0 - d_a / 0.07) * 0.35
-                } else {
-                    0.0
-                };
-                Style::default()
-                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
-                    .add_modifier(Modifier::BOLD)
-            }
-            _ => {
-                let glint_a = if d_a < 0.08 {
-                    (1.0 - d_a / 0.08) * 0.65
-                } else {
-                    0.0
-                };
-                let glint_b = if d_b < 0.05 {
-                    (1.0 - d_b / 0.05) * 0.45
-                } else {
-                    0.0
-                };
-                let breathing = ((phase * std::f32::consts::TAU
-                    + x * std::f32::consts::TAU * 1.4
-                    + row_idx as f32 * 0.65)
-                    .sin()
-                    + 1.0)
-                    * 0.08;
-                Style::default()
-                    .fg(grad(
-                        base_color,
-                        LOGO_GLOW,
-                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
-                    ))
-                    .add_modifier(Modifier::BOLD)
-            }
+        let style = if matches!(ch, '░' | '▒' | '▓') {
+            let shadow_t = ((x + phase * 0.45 + row_idx as f32 * 0.025).fract() - 0.5).abs();
+            let lift = (0.18 - shadow_t).max(0.0) / 0.18;
+            Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
+        } else {
+            let base = logo_grad((x * 0.82 + phase * 0.74 + row_idx as f32 * 0.04).fract());
+            let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
+            let glint = if distance < 0.075 {
+                (1.0 - distance / 0.075) * 0.55
+            } else {
+                0.0
+            };
+            let breathing = ((phase * std::f32::consts::TAU
+                + x * std::f32::consts::TAU * 1.4
+                + row_idx as f32 * 0.65)
+                .sin()
+                + 1.0)
+                * 0.07;
+            Style::default()
+                .fg(grad(
+                    base_rgb(base),
+                    LOGO_GLOW,
+                    (glint + breathing).clamp(0.0, 0.62),
+                ))
+                .add_modifier(Modifier::BOLD)
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
@@ -336,7 +262,7 @@ fn pill(text: &str, bg: Color, fg: Color) -> Span<'static> {
 }
 
 /// Build a unicode progress bar of `width` cells, filled `filled_frac` of the
-/// way through with the cyan-to-violet gradient.
+/// way through with the cyan→violet gradient.
 fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
     let frac = filled_frac.clamp(0.0, 1.0);
     let total_eighths = (frac * (width as f32) * 8.0).round() as usize;
@@ -442,39 +368,6 @@ impl ModelPickerState {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct GoalSwitcherState {
-    pub open: bool,
-    pub filter: String,
-    pub selected: usize,
-}
-
-impl GoalSwitcherState {
-    pub fn filtered_indices(&self, goals: &[GoalEntry]) -> Vec<usize> {
-        let query = self.filter.trim().to_ascii_lowercase();
-        goals
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, goal)| {
-                if query.is_empty()
-                    || goal.description.to_ascii_lowercase().contains(&query)
-                    || goal_status_label(&goal.status).contains(&query)
-                {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn clamp(&mut self, goals: &[GoalEntry]) {
-        self.selected = self
-            .selected
-            .min(self.filtered_indices(goals).len().saturating_sub(1));
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SettingsState {
     pub active_field: SettingsField,
@@ -485,7 +378,6 @@ pub struct SettingsState {
     pub base_url: String,
     pub max_tokens: String,
     pub max_usd_cents: String,
-    pub permission_mode: PermissionMode,
     pub message: Option<String>,
     /// Whether the model picker overlay is visible.
     pub picker_open: bool,
@@ -514,32 +406,12 @@ impl SettingsState {
                 .max_usd_cents
                 .map(|c| c.to_string())
                 .unwrap_or_default(),
-            permission_mode: cfg.permissions.mode,
             message: None,
             picker_open: false,
             picker: ModelPickerState::default(),
             model_ok: None,
         }
     }
-}
-
-fn non_empty_setting(value: &str) -> Option<String> {
-    if value.trim().is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn apply_settings_to_config(settings: &SettingsState, cfg: &mut config::Config) {
-    cfg.provider.name = settings.provider.clone();
-    cfg.provider.model = non_empty_setting(&settings.model);
-    cfg.provider.api_key = non_empty_setting(&settings.api_key);
-    cfg.provider.account_id = non_empty_setting(&settings.account_id);
-    cfg.provider.base_url = non_empty_setting(&settings.base_url);
-    cfg.budget.max_tokens = settings.max_tokens.parse().ok();
-    cfg.budget.max_usd_cents = settings.max_usd_cents.parse().ok();
-    cfg.permissions.mode = settings.permission_mode;
 }
 
 /// A queued or running top-level goal entry in the left panel.
@@ -555,10 +427,6 @@ pub struct GoalEntry {
     pub task_id: TaskId,
     /// Every [`EventRecord`] observed for this goal, oldest first.
     pub flight_log: Vec<EventRecord>,
-    /// True when this row is a TUI plan preview waiting for `/approve`.
-    pub plan_preview: bool,
-    /// Resolved `@...` context mentions captured before goal dispatch.
-    pub context_mentions: Vec<ContextMention>,
     /// Index into `state.checkpoints` the user is hovering over in the
     /// checkpoint picker. `None` when the picker has no focus.
     pub checkpoint_cursor: Option<usize>,
@@ -602,21 +470,6 @@ impl GoalEntry {
             state: None,
             task_id: TaskId::new(),
             flight_log: Vec::new(),
-            plan_preview: false,
-            context_mentions: Vec::new(),
-            checkpoint_cursor: None,
-        }
-    }
-
-    fn new_plan_preview(description: String) -> Self {
-        Self {
-            description,
-            status: TaskStatus::Planning,
-            state: None,
-            task_id: TaskId::new(),
-            flight_log: Vec::new(),
-            plan_preview: true,
-            context_mentions: Vec::new(),
             checkpoint_cursor: None,
         }
     }
@@ -635,23 +488,17 @@ pub struct App {
     pub goals: Vec<GoalEntry>,
     /// The goal currently highlighted in the left pane (index into `goals`).
     pub selected: usize,
-    /// Goal-bar input buffer, including collapsed paste artifacts.
+    /// Goal/task prompt buffer, including collapsed paste artifacts.
     pub goal_prompt: PromptBuffer,
     /// Ask-mode input buffer, preserved across mode toggles.
-    pub ask_prompt: PromptBuffer,
+    pub ask_input: String,
     /// Most recent ask-mode answer, for display in the side panel.
     pub ask_answer: Option<String>,
-    /// One-line context summary for the most recent Ask request.
-    pub ask_context_summary: Option<String>,
-    /// Vertical scroll offset for the Ask answer panel.
-    pub ask_scroll: usize,
     /// True while an ask-mode provider call is in flight; drives the
     /// thinking spinner in the Ask panel.
     pub ask_pending: bool,
     /// When `true`, the render loop exits on the next frame.
     pub should_quit: bool,
-    /// True when Ctrl+C/Esc requested exit and the user must confirm it.
-    pub quit_confirmation_open: bool,
     /// Monotonic tick counter driving the running-tag spinner animation.
     pub spinner_frame: usize,
     /// True when the Flight Log panel is open. Toggled by Shift+L.
@@ -664,14 +511,8 @@ pub struct App {
     pub palette_selected: usize,
     /// Mode to restore after closing the palette.
     pub prev_mode: Mode,
-    /// Submitted prompt history, newest last.
-    pub prompt_history: Vec<String>,
-    /// Cursor into prompt history while browsing with Up/Down.
-    pub prompt_history_cursor: Option<usize>,
-    /// Recent user-run commands.
-    pub command_runs: Vec<CommandRunSummary>,
-    /// One-line prompt feedback for slash-command errors and trust-loop hints.
-    pub command_notice: Option<String>,
+    /// Caret position (in chars) inside `ask_input`.
+    pub ask_cursor: usize,
     /// Session-best token savings percentage (vs naive baseline). Updated
     /// whenever a goal completes with a higher savings rate than seen before.
     pub best_savings_pct: Option<i64>,
@@ -688,12 +529,6 @@ pub struct App {
     pub memory_records: Vec<MemoryRecord>,
     /// Last task-history rows loaded from the persistent store.
     pub history_records: Vec<TaskRecord>,
-    /// In-view history browser filter.
-    pub history_filter: String,
-    /// Selected row within the filtered history browser.
-    pub history_selected: usize,
-    /// Vertical scroll offset for the history browser.
-    pub history_scroll: usize,
     /// Local index/Nexus status shown in the ambient system strip.
     pub nexus_status: NexusStatus,
     /// Path of the SQLite store backing this session.
@@ -702,22 +537,10 @@ pub struct App {
     pub pending_mcp_approvals: Vec<PendingMcpApproval>,
     /// Cursor into `pending_mcp_approvals` when more than one request is queued.
     pub mcp_approval_selected: usize,
-    /// Latest prompt-section token manifest emitted by a worker.
-    pub last_prompt_manifest: Option<PromptContextManifest>,
-    /// Sum of prompt manifest totals observed in this TUI session.
-    pub session_prompt_tokens: u64,
-    /// Tokens the user has explicitly compacted from the visible context meter.
-    pub compacted_prompt_tokens: u64,
-    /// Active panel focus view.
-    pub focus_view: FocusView,
-    /// Vertical scroll offset for the active focus surface.
-    pub focus_scroll: usize,
-    /// Cursor into changed files shown by Code focus.
-    pub focused_changed_file: usize,
-    /// Cursor into command runs shown by Commands focus.
-    pub focused_command_run: usize,
-    /// Searchable goal switcher overlay.
-    pub goal_switcher: GoalSwitcherState,
+    /// True when the pending prompt artifact drawer is visible.
+    pub prompt_artifacts_open: bool,
+    /// Cursor into pending prompt artifacts.
+    pub prompt_artifact_selected: usize,
 }
 
 impl App {
@@ -726,45 +549,30 @@ impl App {
             mode: Mode::Goal,
             goals: Vec::new(),
             selected: 0,
-            goal_prompt: PromptBuffer::new(),
-            ask_prompt: PromptBuffer::new(),
+            goal_prompt: PromptBuffer::default(),
+            ask_input: String::new(),
             ask_answer: None,
-            ask_context_summary: None,
-            ask_scroll: 0,
             ask_pending: false,
             should_quit: false,
-            quit_confirmation_open: false,
             spinner_frame: 0,
             flight_log_open: false,
             settings: SettingsState::new(cfg),
             palette_input: String::new(),
             palette_selected: 0,
             prev_mode: Mode::Goal,
-            prompt_history: Vec::new(),
-            prompt_history_cursor: None,
-            command_runs: Vec::new(),
-            command_notice: None,
+            ask_cursor: 0,
             best_savings_pct: None,
             new_best_ticks: 0,
             help_open: false,
             flight_log_scroll: None,
             memory_records: Vec::new(),
             history_records: Vec::new(),
-            history_filter: String::new(),
-            history_selected: 0,
-            history_scroll: 0,
             nexus_status: NexusStatus::default(),
             store_path: None,
             pending_mcp_approvals: Vec::new(),
             mcp_approval_selected: 0,
-            last_prompt_manifest: None,
-            session_prompt_tokens: 0,
-            compacted_prompt_tokens: 0,
-            focus_view: FocusView::Receipt,
-            focus_scroll: 0,
-            focused_changed_file: 0,
-            focused_command_run: 0,
-            goal_switcher: GoalSwitcherState::default(),
+            prompt_artifacts_open: false,
+            prompt_artifact_selected: 0,
         }
     }
 
@@ -777,765 +585,54 @@ impl App {
             }
         }
     }
-
-    fn apply_slash_action(&mut self, action: SlashAction) -> Option<Intent> {
-        self.help_open = false;
-        self.settings.message = None;
-        self.command_notice = None;
-        match action {
-            SlashAction::GoalMode => {
-                self.mode = Mode::Goal;
-                None
-            }
-            SlashAction::TaskMode => {
-                self.mode = Mode::Task;
-                None
-            }
-            SlashAction::AskMode => {
-                self.mode = Mode::Ask;
-                self.ask_scroll = 0;
-                None
-            }
-            SlashAction::SubmitAsk(question) => {
-                self.mode = Mode::Ask;
-                self.ask_prompt.set_text("");
-                self.ask_answer = None;
-                self.ask_context_summary = None;
-                self.ask_scroll = 0;
-                self.ask_pending = true;
-                Some(Intent::Ask(question))
-            }
-            SlashAction::PreviewPlan(goal) => {
-                let entry = GoalEntry::new_plan_preview(goal.clone());
-                let task_id = entry.task_id;
-                self.goals.insert(0, entry);
-                self.selected = 0;
-                self.focus_view = FocusView::Plan;
-                self.focus_scroll = 0;
-                self.command_notice =
-                    Some("Plan preview requested. Review Plan, then /approve to execute.".into());
-                Some(Intent::PreviewPlan {
-                    goal_index: 0,
-                    task_id,
-                    text: goal,
-                })
-            }
-            SlashAction::ApprovePlan => self.approve_selected_plan_intent(),
-            SlashAction::OpenSettings | SlashAction::ManageModel => {
-                self.mode = Mode::Settings;
-                None
-            }
-            SlashAction::ShowCommands => {
-                self.help_open = true;
-                None
-            }
-            SlashAction::ToggleLog => {
-                self.flight_log_open = !self.flight_log_open;
-                if self.flight_log_open {
-                    self.flight_log_scroll = None;
-                }
-                None
-            }
-            SlashAction::OpenMemory => {
-                self.mode = Mode::Memory;
-                Some(Intent::OpenMemory)
-            }
-            SlashAction::OpenHistory => {
-                self.mode = Mode::History;
-                Some(Intent::OpenHistory)
-            }
-            SlashAction::ClearGoals => {
-                self.goals.clear();
-                self.selected = 0;
-                self.mode = Mode::Goal;
-                None
-            }
-            SlashAction::DeleteSelectedGoal => {
-                self.delete_selected_goal();
-                None
-            }
-            SlashAction::Quit => self.request_quit_confirmation(),
-            SlashAction::ShowStatus => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.status_command_summary());
-                None
-            }
-            SlashAction::ShowPermissions => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.permissions_command_summary());
-                None
-            }
-            SlashAction::ShowTrust => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.trust_command_summary());
-                None
-            }
-            SlashAction::RevokeCurrentTrust => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some("Trust\nRevoking current workspace trust...".into());
-                Some(Intent::RevokeCurrentTrust)
-            }
-            SlashAction::SetPermissionMode(mode) => {
-                self.settings.permission_mode = mode;
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.permissions_command_summary());
-                self.command_notice = Some(format!("Permission mode set to `{mode}`"));
-                Some(Intent::SaveSettings)
-            }
-            SlashAction::ShowContext => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.context_command_summary());
-                None
-            }
-            SlashAction::CompactContext => {
-                let intent = self.compact_context_intent();
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.compact_command_summary(intent.is_some()));
-                intent
-            }
-            SlashAction::ShowProblems => {
-                self.focus_view = FocusView::Problems;
-                self.focus_scroll = 0;
-                self.command_notice = Some("Active focus: Problems".into());
-                None
-            }
-            SlashAction::RetryGoal => self.retry_selected_goal_intent(),
-            SlashAction::ShowWhyTokens => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.why_tokens_command_summary());
-                None
-            }
-            SlashAction::StopGoal => self.stop_selected_goal_intent(),
-            SlashAction::OpenGoals => {
-                self.goal_switcher.open = true;
-                self.goal_switcher.filter.clear();
-                self.goal_switcher.selected = self.selected.min(self.goals.len().saturating_sub(1));
-                None
-            }
-            SlashAction::SetFocus(view) => {
-                self.focus_view = view;
-                self.command_notice = Some(format!("Active focus: {}", view.as_str()));
-                None
-            }
-            SlashAction::CopyFocus => Some(Intent::CopyFocus(self.focus_text())),
-            SlashAction::RerunCommand => {
-                if let Some(command) = self.command_runs.last().map(|run| run.command.clone()) {
-                    Some(Intent::RunCommand(format!("/run {command}")))
-                } else {
-                    self.command_notice = Some("No command has run yet.".into());
-                    None
-                }
-            }
-            SlashAction::ShowStats => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.stats_command_summary());
-                None
-            }
-            SlashAction::ShowReview => {
-                self.mode = Mode::Ask;
-                self.ask_answer = Some(self.review_command_summary());
-                None
-            }
-        }
-    }
-
-    fn status_command_summary(&self) -> String {
-        let totals = self.session_totals();
-        let workspace = std::env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "unknown".into());
-        let store = self
-            .store_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "not open".into());
-        format!(
-            "Status\nversion: v{}\nprovider: {}\nmodel: {}\npermissions: {}\nworkspace: {}\nstore: {}\ngoals: {} total, {} complete, {} failed\ntokens: {} used, {} estimated saved\ncontext: {} latest prompt tokens, {} session prompt tokens",
-            env!("CARGO_PKG_VERSION"),
-            self.settings.provider,
-            self.settings.model,
-            self.settings.permission_mode,
-            workspace,
-            store,
-            totals.goals,
-            totals.completed,
-            totals.failed,
-            totals.tokens_used,
-            totals.estimated_tokens_saved,
-            self.last_prompt_manifest
-                .as_ref()
-                .map(|m| m.total_estimated_tokens)
-                .unwrap_or(0),
-            self.session_prompt_tokens
-        )
-    }
-
-    fn permissions_command_summary(&self) -> String {
-        let pending = self.pending_mcp_approvals.len();
-        let workspace_trust = std::env::current_dir()
-            .ok()
-            .and_then(|path| trust::trust_record(&path))
-            .map(|record| {
-                format!(
-                    "{} ({}, last seen {})",
-                    record.display_name, record.source, record.last_seen_at
-                )
-            })
-            .unwrap_or_else(|| "untrusted current workspace".into());
-        format!(
-            "Permissions\nmode: {}\nworkspace trust: {}\nread-only: blocks file writes and approval-gates commands\nask: safe workspace actions run, risky actions require approval\nworkspace-write: allowlisted commands and workspace writes run\nfull-access: non-sensitive actions run without approval\nmcp approvals pending: {pending}\ncommands: /permissions set ask|read-only|workspace-write|full-access",
-            self.settings.permission_mode,
-            workspace_trust
-        )
-    }
-
-    fn trust_command_summary(&self) -> String {
-        let current = std::env::current_dir()
-            .ok()
-            .and_then(|path| trust::trust_record(&path))
-            .map(|record| {
-                format!(
-                    "current: {} ({})\npath: {}\nmode: {}\ntrusted: {}\nlast seen: {}",
-                    record.display_name,
-                    record.source,
-                    record.canonical_path,
-                    record.permission_mode,
-                    record.trusted_at,
-                    record.last_seen_at
-                )
-            })
-            .unwrap_or_else(|| "current: untrusted".into());
-        let records = trust::list_trust_records();
-        let mut out = format!("Trust\n{current}\n\nknown workspaces: {}", records.len());
-        for record in records.iter().take(8) {
-            out.push_str(&format!(
-                "\n- {}  {}  {}",
-                record.display_name, record.permission_mode, record.source
-            ));
-        }
-        out.push_str("\ncommands: /trust current, /trust list, /trust revoke-current");
-        out
-    }
-
-    fn context_command_summary(&self) -> String {
-        let mentions = self.selected_context_mentions_summary();
-        let Some(m) = &self.last_prompt_manifest else {
-            return format!(
-                "Context\n{mentions}\nlatest prompt: none yet\nsession prompt total: {}\ncompacted by user: {}\nworker compression: automatic near the context threshold\ncommand: /compact",
-                self.session_prompt_tokens, self.compacted_prompt_tokens
-            );
-        };
-        format!(
-            "Context\n{mentions}\nlatest prompt total: {}\ncontext target: {}{}\nattempt: {}{}\nsystem: {}\ngoal: {}\nmemory/context: {}\nrepo map: {}\nrepo code: {}\nomitted code: {}\nattachments: {}\nmcp/tools: {}\n@mentions: {} attribution only\nretry errors: {}\nbudget: {}\nauto-compacted: {}\ndeduped: {}\nsession prompt total: {}\ncompacted by user: {}\ncommand: /compact",
-            m.total_estimated_tokens,
-            if m.context_target_tokens == 0 {
-                "unknown".into()
-            } else {
-                m.context_target_tokens.to_string()
-            },
-            if m.target_exceeded {
-                format!(" (target exceeded by {})", m.over_target_tokens)
-            } else {
-                String::new()
-            },
-            m.attempt,
-            if m.repair_attempt { " repair" } else { "" },
-            m.system_tokens,
-            m.user_goal_tokens,
-            m.memory_tokens,
-            m.repo_map_tokens,
-            m.code_context_tokens,
-            m.omitted_code_tokens,
-            m.attachment_tokens,
-            m.mcp_tool_tokens,
-            m.context_mention_tokens,
-            m.retry_error_tokens,
-            m.budget_limit
-                .map(|limit| limit.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-            m.compacted_tokens,
-            m.deduped_tokens,
-            self.session_prompt_tokens,
-            self.compacted_prompt_tokens
-        )
-    }
-
-    fn selected_context_mentions_summary(&self) -> String {
-        self.goals
-            .get(self.selected)
-            .map(|goal| render_context_mentions(&goal.context_mentions))
-            .unwrap_or_else(|| "Context mentions: none".into())
-    }
-
-    fn why_tokens_command_summary(&self) -> String {
-        let Some(m) = &self.last_prompt_manifest else {
-            return "Why tokens?\nNo provider prompt manifest has been recorded yet. Run a goal first, then use /why-tokens again.".into();
-        };
-        let active_goal = self
-            .goals
-            .get(self.selected)
-            .map(|goal| goal.description.as_str())
-            .unwrap_or("none");
-        let (first_attempt, repair_attempts, context_artifacts, retry_tokens) =
-            self.prompt_attempt_buckets();
-        let routing_note = self.routing_note_for_goal(active_goal);
-        format!(
-            "Why tokens?\ngoal: {}\ntotal prompt estimate: {}\ncontext target: {}{}\nattempt buckets:\n- first attempt: {}\n- repair attempts: {}\n- context/artifacts: {}\n- verifier retry diagnostics: {}\n- system: {} provider instructions\n- goal: {} current request tokens\n- memory/context: {} retained prior context tokens\n- repo map: {} compact orientation tokens\n- code: {} selected repository context tokens\n- omitted code: {} candidate tokens skipped by the context compiler\n- attachments: {} pasted/image/file artifact tokens\n- tools: {} MCP or tool instruction tokens\n- @mentions: {} attribution-only tokens already counted in the concrete buckets above\n- retry diagnostics: {} verifier/provider repair tokens\ncompacted before send: {}\ndeduped before send: {}\n{}provider-reported completion tokens remain the billing source of truth.",
-            active_goal,
-            m.total_estimated_tokens,
-            if m.context_target_tokens == 0 {
-                "unknown".into()
-            } else {
-                m.context_target_tokens.to_string()
-            },
-            if m.target_exceeded {
-                format!(" (target exceeded by {})", m.over_target_tokens)
-            } else {
-                String::new()
-            },
-            first_attempt,
-            repair_attempts,
-            context_artifacts,
-            retry_tokens,
-            m.system_tokens,
-            m.user_goal_tokens,
-            m.memory_tokens,
-            m.repo_map_tokens,
-            m.code_context_tokens,
-            m.omitted_code_tokens,
-            m.attachment_tokens,
-            m.mcp_tool_tokens,
-            m.context_mention_tokens,
-            m.retry_error_tokens,
-            m.compacted_tokens,
-            m.deduped_tokens,
-            routing_note
-        )
-    }
-
-    fn prompt_attempt_buckets(&self) -> (u64, u64, u64, u64) {
-        let mut first_attempt = 0_u64;
-        let mut repair_attempts = 0_u64;
-        let mut context_artifacts = 0_u64;
-        let mut retry_tokens = 0_u64;
-        let mut saw_manifest = false;
-        if let Some(goal) = self.goals.get(self.selected) {
-            for record in &goal.flight_log {
-                if let OrchestratorEvent::PromptManifest { manifest, .. } = &record.event {
-                    saw_manifest = true;
-                    if manifest.repair_attempt || manifest.attempt > 1 {
-                        repair_attempts =
-                            repair_attempts.saturating_add(manifest.total_estimated_tokens);
-                    } else {
-                        first_attempt =
-                            first_attempt.saturating_add(manifest.total_estimated_tokens);
-                    }
-                    context_artifacts = context_artifacts
-                        .saturating_add(manifest.memory_tokens)
-                        .saturating_add(manifest.repo_map_tokens)
-                        .saturating_add(manifest.code_context_tokens)
-                        .saturating_add(manifest.attachment_tokens);
-                    retry_tokens = retry_tokens.saturating_add(manifest.retry_error_tokens);
-                }
-            }
-        }
-        if !saw_manifest {
-            if let Some(manifest) = &self.last_prompt_manifest {
-                if manifest.repair_attempt || manifest.attempt > 1 {
-                    repair_attempts = manifest.total_estimated_tokens;
-                } else {
-                    first_attempt = manifest.total_estimated_tokens;
-                }
-                context_artifacts = manifest
-                    .memory_tokens
-                    .saturating_add(manifest.repo_map_tokens)
-                    .saturating_add(manifest.code_context_tokens)
-                    .saturating_add(manifest.attachment_tokens);
-                retry_tokens = manifest.retry_error_tokens;
-            }
-        }
-        (
-            first_attempt,
-            repair_attempts,
-            context_artifacts,
-            retry_tokens,
-        )
-    }
-
-    fn routing_note_for_goal(&self, goal: &str) -> String {
-        let provider = self.settings.provider.to_ascii_lowercase();
-        let model = self.settings.model.to_ascii_lowercase();
-        let goal = goal.to_ascii_lowercase();
-        let broad_generated = goal.contains("chess")
-            || goal.contains("game")
-            || goal.contains("app")
-            || goal.contains("html")
-            || goal.contains("web");
-        if provider.contains("cloudflare") && model.contains("kimi") && broad_generated {
-            "routing note: Cloudflare Kimi is high-risk for broad generated-code tasks in current evidence; if quality gates repeat, use a stronger code model or narrower prompt.\n".into()
-        } else {
-            String::new()
-        }
-    }
-
-    fn stats_command_summary(&self) -> String {
-        let totals = self.session_totals();
-        let active = self
-            .goals
-            .iter()
-            .filter(|goal| {
-                matches!(
-                    goal.status,
-                    TaskStatus::Planning | TaskStatus::Running { .. }
-                )
-            })
-            .count();
-        format!(
-            "Stats\ngoals: {} total, {} active, {} review, {} done, {} failed\ntokens: {} used, {} estimated saved\ncontext: {} latest prompt tokens, {} session prompt tokens\ncommands: {} recent runs",
-            totals.goals,
-            active,
-            totals.reviewing,
-            totals.completed,
-            totals.failed,
-            totals.tokens_used,
-            totals.estimated_tokens_saved,
-            self.last_prompt_manifest
-                .as_ref()
-                .map(|m| m.total_estimated_tokens)
-                .unwrap_or(0),
-            self.session_prompt_tokens,
-            self.command_runs.len()
-        )
-    }
-
-    fn compact_command_summary(&self, sent_to_worker: bool) -> String {
-        let target = if sent_to_worker {
-            "active worker context was asked to compact"
-        } else {
-            "no active worker context is selected"
-        };
-        format!(
-            "Compact\n{target}\nlatest prompt meter reset locally\ncompacted by user: {}\nworker compression also runs automatically near its threshold",
-            self.compacted_prompt_tokens
-        )
-    }
-
-    fn compact_context_intent(&mut self) -> Option<Intent> {
-        if let Some(manifest) = self.last_prompt_manifest.take() {
-            self.compacted_prompt_tokens = self
-                .compacted_prompt_tokens
-                .saturating_add(manifest.total_estimated_tokens);
-        }
-        if self.selected_goal_can_be_controlled() {
-            Some(Intent::CompactContext {
-                goal_index: self.selected,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn stop_selected_goal_intent(&mut self) -> Option<Intent> {
-        if self.selected_goal_can_be_controlled() {
-            if let Some(goal) = self.goals.get_mut(self.selected) {
-                goal.status = TaskStatus::Rejected;
-            }
-            self.command_notice = Some("Stop requested for selected goal.".into());
-            Some(Intent::StopGoal {
-                goal_index: self.selected,
-            })
-        } else {
-            self.command_notice = Some("No running goal is selected.".into());
-            None
-        }
-    }
-
-    fn retry_selected_goal_intent(&mut self) -> Option<Intent> {
-        let Some(goal) = self.goals.get(self.selected) else {
-            self.command_notice = Some("No selected goal to retry.".into());
-            return None;
-        };
-        if !matches!(goal.status, TaskStatus::Failed { .. }) && problem_diagnostics(goal).is_empty()
-        {
-            self.command_notice = Some("Selected goal has no verifier failure to repair.".into());
-            return None;
-        }
-        let diagnostics = compact_problem_diagnostics(goal, 6);
-        let acceptance_context = repair_acceptance_context(goal);
-        let prompt = format!(
-            "Repair the previous failed Phonton goal.\n\nOriginal goal:\n{}\n\nVerifier diagnostics:\n{}\n\n{}\nInstructions:\n- Fix only the missing or failed acceptance criteria above when listed.\n- Use the smallest reviewable diff and avoid broad rewrites.\n- Keep output runnable and concise.\n- Run static syntax/build verification before review.\n- Do not claim success unless the verifier passes.",
-            goal.description,
-            diagnostics,
-            acceptance_context
-        );
-        self.command_notice = Some("Retry queued with compact diagnostics.".into());
-        Some(Intent::QueueGoal(prompt))
-    }
-
-    fn approve_selected_plan_intent(&mut self) -> Option<Intent> {
-        let selected = self.selected;
-        let (task_id, text) = {
-            let Some(goal) = self.goals.get_mut(selected) else {
-                self.command_notice = Some("No selected plan preview to approve.".into());
-                return None;
-            };
-            if !goal.plan_preview {
-                self.command_notice =
-                    Some("Selected goal is not a plan preview. Use /plan <goal> first.".into());
-                return None;
-            }
-            goal.plan_preview = false;
-            goal.status = TaskStatus::Queued;
-            goal.state = None;
-            (goal.task_id, goal.description.clone())
-        };
-        self.focus_view = FocusView::Plan;
-        self.focus_scroll = 0;
-        self.command_notice = Some("Plan approved; execution queued.".into());
-        Some(Intent::ApprovePlan {
-            goal_index: selected,
-            task_id,
-            text,
-        })
-    }
-
-    fn selected_goal_can_be_controlled(&self) -> bool {
-        self.goals
-            .get(self.selected)
-            .map(|goal| {
-                matches!(
-                    goal.status,
-                    TaskStatus::Planning | TaskStatus::Running { .. }
-                )
-            })
-            .unwrap_or(false)
-    }
-
-    fn review_command_summary(&self) -> String {
-        if let Some(goal) = self.goals.get(self.selected) {
-            let status = match &goal.status {
-                TaskStatus::Queued => "queued",
-                TaskStatus::Planning => "planning",
-                TaskStatus::Running { .. } => "running",
-                TaskStatus::Reviewing { .. } => "review ready",
-                TaskStatus::Done { .. } => "done",
-                TaskStatus::Failed { .. } => "failed",
-                TaskStatus::NeedsClarification { .. } => "needs clarification",
-                TaskStatus::Paused { .. } => "paused",
-                TaskStatus::Rejected => "rejected",
-            };
-            format!(
-                "Review\nselected goal: {}\nstatus: {}\nreceipt: run `phonton review latest` outside the TUI for the exportable handoff packet\nflight log: use /log for the evidence trail",
-                goal.description, status
-            )
-        } else {
-            "Review\nNo goal is selected yet. Submit a goal first, then use /review or `phonton review latest`.".into()
-        }
-    }
-
-    /// Summarize the visible session for the exit receipt.
-    pub fn session_totals(&self) -> SessionTotals {
-        let mut totals = SessionTotals {
-            goals: self.goals.len(),
-            best_savings_pct: self.best_savings_pct,
-            ..SessionTotals::default()
-        };
-        for goal in &self.goals {
-            match goal.status {
-                TaskStatus::Done { .. } => totals.completed += 1,
-                TaskStatus::Failed { .. } => totals.failed += 1,
-                TaskStatus::Reviewing { .. } => totals.reviewing += 1,
-                _ => {}
-            }
-            totals.tokens_used = totals.tokens_used.saturating_add(session_goal_tokens(goal));
-            totals.naive_baseline_tokens = totals
-                .naive_baseline_tokens
-                .saturating_add(session_goal_baseline(goal));
-        }
-        totals.estimated_tokens_saved =
-            token_delta_vs_naive(totals.naive_baseline_tokens, totals.tokens_used);
-        totals
-    }
-
-    /// Build a durable snapshot for resuming this workspace later.
-    pub fn to_session_snapshot(&self, workspace: String, saved_at: u64) -> SessionSnapshot {
-        SessionSnapshot {
-            workspace,
-            saved_at,
-            selected_goal: self.selected.min(self.goals.len().saturating_sub(1)),
-            goal_input: self.goal_prompt.display_text().to_string(),
-            ask_input: self.ask_prompt.display_text().to_string(),
-            ask_answer: self.ask_answer.clone(),
-            prompt_history: bounded_prompt_history(&self.prompt_history, 100),
-            best_savings_pct: self.best_savings_pct,
-            goals: self
-                .goals
-                .iter()
-                .map(|goal| SessionGoalSnapshot {
-                    description: goal.description.clone(),
-                    status: goal.status.clone(),
-                    state: goal.state.clone(),
-                    task_id: goal.task_id,
-                    flight_log: goal.flight_log.clone(),
-                })
-                .collect(),
-            totals: self.session_totals(),
-        }
-    }
-
-    /// Restore review-safe session state from a saved snapshot.
-    pub fn restore_session_snapshot(&mut self, snapshot: SessionSnapshot) {
-        self.goals = snapshot
-            .goals
-            .into_iter()
-            .map(|goal| GoalEntry {
-                description: goal.description,
-                status: goal.status,
-                state: goal.state,
-                task_id: goal.task_id,
-                flight_log: goal.flight_log,
-                plan_preview: false,
-                context_mentions: Vec::new(),
-                checkpoint_cursor: None,
-            })
-            .collect();
-        self.selected = snapshot
-            .selected_goal
-            .min(self.goals.len().saturating_sub(1));
-        self.goal_prompt = PromptBuffer::from_text(snapshot.goal_input);
-        self.ask_prompt = PromptBuffer::from_text(snapshot.ask_input);
-        self.ask_answer = snapshot.ask_answer;
-        self.ask_scroll = 0;
-        self.prompt_history = bounded_prompt_history(&snapshot.prompt_history, 100);
-        self.prompt_history_cursor = None;
-        self.ask_pending = false;
-        self.best_savings_pct = snapshot.best_savings_pct;
-        self.new_best_ticks = 0;
-        self.mode = Mode::Goal;
-        self.flight_log_open = false;
-        self.help_open = false;
-        self.quit_confirmation_open = false;
-        self.pending_mcp_approvals.clear();
-        self.mcp_approval_selected = 0;
-        self.last_prompt_manifest = None;
-        self.session_prompt_tokens = 0;
-        self.compacted_prompt_tokens = 0;
-        self.focus_view = FocusView::Receipt;
-        self.focused_changed_file = 0;
-        self.focused_command_run = 0;
-        self.goal_switcher = GoalSwitcherState::default();
-    }
-
-    fn request_quit_confirmation(&mut self) -> Option<Intent> {
-        self.quit_confirmation_open = true;
-        self.help_open = false;
-        None
-    }
-
-    fn handle_quit_confirmation_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.quit_confirmation_open = false;
-                self.should_quit = true;
-                Some(Intent::Quit)
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.quit_confirmation_open = false;
-                None
-            }
-            _ => None,
-        }
-    }
 }
 
-fn session_goal_tokens(goal: &GoalEntry) -> u64 {
-    goal.state
-        .as_ref()
-        .map(|s| s.tokens_used)
-        .unwrap_or_else(|| match goal.status {
-            TaskStatus::Reviewing { tokens_used, .. } | TaskStatus::Done { tokens_used, .. } => {
-                tokens_used
-            }
-            _ => 0,
-        })
+/// Insert a character at a char-index position in `s`. Returns the new
+/// caret position (one past the inserted char).
+fn insert_char_at(s: &mut String, char_idx: usize, c: char) -> usize {
+    let byte_idx = s
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    s.insert(byte_idx, c);
+    char_idx + 1
 }
 
-fn session_goal_baseline(goal: &GoalEntry) -> u64 {
-    goal.state
-        .as_ref()
-        .map(|s| s.estimated_naive_tokens)
-        .unwrap_or_else(|| match goal.status {
-            TaskStatus::Reviewing {
-                tokens_used,
-                estimated_savings_tokens,
-            } => tokens_used.saturating_add(estimated_savings_tokens),
-            _ => 0,
-        })
+/// Delete the character immediately before the caret. Returns the new caret.
+fn delete_char_before(s: &mut String, char_idx: usize) -> usize {
+    if char_idx == 0 {
+        return 0;
+    }
+    let new_idx = char_idx - 1;
+    let start = s.char_indices().nth(new_idx).map(|(b, _)| b).unwrap_or(0);
+    let end = s
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    s.replace_range(start..end, "");
+    new_idx
 }
 
-fn repair_acceptance_context(goal: &GoalEntry) -> String {
-    let Some(contract) = goal
-        .state
-        .as_ref()
-        .and_then(|state| state.goal_contract.as_ref())
-    else {
-        return "Missing acceptance criteria:\n- none recorded; use verifier diagnostics only.\n"
-            .into();
-    };
-
-    if !contract.acceptance_slices.is_empty() {
-        let items = contract
-            .acceptance_slices
-            .iter()
-            .take(6)
-            .map(|slice| format!("- {}: {}", slice.id, slice.criterion))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return format!("Missing or unverified acceptance slices:\n{items}\n");
+/// Delete the word (and trailing whitespace) immediately before the caret.
+fn delete_word_before(s: &mut String, char_idx: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = char_idx.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
     }
-
-    if !contract.acceptance_criteria.is_empty() {
-        let items = contract
-            .acceptance_criteria
-            .iter()
-            .take(4)
-            .map(|criterion| format!("- {criterion}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return format!("Missing or unverified acceptance criteria:\n{items}\n");
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
     }
-
-    "Missing acceptance criteria:\n- none recorded; use verifier diagnostics only.\n".into()
-}
-
-fn token_delta_vs_naive(naive_baseline_tokens: u64, tokens_used: u64) -> i64 {
-    if naive_baseline_tokens >= tokens_used {
-        let saved = naive_baseline_tokens - tokens_used;
-        saved.min(i64::MAX as u64) as i64
-    } else {
-        let over = tokens_used - naive_baseline_tokens;
-        -(over.min(i64::MAX as u64) as i64)
-    }
-}
-
-fn bounded_prompt_history(history: &[String], max_entries: usize) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let start = history.len().saturating_sub(max_entries.saturating_mul(2));
-    for item in history.iter().skip(start) {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if out.last().is_some_and(|last| last == trimmed) {
-            continue;
-        }
-        out.push(trimmed.to_string());
-        if out.len() > max_entries {
-            out.remove(0);
-        }
-    }
-    out
+    let start = s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(0);
+    let end = s
+        .char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    s.replace_range(start..end, "");
+    i
 }
 
 fn char_count(s: &str) -> usize {
@@ -1587,13 +684,9 @@ pub fn looks_like_api_key(s: &str) -> bool {
     false
 }
 
-fn paste_contains_likely_secret(text: &str) -> bool {
-    text.lines().any(|line| {
-        line.split(|c: char| {
-            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ':' | '=' | ',' | ';')
-        })
+fn contains_likely_secret(s: &str) -> bool {
+    s.split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';'))
         .any(looks_like_api_key)
-    })
 }
 
 impl Default for App {
@@ -1605,16 +698,11 @@ impl Default for App {
                 model: None,
                 account_id: None,
                 base_url: None,
-                catalog: None,
-                api_key_source: None,
-                allow_unverified_model: false,
-                keys: std::collections::HashMap::new(),
             },
             budget: crate::config::BudgetConfig {
                 max_tokens: None,
                 max_usd_cents: None,
             },
-            permissions: crate::config::PermissionsConfig::default(),
         };
         Self::new(&default_cfg)
     }
@@ -1644,225 +732,12 @@ impl App {
             g.status = state.task_status.clone();
             g.state = Some(state);
         }
-        if index == self.selected
-            && matches!(
-                self.goals.get(index).map(|g| &g.status),
-                Some(TaskStatus::Failed { .. })
-            )
-        {
-            self.focus_view = FocusView::Problems;
-            self.focus_scroll = 0;
-        }
-        if index == self.selected
-            && matches!(
-                self.goals.get(index).map(|g| &g.status),
-                Some(TaskStatus::NeedsClarification { .. })
-            )
-        {
-            self.focus_view = FocusView::Plan;
-            self.focus_scroll = 0;
-        }
     }
 
     /// Append a flight-log event to the goal at `index`.
     pub fn apply_event(&mut self, index: usize, event: EventRecord) {
-        let should_default_problems_focus = index == self.selected
-            && matches!(
-                &event.event,
-                OrchestratorEvent::VerifyFail { .. } | OrchestratorEvent::SubtaskFailed { .. }
-            );
-        if let OrchestratorEvent::PromptManifest { manifest, .. } = &event.event {
-            self.record_prompt_manifest(manifest.clone());
-        }
         if let Some(g) = self.goals.get_mut(index) {
             g.flight_log.push(event);
-        }
-        if should_default_problems_focus {
-            self.focus_view = FocusView::Problems;
-            self.focus_scroll = 0;
-        }
-    }
-
-    pub fn record_prompt_manifest(&mut self, manifest: PromptContextManifest) {
-        self.session_prompt_tokens = self
-            .session_prompt_tokens
-            .saturating_add(manifest.total_estimated_tokens);
-        self.last_prompt_manifest = Some(manifest);
-    }
-
-    pub fn active_focus_view_for_current_goal(&self) -> FocusView {
-        self.focus_view
-    }
-
-    pub fn focus_text(&self) -> String {
-        let Some(goal) = self.current_goal() else {
-            return "Phonton\nNo goal selected.".into();
-        };
-        match self.active_focus_view_for_current_goal() {
-            FocusView::Plan => plan_focus_text(goal),
-            FocusView::Receipt => receipt_focus_text(goal),
-            FocusView::Problems => problems_focus_text(goal, self.focused_changed_file),
-            FocusView::Code => code_focus_text(goal, self.focused_changed_file),
-            FocusView::Commands => {
-                commands_focus_text(&self.command_runs, self.focused_command_run)
-            }
-            FocusView::Context => context_focus_text(goal),
-            FocusView::Tokens => tokens_focus_text(goal),
-            FocusView::Log => log_focus_text(goal),
-        }
-    }
-
-    fn cycle_focus_view(&mut self) {
-        self.focus_view = self.active_focus_view_for_current_goal().next();
-        self.focus_scroll = 0;
-    }
-
-    fn previous_goal(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-        self.focus_scroll = 0;
-        self.clamp_focus_indices();
-        self.default_focus_for_selected_goal();
-    }
-
-    fn next_goal(&mut self) {
-        if self.selected + 1 < self.goals.len() {
-            self.selected += 1;
-        }
-        self.focus_scroll = 0;
-        self.clamp_focus_indices();
-        self.default_focus_for_selected_goal();
-    }
-
-    fn jump_to_goal_number(&mut self, number: usize) {
-        if number > 0 && number <= self.goals.len() {
-            self.selected = number - 1;
-            self.focus_scroll = 0;
-            self.clamp_focus_indices();
-            self.default_focus_for_selected_goal();
-        }
-    }
-
-    fn clamp_focus_indices(&mut self) {
-        let changed_len = self.current_goal().map(focused_file_count).unwrap_or(0);
-        self.focused_changed_file = self.focused_changed_file.min(changed_len.saturating_sub(1));
-        self.focused_command_run = self
-            .focused_command_run
-            .min(self.command_runs.len().saturating_sub(1));
-    }
-
-    fn default_focus_for_selected_goal(&mut self) {
-        if self
-            .current_goal()
-            .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
-        {
-            self.focus_view = FocusView::Problems;
-            self.focus_scroll = 0;
-        }
-    }
-
-    /// Insert pasted text into the active prompt surface. Long or multi-line
-    /// content is collapsed into a prompt artifact by [`PromptBuffer`].
-    pub fn handle_paste(&mut self, text: &str) {
-        match self.mode {
-            Mode::Goal | Mode::Task => {
-                if looks_like_api_key(text.trim()) {
-                    self.help_open = false;
-                    self.settings.active_field = SettingsField::ApiKey;
-                    self.settings.message = Some(
-                        "That looked like an API key — open Settings (/settings) and paste it into the API Key field, not the Goal bar."
-                            .into(),
-                    );
-                    self.mode = Mode::Settings;
-                    return;
-                }
-                if paste_contains_likely_secret(text) {
-                    self.command_notice = Some(
-                        "Paste blocked: it looks like it contains credentials. Use /settings for API keys."
-                            .into(),
-                    );
-                    return;
-                }
-                self.goal_prompt.insert_paste(text)
-            }
-            Mode::Ask => self.ask_prompt.insert_paste(text),
-            Mode::Settings => self.paste_into_settings(text),
-            _ => {}
-        }
-    }
-
-    fn paste_into_settings(&mut self, text: &str) {
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let text = text.trim_end_matches('\n');
-        match self.settings.active_field {
-            SettingsField::Provider => self.settings.provider.push_str(text),
-            SettingsField::Model => {
-                self.settings.model.push_str(text);
-                self.settings.model_ok = None;
-            }
-            SettingsField::ApiKey => self.settings.api_key.push_str(text),
-            SettingsField::AccountId => self.settings.account_id.push_str(text),
-            SettingsField::BaseUrl => self.settings.base_url.push_str(text),
-            SettingsField::MaxTokens => self.settings.max_tokens.push_str(
-                &text
-                    .chars()
-                    .filter(|c| c.is_ascii_digit())
-                    .collect::<String>(),
-            ),
-            SettingsField::MaxUsdCents => self.settings.max_usd_cents.push_str(
-                &text
-                    .chars()
-                    .filter(|c| c.is_ascii_digit())
-                    .collect::<String>(),
-            ),
-        }
-        self.settings.message = None;
-    }
-
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_visible_surface(-3),
-            MouseEventKind::ScrollDown => self.scroll_visible_surface(3),
-            _ => {}
-        }
-    }
-
-    fn scroll_visible_surface(&mut self, delta: isize) {
-        if self.flight_log_open && matches!(self.mode, Mode::Goal | Mode::Task) {
-            if delta < 0 {
-                let cur = self.flight_log_scroll.unwrap_or(usize::MAX);
-                self.flight_log_scroll = Some(cur.saturating_sub(delta.unsigned_abs()));
-            } else if let Some(s) = self.flight_log_scroll {
-                self.flight_log_scroll = Some(s.saturating_add(delta as usize));
-            }
-            return;
-        }
-
-        if self.mode == Mode::Ask {
-            if delta < 0 {
-                self.ask_scroll = self.ask_scroll.saturating_sub(delta.unsigned_abs());
-            } else {
-                self.ask_scroll = self.ask_scroll.saturating_add(delta as usize);
-            }
-            return;
-        }
-
-        if matches!(self.mode, Mode::Goal | Mode::Task) {
-            if delta < 0 {
-                self.focus_scroll = self.focus_scroll.saturating_sub(delta.unsigned_abs());
-            } else {
-                self.focus_scroll = self.focus_scroll.saturating_add(delta as usize);
-            }
-        }
-    }
-
-    pub fn push_command_run(&mut self, summary: CommandRunSummary) {
-        self.command_runs.push(summary);
-        self.focused_command_run = self.command_runs.len().saturating_sub(1);
-        const MAX_COMMAND_RUNS: usize = 20;
-        if self.command_runs.len() > MAX_COMMAND_RUNS {
-            let overflow = self.command_runs.len() - MAX_COMMAND_RUNS;
-            self.command_runs.drain(0..overflow);
-            self.focused_command_run = self.focused_command_run.saturating_sub(overflow);
         }
     }
 
@@ -1902,37 +777,12 @@ impl App {
     /// Returns `Some(Intent)` when the caller should act on the outside
     /// world (queue a new goal, issue an ask, exit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        if self.quit_confirmation_open {
-            return self.handle_quit_confirmation_key(key);
-        }
-
-        if self.goal_switcher.open {
-            return self.handle_goal_switcher_key(key);
-        }
-
         if !self.pending_mcp_approvals.is_empty() {
             return self.handle_mcp_approval_key(key);
         }
 
-        if key.modifiers.contains(KeyModifiers::ALT) && matches!(self.mode, Mode::Goal | Mode::Task)
-        {
-            match key.code {
-                KeyCode::Up => {
-                    self.previous_goal();
-                    return None;
-                }
-                KeyCode::Down => {
-                    self.next_goal();
-                    return None;
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() => {
-                    if let Some(number) = c.to_digit(10) {
-                        self.jump_to_goal_number(number as usize);
-                    }
-                    return None;
-                }
-                _ => {}
-            }
+        if self.prompt_artifacts_open {
+            return self.handle_prompt_artifacts_key(key);
         }
 
         // Global shortcuts first, regardless of mode.
@@ -1952,7 +802,8 @@ impl App {
                 self.mode = Mode::Goal;
                 return None;
             }
-            return self.request_quit_confirmation();
+            self.should_quit = true;
+            return Some(Intent::Quit);
         }
 
         // `?` toggles the help overlay anywhere it isn't legitimate text input.
@@ -1972,11 +823,10 @@ impl App {
             return None;
         }
 
-        // Ctrl+/ keeps the legacy command palette available while plain '/'
-        // is now real prompt input for slash commands like `/run`.
+        // Handle '/' as the command trigger (like gemini cli / slash commands)
         if matches!(key.code, KeyCode::Char('/'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
             && !matches!(self.mode, Mode::CommandPalette | Mode::Ask | Mode::Settings)
+            && self.goal_prompt.is_empty()
         {
             self.prev_mode = self.mode;
             self.mode = Mode::CommandPalette;
@@ -2044,63 +894,11 @@ impl App {
                 _ => {}
             }
         }
-        if !self.flight_log_open
-            && matches!(self.mode, Mode::Goal | Mode::Task)
-            && self.goal_prompt.is_empty()
-        {
-            match key.code {
-                KeyCode::PageUp => {
-                    self.focus_scroll = self.focus_scroll.saturating_sub(12);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    self.focus_scroll = self.focus_scroll.saturating_add(12);
-                    return None;
-                }
-                KeyCode::Home => {
-                    self.focus_scroll = 0;
-                    return None;
-                }
-                KeyCode::End => {
-                    self.focus_scroll = usize::MAX;
-                    return None;
-                }
-                _ => {}
-            }
-        }
-        if self.mode == Mode::Ask && self.ask_prompt.is_empty() {
-            match key.code {
-                KeyCode::PageUp => {
-                    self.ask_scroll = self.ask_scroll.saturating_sub(12);
-                    return None;
-                }
-                KeyCode::PageDown => {
-                    self.ask_scroll = self.ask_scroll.saturating_add(12);
-                    return None;
-                }
-                KeyCode::Up => {
-                    self.ask_scroll = self.ask_scroll.saturating_sub(1);
-                    return None;
-                }
-                KeyCode::Down => {
-                    self.ask_scroll = self.ask_scroll.saturating_add(1);
-                    return None;
-                }
-                KeyCode::Home => {
-                    self.ask_scroll = 0;
-                    return None;
-                }
-                KeyCode::End => {
-                    self.ask_scroll = usize::MAX;
-                    return None;
-                }
-                _ => {}
-            }
-        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
-                    return self.request_quit_confirmation();
+                    self.should_quit = true;
+                    return Some(Intent::Quit);
                 }
                 // Cmd/Ctrl+; toggles the Ask side panel.
                 KeyCode::Char(';') => {
@@ -2110,6 +908,9 @@ impl App {
                         Mode::Ask
                     };
                     return None;
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Some(Intent::PasteClipboard);
                 }
                 // Ctrl+D deletes the highlighted goal (only meaningful in
                 // Goal/Task mode; in Ask/Settings the input swallows it).
@@ -2127,141 +928,15 @@ impl App {
             Mode::Goal | Mode::Task => self.handle_goal_key(key),
             Mode::Ask => self.handle_ask_key(key),
             Mode::Settings => self.handle_settings_key(key),
-            Mode::Memory => None,
-            Mode::History => self.handle_history_key(key),
+            Mode::Memory | Mode::History => None,
             Mode::CommandPalette => self.handle_palette_key(key),
         }
     }
 
-    fn handle_history_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Goal;
-            }
-            KeyCode::Char('r') if self.history_filter.is_empty() => {
-                return Some(Intent::OpenHistory);
-            }
-            KeyCode::Up => {
-                self.history_selected = self.history_selected.saturating_sub(1);
-                if self.history_selected < self.history_scroll {
-                    self.history_scroll = self.history_selected;
-                }
-            }
-            KeyCode::Down => {
-                let max = self.filtered_history_indices().len().saturating_sub(1);
-                self.history_selected = (self.history_selected + 1).min(max);
-                if self.history_selected > self.history_scroll.saturating_add(12) {
-                    self.history_scroll = self.history_selected.saturating_sub(12);
-                }
-            }
-            KeyCode::PageUp => {
-                self.history_selected = self.history_selected.saturating_sub(10);
-                self.history_scroll = self.history_scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
-                let max = self.filtered_history_indices().len().saturating_sub(1);
-                self.history_selected = (self.history_selected + 10).min(max);
-                self.history_scroll = self.history_scroll.saturating_add(10).min(max);
-            }
-            KeyCode::Home => {
-                self.history_selected = 0;
-                self.history_scroll = 0;
-            }
-            KeyCode::End => {
-                let max = self.filtered_history_indices().len().saturating_sub(1);
-                self.history_selected = max;
-                self.history_scroll = max.saturating_sub(12);
-            }
-            KeyCode::Backspace => {
-                self.history_filter.pop();
-                self.history_selected = 0;
-                self.history_scroll = 0;
-            }
-            KeyCode::Char(c) => {
-                self.history_filter.push(c);
-                self.history_selected = 0;
-                self.history_scroll = 0;
-            }
-            _ => {}
-        }
-        self.clamp_history_selection();
-        None
-    }
-
-    fn filtered_history_indices(&self) -> Vec<usize> {
-        let query = self.history_filter.trim().to_ascii_lowercase();
-        self.history_records
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, row)| {
-                if query.is_empty()
-                    || row.goal_text.to_ascii_lowercase().contains(&query)
-                    || task_status_label(&row.status).contains(&query)
-                    || row.id.to_string().contains(&query)
-                {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn selected_history_record(&self) -> Option<&TaskRecord> {
-        let indices = self.filtered_history_indices();
-        indices
-            .get(self.history_selected.min(indices.len().saturating_sub(1)))
-            .and_then(|idx| self.history_records.get(*idx))
-    }
-
-    fn clamp_history_selection(&mut self) {
-        let max = self.filtered_history_indices().len().saturating_sub(1);
-        self.history_selected = self.history_selected.min(max);
-        self.history_scroll = self.history_scroll.min(max);
-    }
-
-    fn handle_goal_switcher_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        match key.code {
-            KeyCode::Esc => {
-                self.goal_switcher.open = false;
-            }
-            KeyCode::Enter => {
-                let filtered = self.goal_switcher.filtered_indices(&self.goals);
-                if let Some(goal_index) = filtered.get(self.goal_switcher.selected).copied() {
-                    self.selected = goal_index;
-                    self.clamp_focus_indices();
-                    self.default_focus_for_selected_goal();
-                }
-                self.goal_switcher.open = false;
-            }
-            KeyCode::Up => {
-                self.goal_switcher.selected = self.goal_switcher.selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                let max = self
-                    .goal_switcher
-                    .filtered_indices(&self.goals)
-                    .len()
-                    .saturating_sub(1);
-                self.goal_switcher.selected = (self.goal_switcher.selected + 1).min(max);
-            }
-            KeyCode::Backspace => {
-                self.goal_switcher.filter.pop();
-                self.goal_switcher.selected = 0;
-            }
-            KeyCode::Char(c) => {
-                self.goal_switcher.filter.push(c);
-                self.goal_switcher.selected = 0;
-            }
-            _ => {}
-        }
-        self.goal_switcher.clamp(&self.goals);
-        None
-    }
-
     fn handle_mcp_approval_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            return self.request_quit_confirmation();
+            self.should_quit = true;
+            return Some(Intent::Quit);
         }
 
         match key.code {
@@ -2285,8 +960,145 @@ impl App {
         }
     }
 
+    pub fn handle_paste(&mut self, text: String) -> Option<Intent> {
+        if text.trim().is_empty() {
+            return None;
+        }
+
+        if self.mode == Mode::Settings {
+            self.paste_into_settings(&text);
+            return None;
+        }
+
+        match self.mode {
+            Mode::Goal | Mode::Task => {
+                if looks_like_api_key(text.trim()) {
+                    self.help_open = false;
+                    self.settings.message = Some(
+                        "That looked like an API key - open Settings (/settings) and paste it into the API Key field, not the Goal bar."
+                            .into(),
+                    );
+                    self.mode = Mode::Settings;
+                    return None;
+                }
+                if contains_likely_secret(&text) {
+                    self.goal_prompt.set_notice(
+                        "Pasted text looked like it contains a secret; it was not attached.",
+                    );
+                    return None;
+                }
+                self.goal_prompt.handle_paste(&text);
+                self.prompt_artifact_selected =
+                    self.goal_prompt.artifacts().len().saturating_sub(1);
+            }
+            Mode::Ask => {
+                for c in prompt_buffer::normalize_paste(&text).chars() {
+                    self.ask_cursor = insert_char_at(&mut self.ask_input, self.ask_cursor, c);
+                }
+            }
+            Mode::CommandPalette => {
+                self.palette_input.push_str(
+                    prompt_buffer::normalize_paste(&text)
+                        .lines()
+                        .next()
+                        .unwrap_or(""),
+                );
+                self.palette_selected = 0;
+            }
+            Mode::Settings => {}
+            Mode::Memory | Mode::History => {}
+        }
+        None
+    }
+
+    fn paste_into_settings(&mut self, text: &str) {
+        let value = prompt_buffer::normalize_paste(text);
+        let value = value.trim_end_matches('\n');
+        match self.settings.active_field {
+            SettingsField::Provider => self.settings.provider.push_str(value),
+            SettingsField::Model => {
+                self.settings.model.push_str(value);
+                self.settings.model_ok = None;
+            }
+            SettingsField::ApiKey => self.settings.api_key.push_str(value.trim()),
+            SettingsField::AccountId => self.settings.account_id.push_str(value.trim()),
+            SettingsField::BaseUrl => self.settings.base_url.push_str(value.trim()),
+            SettingsField::MaxTokens => self.settings.max_tokens.push_str(
+                &value
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+            ),
+            SettingsField::MaxUsdCents => self.settings.max_usd_cents.push_str(
+                &value
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+            ),
+        }
+        self.settings.message = None;
+    }
+
+    fn handle_prompt_artifacts_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.prompt_artifacts_open = false;
+                None
+            }
+            KeyCode::Up => {
+                self.prompt_artifact_selected = self.prompt_artifact_selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down => {
+                if self.prompt_artifact_selected + 1 < self.goal_prompt.artifacts().len() {
+                    self.prompt_artifact_selected += 1;
+                }
+                None
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                self.goal_prompt
+                    .remove_artifact(self.prompt_artifact_selected);
+                self.prompt_artifact_selected = self
+                    .prompt_artifact_selected
+                    .min(self.goal_prompt.artifacts().len().saturating_sub(1));
+                if self.goal_prompt.artifacts().is_empty() {
+                    self.prompt_artifacts_open = false;
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn handle_palette_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        let filtered_options = command_suggestions(&self.palette_input);
+        let all_options = vec![
+            "Goal Mode",
+            "Task Mode",
+            "Ask Mode",
+            "Memory",
+            "History",
+            "Settings",
+            "Paste Clipboard",
+            "Artifacts",
+            "Toggle Log",
+            "Help",
+            "Delete Selected Goal",
+            "Clear History",
+            "Quit",
+        ];
+
+        let filtered_options: Vec<&str> = if self.palette_input.is_empty() {
+            all_options.clone()
+        } else {
+            all_options
+                .iter()
+                .filter(|opt| {
+                    opt.to_lowercase()
+                        .contains(&self.palette_input.to_lowercase())
+                })
+                .copied()
+                .collect()
+        };
 
         match key.code {
             KeyCode::Esc => {
@@ -2298,8 +1110,59 @@ impl App {
                     return None;
                 }
                 let selected = filtered_options[self.palette_selected % filtered_options.len()];
-                self.mode = self.prev_mode;
-                self.apply_slash_action(selected.action.clone())
+                match selected {
+                    "Goal Mode" => {
+                        self.mode = Mode::Goal;
+                    }
+                    "Task Mode" => {
+                        self.mode = Mode::Task;
+                    }
+                    "Ask Mode" => {
+                        self.mode = Mode::Ask;
+                    }
+                    "Memory" => {
+                        self.mode = Mode::Memory;
+                        return Some(Intent::OpenMemory);
+                    }
+                    "History" => {
+                        self.mode = Mode::History;
+                        return Some(Intent::OpenHistory);
+                    }
+                    "Settings" => {
+                        self.mode = Mode::Settings;
+                    }
+                    "Paste Clipboard" => {
+                        self.mode = self.prev_mode;
+                        return Some(Intent::PasteClipboard);
+                    }
+                    "Artifacts" => {
+                        self.prompt_artifacts_open = true;
+                        self.mode = self.prev_mode;
+                    }
+                    "Toggle Log" => {
+                        self.flight_log_open = !self.flight_log_open;
+                        self.mode = self.prev_mode;
+                    }
+                    "Help" => {
+                        self.help_open = true;
+                        self.mode = self.prev_mode;
+                    }
+                    "Delete Selected Goal" => {
+                        self.delete_selected_goal();
+                        self.mode = self.prev_mode;
+                    }
+                    "Clear History" => {
+                        self.goals.clear();
+                        self.selected = 0;
+                        self.mode = Mode::Goal;
+                    }
+                    "Quit" => {
+                        self.should_quit = true;
+                        return Some(Intent::Quit);
+                    }
+                    _ => {}
+                }
+                None
             }
             KeyCode::Up => {
                 self.palette_selected = self.palette_selected.saturating_sub(1);
@@ -2327,85 +1190,8 @@ impl App {
     }
 
     fn handle_goal_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            match key.code {
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    self.cycle_focus_view();
-                    return None;
-                }
-                KeyCode::Char('p') | KeyCode::Char('P') => {
-                    self.focus_view = FocusView::Problems;
-                    self.focus_scroll = 0;
-                    return None;
-                }
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    self.focus_view = FocusView::Code;
-                    self.focus_scroll = 0;
-                    self.focused_changed_file = self.focused_changed_file.min(
-                        self.current_goal()
-                            .map(focused_file_count)
-                            .unwrap_or(0)
-                            .saturating_sub(1),
-                    );
-                    return None;
-                }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    if self
-                        .current_goal()
-                        .is_some_and(|goal| matches!(goal.status, TaskStatus::Failed { .. }))
-                    {
-                        return self.retry_selected_goal_intent();
-                    }
-                    let goal_index = self.selected;
-                    if let Some(g) = self.goals.get(goal_index) {
-                        if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref())
-                        {
-                            if let Some(cp) = state.checkpoints.get(cursor) {
-                                return Some(Intent::Rollback {
-                                    goal_index,
-                                    to_seq: cp.seq,
-                                });
-                            }
-                        }
-                    }
-                    return None;
-                }
-                KeyCode::Char('[') => {
-                    match self.active_focus_view_for_current_goal() {
-                        FocusView::Code => {
-                            self.focused_changed_file = self.focused_changed_file.saturating_sub(1)
-                        }
-                        FocusView::Commands => {
-                            self.focused_command_run = self.focused_command_run.saturating_sub(1)
-                        }
-                        _ => {}
-                    }
-                    return None;
-                }
-                KeyCode::Char(']') => {
-                    match self.active_focus_view_for_current_goal() {
-                        FocusView::Code => {
-                            let max = self
-                                .current_goal()
-                                .map(focused_file_count)
-                                .unwrap_or(0)
-                                .saturating_sub(1);
-                            self.focused_changed_file = (self.focused_changed_file + 1).min(max);
-                        }
-                        FocusView::Commands => {
-                            let max = self.command_runs.len().saturating_sub(1);
-                            self.focused_command_run = (self.focused_command_run + 1).min(max);
-                        }
-                        _ => {}
-                    }
-                    return None;
-                }
-                _ => {}
-            }
-        }
-
         // Ctrl+Up / Ctrl+Down navigate the checkpoint picker inside the
-        // currently selected goal. Alt+R triggers a rollback to the
+        // currently selected goal.  'r' triggers a rollback to the
         // cursor-highlighted checkpoint.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -2432,10 +1218,11 @@ impl App {
                 _ => {}
             }
         }
+        // Ctrl+W deletes the word before the caret.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('w') => {
-                    self.goal_prompt.delete_word_before_cursor();
+                    self.goal_prompt.delete_word_before();
                     return None;
                 }
                 KeyCode::Char('u') => {
@@ -2446,22 +1233,19 @@ impl App {
                     self.goal_prompt.clear_after_cursor();
                     return None;
                 }
-                KeyCode::Char('v') => return Some(Intent::PasteClipboard),
                 _ => {}
             }
         }
         match key.code {
             KeyCode::Enter => {
-                let submission = self.goal_prompt.take_submission()?;
-                let display_text = submission.display_text;
-                let text = submission.model_text;
+                let prompt = self.goal_prompt.submit()?;
                 // Guard against the user pasting an API key into the
                 // goal bar (it has happened — see issue with AIza... in
                 // the wild). Keys would otherwise be sent verbatim to
                 // the LLM as the user prompt, which is both unhelpful
                 // and a credential leak. Detect, refuse, and surface a
                 // clear redirect to Settings instead.
-                if looks_like_api_key(text.trim()) {
+                if looks_like_api_key(prompt.description.trim()) {
                     self.help_open = false;
                     self.settings.message = Some(
                         "That looked like an API key — open Settings (/settings) and \
@@ -2471,48 +1255,17 @@ impl App {
                     self.mode = Mode::Settings;
                     return None;
                 }
-                self.prompt_history.push(display_text.clone());
-                self.prompt_history_cursor = None;
-                if let Some(model) = display_text.trim().strip_prefix("/model set ") {
-                    let model = model.trim();
-                    if model.is_empty() {
-                        self.command_notice = Some("Usage: /model set <name>".into());
-                        return None;
-                    }
-                    self.settings.model = model.to_string();
-                    self.command_notice = Some(format!("Model set to `{model}`"));
-                    self.mode = Mode::Settings;
-                    return Some(Intent::SaveSettings);
-                }
-                match parse_slash_command(&display_text) {
-                    SlashParse::RunCommand => return Some(Intent::RunCommand(display_text)),
-                    SlashParse::Command(action) => return self.apply_slash_action(action),
-                    SlashParse::Unknown {
-                        command,
-                        suggestion,
-                    } => {
-                        let message = unknown_command_message(&command, suggestion.as_deref());
-                        self.settings.message = Some(message.clone());
-                        self.command_notice = Some(message);
-                        return None;
-                    }
-                    SlashParse::NotCommand => {
-                        if parse_prompt_command(&display_text).is_some() {
-                            return Some(Intent::RunCommand(display_text));
-                        }
-                    }
-                }
-                self.goals.insert(0, GoalEntry::new(display_text));
+                self.goals
+                    .insert(0, GoalEntry::new(prompt.display_text.clone()));
                 self.selected = 0;
                 if self.mode == Mode::Task {
-                    Some(Intent::QueueTask(text))
+                    Some(Intent::QueueTask(prompt))
                 } else {
-                    Some(Intent::QueueGoal(text))
+                    Some(Intent::QueueGoal(prompt))
                 }
             }
             KeyCode::Backspace => {
-                self.command_notice = None;
-                self.goal_prompt.delete_char_before_cursor();
+                self.goal_prompt.delete_char_before();
                 None
             }
             KeyCode::Left => {
@@ -2532,45 +1285,33 @@ impl App {
                 None
             }
             KeyCode::Up => {
-                if self.goal_prompt.is_empty() && !self.prompt_history.is_empty() {
-                    let idx = self
-                        .prompt_history_cursor
-                        .map(|i| i.saturating_sub(1))
-                        .unwrap_or_else(|| self.prompt_history.len().saturating_sub(1));
-                    self.prompt_history_cursor = Some(idx);
-                    if let Some(entry) = self.prompt_history.get(idx) {
-                        self.goal_prompt.set_text(entry.clone());
-                    }
-                } else {
-                    self.previous_goal();
-                }
+                self.selected = self.selected.saturating_sub(1);
                 None
             }
             KeyCode::Down => {
-                if let Some(idx) = self.prompt_history_cursor {
-                    if idx + 1 < self.prompt_history.len() {
-                        let next = idx + 1;
-                        self.prompt_history_cursor = Some(next);
-                        if let Some(entry) = self.prompt_history.get(next) {
-                            self.goal_prompt.set_text(entry.clone());
-                        }
-                    } else {
-                        self.prompt_history_cursor = None;
-                        self.goal_prompt.set_text("");
-                    }
-                } else {
-                    self.next_goal();
+                if self.selected + 1 < self.goals.len() {
+                    self.selected += 1;
                 }
                 None
             }
-            KeyCode::Tab => {
-                if let Some(completion) = complete_command_prefix(self.goal_prompt.display_text()) {
-                    self.goal_prompt.set_text(completion);
+            KeyCode::Char('r') if self.goal_prompt.is_empty() => {
+                // Rollback shortcut — only when the goal bar is empty so the
+                // user can still type words starting with 'r' normally.
+                let goal_index = self.selected;
+                if let Some(g) = self.goals.get(goal_index) {
+                    if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref()) {
+                        if let Some(cp) = state.checkpoints.get(cursor) {
+                            return Some(Intent::Rollback {
+                                goal_index,
+                                to_seq: cp.seq,
+                            });
+                        }
+                    }
                 }
+                self.goal_prompt.insert_char('r');
                 None
             }
             KeyCode::Char(c) => {
-                self.command_notice = None;
                 self.goal_prompt.insert_char(c);
                 None
             }
@@ -2579,57 +1320,43 @@ impl App {
     }
 
     fn handle_ask_key(&mut self, key: KeyEvent) -> Option<Intent> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('w') => {
-                    self.ask_prompt.delete_word_before_cursor();
-                    return None;
-                }
-                KeyCode::Char('u') => {
-                    self.ask_prompt.clear_before_cursor();
-                    return None;
-                }
-                KeyCode::Char('k') => {
-                    self.ask_prompt.clear_after_cursor();
-                    return None;
-                }
-                KeyCode::Char('v') => return Some(Intent::PasteClipboard),
-                _ => {}
-            }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
+            self.ask_cursor = delete_word_before(&mut self.ask_input, self.ask_cursor);
+            return None;
         }
         match key.code {
             KeyCode::Enter => {
-                let submission = self.ask_prompt.take_submission()?;
-                self.prompt_history.push(submission.display_text);
-                self.prompt_history_cursor = None;
-                self.ask_answer = None;
-                self.ask_context_summary = None;
-                self.ask_scroll = 0;
-                self.ask_pending = true;
-                Some(Intent::Ask(submission.model_text))
+                let q = std::mem::take(&mut self.ask_input);
+                self.ask_cursor = 0;
+                if q.trim().is_empty() {
+                    return None;
+                }
+                Some(Intent::Ask(q))
             }
             KeyCode::Backspace => {
-                self.ask_prompt.delete_char_before_cursor();
+                self.ask_cursor = delete_char_before(&mut self.ask_input, self.ask_cursor);
                 None
             }
             KeyCode::Left => {
-                self.ask_prompt.move_left();
+                self.ask_cursor = self.ask_cursor.saturating_sub(1);
                 None
             }
             KeyCode::Right => {
-                self.ask_prompt.move_right();
+                if self.ask_cursor < char_count(&self.ask_input) {
+                    self.ask_cursor += 1;
+                }
                 None
             }
             KeyCode::Home => {
-                self.ask_prompt.move_home();
+                self.ask_cursor = 0;
                 None
             }
             KeyCode::End => {
-                self.ask_prompt.move_end();
+                self.ask_cursor = char_count(&self.ask_input);
                 None
             }
             KeyCode::Char(c) => {
-                self.ask_prompt.insert_char(c);
+                self.ask_cursor = insert_char_at(&mut self.ask_input, self.ask_cursor, c);
                 None
             }
             _ => None,
@@ -2856,38 +1583,14 @@ impl App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     /// User submitted a goal — caller should spawn an orchestration task.
-    QueueGoal(String),
+    QueueGoal(SubmittedPrompt),
     /// User submitted a direct single subtask. Skips planner decomposition.
-    QueueTask(String),
-    /// User requested a TUI plan preview without executing workers.
-    PreviewPlan {
-        goal_index: usize,
-        task_id: TaskId,
-        text: String,
-    },
-    /// User approved a selected TUI plan preview for execution.
-    ApprovePlan {
-        goal_index: usize,
-        task_id: TaskId,
-        text: String,
-    },
+    QueueTask(SubmittedPrompt),
     /// User submitted an ask-mode question. Isolated from goal context.
     Ask(String),
-    /// User submitted `/run <cmd>` or `!<cmd>` from the prompt bar.
-    RunCommand(String),
-    /// User requested copying the current focus surface to the OS clipboard.
-    CopyFocus(String),
-    /// User requested OS clipboard paste. On Windows this supports Win+V
-    /// selections that land in the clipboard but are not emitted as terminal
-    /// bracketed-paste events.
-    PasteClipboard,
     /// User triggered a rollback to a specific checkpoint seq for the
     /// currently selected goal.
     Rollback { goal_index: usize, to_seq: u32 },
-    /// User requested context compaction for the selected active goal.
-    CompactContext { goal_index: usize },
-    /// User requested cancellation of the selected active goal.
-    StopGoal { goal_index: usize },
     /// User approved or denied a pending MCP approval prompt.
     ResolveMcpApproval { approval_id: u64, approved: bool },
     /// Save settings.
@@ -2906,8 +1609,8 @@ pub enum Intent {
     OpenMemory,
     /// Open the history browser and refresh rows from the store.
     OpenHistory,
-    /// Revoke trust for the current workspace.
-    RevokeCurrentTrust,
+    /// Import the OS clipboard into the active prompt field.
+    PasteClipboard,
     /// User accepted the workspace-trust prompt — proceed into the TUI.
     AcceptTrust,
     /// User declined trust. Caller should exit cleanly.
@@ -3015,11 +1718,11 @@ pub fn render_savings_line_styled(
 /// whole UI into a [`ratatui::backend::TestBackend`] and assert.
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    // Once a goal is queued, collapse the large ASCII logo down to a slim
+    // Once a goal is queued, collapse the giant ASCII logo down to a slim
     // one-line header so the work area gets the screen real estate.
     let want_full_logo = app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD;
     let splash_h: u16 = if want_full_logo {
-        LOGO.len() as u16 + 2
+        LOGO.len() as u16 + 1
     } else {
         1
     };
@@ -3073,9 +1776,6 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_ask(frame, body_chunks[2], app);
     }
     render_input(frame, input_row, app);
-    if command_drawer_visible(app) {
-        render_command_drawer(frame, area, input_row, app);
-    }
     render_footer(frame, footer_row, app);
 
     if app.mode == Mode::Settings {
@@ -3084,74 +1784,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.mode == Mode::CommandPalette {
         render_palette(frame, area, app);
     }
-    if app.goal_switcher.open {
-        render_goal_switcher(frame, area, app);
-    }
     if app.help_open {
         render_help(frame, area);
+    }
+    if app.prompt_artifacts_open {
+        render_prompt_artifacts_drawer(frame, area, app);
     }
     if !app.pending_mcp_approvals.is_empty() {
         render_mcp_approval(frame, area, app);
     }
-    if app.quit_confirmation_open {
-        render_quit_confirmation(frame, area, app);
-    }
-}
-
-fn command_drawer_visible(app: &App) -> bool {
-    matches!(app.mode, Mode::Goal | Mode::Task)
-        && app.goal_prompt.display_text().starts_with('/')
-        && !app.help_open
-        && !app.quit_confirmation_open
-}
-
-fn render_command_drawer(frame: &mut Frame, area: Rect, input_row: Rect, app: &App) {
-    let suggestions = command_suggestions(app.goal_prompt.display_text());
-    if suggestions.is_empty() {
-        return;
-    }
-    let max_rows = suggestions.len().min(6);
-    let popup_h = max_rows as u16 + 2;
-    if input_row.y <= area.y + 1 {
-        return;
-    }
-    let popup_w = area.width.saturating_sub(6).clamp(44, 90);
-    let popup_area = Rect {
-        x: area.x + 3,
-        y: input_row.y.saturating_sub(popup_h),
-        width: popup_w,
-        height: popup_h,
-    };
-    frame.render_widget(Clear, popup_area);
-    let block = Block::default()
-        .title(Span::styled(
-            " Commands ",
-            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(BG_DEEP));
-    frame.render_widget(block.clone(), popup_area);
-    let inner = block.inner(popup_area);
-    let lines: Vec<ListItem> = suggestions
-        .iter()
-        .take(max_rows)
-        .map(|spec| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    spec.name,
-                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(if spec.args.is_empty() { "" } else { " " }),
-                Span::styled(spec.args, Style::default().fg(WARN)),
-                Span::styled("  ", Style::default().fg(DIM)),
-                Span::styled(spec.description, Style::default().fg(MUTED)),
-            ]))
-            .style(Style::default().bg(BG_DEEP))
-        })
-        .collect();
-    frame.render_widget(List::new(lines), inner);
 }
 
 /// Centred modal listing every keybinding in one place. Toggled by `?`,
@@ -3159,46 +1800,21 @@ fn render_command_drawer(frame: &mut Frame, area: Rect, input_row: Rect, app: &A
 fn render_help(frame: &mut Frame, area: Rect) {
     let rows: &[(&str, &str)] = &[
         ("Enter", "submit goal / question"),
-        ("/settings", "open provider, model, and budget settings"),
-        ("/status", "show provider, model, session, and token state"),
-        (
-            "/memory",
-            "inspect memories that can influence future tasks",
-        ),
-        ("/review", "use `phonton review latest` outside the TUI"),
-        ("/plan", "preview a GoalContract before execution"),
-        ("/approve", "execute the selected plan preview"),
-        ("/context", "show prompt context usage and token sections"),
-        ("/compact-context", "compact active worker context"),
-        ("/problems", "inspect verifier failures and repair hints"),
-        ("/retry", "repair the selected failed goal with diagnostics"),
-        ("/why-tokens", "explain latest prompt token buckets"),
-        (
-            "/ask",
-            "ask a bounded workspace question without queueing a goal",
-        ),
-        ("/commands", "show command and keyboard help"),
-        ("/run", "run a command through the sandbox"),
-        ("!", "run command shorthand, e.g. !npm test"),
-        ("Ctrl+/", "open the command palette"),
+        ("/", "open the command palette"),
         ("?", "toggle this help"),
+        ("Ctrl+V", "paste clipboard as text or artifact"),
         ("Ctrl+;", "toggle the Ask side panel"),
-        ("Ctrl+V", "paste from Windows clipboard"),
         ("Shift+L", "toggle the Flight Log"),
         ("Ctrl+D", "delete the selected goal"),
+        ("Ctrl+U / Ctrl+K", "clear before/after cursor"),
         ("Ctrl+W", "delete the previous word in the input"),
-        ("Ctrl+U/K", "clear before / after the caret"),
-        ("Tab", "complete slash command prefix"),
         ("↑ / ↓", "move selection in Goals (or palette)"),
         ("← / →", "move caret in the input bar"),
         ("Home / End", "jump to start/end of the input"),
         ("Ctrl+↑↓", "move the checkpoint cursor"),
-        ("Alt+F", "cycle Active panel focus"),
-        ("Alt+D", "open the verified diff/code focus"),
-        ("Alt+P", "open Problems focus"),
-        ("Alt+R", "retry failed goal or rollback checkpoint"),
-        ("Ctrl+C", "ask to save and quit"),
-        ("Esc", "close overlay / cancel / ask to quit"),
+        ("r", "rollback to the highlighted checkpoint (input empty)"),
+        ("Ctrl+C", "quit immediately"),
+        ("Esc", "close overlay / cancel / quit"),
     ];
 
     // Fit the modal to the longest description so wrapping never bites.
@@ -3261,10 +1877,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(p, inner);
 }
 
-/// Confirmation modal shown before ending an interactive session.
-fn render_quit_confirmation(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_w = area.width.saturating_sub(4).clamp(48, 76);
-    let popup_h = area.height.saturating_sub(2).clamp(13, 17);
+fn render_prompt_artifacts_drawer(frame: &mut Frame, area: Rect, app: &App) {
+    let popup_w = 72u16.min(area.width.saturating_sub(2)).max(32);
+    let popup_h = 18u16.min(area.height.saturating_sub(2)).max(8);
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
         y: area.y + (area.height.saturating_sub(popup_h)) / 2,
@@ -3275,89 +1890,71 @@ fn render_quit_confirmation(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .title(Span::styled(
-            " End Session ",
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            " Prompt Artifacts ",
+            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
         ))
-        .title_bottom(Line::from(vec![
-            Span::styled(" Enter/Y save + exit ", Style::default().fg(SUCCESS)),
-            Span::styled("  N/Esc cancel ", Style::default().fg(MUTED)),
-        ]))
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(WARN))
+        .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(block.clone(), popup_area);
+    let inner = block.inner(popup_area);
 
-    let totals = app.session_totals();
-    let saved_label = if totals.estimated_tokens_saved >= 0 {
-        "saved"
-    } else {
-        "over"
-    };
-    let saved_value = totals.estimated_tokens_saved.saturating_abs();
-    let best = totals
-        .best_savings_pct
-        .map(|p| format!("{p}%"))
-        .unwrap_or_else(|| "n/a".into());
-    let lines = vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  Save this workspace session and exit Phonton?",
+    let artifacts = app.goal_prompt.artifacts();
+    if artifacts.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No pending prompt artifacts.")
+                .style(Style::default().fg(MUTED).bg(BG_DEEP))
+                .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let selected = app
+        .prompt_artifact_selected
+        .min(artifacts.len().saturating_sub(1));
+    let mut lines = Vec::new();
+    for (idx, artifact) in artifacts.iter().enumerate() {
+        let style = if idx == selected {
             Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  Goals      ", Style::default().fg(MUTED)),
-            Span::styled(
-                totals.goals.to_string(),
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  done ", Style::default().fg(MUTED)),
-            Span::styled(totals.completed.to_string(), Style::default().fg(SUCCESS)),
-            Span::styled("  review ", Style::default().fg(MUTED)),
-            Span::styled(totals.reviewing.to_string(), Style::default().fg(WARN)),
-            Span::styled("  failed ", Style::default().fg(MUTED)),
-            Span::styled(totals.failed.to_string(), Style::default().fg(DANGER)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Tokens     ", Style::default().fg(MUTED)),
-            Span::styled(
-                totals.tokens_used.to_string(),
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  vs baseline ", Style::default().fg(MUTED)),
-            Span::styled(
-                totals.naive_baseline_tokens.to_string(),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Efficiency ", Style::default().fg(MUTED)),
-            Span::styled(
-                format!("{saved_label} {saved_value}"),
-                Style::default().fg(if totals.estimated_tokens_saved >= 0 {
-                    SUCCESS
-                } else {
-                    WARN
-                }),
-            ),
-            Span::styled("  best ", Style::default().fg(MUTED)),
-            Span::styled(best, Style::default().fg(SUCCESS)),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  The session snapshot is saved locally for `phonton -r`.",
-            Style::default().fg(MUTED),
-        )),
-    ];
+                .fg(BG_DEEP)
+                .bg(ACCENT_HI)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).bg(BG_DEEP)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{} {}", idx + 1, artifact.label),
+            style,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("   {}", artifact_preview(artifact, inner.width as usize)),
+            Style::default().fg(MUTED).bg(BG_DEEP),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Backspace/Delete removes selected - Esc closes",
+        Style::default().fg(MUTED).bg(BG_DEEP),
+    )));
+
     frame.render_widget(
         Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().bg(BG_DEEP)),
-        block.inner(popup_area),
+            .style(Style::default().bg(BG_DEEP))
+            .wrap(Wrap { trim: true }),
+        inner,
     );
+}
+
+fn artifact_preview(artifact: &PromptArtifact, width: usize) -> String {
+    let preview = artifact
+        .text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    short(preview, width.saturating_sub(4).max(12))
 }
 
 /// Focused modal for approval-gated MCP operations.
@@ -3459,38 +2056,27 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
-    // Keep the normal ANSI Shadow wordmark. The terminal-corruption fix is
-    // keeping semantic-index downloads silent while Ratatui owns the screen.
-    let header_phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
-    let logo_phase = 0.17;
-    if area.height >= LOGO.len() as u16 + 2 && area.width >= LOGO_WIDTH_THRESHOLD {
-        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 2);
+    // Slowly drifting phase so the logo gets a deliberate scanline shimmer
+    // without turning the whole splash into a fast flashing surface.
+    let phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
+    if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
+        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 1);
         lines.push(Line::raw(""));
         lines.extend(
             LOGO.iter()
                 .enumerate()
-                .map(|(row_idx, row)| logo_line(row, logo_phase, row_idx)),
+                .map(|(row_idx, row)| logo_line(row, phase, row_idx)),
         );
-        lines.push(Line::from(Span::styled(
-            format!("v{}", env!("CARGO_PKG_VERSION")),
-            Style::default().fg(MUTED),
-        )));
         let p = Paragraph::new(lines)
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
         frame.render_widget(p, area);
     } else {
         // Compact one-line header - gradient "phonton" + dim subtitle.
-        let compact_phase = logo_phase + header_phase * 0.8;
-        let mut spans = gradient_line("✦ phonton", compact_phase, true).spans;
+        let mut spans = gradient_line("✦ phonton", phase * 0.8, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
             "agentic dev environment",
-            Style::default().fg(MUTED),
-        ));
-        spans.push(Span::styled("  ·  ", Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            format!("v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(MUTED),
         ));
         let p = Paragraph::new(Line::from(spans))
@@ -3514,26 +2100,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Enter", key),
             Span::styled(" run  ", txt),
             sep.clone(),
-            Span::styled("/run", key),
-            Span::styled(" command  ", txt),
-            sep.clone(),
-            Span::styled("!", key),
-            Span::styled(" cmd  ", txt),
+            Span::styled("/", key),
+            Span::styled(" commands  ", txt),
             sep.clone(),
             Span::styled("Ctrl+V", key),
             Span::styled(" paste  ", txt),
             sep.clone(),
             Span::styled("?", key),
             Span::styled(" help  ", txt),
-            sep.clone(),
-            Span::styled("Alt+↑↓", key),
-            Span::styled(" goal  ", txt),
-            sep.clone(),
-            Span::styled("Alt+F", key),
-            Span::styled(" focus  ", txt),
-            sep.clone(),
-            Span::styled("Alt+D", key),
-            Span::styled(" diff  ", txt),
             sep.clone(),
             Span::styled("Ctrl+;", key),
             Span::styled(" ask  ", txt),
@@ -3545,14 +2119,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(" del  ", txt),
             sep,
             Span::styled("Esc", key),
-            Span::styled(" exit?", txt),
+            Span::styled(" quit", txt),
         ],
         Mode::Ask => vec![
             Span::styled("Enter", key),
             Span::styled(" send  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+V", key),
-            Span::styled(" paste  ", txt),
             sep.clone(),
             Span::styled("Ctrl+;", key),
             Span::styled(" close ask  ", txt),
@@ -3600,8 +2171,34 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
-    let all_options = command_suggestions("");
-    let filtered_options = command_suggestions(&app.palette_input);
+    let all_options = vec![
+        "Goal Mode",
+        "Task Mode",
+        "Ask Mode",
+        "Memory",
+        "History",
+        "Settings",
+        "Paste Clipboard",
+        "Artifacts",
+        "Toggle Log",
+        "Help",
+        "Delete Selected Goal",
+        "Clear History",
+        "Quit",
+    ];
+
+    let filtered_options: Vec<&str> = if app.palette_input.is_empty() {
+        all_options.clone()
+    } else {
+        all_options
+            .iter()
+            .filter(|opt| {
+                opt.to_lowercase()
+                    .contains(&app.palette_input.to_lowercase())
+            })
+            .copied()
+            .collect()
+    };
 
     let block = Block::default()
         .title(Line::from(vec![
@@ -3618,7 +2215,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(BG_DEEP));
 
-    let popup_w = 72;
+    let popup_w = 40;
     let popup_h = (all_options.len() as u16 + 4).max(8);
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(popup_w)) / 2,
@@ -3659,7 +2256,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     let list_items: Vec<ListItem> = filtered_options
         .iter()
         .enumerate()
-        .map(|(i, spec)| {
+        .map(|(i, &opt)| {
             let selected = i == app.palette_selected % filtered_options.len().max(1);
             let (marker, style) = if selected {
                 (
@@ -3672,11 +2269,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 ("  ", Style::default().fg(MUTED))
             };
-            ListItem::new(Line::from(format!(
-                "{marker}{}",
-                render_command_label(spec)
-            )))
-            .style(style)
+            ListItem::new(Line::from(format!("{marker}{opt}"))).style(style)
         })
         .collect();
 
@@ -3689,101 +2282,6 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
         let list = List::new(list_items);
         frame.render_widget(list, chunks[2]);
     }
-}
-
-fn render_goal_switcher(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_w = area.width.saturating_sub(8).clamp(48, 90);
-    let popup_h = area.height.saturating_sub(6).clamp(8, 18);
-    let popup_area = Rect {
-        x: area.x + (area.width.saturating_sub(popup_w)) / 2,
-        y: area.y + (area.height.saturating_sub(popup_h)) / 2,
-        width: popup_w.min(area.width),
-        height: popup_h.min(area.height),
-    };
-
-    frame.render_widget(Clear, popup_area);
-    let block = Block::default()
-        .title(Span::styled(
-            " Goals ",
-            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Thick)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(BG_DEEP));
-    frame.render_widget(block, popup_area);
-
-    let inner = popup_area.inner(ratatui::layout::Margin {
-        vertical: 1,
-        horizontal: 2,
-    });
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "/",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::raw(app.goal_switcher.filter.clone()),
-        ])),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new("─".repeat(inner.width as usize)).style(Style::default().fg(MUTED)),
-        chunks[1],
-    );
-
-    let filtered = app.goal_switcher.filtered_indices(&app.goals);
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .enumerate()
-        .map(|(row, goal_idx)| {
-            let goal = &app.goals[*goal_idx];
-            let selected = row == app.goal_switcher.selected;
-            let style = if selected {
-                Style::default()
-                    .fg(BG_DEEP)
-                    .bg(ACCENT_HI)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(MUTED)
-            };
-            let status = if matches!(goal.status, TaskStatus::Failed { .. }) {
-                goal_failure_kind(goal)
-            } else {
-                goal_status_label(&goal.status)
-            };
-            ListItem::new(Line::from(format!(
-                "{:>2}. {:<7} {}",
-                goal_idx + 1,
-                status,
-                short(&goal.description, inner.width.saturating_sub(14) as usize)
-            )))
-            .style(style)
-        })
-        .collect();
-    if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No matching goals.").style(Style::default().fg(MUTED)),
-            chunks[2],
-        );
-    } else {
-        frame.render_widget(List::new(items), chunks[2]);
-    }
-    frame.render_widget(
-        Paragraph::new("Alt+1-9 jump · Enter select · Esc close").style(Style::default().fg(MUTED)),
-        chunks[3],
-    );
 }
 
 fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
@@ -3802,18 +2300,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 ("  ", Style::default().fg(MUTED))
             };
             let mut spans = vec![Span::styled(marker, base_style)];
-            spans.push(Span::styled(
-                format!("{:>2} ", i + 1),
-                Style::default().fg(if selected { ACCENT_HI } else { MUTED }),
-            ));
             spans.extend(status_tag_spans(&g.status, app.spinner_frame));
-            if matches!(g.status, TaskStatus::Failed { .. }) {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    goal_failure_kind(g),
-                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-                ));
-            }
             // Parallel-worker indicator: one spinner glyph per concurrently
             // active subtask, capped at 5 so the sidebar stays readable.
             // Each glyph is drawn at a different phase of the spinner so
@@ -3843,7 +2330,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
             spans.push(Span::raw(" "));
-            spans.extend(artifact_text_spans(&short(&g.description, 40), base_style));
+            spans.push(Span::styled(short(&g.description, 40), base_style));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -3874,7 +2361,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(9)])
+        .constraints([Constraint::Min(1), Constraint::Length(7)])
         .split(area);
 
     frame.render_widget(list, chunks[0]);
@@ -3914,19 +2401,6 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 },
                 Style::default().fg(if app.flight_log_open { SUCCESS } else { MUTED }),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(" PM ", Style::default().fg(WARN)),
-            Span::styled("perm      ", Style::default().fg(MUTED)),
-            Span::styled(
-                app.settings.permission_mode.as_str(),
-                Style::default().fg(ACCENT_HI),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" CTX ", Style::default().fg(ACCENT)),
-            Span::styled("context   ", Style::default().fg(MUTED)),
-            Span::styled(context_meter_label(app), Style::default().fg(ACCENT_HI)),
         ]),
     ];
     let mut sys_info = sys_info;
@@ -3999,7 +2473,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         MUTED
     };
 
-    let mut block = Block::default()
+    let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
             Span::styled("◉ ", Style::default().fg(pulse_color)),
@@ -4029,7 +2503,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
         welcome_spans.push(Span::styled(".", muted));
-        let mut lines = vec![
+        let lines = vec![
             Line::raw(""),
             Line::from(welcome_spans),
             Line::raw(""),
@@ -4068,24 +2542,10 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(Span::styled("  Shortcuts:", label)),
             Line::from(vec![
                 Span::styled(
-                    "    /run",
+                    "    /",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("    sandboxed command", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    !",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("       command shorthand", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Ctrl+V",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  paste clipboard", muted),
+                Span::styled("       command palette", muted),
             ]),
             Line::from(vec![
                 Span::styled(
@@ -4106,10 +2566,9 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                     "    Esc",
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("     save + exit?", muted),
+                Span::styled("     quit", muted),
             ]),
         ];
-        append_command_run_lines(&mut lines, &app.command_runs, app.focused_command_run);
         let p = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false });
@@ -4118,24 +2577,20 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        "goal: ",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )]));
-    if let Some(last) = lines.last_mut() {
-        last.spans.extend(artifact_text_spans(
-            &g.description,
-            Style::default().fg(Color::White),
-        ));
-    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "goal: ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(g.description.clone()),
+    ]));
     lines.push(Line::raw(""));
 
     if let Some(state) = &g.state {
         for w in &state.active_workers {
             let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
             spans.push(Span::raw(" "));
-            let label = worker_display_description(&w.subtask_description);
-            spans.push(Span::raw(short(&label, 50)));
+            spans.push(Span::raw(short(&w.subtask_description, 50)));
             if w.is_thinking {
                 let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
                 let frame_ch = SPINNER[frame_idx];
@@ -4160,98 +2615,8 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             app.new_best_ticks,
         ));
 
-        if let TaskStatus::Failed {
-            reason,
-            failed_subtask,
-        } = &state.task_status
-        {
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Failure: ",
-                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(reason.clone(), Style::default().fg(Color::White)),
-            ]));
-            if let Some(subtask) = failed_subtask {
-                lines.push(Line::from(vec![
-                    Span::styled("  subtask ", Style::default().fg(MUTED)),
-                    Span::styled(
-                        subtask.to_string(),
-                        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-            }
-        }
-
-        if let TaskStatus::NeedsClarification { questions } = &state.task_status {
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Needs clarification",
-                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" before workers run", Style::default().fg(MUTED)),
-            ]));
-            for question in questions.iter().take(5) {
-                lines.push(Line::from(vec![
-                    Span::styled("  - ", Style::default().fg(WARN)),
-                    Span::styled(question.clone(), Style::default().fg(Color::White)),
-                ]));
-            }
-            lines.push(Line::from(vec![
-                Span::styled("  answer: ", Style::default().fg(MUTED)),
-                Span::styled(
-                    "submit a more specific goal, for example `make chess as a terminal game`",
-                    Style::default().fg(MUTED),
-                ),
-            ]));
-        }
-
-        append_focus_tabs(&mut lines, app.active_focus_view_for_current_goal());
-        match app.active_focus_view_for_current_goal() {
-            FocusView::Plan => {
-                for line in plan_focus_text(g).lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::White),
-                    )));
-                }
-            }
-            FocusView::Receipt => {
-                if let Some(handoff) = &state.handoff_packet {
-                    append_handoff_lines(&mut lines, handoff);
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        "  No handoff packet yet.",
-                        Style::default().fg(MUTED),
-                    )));
-                }
-            }
-            FocusView::Problems => {
-                append_problems_focus_lines(&mut lines, g, app.focused_changed_file)
-            }
-            FocusView::Code => append_code_focus_lines(&mut lines, g, app.focused_changed_file),
-            FocusView::Commands => {
-                append_command_run_lines(&mut lines, &app.command_runs, app.focused_command_run)
-            }
-            FocusView::Context => {
-                for line in context_focus_text(g).lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::White),
-                    )));
-                }
-            }
-            FocusView::Tokens => {
-                for line in tokens_focus_text(g).lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::White),
-                    )));
-                }
-            }
-            FocusView::Log => append_log_focus_lines(&mut lines, g),
+        if let Some(handoff) = &state.handoff_packet {
+            append_handoff_lines(&mut lines, handoff);
         }
 
         // Checkpoint picker — one line per landed subtask, newest last.
@@ -4259,9 +2624,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         // rollback is dispatched through the orchestrator's control
         // channel (see `OrchestratorMessage::RollbackRequest`); this
         // panel only surfaces the picker.
-        if !state.checkpoints.is_empty()
-            && app.active_focus_view_for_current_goal() == FocusView::Receipt
-        {
+        if !state.checkpoints.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 format!(
@@ -4298,22 +2661,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(inner_h);
-    let focus_scroll = app.focus_scroll.min(max_scroll);
-    if max_scroll > 0 {
-        block = block.title_bottom(Line::from(Span::styled(
-            format!(
-                " PgUp/PgDn scroll {}/{} · Home/End ",
-                focus_scroll, max_scroll
-            ),
-            Style::default().fg(MUTED),
-        )));
-    }
-    let p = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .scroll((focus_scroll.min(u16::MAX as usize) as u16, 0))
-        .block(block);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
     frame.render_widget(p, area);
 }
 
@@ -4541,7 +2889,7 @@ fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
     let max_scroll = total.saturating_sub(inner_h);
     // None == "tail mode": always show the newest content. Some(n) == the
     // user has scrolled, n is the offset from the top.
-    let scroll = resolved_flight_log_scroll(app.flight_log_scroll, max_scroll);
+    let scroll = app.flight_log_scroll.unwrap_or(max_scroll).min(max_scroll);
     let visible: Vec<Line> = lines.into_iter().skip(scroll).take(inner_h).collect();
 
     let p = Paragraph::new(visible)
@@ -4587,41 +2935,6 @@ fn render_memory(frame: &mut Frame, area: Rect, app: &App) {
                 Span::raw(short(&body, 90)),
             ]));
         }
-        if let Some(row) = app.selected_history_record() {
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "Selected",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(vec![
-                Span::styled("id ", Style::default().fg(MUTED)),
-                Span::styled(row.id.to_string(), Style::default().fg(ACCENT_HI)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("goal ", Style::default().fg(MUTED)),
-                Span::styled(
-                    short(&row.goal_text, 120),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("status ", Style::default().fg(MUTED)),
-                Span::styled(
-                    task_status_label(&row.status),
-                    Style::default().fg(ACCENT_HI),
-                ),
-                Span::styled("  tokens ", Style::default().fg(MUTED)),
-                Span::styled(row.total_tokens.to_string(), Style::default().fg(ACCENT_HI)),
-            ]));
-            if let Some(ledger) = &row.outcome_ledger {
-                if let Some(handoff) = &ledger.handoff {
-                    lines.push(Line::from(vec![
-                        Span::styled("receipt ", Style::default().fg(MUTED)),
-                        Span::styled(short(&handoff.headline, 120), Style::default().fg(SUCCESS)),
-                    ]));
-                }
-            }
-        }
     }
 
     frame.render_widget(
@@ -4631,10 +2944,9 @@ fn render_memory(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_history(frame: &mut Frame, area: Rect, app: &App) {
-    let filtered = app.filtered_history_indices();
     let block = Block::default()
         .title(Span::styled(
-            format!(" History {}/{} ", filtered.len(), app.history_records.len()),
+            " History ",
             Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
@@ -4647,41 +2959,13 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
         .style(Style::default().bg(BG_PANEL));
 
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("filter: ", Style::default().fg(MUTED)),
-        Span::styled(
-            if app.history_filter.is_empty() {
-                "<none>".into()
-            } else {
-                app.history_filter.clone()
-            },
-            Style::default().fg(ACCENT_HI),
-        ),
-    ]));
-    lines.push(Line::raw(""));
     if app.history_records.is_empty() {
         lines.push(Line::from(Span::styled(
             "No persisted task history yet.",
             Style::default().fg(MUTED),
         )));
-    } else if filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No history rows match this filter.",
-            Style::default().fg(MUTED),
-        )));
     } else {
-        let visible_count = (area.height.saturating_sub(9) as usize).clamp(6, 20);
-        let start = app.history_scroll.min(filtered.len().saturating_sub(1));
-        for (visible_idx, row_index) in filtered
-            .iter()
-            .copied()
-            .enumerate()
-            .skip(start)
-            .take(visible_count)
-        {
-            let Some(row) = app.history_records.get(row_index) else {
-                continue;
-            };
+        for row in app.history_records.iter().take(20) {
             let status = task_status_label(&row.status);
             let outcome = row
                 .outcome_ledger
@@ -4696,22 +2980,10 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
                     )
                 })
                 .unwrap_or_default();
-            let selected = visible_idx == app.history_selected;
             lines.push(Line::from(vec![
                 Span::styled(
-                    if selected { "> " } else { "  " },
-                    Style::default().fg(ACCENT_HI),
-                ),
-                Span::styled(
                     format!("{status:<9} "),
-                    if selected {
-                        Style::default()
-                            .fg(BG_DEEP)
-                            .bg(ACCENT_HI)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD)
-                    },
+                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{} tok  ", row.total_tokens),
@@ -4744,28 +3016,12 @@ fn task_status_label(status: &serde_json::Value) -> &'static str {
         "review"
     } else if status.get("Failed").is_some() {
         "failed"
-    } else if status.get("NeedsClarification").is_some() {
-        "clarify"
     } else if status.get("Running").is_some() {
         "running"
     } else if status.get("Paused").is_some() {
         "paused"
     } else {
         "task"
-    }
-}
-
-fn goal_status_label(status: &TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Queued => "queued",
-        TaskStatus::Planning => "planning",
-        TaskStatus::Running { .. } => "running",
-        TaskStatus::Reviewing { .. } => "review",
-        TaskStatus::Done { .. } => "done",
-        TaskStatus::Failed { .. } => "failed",
-        TaskStatus::NeedsClarification { .. } => "clarify",
-        TaskStatus::Paused { .. } => "paused",
-        TaskStatus::Rejected => "rejected",
     }
 }
 
@@ -4793,21 +3049,6 @@ fn nexus_label(status: &NexusStatus) -> String {
         format!("{} repos", status.repo_count)
     } else {
         "single repo".into()
-    }
-}
-
-fn context_meter_label(app: &App) -> String {
-    let latest = app
-        .last_prompt_manifest
-        .as_ref()
-        .map(|m| m.total_estimated_tokens)
-        .unwrap_or(0);
-    if latest == 0 {
-        "none".into()
-    } else if app.compacted_prompt_tokens > 0 {
-        format!("{} tok, {} compacted", latest, app.compacted_prompt_tokens)
-    } else {
-        format!("{latest} tok")
     }
 }
 
@@ -4861,17 +3102,6 @@ fn wrap_text(s: &str, w: usize) -> Vec<String> {
     out
 }
 
-fn resolved_flight_log_scroll(raw_scroll: Option<usize>, max_scroll: usize) -> usize {
-    match raw_scroll {
-        None => max_scroll,
-        Some(raw) if raw > max_scroll => {
-            let distance_from_tail = usize::MAX.saturating_sub(raw);
-            max_scroll.saturating_sub(distance_from_tail)
-        }
-        Some(raw) => raw.min(max_scroll),
-    }
-}
-
 fn event_style(rec: &EventRecord) -> (Color, &'static str) {
     use phonton_types::OrchestratorEvent as E;
     match &rec.event {
@@ -4880,8 +3110,6 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::TaskFailed { .. } => (DANGER, "task-failed"),
         E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
         E::ContextSelected { .. } => (VIOLET, "context"),
-        E::PromptManifest { .. } => (VIOLET, "prompt"),
-        E::ContextCompacted { .. } => (WARN, "compact"),
         E::ExtensionLoaded { .. } => (ACCENT, "ext-loaded"),
         E::ExtensionSkipped { .. } => (WARN, "ext-skipped"),
         E::ExtensionConflict { .. } => (WARN, "ext-conflict"),
@@ -4904,6 +3132,8 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::CheckpointCreated { .. } => (SUCCESS, "checkpoint"),
         E::RollbackPerformed { .. } => (WARN, "rollback"),
         E::ReviewDecision { .. } => (ACCENT, "review"),
+        E::VerifyBrowserCheckPass { .. } => (SUCCESS, "browser-pass"),
+        E::VerifyBrowserCheckFail { .. } => (WARN, "browser-fail"),
     }
 }
 
@@ -4918,17 +3148,13 @@ fn fmt_ts(ms: u64) -> String {
 }
 
 fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
-    let mut lines = vec![Line::from(Span::styled(
-        "Ask mode (Ctrl+; to close, Esc to cancel)",
-        Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
-    ))];
-    if let Some(summary) = &app.ask_context_summary {
-        lines.push(Line::from(Span::styled(
-            summary.clone(),
-            Style::default().fg(MUTED),
-        )));
-    }
-    lines.push(Line::raw(""));
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Ask mode (Ctrl+; to close, Esc to cancel)",
+            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
     if app.ask_pending {
         let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
         let frame_ch = SPINNER[frame_idx];
@@ -4944,230 +3170,64 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
             "A:",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )));
-        lines.extend(render_rich_text_lines(ans));
+        for l in ans.lines() {
+            lines.push(Line::raw(l.to_string()));
+        }
     } else {
         lines.push(Line::from(Span::styled(
             "(no answer yet)",
             Style::default().fg(MUTED),
         )));
     }
-    let viewport = area.height.saturating_sub(2) as usize;
-    let max_scroll = lines.len().saturating_sub(viewport);
-    let scroll = app.ask_scroll.min(max_scroll);
-    let p = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    format!(" Ask  {scroll}/{max_scroll}  PgUp/PgDn "),
-                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::default().fg(VIOLET)),
-        )
-        .scroll((scroll as u16, 0));
+    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .title(Span::styled(
+                " Ask ",
+                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(VIOLET)),
+    );
     frame.render_widget(p, area);
 }
 
-fn render_rich_text_lines(text: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut in_code = false;
-    for raw in text.lines() {
-        let line = raw.to_string();
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            lines.push(Line::from(Span::styled(
-                line,
-                Style::default().fg(ACCENT_HI),
-            )));
-            continue;
-        }
-        let style = if in_code {
-            Style::default().fg(ACCENT_HI)
-        } else if trimmed.starts_with('#') {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else if trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || numbered_list_prefix(trimmed)
-        {
-            Style::default().fg(Color::White)
-        } else if status_line_prefix(trimmed) == Some(DANGER) {
-            Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
-        } else if status_line_prefix(trimmed) == Some(WARN) {
-            Style::default().fg(WARN)
-        } else if status_line_prefix(trimmed) == Some(SUCCESS) {
-            Style::default().fg(SUCCESS)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        if in_code {
-            lines.push(Line::from(Span::styled(line, style)));
-        } else {
-            lines.push(Line::from(render_inline_markdown_spans(&line, style)));
-        }
-    }
-    lines
-}
-
-fn render_inline_markdown_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut spans = Vec::new();
-    let mut plain = String::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_marker(&chars, i + 2, "**") {
-                push_plain_span(&mut spans, &mut plain, base_style);
-                let content: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    base_style.add_modifier(Modifier::BOLD),
-                ));
-                i = end + 2;
-                continue;
-            }
-        }
-        if i + 1 < chars.len() && chars[i] == '_' && chars[i + 1] == '_' {
-            if let Some(end) = find_marker(&chars, i + 2, "__") {
-                push_plain_span(&mut spans, &mut plain, base_style);
-                let content: String = chars[i + 2..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    base_style.add_modifier(Modifier::BOLD),
-                ));
-                i = end + 2;
-                continue;
-            }
-        }
-        if chars[i] == '`' {
-            if let Some(end) = find_marker(&chars, i + 1, "`") {
-                push_plain_span(&mut spans, &mut plain, base_style);
-                let content: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    base_style.fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-                ));
-                i = end + 1;
-                continue;
-            }
-        }
-        if chars[i] == '*' {
-            if let Some(end) = find_marker(&chars, i + 1, "*") {
-                push_plain_span(&mut spans, &mut plain, base_style);
-                let content: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    base_style.add_modifier(Modifier::ITALIC),
-                ));
-                i = end + 1;
-                continue;
-            }
-        }
-        if chars[i] == '_' {
-            if let Some(end) = find_marker(&chars, i + 1, "_") {
-                push_plain_span(&mut spans, &mut plain, base_style);
-                let content: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    content,
-                    base_style.add_modifier(Modifier::ITALIC),
-                ));
-                i = end + 1;
-                continue;
-            }
-        }
-        plain.push(chars[i]);
-        i += 1;
-    }
-    push_plain_span(&mut spans, &mut plain, base_style);
-    spans
-}
-
-fn find_marker(chars: &[char], start: usize, marker: &str) -> Option<usize> {
-    let marker_chars: Vec<char> = marker.chars().collect();
-    if marker_chars.is_empty() {
-        return None;
-    }
-    let mut i = start;
-    while i + marker_chars.len() <= chars.len() {
-        if chars[i..i + marker_chars.len()] == marker_chars {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn push_plain_span(spans: &mut Vec<Span<'static>>, plain: &mut String, style: Style) {
-    if !plain.is_empty() {
-        spans.push(Span::styled(std::mem::take(plain), style));
-    }
-}
-
-fn numbered_list_prefix(line: &str) -> bool {
-    let Some((digits, rest)) = line.split_once('.') else {
-        return false;
-    };
-    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()) && rest.starts_with(' ')
-}
-
-fn status_line_prefix(line: &str) -> Option<Color> {
-    let lower = line.to_ascii_lowercase();
-    if lower.starts_with("error") || lower.starts_with("fail") || lower.starts_with("failed") {
-        Some(DANGER)
-    } else if lower.starts_with("warn") || lower.starts_with("warning") {
-        Some(WARN)
-    } else if lower.starts_with("pass") || lower.starts_with("success") {
-        Some(SUCCESS)
-    } else {
-        None
-    }
-}
-
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
-    let (icon, mode_label, buf, cursor) = match app.mode {
+    let (icon, mode_label, buf, cursor, artifacts, notice) = match app.mode {
         Mode::Goal => (
             "›",
             " GOAL ",
-            app.goal_prompt.display_text(),
+            app.goal_prompt.text(),
             app.goal_prompt.cursor(),
+            app.goal_prompt.artifacts(),
+            app.goal_prompt.notice(),
         ),
         Mode::Task => (
             "›",
             " TASK ",
-            app.goal_prompt.display_text(),
+            app.goal_prompt.text(),
             app.goal_prompt.cursor(),
+            app.goal_prompt.artifacts(),
+            app.goal_prompt.notice(),
         ),
         Mode::Ask => (
             "?",
             " ASK ",
-            app.ask_prompt.display_text(),
-            app.ask_prompt.cursor(),
+            app.ask_input.as_str(),
+            app.ask_cursor,
+            &[][..],
+            None,
         ),
-        Mode::Settings => (
-            "⚙",
-            " SETTINGS ",
-            app.goal_prompt.display_text(),
-            app.goal_prompt.cursor(),
-        ),
-        Mode::Memory => (
-            "M",
-            " MEMORY ",
-            app.goal_prompt.display_text(),
-            app.goal_prompt.cursor(),
-        ),
-        Mode::History => (
-            "H",
-            " HISTORY ",
-            app.goal_prompt.display_text(),
-            app.goal_prompt.cursor(),
-        ),
+        Mode::Settings => ("⚙", " SETTINGS ", "", 0, &[][..], None),
+        Mode::Memory => ("M", " MEMORY ", "", 0, &[][..], None),
+        Mode::History => ("H", " HISTORY ", "", 0, &[][..], None),
         Mode::CommandPalette => (
             "/",
             " COMMAND ",
-            app.goal_prompt.display_text(),
-            app.goal_prompt.cursor(),
+            app.palette_input.as_str(),
+            char_count(&app.palette_input),
+            &[][..],
+            None,
         ),
     };
 
@@ -5205,17 +3265,11 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         _ => ACCENT,
     };
 
-    let mut block = Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(BG_DEEP));
-    if let Some(notice) = &app.command_notice {
-        block = block.title_bottom(Line::from(Span::styled(
-            format!(" {notice} "),
-            Style::default().fg(WARN),
-        )));
-    }
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -5230,8 +3284,47 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let prompt_prefix = format!(" {icon} ");
     let prompt_prefix_w = prompt_prefix.chars().count() as u16;
 
-    // Horizontal scroll so the caret is always visible inside the input slot.
     let input_width = row[0].width.saturating_sub(prompt_prefix_w) as usize;
+    let mut chip_spans: Vec<Span<'static>> = Vec::new();
+    let mut chip_width = 0usize;
+    for (idx, artifact) in artifacts.iter().enumerate() {
+        let label = if idx < 2 {
+            artifact.label.clone()
+        } else {
+            format!("+{} artifacts", artifacts.len() - idx)
+        };
+        let needed = label.chars().count() + 1;
+        if chip_width + needed >= input_width.saturating_sub(8) {
+            let hidden = artifacts.len().saturating_sub(idx);
+            let label = format!("+{hidden} artifacts");
+            chip_width += label.chars().count() + 1;
+            chip_spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(BG_DEEP)
+                    .bg(VIOLET)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            chip_spans.push(Span::raw(" "));
+            break;
+        }
+        chip_width += needed;
+        chip_spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(BG_DEEP)
+                .bg(ACCENT_HI)
+                .add_modifier(Modifier::BOLD),
+        ));
+        chip_spans.push(Span::raw(" "));
+    }
+
+    // Horizontal scroll so the caret is always visible inside the text slot.
+    let input_width = input_width.saturating_sub(chip_width);
+    let total_chars = char_count(buf);
+    let cursor_clamped = cursor.min(total_chars);
+    let scroll = cursor_clamped.saturating_sub(input_width.saturating_sub(1));
+    let visible: String = buf.chars().skip(scroll).take(input_width.max(1)).collect();
 
     let mut prompt_spans = vec![Span::styled(
         prompt_prefix,
@@ -5239,13 +3332,20 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             .fg(border_color)
             .add_modifier(Modifier::BOLD),
     )];
-    prompt_spans.extend(prompt_input_spans_with_caret(
-        buf,
-        cursor,
-        input_width.max(1),
-        Style::default().fg(Color::White),
-        Style::default().bg(border_color).fg(BG_DEEP),
-    ));
+    prompt_spans.extend(chip_spans);
+    if visible.is_empty() {
+        if let Some(notice) = notice {
+            prompt_spans.push(Span::styled(
+                short(notice, input_width),
+                Style::default().fg(DANGER),
+            ));
+        } else {
+            prompt_spans.push(Span::styled(visible, Style::default().fg(Color::White)));
+        }
+    } else {
+        prompt_spans.push(Span::styled(visible, Style::default().fg(Color::White)));
+    }
+
     let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
     frame.render_widget(prompt, row[0]);
 
@@ -5253,34 +3353,20 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(Alignment::Right)
         .style(Style::default().bg(BG_DEEP));
     frame.render_widget(badge, row[1]);
-}
 
-fn prompt_input_spans_with_caret(
-    text: &str,
-    cursor: usize,
-    width: usize,
-    text_style: Style,
-    caret_style: Style,
-) -> Vec<Span<'static>> {
-    if width == 0 {
-        return Vec::new();
+    // Draw a native terminal cursor instead of a manual in-buffer caret.
+    // Native cursors are handled efficiently by the terminal emulator and
+    // don't flicker on every frame draw.
+    if !matches!(
+        app.mode,
+        Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+    ) {
+        let cx = row[0].x + prompt_prefix_w + chip_width as u16 + (cursor_clamped - scroll) as u16;
+        let cy = row[0].y;
+        if cx < row[0].x + row[0].width {
+            frame.set_cursor_position((cx, cy));
+        }
     }
-    let total_chars = char_count(text);
-    let cursor = cursor.min(total_chars);
-    let scroll = cursor.saturating_sub(width.saturating_sub(1));
-    let visible_chars: Vec<char> = text.chars().skip(scroll).take(width).collect();
-    let relative_cursor = cursor.saturating_sub(scroll).min(width.saturating_sub(1));
-
-    let before: String = visible_chars.iter().take(relative_cursor).collect();
-    let mut spans = artifact_text_spans(&before, text_style);
-    if let Some(ch) = visible_chars.get(relative_cursor) {
-        spans.push(Span::styled(ch.to_string(), caret_style));
-        let after: String = visible_chars.iter().skip(relative_cursor + 1).collect();
-        spans.extend(artifact_text_spans(&after, text_style));
-    } else {
-        spans.push(Span::styled(" ", caret_style));
-    }
-    spans
 }
 
 /// Styled pill-badge rendering of a [`TaskStatus`]. `spinner_frame` drives
@@ -5311,9 +3397,6 @@ fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> 
         TaskStatus::Reviewing { .. } => vec![pill("review", Color::Rgb(180, 100, 255), BG_DEEP)],
         TaskStatus::Done { .. } => vec![pill("done", Color::Rgb(0, 200, 100), BG_DEEP)],
         TaskStatus::Failed { .. } => vec![pill("fail", Color::Rgb(255, 50, 50), Color::White)],
-        TaskStatus::NeedsClarification { .. } => {
-            vec![pill("clarify", Color::Rgb(255, 200, 0), BG_DEEP)]
-        }
         TaskStatus::Paused {
             limit,
             observed,
@@ -5335,7 +3418,7 @@ fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> 
     }
 }
 
-pub(crate) fn short(s: &str, n: usize) -> String {
+fn short(s: &str, n: usize) -> String {
     if s.chars().count() > n {
         let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
         out.push('…');
@@ -5343,75 +3426,6 @@ pub(crate) fn short(s: &str, n: usize) -> String {
     } else {
         s.to_string()
     }
-}
-
-const ARTIFACT_CHIP_COLORS: [Color; 8] = [
-    Color::Rgb(99, 179, 237),
-    Color::Rgb(160, 122, 234),
-    Color::Rgb(237, 100, 166),
-    Color::Rgb(72, 199, 142),
-    Color::Rgb(246, 173, 85),
-    Color::Rgb(69, 144, 255),
-    Color::Rgb(56, 217, 169),
-    Color::Rgb(255, 121, 198),
-];
-
-fn artifact_chip_color(chip: &str) -> Color {
-    let hash = chip.bytes().fold(0usize, |acc, b| {
-        acc.wrapping_mul(33).wrapping_add(b as usize)
-    });
-    ARTIFACT_CHIP_COLORS[hash % ARTIFACT_CHIP_COLORS.len()]
-}
-
-fn artifact_text_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    while let Some(start) = find_artifact_chip_start(rest) {
-        if start > 0 {
-            spans.push(Span::styled(rest[..start].to_string(), base_style));
-        }
-        let tail = &rest[start..];
-        let Some(end) = tail.find(']').map(|idx| idx + 1) else {
-            spans.push(Span::styled(tail.to_string(), base_style));
-            return spans;
-        };
-        let chip = &tail[..end];
-        spans.push(Span::styled(
-            chip.to_string(),
-            Style::default()
-                .fg(BG_DEEP)
-                .bg(artifact_chip_color(chip))
-                .add_modifier(Modifier::BOLD),
-        ));
-        rest = &tail[end..];
-    }
-    if !rest.is_empty() {
-        spans.push(Span::styled(rest.to_string(), base_style));
-    }
-    spans
-}
-
-fn find_artifact_chip_start(text: &str) -> Option<usize> {
-    match (text.find("[paste:"), text.find("[image:")) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
-fn worker_display_description(description: &str) -> String {
-    let trimmed = description.trim();
-    if trimmed.starts_with("# Prior context") {
-        return trimmed
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or(trimmed)
-            .trim()
-            .to_string();
-    }
-    trimmed.lines().next().unwrap_or(trimmed).trim().to_string()
 }
 
 /// Helper for rendering a `SubtaskStatus` using the same taxonomy as a
@@ -5507,8 +3521,8 @@ impl WorkerDispatcher for StubDispatcher {
 /// state update the driver received on one of the watch channels.
 enum LoopEvent {
     Key(KeyEvent),
-    Mouse(MouseEvent),
     Paste(String),
+    ClipboardPaste(Result<String, String>),
     StateUpdate(usize, Box<GlobalState>),
     AskAnswer(String),
     McpApprovalRequested {
@@ -5526,8 +3540,6 @@ enum LoopEvent {
     /// Background model-list fetch completed for the picker overlay.
     /// Carries the full list on success or an error string.
     ModelsLoaded(Result<Vec<String>, String>),
-    /// A prompt-bar command finished running through the sandbox.
-    CommandFinished(CommandRunSummary),
     FlightEvent(usize, EventRecord),
     Tick,
 }
@@ -5585,143 +3597,6 @@ fn default_store_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
 }
 
-fn models_dev_catalog_cache_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("models-dev-catalog.json"))
-}
-
-fn provider_health_cache_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("provider-health.json"))
-}
-
-fn load_cached_models_dev_catalog() -> Option<Vec<CatalogProvider>> {
-    let path = models_dev_catalog_cache_path()?;
-    let raw = std::fs::read_to_string(path).ok()?;
-    models_dev_catalog_from_str(&raw)
-        .ok()
-        .or_else(|| serde_json::from_str::<Vec<CatalogProvider>>(&raw).ok())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ProviderHealthCache {
-    entries: HashMap<String, ProviderHealthEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProviderHealthEntry {
-    ok: bool,
-    detail: String,
-    checked_at_unix: u64,
-}
-
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn provider_health_key(
-    provider: &str,
-    model: &str,
-    base_url: Option<&str>,
-    api_key: &str,
-) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    PROVIDER_HEALTH_CONTRACT_VERSION.hash(&mut hasher);
-    provider.hash(&mut hasher);
-    model.hash(&mut hasher);
-    base_url.unwrap_or("").hash(&mut hasher);
-    api_key.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn load_provider_health_cache() -> ProviderHealthCache {
-    provider_health_cache_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn save_provider_health_cache(cache: &ProviderHealthCache) {
-    let Some(path) = provider_health_cache_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(raw) = serde_json::to_string_pretty(cache) {
-        let _ = std::fs::write(path, raw);
-    }
-}
-
-async fn ensure_provider_diff_contract_cached(
-    provider_name: &str,
-    model: &str,
-    api_key: &str,
-    account_id: Option<String>,
-    base_url: Option<String>,
-    allow_unverified_model: bool,
-) -> Result<(), String> {
-    if allow_unverified_model || !provider_requires_key(provider_name) {
-        return Ok(());
-    }
-    let cache_key = provider_health_key(provider_name, model, base_url.as_deref(), api_key);
-    let now = unix_now_secs();
-    let mut cache = load_provider_health_cache();
-    if let Some(entry) = cache.entries.get(&cache_key) {
-        let ttl = if entry.ok { 24 * 60 * 60 } else { 60 * 60 };
-        if now.saturating_sub(entry.checked_at_unix) <= ttl {
-            return if entry.ok {
-                Ok(())
-            } else {
-                Err(entry.detail.clone())
-            };
-        }
-    }
-    let cfg = make_api_provider_config(
-        provider_name,
-        api_key.to_string(),
-        model.to_string(),
-        account_id,
-        base_url,
-    )
-    .ok_or_else(|| provider_config_failure_message(provider_name))?;
-    let provider = provider_for(cfg);
-    let result = match tokio::time::timeout(
-        Duration::from_secs(20),
-        probe_diff_contract(provider.as_ref()),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!("diff canary timed out after 20s")),
-    };
-    let entry = match result {
-        Ok(resp) => ProviderHealthEntry {
-            ok: true,
-            detail: format!(
-                "diff canary passed via {} ({})",
-                resp.provider, resp.model_name
-            ),
-            checked_at_unix: now,
-        },
-        Err(err) => ProviderHealthEntry {
-            ok: false,
-            detail: format!("diff canary failed for {provider_name}/{model}: {err}"),
-            checked_at_unix: now,
-        },
-    };
-    let ok = entry.ok;
-    let detail = entry.detail.clone();
-    cache.entries.insert(cache_key, entry);
-    save_provider_health_cache(&cache);
-    if ok {
-        Ok(())
-    } else {
-        Err(detail)
-    }
-}
-
 fn open_persistent_store() -> Result<Store> {
     let path = default_store_path()
         .ok_or_else(|| anyhow::anyhow!("could not determine ~/.phonton path"))?;
@@ -5729,6 +3604,17 @@ fn open_persistent_store() -> Result<Store> {
         std::fs::create_dir_all(parent)?;
     }
     Store::open(path)
+}
+
+fn read_clipboard_text() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        clipboard_win::get_clipboard_string().map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("clipboard import is currently implemented for Windows builds".into())
+    }
 }
 
 fn detect_nexus_status(root: &std::path::Path) -> NexusStatus {
@@ -5774,20 +3660,22 @@ async fn build_semantic_context(
     match tokio::time::timeout(Duration::from_secs(SEMANTIC_INDEX_TIMEOUT_SECS), build).await {
         Ok(Ok(ctx)) => Some(ctx),
         Ok(Err(e)) => {
-            tracing::warn!("semantic index unavailable: {e}");
+            eprintln!(
+                "phonton: semantic index unavailable ({e}); continuing without indexed context"
+            );
             None
         }
         Err(_) => {
-            tracing::warn!(
-                "semantic index timed out after {SEMANTIC_INDEX_TIMEOUT_SECS}s; continuing without indexed context"
+            eprintln!(
+                "phonton: semantic index timed out after {SEMANTIC_INDEX_TIMEOUT_SECS}s; continuing without indexed context"
             );
             None
         }
     }
 }
 
-/// Load a provider for Ask mode using the config file or env vars. Returns
-/// `None` when no key is available.
+/// Load a provider for ask-mode (stateless Q&A) using the config file or
+/// env vars. Returns `None` when no key is available.
 fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
     let api_key = provider_key_for_run(&cfg.provider)?;
     let model = cfg
@@ -5849,643 +3737,6 @@ fn provider_key_for_run(cfg: &config::ProviderConfig) -> Option<String> {
     })
 }
 
-async fn maybe_detect_provider_model(cfg: &mut config::Config) {
-    if cfg.provider.model.is_some() {
-        return;
-    }
-    let Some(api_key) = provider_key_for_run(&cfg.provider) else {
-        return;
-    };
-    let detect = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        select_best_working_model(
-            &cfg.provider.name,
-            &api_key,
-            cfg.provider.base_url.as_deref(),
-            3,
-        ),
-    )
-    .await;
-    if let Ok(Ok(Some(model))) = detect {
-        cfg.provider.model = Some(model);
-        let _ = config::save(cfg);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GoalCliRequest {
-    goal_parts: Vec<String>,
-    prompt_file: Option<PathBuf>,
-    stdin: bool,
-    json: bool,
-    yes: bool,
-    direct_task: bool,
-    permission_mode: Option<PermissionMode>,
-    timeout: Option<Duration>,
-}
-
-impl GoalCliRequest {
-    fn prompt_source_count(&self) -> usize {
-        usize::from(!self.goal_parts.is_empty())
-            + usize::from(self.prompt_file.is_some())
-            + usize::from(self.stdin)
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct GoalCliReport {
-    task_id: TaskId,
-    status: TaskStatus,
-    status_label: String,
-    tokens_used: u64,
-    estimated_naive_tokens: u64,
-    event_count: usize,
-    goal_contract: Option<phonton_types::GoalContract>,
-    handoff_packet: Option<HandoffPacket>,
-}
-
-struct GoalCliOutcome {
-    state: GlobalState,
-    evidence: LedgerEvidence,
-    event_count: usize,
-}
-
-fn parse_goal_cli_request(args: &[String]) -> Result<GoalCliRequest> {
-    let mut request = GoalCliRequest {
-        goal_parts: Vec::new(),
-        prompt_file: None,
-        stdin: false,
-        json: false,
-        yes: false,
-        direct_task: false,
-        permission_mode: None,
-        timeout: None,
-    };
-
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--json" => request.json = true,
-            "--yes" | "-y" => request.yes = true,
-            "--task" => request.direct_task = true,
-            "--stdin" => request.stdin = true,
-            "--full-access" => request.permission_mode = Some(PermissionMode::FullAccess),
-            "--prompt-file" | "--file" | "-f" => {
-                let path = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--prompt-file requires a path"))?;
-                request.prompt_file = Some(PathBuf::from(path));
-            }
-            "--permission-mode" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--permission-mode requires a value"))?;
-                request.permission_mode = PermissionMode::parse(raw)
-                    .ok_or_else(|| anyhow::anyhow!("unknown permission mode `{raw}`"))
-                    .map(Some)?;
-            }
-            "--timeout" | "--timeout-seconds" => {
-                let raw = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a value in seconds"))?;
-                let seconds = raw
-                    .parse::<u64>()
-                    .map_err(|_| anyhow::anyhow!("{arg} must be an integer number of seconds"))?;
-                request.timeout = Some(Duration::from_secs(seconds));
-            }
-            "-h" | "--help" => {
-                return Err(anyhow::anyhow!(
-                    "usage: phonton goal [--json] [--yes] [--permission-mode <mode>] [--timeout-seconds <n>] [--prompt-file <path>|--stdin|<goal>]"
-                ));
-            }
-            "--" => {
-                request.goal_parts.extend(iter.cloned());
-                break;
-            }
-            other if other.starts_with('-') => {
-                return Err(anyhow::anyhow!("unknown goal option `{other}`"));
-            }
-            other => request.goal_parts.push(other.to_string()),
-        }
-    }
-
-    if request.prompt_source_count() > 1 {
-        return Err(anyhow::anyhow!(
-            "only one prompt source is allowed: use a goal argument, --prompt-file, or --stdin"
-        ));
-    }
-    if request.prompt_source_count() == 0 {
-        return Err(anyhow::anyhow!(
-            "`phonton goal` requires a prompt, e.g. `phonton goal --prompt-file prompt.md`"
-        ));
-    }
-
-    Ok(request)
-}
-
-fn read_goal_cli_text(request: &GoalCliRequest) -> Result<String> {
-    if let Some(path) = &request.prompt_file {
-        return std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()));
-    }
-    if request.stdin {
-        let mut text = String::new();
-        let mut stdin = std::io::stdin();
-        use std::io::Read as _;
-        stdin.read_to_string(&mut text)?;
-        return Ok(text);
-    }
-    Ok(request.goal_parts.join(" "))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HeadlessBaselineCommand {
-    label: String,
-    command: Vec<String>,
-}
-
-fn headless_baseline_commands(prompt: &str, workspace: &Path) -> Vec<HeadlessBaselineCommand> {
-    if !prompt_requests_headless_baseline(prompt) {
-        return Vec::new();
-    }
-
-    let mut commands = Vec::new();
-    let lower = prompt.to_ascii_lowercase();
-    let explicit: [(&str, &[&str], &str); 5] = [
-        ("npm test", &["npm", "test"], "baseline npm test"),
-        ("pnpm test", &["pnpm", "test"], "baseline pnpm test"),
-        ("yarn test", &["yarn", "test"], "baseline yarn test"),
-        ("cargo test", &["cargo", "test"], "baseline cargo test"),
-        ("pytest", &["pytest"], "baseline pytest"),
-    ];
-    for (needle, command, label) in explicit {
-        if lower.contains(needle) {
-            push_headless_baseline_command(&mut commands, label, command);
-        }
-    }
-
-    if commands.is_empty() {
-        if workspace.join("package.json").is_file() {
-            push_headless_baseline_command(&mut commands, "baseline npm test", &["npm", "test"]);
-        } else if workspace.join("Cargo.toml").is_file() {
-            push_headless_baseline_command(
-                &mut commands,
-                "baseline cargo test",
-                &["cargo", "test"],
-            );
-        } else if workspace.join("pyproject.toml").is_file()
-            || workspace.join("pytest.ini").is_file()
-        {
-            push_headless_baseline_command(&mut commands, "baseline pytest", &["pytest"]);
-        }
-    }
-
-    commands
-}
-
-fn prompt_requests_headless_baseline(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    [
-        "run tests first",
-        "run the tests first",
-        "run test first",
-        "run the test suite first",
-        "test first",
-        "baseline test",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase))
-}
-
-fn push_headless_baseline_command(
-    commands: &mut Vec<HeadlessBaselineCommand>,
-    label: &str,
-    command: &[&str],
-) {
-    let command: Vec<String> = command.iter().map(|part| (*part).to_string()).collect();
-    if commands.iter().any(|existing| existing.command == command) {
-        return;
-    }
-    commands.push(HeadlessBaselineCommand {
-        label: label.into(),
-        command,
-    });
-}
-
-fn run_headless_baseline_commands(
-    commands: &[HeadlessBaselineCommand],
-    workspace: &Path,
-) -> Vec<CommandRunSummary> {
-    commands
-        .iter()
-        .filter_map(|baseline| {
-            let program = baseline.command.first()?;
-            let started = Instant::now();
-            let output = std::process::Command::new(headless_spawn_program(program))
-                .args(&baseline.command[1..])
-                .current_dir(workspace)
-                .output();
-            let duration_ms = started.elapsed().as_millis().try_into().ok();
-            let command_line = baseline.command.join(" ");
-            Some(match output {
-                Ok(output) => summarize_output_with_duration(
-                    &command_line,
-                    output.status.code(),
-                    &output.stdout,
-                    &output.stderr,
-                    duration_ms,
-                ),
-                Err(e) => CommandRunSummary {
-                    command: command_line,
-                    exit_code: None,
-                    stdout_preview: String::new(),
-                    stderr_preview: format!("failed to start command: {e}"),
-                    duration_ms,
-                },
-            })
-        })
-        .collect()
-}
-
-fn headless_spawn_program(program: &str) -> String {
-    if cfg!(windows) {
-        match program.to_ascii_lowercase().as_str() {
-            "npm" | "pnpm" | "yarn" | "npx" => format!("{program}.cmd"),
-            _ => program.to_string(),
-        }
-    } else {
-        program.to_string()
-    }
-}
-
-fn render_headless_baseline_evidence(summaries: &[CommandRunSummary]) -> Option<String> {
-    if summaries.is_empty() {
-        return None;
-    }
-    let mut out = String::from(
-        "Headless baseline test evidence captured before editing. Use this as failing-test context, not as final verification:\n",
-    );
-    for summary in summaries.iter().take(3) {
-        let status = summary
-            .exit_code
-            .map(|code| format!("exit {code}"))
-            .unwrap_or_else(|| "not started".into());
-        let duration = summary
-            .duration_ms
-            .map(|ms| format!(", {ms}ms"))
-            .unwrap_or_default();
-        out.push_str(&format!("- `{}`: {status}{duration}\n", summary.command));
-        if !summary.stdout_preview.trim().is_empty() {
-            out.push_str("  stdout: ");
-            out.push_str(&compact_headless_evidence_text(
-                &summary.stdout_preview,
-                260,
-            ));
-            out.push('\n');
-        }
-        if !summary.stderr_preview.trim().is_empty() {
-            out.push_str("  stderr: ");
-            out.push_str(&compact_headless_evidence_text(
-                &summary.stderr_preview,
-                360,
-            ));
-            out.push('\n');
-        }
-    }
-    Some(out)
-}
-
-fn compact_headless_evidence_text(value: &str, max_chars: usize) -> String {
-    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= max_chars {
-        return collapsed;
-    }
-    let mut compact: String = collapsed.chars().take(max_chars).collect();
-    compact.push_str(" ...");
-    compact
-}
-
-fn append_headless_worker_context(plan: &mut PlannerOutput, context: &str) {
-    let context = context.trim();
-    if context.is_empty() {
-        return;
-    }
-    let path = PathBuf::from(".phonton/headless-baseline.txt");
-    let attachment = PromptAttachment {
-        path: path.clone(),
-        kind: PromptAttachmentKind::Text,
-        mime_type: Some("text/plain".into()),
-        size_bytes: context.len() as u64,
-        text: Some(context.to_string()),
-        data_base64: None,
-        truncated: false,
-        note: Some("Captured before headless editing as bounded baseline test evidence.".into()),
-    };
-    for subtask in &mut plan.subtasks {
-        if !subtask
-            .attachments
-            .iter()
-            .any(|existing| existing.path == path)
-        {
-            subtask.attachments.push(attachment.clone());
-        }
-    }
-}
-
-async fn run_goal_cli(args: &[String]) -> Result<i32> {
-    let request = match parse_goal_cli_request(args) {
-        Ok(request) => request,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.starts_with("usage:") {
-                println!("{msg}");
-                return Ok(0);
-            }
-            eprintln!("phonton goal: {msg}");
-            eprintln!("Run `phonton goal --help` for usage.");
-            return Ok(2);
-        }
-    };
-
-    let text = read_goal_cli_text(&request)?;
-    if text.trim().is_empty() {
-        eprintln!("phonton goal: prompt is empty");
-        return Ok(2);
-    }
-
-    let mut cfg = config::load().unwrap_or_default();
-    if let Some(mode) = request.permission_mode {
-        cfg.permissions.mode = mode;
-    }
-    maybe_detect_provider_model(&mut cfg).await;
-
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if request.yes {
-        let _ = trust::record_trust_with_mode(
-            &working_dir,
-            cfg.permissions.mode,
-            WorkspaceTrustSource::JsonRecord,
-        );
-    } else if !trust::prompt_if_needed(&working_dir)? {
-        return Ok(1);
-    }
-
-    let store = match open_persistent_store() {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("phonton goal: memory store unavailable ({e}); using in-memory store");
-            Store::in_memory()?
-        }
-    };
-    if let Some(record) = trust::trust_record(&working_dir) {
-        let _ = store.upsert_workspace_trust(&record);
-    }
-    let store = Arc::new(std::sync::Mutex::new(store));
-    let sandbox = Arc::new(Sandbox::new_with_mode(
-        working_dir.clone(),
-        "phonton-cli".to_string(),
-        cfg.permissions.mode,
-    ));
-    let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let (tx, rx) = mpsc::channel::<LoopEvent>(512);
-    let task_id = TaskId::new();
-    let baseline_commands = headless_baseline_commands(&text, &working_dir);
-    let baseline_summaries = run_headless_baseline_commands(&baseline_commands, &working_dir);
-    let baseline_context = render_headless_baseline_evidence(&baseline_summaries);
-
-    spawn_goal(
-        0,
-        task_id,
-        text.clone(),
-        request.direct_task,
-        baseline_context,
-        tx.clone(),
-        Arc::clone(&store),
-        sandbox,
-        Arc::clone(&controls),
-        cfg,
-        working_dir,
-    )
-    .await;
-
-    let wait = wait_for_goal_cli(task_id, rx, request.yes);
-    let outcome = if let Some(timeout) = request.timeout {
-        match tokio::time::timeout(timeout, wait).await {
-            Ok(outcome) => outcome?,
-            Err(_) => {
-                if let Ok(registry) = controls.lock() {
-                    if let Some(control) = registry.get(&0) {
-                        let _ = control
-                            .control_tx
-                            .try_send(OrchestratorMessage::UserCancelled);
-                    }
-                }
-                eprintln!(
-                    "phonton goal: timed out after {} seconds",
-                    timeout.as_secs()
-                );
-                return Ok(124);
-            }
-        }
-    } else {
-        wait.await?
-    };
-    if let Ok(g) = store.lock() {
-        let _ = g.upsert_task(
-            task_id,
-            &text,
-            &outcome.state.task_status,
-            outcome.state.tokens_used,
-        );
-        if let Some(ledger) =
-            outcome_ledger_from_state_with_evidence(task_id, &outcome.state, &outcome.evidence)
-        {
-            let _ = g.upsert_outcome_ledger(&ledger);
-        }
-    }
-    let report = goal_cli_report(task_id, &outcome.state, outcome.event_count);
-
-    if request.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_goal_cli_report(&report);
-    }
-
-    Ok(if goal_cli_success(&report.status) {
-        0
-    } else {
-        1
-    })
-}
-
-async fn wait_for_goal_cli(
-    task_id: TaskId,
-    mut rx: mpsc::Receiver<LoopEvent>,
-    auto_approve: bool,
-) -> Result<GoalCliOutcome> {
-    let mut latest: Option<GlobalState> = None;
-    let mut terminal: Option<GlobalState> = None;
-    let mut evidence = LedgerEvidence::default();
-    let mut event_count = 0usize;
-    loop {
-        let event = if terminal.is_some() {
-            match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
-                Ok(event) => event,
-                Err(_) => break,
-            }
-        } else {
-            rx.recv().await
-        };
-        let Some(event) = event else { break };
-        match event {
-            LoopEvent::StateUpdate(_, state) => {
-                latest = Some((*state).clone());
-                if let Some(state) = latest.as_ref() {
-                    if goal_cli_terminal(&state.task_status) {
-                        terminal = Some(state.clone());
-                    }
-                }
-            }
-            LoopEvent::FlightEvent(_, record) => {
-                evidence.apply_event(&record);
-                event_count = event_count.saturating_add(1);
-            }
-            LoopEvent::McpApprovalRequested { reply_tx, .. } => {
-                let decision = if auto_approve {
-                    McpApprovalDecision::Approved
-                } else {
-                    McpApprovalDecision::Denied
-                };
-                let _ = reply_tx.send(decision);
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(state) = terminal.or(latest) {
-        return Ok(GoalCliOutcome {
-            state,
-            evidence,
-            event_count,
-        });
-    }
-
-    Err(anyhow::anyhow!(
-        "goal {task_id} ended before any state was reported"
-    ))
-}
-
-fn goal_cli_terminal(status: &TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Reviewing { .. }
-            | TaskStatus::Done { .. }
-            | TaskStatus::Failed { .. }
-            | TaskStatus::NeedsClarification { .. }
-            | TaskStatus::Paused { .. }
-            | TaskStatus::Rejected
-    )
-}
-
-fn goal_cli_success(status: &TaskStatus) -> bool {
-    matches!(
-        status,
-        TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
-    )
-}
-
-fn goal_cli_report(task_id: TaskId, state: &GlobalState, event_count: usize) -> GoalCliReport {
-    GoalCliReport {
-        task_id,
-        status: state.task_status.clone(),
-        status_label: goal_status_label(&state.task_status).to_string(),
-        tokens_used: state.tokens_used,
-        estimated_naive_tokens: state.estimated_naive_tokens,
-        event_count,
-        goal_contract: state.goal_contract.clone(),
-        handoff_packet: state.handoff_packet.clone(),
-    }
-}
-
-fn print_goal_cli_report(report: &GoalCliReport) {
-    println!("Phonton goal");
-    println!("task_id: {}", report.task_id);
-    println!("status: {}", report.status_label);
-    println!(
-        "tokens: {} / naive baseline {}",
-        report.tokens_used, report.estimated_naive_tokens
-    );
-    if let Some(handoff) = &report.handoff_packet {
-        println!("changed_files: {}", handoff.changed_files.len());
-        println!("known_gaps: {}", handoff.known_gaps.len());
-    }
-    if let TaskStatus::Failed { reason, .. } = &report.status {
-        println!("failure: {reason}");
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AskCliRequest {
-    question: String,
-    no_workspace: bool,
-    json: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct AskCliResponse {
-    answer: String,
-    context_tokens: usize,
-    selected_paths: Vec<String>,
-}
-
-fn parse_ask_cli_request(args: &[String]) -> Result<AskCliRequest> {
-    let mut no_workspace = false;
-    let mut json = false;
-    let mut parts = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--no-workspace" => no_workspace = true,
-            "--json" => json = true,
-            "-h" | "--help" => {
-                return Err(anyhow::anyhow!(
-                    "phonton ask [--no-workspace] [--json] <question>"
-                ));
-            }
-            other if other.starts_with('-') => {
-                return Err(anyhow::anyhow!("phonton ask: unknown flag `{other}`"));
-            }
-            _ => parts.push(arg.clone()),
-        }
-    }
-    Ok(AskCliRequest {
-        question: parts.join(" "),
-        no_workspace,
-        json,
-    })
-}
-
-fn selected_goal_ask_context(app: &App) -> (Option<String>, Vec<String>) {
-    let Some(goal) = app.current_goal() else {
-        return (None, Vec::new());
-    };
-    let goal_summary = format!(
-        "{} (status: {})",
-        goal.description,
-        goal_status_label(&goal.status)
-    );
-    let mut diagnostics = problem_diagnostics(goal);
-    if let Some(handoff) = goal
-        .state
-        .as_ref()
-        .and_then(|state| state.handoff_packet.as_ref())
-    {
-        for gap in handoff.known_gaps.iter().take(4) {
-            diagnostics.push(format!("known gap: {gap}"));
-        }
-    }
-    (Some(goal_summary), diagnostics)
-}
-
 /// Build an [`ApiProviderConfig`] from the provider name, resolved key,
 /// model, and optional base URL. Returns `None` for unknown provider names.
 ///
@@ -6523,20 +3774,8 @@ fn make_api_provider_config(
             }),
             None => Some(ApiProviderConfig::OpenRouter { api_key, model }),
         },
-        "gemini" | "google" => Some(ApiProviderConfig::Gemini { api_key, model }),
+        "gemini" => Some(ApiProviderConfig::Gemini { api_key, model }),
         "agentrouter" => Some(ApiProviderConfig::AgentRouter { api_key, model }),
-        "opencode" => Some(ApiProviderConfig::OpenAiCompatible {
-            name: "opencode".into(),
-            api_key,
-            model,
-            base_url: base_url.unwrap_or_else(|| "https://opencode.ai/zen/v1".into()),
-        }),
-        "opencode-go" => Some(ApiProviderConfig::OpenAiCompatible {
-            name: "opencode-go".into(),
-            api_key,
-            model,
-            base_url: base_url.unwrap_or_else(|| "https://opencode.ai/zen/go/v1".into()),
-        }),
         "cloudflare" => cloudflare_base_url(account_id, base_url).map(|url| {
             ApiProviderConfig::OpenAiCompatible {
                 name: "cloudflare".into(),
@@ -6575,12 +3814,6 @@ fn make_api_provider_config(
             model,
             base_url: base_url.unwrap_or_else(|| "https://api.together.xyz/v1".into()),
         }),
-        "kimi" | "moonshot" => Some(ApiProviderConfig::OpenAiCompatible {
-            name: "kimi".into(),
-            api_key,
-            model,
-            base_url: base_url.unwrap_or_else(|| "https://api.moonshot.cn/v1".into()),
-        }),
         // Fully custom: caller must supply `base_url`. Without one the
         // request would have nowhere to go, so return None.
         "custom" | "openai-compatible" => base_url.map(|url| ApiProviderConfig::OpenAiCompatible {
@@ -6589,63 +3822,7 @@ fn make_api_provider_config(
             model,
             base_url: url,
         }),
-        _ => load_cached_models_dev_catalog().and_then(|catalog| {
-            provider_config_from_catalog(name, api_key, model, base_url, &catalog)
-        }),
-    }
-}
-
-fn provider_config_failure_message(name: &str) -> String {
-    match name {
-        "cloudflare" => concat!(
-            "Cloudflare requires an Account ID or full Workers AI base URL. ",
-            "Set Account ID in Settings or set CLOUDFLARE_ACCOUNT_ID."
-        )
-        .into(),
-        "custom" | "openai-compatible" => {
-            "OpenAI-compatible providers require a Base URL in Settings.".into()
-        }
-        other => format!("Unknown provider `{other}`."),
-    }
-}
-
-fn provider_config_with_model(template: &ApiProviderConfig, model: String) -> ApiProviderConfig {
-    match template {
-        ApiProviderConfig::Anthropic { api_key, .. } => ApiProviderConfig::Anthropic {
-            api_key: api_key.clone(),
-            model,
-        },
-        ApiProviderConfig::OpenAI { api_key, .. } => ApiProviderConfig::OpenAI {
-            api_key: api_key.clone(),
-            model,
-        },
-        ApiProviderConfig::OpenRouter { api_key, .. } => ApiProviderConfig::OpenRouter {
-            api_key: api_key.clone(),
-            model,
-        },
-        ApiProviderConfig::Gemini { api_key, .. } => ApiProviderConfig::Gemini {
-            api_key: api_key.clone(),
-            model,
-        },
-        ApiProviderConfig::Ollama { base_url, .. } => ApiProviderConfig::Ollama {
-            base_url: base_url.clone(),
-            model,
-        },
-        ApiProviderConfig::AgentRouter { api_key, .. } => ApiProviderConfig::AgentRouter {
-            api_key: api_key.clone(),
-            model,
-        },
-        ApiProviderConfig::OpenAiCompatible {
-            name,
-            api_key,
-            base_url,
-            ..
-        } => ApiProviderConfig::OpenAiCompatible {
-            name: name.clone(),
-            api_key: api_key.clone(),
-            model,
-            base_url: base_url.clone(),
-        },
+        _ => None,
     }
 }
 
@@ -6667,15 +3844,16 @@ async fn test_provider(
         return Err("no API key — paste one in the API Key field or set the env var".into());
     }
     let cfg = make_api_provider_config(&name, api_key, model, account_id, base_url)
-        .ok_or_else(|| provider_config_failure_message(&name))?;
+        .ok_or_else(|| format!("unknown provider `{name}`"))?;
     let provider: Arc<dyn Provider> = Arc::from(provider_for(cfg));
-    let resp = tokio::time::timeout(
-        Duration::from_secs(20),
-        probe_diff_contract(provider.as_ref()),
-    )
-    .await
-    .map_err(|_| "diff canary timed out after 20s".to_string())?
-    .map_err(|e| format!("{e}"))?;
+    let resp = provider
+        .call(
+            "You are a terse assistant. Respond only with JSON.",
+            "Return exactly {\"ok\":true} as JSON.",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("{e}"))?;
     Ok(resp.content)
 }
 
@@ -6992,20 +4170,17 @@ fn default_model_for(provider: &str) -> String {
         "anthropic" => "claude-haiku-4-5-20251001".into(),
         "openai" => "gpt-4o-mini".into(),
         "openrouter" => "openai/gpt-4o-mini".into(),
-        "opencode" => "big-pickle".into(),
-        "opencode-go" => "deepseek-v4-flash".into(),
         // `gemini-flash-latest` is an always-current alias that points at
         // whichever flash model is generally available on free-tier keys.
         // `gemini-2.5-flash` exists on most keys but the alias avoids
         // surprises when Google rotates the GA model. The Gemini provider
         // also auto-routes to a working model on 404 (see
         // `phonton-providers::GeminiProvider`).
-        "gemini" | "google" => "gemini-flash-latest".into(),
+        "gemini" => "gemini-flash-latest".into(),
         "agentrouter" => "claude-sonnet-4-5".into(),
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "ollama" => "llama3.2:3b".into(),
-        "deepseek" => "deepseek-v4-flash".into(),
-        "kimi" | "moonshot" => "kimi-k2.6".into(),
+        "deepseek" => "deepseek-chat".into(),
         "xai" | "grok" => "grok-2-mini".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
@@ -7020,30 +4195,18 @@ fn print_help() {
         "phonton — agentic dev environment\n\
          \n\
          USAGE:\n  \
-         phonton\n  \
-         phonton -r|--resume\n  \
-         phonton <SUBCOMMAND>\n\
+         phonton [SUBCOMMAND]\n\
          \n\
          SUBCOMMANDS:\n  \
          (none)            Launch the interactive TUI (default)\n  \
-         init              Create ~/.phonton/config.toml if it is missing\n  \
-         ask [flags] <q>   One-shot workspace-aware Q&A using the configured provider\n  \
-         goal [flags] <p>  Execute one goal without launching the TUI\n  \
-         demo trust-loop   Print the evidence-trail demo loop\n  \
+         ask <question>    One-shot Q&A using the configured provider\n  \
          doctor            Check config, store, trust, git, cargo, and Nexus\n  \
-         extensions        Install and inspect steering, skills, MCP, and profiles\n  \
+         extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
          skills            Inspect loaded skills\n  \
          steering          Inspect loaded steering rules\n  \
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
-         context           Evaluate deterministic context-selection fixtures\n  \
          review [task-id]  Show verified diff review payloads\n  \
-         diff [task-id]    Print verified unified diffs from review-ready tasks\n  \
-         proof             Export proof bundles from OutcomeLedger\n  \
-         providers         List, sync, and verify provider/model routes\n  \
-         run [task-id]     Run a receipt-suggested command from latest task\n  \
-         benchmark         Export benchmark evidence from OutcomeLedger\n  \
-         why-tokens        Explain latest token buckets by source\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
          config path       Print the resolved config file path\n  \
          config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
@@ -7052,7 +4215,6 @@ fn print_help() {
          help              Print this help and exit\n\
          \n\
          FLAGS:\n  \
-         -r, --resume     Resume the saved session for this workspace\n  \
          -h, --help        Same as `help`\n  \
          -V, --version     Same as `version`\n\
          \n\
@@ -7060,48 +4222,17 @@ fn print_help() {
          Settings live in ~/.phonton/config.toml. Override the provider key with\n  \
          ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
          \n\
-         TUI SLASH COMMANDS:\n  \
-         /settings, /config, /status, /context, /compact, /compact-context, /compress,\n  \
-         /problems, /diagnostics, /retry, /repair, /why-tokens, /ask <question>,\n  \
-         /plan <goal>, /approve,\n  \
-         /goals, /switch, /focus <view>, /diff, /code, /copy, /rerun, /stats, /stop,\n  \
-         /review, /memory, /permissions set <mode>, /trust, /model set <name>,\n  \
-         /commands, /run <cmd>, and !<cmd>\n\
-         \n\
-         DEMO:\n  \
-         phonton demo trust-loop [--json]\n\
-         \n\
          DOCTOR:\n  \
          phonton doctor [--json] [--provider]\n\
          \n\
          PLAN PREVIEW:\n  \
          phonton plan [--json] [--no-memory] [--no-tests] <goal>\n\
          \n\
-         HEADLESS GOAL:\n  \
-         phonton goal [--json] [--yes] [--permission-mode <mode>] [--timeout-seconds <n>] <goal>\n  \
-         phonton goal --prompt-file prompt.md --yes --permission-mode full-access\n\
-         \n\
-         ASK:\n  \
-         phonton ask [--no-workspace] [--json] <question>\n\
-         \n\
          REVIEW:\n  \
-         phonton review [--json|--markdown] [latest|<task-id>]\n  \
+         phonton review [--json] [latest|<task-id>]\n  \
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
          phonton review rollback [--json] [latest|<task-id>] <seq>\n\
-         \n\
-         DIFF:\n  \
-         phonton diff [--json|--stat|--name-only] [latest|<task-id>]\n\
-         \n\
-         RUN:\n  \
-         phonton run [--json] [--index <n>] [latest|<task-id>]\n\
-         \n\
-         BENCHMARK:\n  \
-         phonton benchmark export --latest --format json\n  \
-         phonton proof export --latest --format json\n  \
-         phonton context eval <fixture.json> [--format json]\n  \
-         phonton context diff --indexed --non-indexed <fixture.json> [--format json]\n  \
-         phonton why-tokens --by-source\n\
          \n\
          MCP:\n  \
          phonton mcp list [--json]\n  \
@@ -7109,12 +4240,8 @@ fn print_help() {
          phonton mcp call <server-id> <tool-name> [json-args] [--json] [--yes]\n\
          \n\
          EXTENSIONS:\n  \
-         phonton extensions install <source> [--scope workspace|user] [--ref <ref>]\n  \
-         phonton extensions catalog [--json]\n  \
          phonton extensions list [--json]\n  \
          phonton extensions doctor [--json]\n  \
-         phonton extensions validate [--json]\n  \
-         phonton extensions new <path> [skill|steering|mcp-server|profile]\n  \
          phonton skills list [--json]\n  \
          phonton steering list [--json]\n\
          \n\
@@ -7131,118 +4258,22 @@ fn print_version() {
     println!("phonton {}", env!("CARGO_PKG_VERSION"));
 }
 
-fn run_init() -> Result<()> {
-    let path =
-        config::config_path().ok_or_else(|| anyhow::anyhow!("could not resolve config path"))?;
-    if path.exists() {
-        println!("Phonton already initialized at {}", path.display());
-    } else {
-        config::save(&config::Config::default())?;
-        println!("Created {}", path.display());
-    }
-    println!("Next: phonton doctor");
-    println!("Then: phonton plan \"add validation to config loading\"");
-    Ok(())
-}
-
-pub fn render_trust_demo() -> String {
-    demo::render_trust_demo()
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn workspace_session_key(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .display()
-        .to_string()
-}
-
-/// Render the plain terminal receipt printed after a confirmed TUI exit.
-pub fn render_exit_receipt(totals: &SessionTotals) -> String {
-    let saved_line = if totals.estimated_tokens_saved >= 0 {
-        format!(
-            "estimated saved vs naive: {}",
-            totals.estimated_tokens_saved
-        )
-    } else {
-        format!(
-            "estimated over naive: {}",
-            totals.estimated_tokens_saved.saturating_abs()
-        )
-    };
-    let best = totals
-        .best_savings_pct
-        .map(|p| format!("{p}%"))
-        .unwrap_or_else(|| "n/a".into());
-    format!(
-        "Session saved\n\
-         goals: {}  completed: {}  reviewing: {}  failed: {}\n\
-         tokens used: {}\n\
-         naive baseline: {}\n\
-         {}\n\
-         best savings: {}",
-        totals.goals,
-        totals.completed,
-        totals.reviewing,
-        totals.failed,
-        totals.tokens_used,
-        totals.naive_baseline_tokens,
-        saved_line,
-        best
-    )
-}
-
-/// Parse arguments that launch the interactive TUI instead of a subcommand.
-pub fn launch_options_from_args(args: &[String]) -> Option<LaunchOptions> {
-    match args {
-        [] => Some(LaunchOptions::default()),
-        [flag] if flag == "-r" || flag == "--resume" => Some(LaunchOptions {
-            resume_last_session: true,
-        }),
-        _ => None,
-    }
-}
-
 /// Handle CLI subcommands that exit before the TUI launches.
-/// Returns `Ok(Some(_))` when the TUI should launch, or `Ok(None)` when a
-/// subcommand was handled and the caller should exit.
-async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
+/// Returns `Ok(true)` if a subcommand was handled (caller should exit),
+/// `Ok(false)` if the TUI should launch normally.
+async fn handle_cli_args() -> Result<bool> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(options) = launch_options_from_args(&args) {
-        return Ok(Some(options));
+    if args.is_empty() {
+        return Ok(false);
     }
     match args[0].as_str() {
         "-h" | "--help" | "help" => {
             print_help();
-            Ok(None)
+            Ok(true)
         }
         "-V" | "--version" | "version" => {
             print_version();
-            Ok(None)
-        }
-        "init" => {
-            run_init()?;
-            Ok(None)
-        }
-        "demo" => {
-            let code = demo::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
-        }
-        "benchmark" => {
-            let code = benchmark_cli::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
+            Ok(true)
         }
         "config" => {
             let sub = args.get(1).map(|s| s.as_str()).unwrap_or("path");
@@ -7302,7 +4333,7 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
                     std::process::exit(2);
                 }
             }
-            Ok(None)
+            Ok(true)
         }
         "doctor" => {
             let working_dir =
@@ -7311,14 +4342,7 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
-        }
-        "providers" => {
-            let code = providers_cli::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
+            Ok(true)
         }
         "extensions" => {
             let working_dir =
@@ -7327,7 +4351,7 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
+            Ok(true)
         }
         "skills" => {
             let working_dir =
@@ -7336,7 +4360,7 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
+            Ok(true)
         }
         "steering" => {
             let working_dir =
@@ -7345,7 +4369,7 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
+            Ok(true)
         }
         "mcp" => {
             let working_dir =
@@ -7354,80 +4378,32 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
+            Ok(true)
         }
         "plan" => {
             let code = plan_preview::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
-        }
-        "goal" => {
-            let code = run_goal_cli(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
-        }
-        "context" => {
-            let code = context_cli::run(&args[1..])?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
+            Ok(true)
         }
         "review" => {
             let code = review::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
-        }
-        "diff" => {
-            let code = diff_cli::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
-        }
-        "proof" => {
-            let code = proof_cli::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
-        }
-        "run" => {
-            let code = run_command::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
-        }
-        "why-tokens" => {
-            let code = tokens_cli::run(&args[1..]).await?;
-            if code != 0 {
-                std::process::exit(code);
-            }
-            Ok(None)
+            Ok(true)
         }
         "memory" => {
             let code = memory_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
-            Ok(None)
+            Ok(true)
         }
         "ask" => {
-            let request = match parse_ask_cli_request(&args[1..]) {
-                Ok(request) => request,
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-            };
-            if request.question.trim().is_empty() {
+            let question = args.get(1..).map(|a| a.join(" ")).unwrap_or_default();
+            if question.trim().is_empty() {
                 eprintln!("phonton: `ask` requires a question.\n  e.g. phonton ask \"how do I add a feature flag?\"");
                 std::process::exit(2);
             }
@@ -7438,53 +4414,13 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
                      or run `phonton` and configure one in Settings"
                 )
             })?;
-            let workspace_context = if request.no_workspace {
-                None
-            } else {
-                let working_dir =
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let attachments = prepare_goal_attachments(&request.question, &working_dir);
-                Some(ask_context::build_ask_context(
-                    ask_context::AskContextRequest {
-                        question: &request.question,
-                        workspace_root: &working_dir,
-                        attachments: &attachments,
-                        current_goal: None,
-                        diagnostics: &[],
-                        max_tokens: ask_context::ASK_CONTEXT_TARGET_TOKENS,
-                    },
-                ))
-            };
-            let stateless_prompt;
-            let user_prompt = if let Some(context) = workspace_context.as_ref() {
-                context.prompt.as_str()
-            } else {
-                stateless_prompt = ask_context::build_stateless_ask_prompt(&request.question);
-                stateless_prompt.as_str()
-            };
-            let system_prompt = if request.no_workspace {
-                "You are a helpful coding assistant."
-            } else {
-                ask_context::ASK_SYSTEM_PROMPT
-            };
-            match provider.call(system_prompt, user_prompt, &[]).await {
+            match provider
+                .call("You are a helpful coding assistant.", &question, &[])
+                .await
+            {
                 Ok(resp) => {
-                    if request.json {
-                        let body = AskCliResponse {
-                            answer: resp.content,
-                            context_tokens: workspace_context
-                                .as_ref()
-                                .map(|context| context.context_tokens)
-                                .unwrap_or(0),
-                            selected_paths: workspace_context
-                                .map(|context| context.selected_paths)
-                                .unwrap_or_default(),
-                        };
-                        println!("{}", serde_json::to_string_pretty(&body)?);
-                    } else {
-                        println!("{}", resp.content);
-                    }
-                    Ok(None)
+                    println!("{}", resp.content);
+                    Ok(true)
                 }
                 Err(e) => {
                     eprintln!("phonton ask: {}", e);
@@ -7507,10 +4443,9 @@ async fn handle_cli_args() -> Result<Option<LaunchOptions>> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let launch_options = match handle_cli_args().await? {
-        Some(options) => options,
-        None => return Ok(()),
-    };
+    if handle_cli_args().await? {
+        return Ok(());
+    }
     // Load configuration first so the rest of startup can use it.
     let mut cfg = config::load().unwrap_or_default();
 
@@ -7545,7 +4480,6 @@ async fn main() -> Result<()> {
     // launch). Shared across every spawned goal so tool-execution policy
     // is uniform across the session.
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let workspace_key = workspace_session_key(&working_dir);
     let mut app = App::new(&cfg);
     app.nexus_status = detect_nexus_status(&working_dir);
 
@@ -7572,58 +4506,20 @@ async fn main() -> Result<()> {
     if !trust::prompt_if_needed(&working_dir)? {
         return Ok(());
     }
-    let trust_source = trust::trust_record(&working_dir)
-        .map(|record| record.source)
-        .unwrap_or(phonton_types::WorkspaceTrustSource::JsonRecord);
-    let _ = trust::record_trust_with_mode(&working_dir, cfg.permissions.mode, trust_source);
-    if let Some(record) = trust::trust_record(&working_dir) {
-        if let Ok(s) = store.lock() {
-            let _ = s.upsert_workspace_trust(&record);
-        }
-    }
 
-    if launch_options.resume_last_session {
-        match store.lock() {
-            Ok(s) => match s.load_session_snapshot(&workspace_key) {
-                Ok(Some(snapshot)) => app.restore_session_snapshot(snapshot),
-                Ok(None) => {
-                    app.settings.message = Some("No saved session for this workspace yet.".into());
-                }
-                Err(e) => {
-                    app.settings.message = Some(format!("Could not load saved session: {e}"));
-                }
-            },
-            Err(_) => {
-                app.settings.message =
-                    Some("Could not load saved session: store lock poisoned.".into());
-            }
-        }
-    }
-
-    let sandbox = Arc::new(Sandbox::new_with_mode(
-        working_dir.clone(),
-        "phonton-cli".to_string(),
-        cfg.permissions.mode,
-    ));
+    let sandbox = Arc::new(Sandbox::new(working_dir.clone(), "phonton-cli".to_string()));
     let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     execute!(stdout, SetCursorStyle::SteadyBar)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.hide_cursor()?;
 
-    let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(512);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<LoopEvent>(64);
     spawn_input_task(evt_tx.clone());
 
-    let store_for_exit = Arc::clone(&store);
     let result = run_app(
         &mut terminal,
         &mut app,
@@ -7637,33 +4533,16 @@ async fn main() -> Result<()> {
         working_dir,
     )
     .await;
-    let exit_snapshot = if result.is_ok() && app.should_quit {
-        Some(app.to_session_snapshot(workspace_key, now_unix_secs()))
-    } else {
-        None
-    };
 
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show,
         SetCursorStyle::DefaultUserShape,
     )?;
     terminal.show_cursor()?;
-    if let Some(snapshot) = exit_snapshot {
-        match store_for_exit.lock() {
-            Ok(s) => {
-                if let Err(e) = s.save_session_snapshot(&snapshot) {
-                    eprintln!("phonton: failed to save session snapshot: {e}");
-                }
-            }
-            Err(_) => eprintln!("phonton: failed to save session snapshot: store lock poisoned"),
-        }
-        println!("{}", render_exit_receipt(&snapshot.totals));
-    }
     result
 }
 
@@ -7673,156 +4552,26 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
         // preventing the splash animation and terminal cursor from feeling
         // like they are flashing on every frame.
         if event::poll(Duration::from_millis(UI_TICK_MS)).unwrap_or(false) {
-            match event::read() {
-                Ok(Event::Key(k)) if k.kind != event::KeyEventKind::Release => {
-                    let mut keys = vec![k];
-                    drain_queued_key_events(&mut keys);
-                    if let Some(text) = bracketless_paste_text(&keys) {
-                        if tx.blocking_send(LoopEvent::Paste(text)).is_err() {
-                            break;
-                        }
-                    } else {
-                        for key in keys {
-                            if tx.blocking_send(LoopEvent::Key(key)).is_err() {
-                                return;
-                            }
-                        }
+            if let Ok(event) = event::read() {
+                let should_break = match event {
+                    // IMPORTANT: Filter for 'Press' events only. Windows and some
+                    // modern terminal emulators send 'Release' events too. If we
+                    // handle both, the user sees "double input" (e.g. 'ww') and
+                    // the TUI flickers because we redraw twice.
+                    Event::Key(k) if k.kind != event::KeyEventKind::Release => {
+                        tx.blocking_send(LoopEvent::Key(k)).is_err()
                     }
+                    Event::Paste(text) => tx.blocking_send(LoopEvent::Paste(text)).is_err(),
+                    _ => false,
+                };
+                if should_break {
+                    break;
                 }
-                Ok(Event::Paste(text)) => {
-                    if let Err(_err) = tx.blocking_send(LoopEvent::Paste(text)) {
-                        break;
-                    }
-                }
-                Ok(Event::Mouse(mouse)) => {
-                    if let Err(_err) = tx.blocking_send(LoopEvent::Mouse(mouse)) {
-                        break;
-                    }
-                }
-                _ => {}
             }
         } else if tx.blocking_send(LoopEvent::Tick).is_err() {
             break;
         }
     });
-}
-
-fn drain_queued_key_events(keys: &mut Vec<KeyEvent>) {
-    while keys.len() < 4096 && event::poll(Duration::from_millis(1)).unwrap_or(false) {
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind != event::KeyEventKind::Release => keys.push(k),
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-}
-
-fn bracketless_paste_text(keys: &[KeyEvent]) -> Option<String> {
-    if keys.len() < 2 {
-        return None;
-    }
-
-    let mut text = String::new();
-    let mut line_breaks = 0usize;
-    let mut printable = 0usize;
-    for key in keys {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return None;
-        }
-        match key.code {
-            KeyCode::Char(c) => {
-                text.push(c);
-                printable += 1;
-            }
-            KeyCode::Enter => {
-                text.push('\n');
-                line_breaks += 1;
-            }
-            KeyCode::Tab => {
-                text.push('\t');
-                printable += 1;
-            }
-            _ => return None,
-        }
-    }
-
-    if printable == 0 {
-        return None;
-    }
-
-    let looks_like_multiline_paste = line_breaks >= 2 || (line_breaks >= 1 && keys.len() >= 8);
-    let looks_like_long_single_line_paste = line_breaks == 0 && printable >= 64;
-    if looks_like_multiline_paste || looks_like_long_single_line_paste {
-        Some(text)
-    } else {
-        None
-    }
-}
-
-fn read_clipboard_text() -> std::result::Result<Option<String>, String> {
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(if err.is_empty() {
-                "PowerShell Get-Clipboard failed".into()
-            } else {
-                err
-            });
-        }
-        let text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let text = text.trim_end_matches(['\r', '\n']).to_string();
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(text))
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        Err("clipboard paste is currently implemented for Windows only".into())
-    }
-}
-
-fn write_clipboard_text(text: &str) -> std::result::Result<(), String> {
-    #[cfg(windows)]
-    {
-        let mut child = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", "Set-Clipboard"])
-            .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            use std::io::Write;
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        let output = child.wait_with_output().map_err(|e| e.to_string())?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if err.is_empty() {
-                "PowerShell Set-Clipboard failed".into()
-            } else {
-                err
-            })
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = text;
-        Err("clipboard copy is currently implemented for Windows only".into())
-    }
 }
 
 async fn run_app<B: Backend>(
@@ -7832,7 +4581,7 @@ async fn run_app<B: Backend>(
     tx: mpsc::Sender<LoopEvent>,
     store: Arc<std::sync::Mutex<Store>>,
     ask_provider: Option<Arc<dyn Provider>>,
-    mut sandbox: Arc<Sandbox>,
+    sandbox: Arc<Sandbox>,
     controls: ControlRegistry,
     mut cfg: config::Config,
     working_dir: std::path::PathBuf,
@@ -7853,10 +4602,6 @@ async fn run_app<B: Backend>(
                     app.new_best_ticks -= 1;
                 }
             }
-            LoopEvent::Paste(text) => {
-                app.handle_paste(&text);
-            }
-            LoopEvent::Mouse(mouse) => app.handle_mouse(mouse),
             LoopEvent::Key(k) => {
                 if let Some(intent) = app.handle_key(k) {
                     match intent {
@@ -7864,118 +4609,10 @@ async fn run_app<B: Backend>(
                             deny_pending_mcp_approvals(&mut approval_replies);
                             break;
                         }
-                        Intent::PasteClipboard => match read_clipboard_text() {
-                            Ok(Some(text)) => app.handle_paste(&text),
-                            Ok(None) => {
-                                app.settings.message = Some("Clipboard is empty.".into());
-                            }
-                            Err(e) => {
-                                app.settings.message = Some(format!("Clipboard paste failed: {e}"));
-                            }
-                        },
-                        Intent::CopyFocus(text) => match write_clipboard_text(&text) {
-                            Ok(()) => {
-                                app.command_notice = Some("Copied current focus view.".into());
-                            }
-                            Err(e) => {
-                                app.command_notice = Some(format!("Copy failed: {e}"));
-                            }
-                        },
-                        Intent::RunCommand(text) => {
-                            if let Some(parsed) = parse_prompt_command(&text) {
-                                let command = parsed.original.clone();
-                                app.push_command_run(CommandRunSummary {
-                                    command: command.clone(),
-                                    exit_code: None,
-                                    stdout_preview: "running...".into(),
-                                    stderr_preview: String::new(),
-                                    duration_ms: None,
-                                });
-                                let tx2 = tx.clone();
-                                let sandbox = Arc::clone(&sandbox);
-                                tokio::spawn(async move {
-                                    let started = std::time::Instant::now();
-                                    let summary = match sandbox.run_tool(parsed.call).await {
-                                        Ok(output) => summarize_output_with_duration(
-                                            &command,
-                                            output.status.code(),
-                                            &output.stdout,
-                                            &output.stderr,
-                                            Some(started.elapsed().as_millis() as u64),
-                                        ),
-                                        Err(e) => CommandRunSummary {
-                                            command,
-                                            exit_code: None,
-                                            stdout_preview: String::new(),
-                                            stderr_preview: e.to_string(),
-                                            duration_ms: Some(started.elapsed().as_millis() as u64),
-                                        },
-                                    };
-                                    let _ = tx2.send(LoopEvent::CommandFinished(summary)).await;
-                                });
-                            }
-                        }
-                        Intent::PreviewPlan {
-                            goal_index,
-                            task_id,
-                            text,
-                        } => {
-                            if let Some(goal) = app.goals.get_mut(goal_index) {
-                                goal.context_mentions =
-                                    resolve_context_mentions_for_prompt(&text, &working_dir);
-                            }
-                            let tx_goal = tx.clone();
-                            let store_goal = Arc::clone(&store);
-                            let working_dir_goal = working_dir.clone();
-                            tokio::spawn(async move {
-                                preview_goal_plan(
-                                    goal_index,
-                                    task_id,
-                                    text,
-                                    tx_goal,
-                                    store_goal,
-                                    working_dir_goal,
-                                )
-                                .await;
-                            });
-                        }
-                        Intent::ApprovePlan {
-                            goal_index,
-                            task_id,
-                            text,
-                        } => {
-                            apply_settings_to_config(&app.settings, &mut cfg);
-                            let tx_goal = tx.clone();
-                            let store_goal = Arc::clone(&store);
-                            let sandbox_goal = Arc::clone(&sandbox);
-                            let controls_goal = Arc::clone(&controls);
-                            let cfg_goal = cfg.clone();
-                            let working_dir_goal = working_dir.clone();
-                            tokio::spawn(async move {
-                                spawn_goal(
-                                    goal_index,
-                                    task_id,
-                                    text,
-                                    false,
-                                    None,
-                                    tx_goal,
-                                    store_goal,
-                                    sandbox_goal,
-                                    controls_goal,
-                                    cfg_goal,
-                                    working_dir_goal,
-                                )
-                                .await;
-                            });
-                        }
-                        Intent::QueueGoal(text) | Intent::QueueTask(text) => {
+                        Intent::QueueGoal(prompt) | Intent::QueueTask(prompt) => {
                             let direct_task = app.mode == Mode::Task;
                             // `handle_key` inserts the goal at index 0.
                             let task_id = app.goals.first().map(|g| g.task_id).unwrap_or_default();
-                            if let Some(goal) = app.goals.first_mut() {
-                                goal.context_mentions =
-                                    resolve_context_mentions_for_prompt(&text, &working_dir);
-                            }
                             // Sync any in-memory Settings inputs into cfg so
                             // this goal uses the *currently displayed*
                             // provider/model/key — not the stale on-disk
@@ -7983,29 +4620,40 @@ async fn run_app<B: Backend>(
                             // explicitly saving would silently route goals
                             // through the previous provider while the System
                             // panel showed the new one (a real footgun).
-                            apply_settings_to_config(&app.settings, &mut cfg);
-                            let tx_goal = tx.clone();
-                            let store_goal = Arc::clone(&store);
-                            let sandbox_goal = Arc::clone(&sandbox);
-                            let controls_goal = Arc::clone(&controls);
-                            let cfg_goal = cfg.clone();
-                            let working_dir_goal = working_dir.clone();
-                            tokio::spawn(async move {
-                                spawn_goal(
-                                    0,
-                                    task_id,
-                                    text,
-                                    direct_task,
-                                    None,
-                                    tx_goal,
-                                    store_goal,
-                                    sandbox_goal,
-                                    controls_goal,
-                                    cfg_goal,
-                                    working_dir_goal,
-                                )
-                                .await;
-                            });
+                            cfg.provider.name = app.settings.provider.clone();
+                            cfg.provider.model = if app.settings.model.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.model.clone())
+                            };
+                            cfg.provider.api_key = if app.settings.api_key.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.api_key.clone())
+                            };
+                            cfg.provider.account_id = if app.settings.account_id.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.account_id.clone())
+                            };
+                            cfg.provider.base_url = if app.settings.base_url.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.base_url.clone())
+                            };
+                            spawn_goal(
+                                0,
+                                task_id,
+                                prompt,
+                                direct_task,
+                                &tx,
+                                &store,
+                                &sandbox,
+                                &controls,
+                                &cfg,
+                                &working_dir,
+                            )
+                            .await;
                         }
                         Intent::Rollback { goal_index, to_seq } => {
                             if let Ok(reg) = controls.lock() {
@@ -8013,22 +4661,6 @@ async fn run_app<B: Backend>(
                                     let _ = gc
                                         .control_tx
                                         .try_send(OrchestratorMessage::RollbackRequest { to_seq });
-                                }
-                            }
-                        }
-                        Intent::CompactContext { goal_index } => {
-                            if let Ok(reg) = controls.lock() {
-                                if let Some(gc) = reg.get(&goal_index) {
-                                    let _ =
-                                        gc.control_tx.try_send(OrchestratorMessage::CompactContext);
-                                }
-                            }
-                        }
-                        Intent::StopGoal { goal_index } => {
-                            if let Ok(reg) = controls.lock() {
-                                if let Some(gc) = reg.get(&goal_index) {
-                                    let _ =
-                                        gc.control_tx.try_send(OrchestratorMessage::UserCancelled);
                                 }
                             }
                         }
@@ -8046,12 +4678,24 @@ async fn run_app<B: Backend>(
                             }
                         }
                         Intent::SaveSettings => {
-                            apply_settings_to_config(&app.settings, &mut cfg);
-                            sandbox = Arc::new(Sandbox::new_with_mode(
-                                working_dir.clone(),
-                                "phonton-cli".to_string(),
-                                cfg.permissions.mode,
-                            ));
+                            cfg.provider.name = app.settings.provider.clone();
+                            cfg.provider.model = if app.settings.model.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.model.clone())
+                            };
+                            cfg.provider.api_key = if app.settings.api_key.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.api_key.clone())
+                            };
+                            cfg.provider.base_url = if app.settings.base_url.is_empty() {
+                                None
+                            } else {
+                                Some(app.settings.base_url.clone())
+                            };
+                            cfg.budget.max_tokens = app.settings.max_tokens.parse().ok();
+                            cfg.budget.max_usd_cents = app.settings.max_usd_cents.parse().ok();
 
                             // Swap the in-memory ask provider so the next
                             // Ctrl+; question uses the new credentials
@@ -8091,10 +4735,6 @@ async fn run_app<B: Backend>(
                                         Some(app.settings.account_id.clone())
                                     },
                                     base_url: None,
-                                    catalog: None,
-                                    api_key_source: None,
-                                    allow_unverified_model: false,
-                                    keys: std::collections::HashMap::new(),
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -8128,10 +4768,10 @@ async fn run_app<B: Backend>(
                                 // settings mode.
                                 let msg = match result {
                                     Ok(reply) => format!(
-                                        "Provider diff canary passed ({} chars). Key works.",
+                                        "✓ Connected — got reply ({} chars). Key works.",
                                         reply.len()
                                     ),
-                                    Err(e) => format!("Provider diff canary failed: {e}"),
+                                    Err(e) => format!("✗ Connection failed: {e}"),
                                 };
                                 let _ = tx2.send(LoopEvent::TestResult(msg)).await;
                             });
@@ -8149,10 +4789,6 @@ async fn run_app<B: Backend>(
                                         Some(app.settings.account_id.clone())
                                     },
                                     base_url: None,
-                                    catalog: None,
-                                    api_key_source: None,
-                                    allow_unverified_model: false,
-                                    keys: std::collections::HashMap::new(),
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -8257,10 +4893,6 @@ async fn run_app<B: Backend>(
                                             Some(app.settings.account_id.clone())
                                         },
                                         base_url: None,
-                                        catalog: None,
-                                        api_key_source: None,
-                                        allow_unverified_model: false,
-                                        keys: std::collections::HashMap::new(),
                                     };
                                     provider_key_for_run(&stub).unwrap_or_default()
                                 } else {
@@ -8305,10 +4937,7 @@ async fn run_app<B: Backend>(
                         },
                         Intent::OpenHistory => match store.lock() {
                             Ok(s) => match s.list_tasks(50).await {
-                                Ok(rows) => {
-                                    app.history_records = rows;
-                                    app.clamp_history_selection();
-                                }
+                                Ok(rows) => app.history_records = rows,
                                 Err(e) => {
                                     app.settings.message = Some(format!("History load failed: {e}"))
                                 }
@@ -8318,21 +4947,12 @@ async fn run_app<B: Backend>(
                                     Some("History load failed: store lock poisoned".into())
                             }
                         },
-                        Intent::RevokeCurrentTrust => {
-                            let revoked = trust::revoke_trust(&working_dir).unwrap_or(false);
-                            if revoked {
-                                if let Ok(s) = store.lock() {
-                                    let workspace = workspace_session_key(&working_dir);
-                                    let _ = s.delete_workspace_trust(&workspace);
-                                }
-                                app.ask_answer = Some(
-                                    "Trust\nCurrent workspace trust revoked. Restart Phonton to re-approve before more work."
-                                        .into(),
-                                );
-                            } else {
-                                app.ask_answer =
-                                    Some("Trust\nCurrent workspace was not trusted.".into());
-                            }
+                        Intent::PasteClipboard => {
+                            let tx2 = tx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let result = read_clipboard_text();
+                                let _ = tx2.blocking_send(LoopEvent::ClipboardPaste(result));
+                            });
                         }
                         Intent::AcceptTrust | Intent::DeclineTrust => {
                             // Trust prompt is handled before the TUI loop
@@ -8340,31 +4960,16 @@ async fn run_app<B: Backend>(
                             // a no-op.
                         }
                         Intent::Ask(q) => {
-                            // Ask is read-only: it can inspect bounded
-                            // workspace context but never dispatches the
-                            // orchestrator or writes memory.
+                            // Stateless ask: no orchestrator involvement,
+                            // no goal context, no memory write.
                             let tx2 = tx.clone();
                             let provider = ask_provider.clone();
-                            let attachments = prepare_goal_attachments(&q, &working_dir);
-                            let (current_goal, diagnostics) = selected_goal_ask_context(app);
-                            let ask_report =
-                                ask_context::build_ask_context(ask_context::AskContextRequest {
-                                    question: &q,
-                                    workspace_root: &working_dir,
-                                    attachments: &attachments,
-                                    current_goal: current_goal.as_deref(),
-                                    diagnostics: &diagnostics,
-                                    max_tokens: ask_context::ASK_CONTEXT_TARGET_TOKENS,
-                                });
-                            let ask_prompt = ask_report.prompt.clone();
-                            app.ask_context_summary = Some(ask_report.summary.clone());
                             app.ask_pending = true;
                             app.ask_answer = None;
-                            app.ask_scroll = 0;
                             tokio::spawn(async move {
                                 let a = match provider {
                                     Some(p) => match p
-                                        .call(ask_context::ASK_SYSTEM_PROMPT, &ask_prompt, &[])
+                                        .call("You are a helpful coding assistant.", &q, &[])
                                         .await
                                     {
                                         Ok(resp) => resp.content,
@@ -8380,15 +4985,23 @@ async fn run_app<B: Backend>(
                     }
                 }
             }
+            LoopEvent::Paste(text) => {
+                app.handle_paste(text);
+            }
+            LoopEvent::ClipboardPaste(result) => match result {
+                Ok(text) => {
+                    app.handle_paste(text);
+                }
+                Err(msg) => {
+                    app.goal_prompt
+                        .set_notice(format!("Clipboard unavailable: {msg}"));
+                }
+            },
             LoopEvent::StateUpdate(idx, state) => app.apply_state(idx, *state),
             LoopEvent::FlightEvent(idx, ev) => app.apply_event(idx, ev),
             LoopEvent::AskAnswer(a) => {
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
-                app.ask_scroll = 0;
-            }
-            LoopEvent::CommandFinished(summary) => {
-                app.push_command_run(summary);
             }
             LoopEvent::McpApprovalRequested { prompt, reply_tx } => {
                 approval_replies.insert(prompt.id, reply_tx);
@@ -8442,9 +5055,14 @@ async fn run_app<B: Backend>(
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 64 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
-fn single_task_plan(description: String, attachments: Vec<PromptAttachment>) -> PlannerOutput {
+fn single_task_plan(
+    description: String,
+    attachments: Vec<PromptAttachment>,
+    prompt_artifacts: Vec<PromptArtifact>,
+) -> PlannerOutput {
     let goal_contract = Goal::new(description.clone())
         .with_attachments(attachments.clone())
+        .with_prompt_artifacts(prompt_artifacts.clone())
         .contract();
     let subtask = Subtask {
         id: SubtaskId::new(),
@@ -8452,6 +5070,7 @@ fn single_task_plan(description: String, attachments: Vec<PromptAttachment>) -> 
         model_tier: ModelTier::Standard,
         dependencies: Vec::new(),
         attachments,
+        prompt_artifacts,
         status: SubtaskStatus::Queued,
     };
 
@@ -8483,20 +5102,16 @@ fn prepare_goal_attachments(text: &str, working_dir: &Path) -> Vec<PromptAttachm
     attachments
 }
 
-fn resolve_context_mentions_for_prompt(text: &str, working_dir: &Path) -> Vec<ContextMention> {
-    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(working_dir));
-    let catalog = MentionCapabilityCatalog::from_mcp_servers(&extension_set.mcp_servers);
-    ContextMentionResolver::new(working_dir, catalog).resolve_text(text)
-}
-
-fn annotate_prompt_manifest_event(
-    mut record: EventRecord,
-    context_mentions: &[ContextMention],
-) -> EventRecord {
-    if let OrchestratorEvent::PromptManifest { manifest, .. } = &mut record.event {
-        manifest.context_mentions = context_mentions.to_vec();
+fn prepare_prompt_attachments(
+    prompt: &SubmittedPrompt,
+    working_dir: &Path,
+) -> Vec<PromptAttachment> {
+    let mut text = prompt.description.clone();
+    for artifact in &prompt.prompt_artifacts {
+        text.push('\n');
+        text.push_str(&artifact.text);
     }
-    record
+    prepare_goal_attachments(&text, working_dir)
 }
 
 fn extract_file_mentions(text: &str) -> Vec<String> {
@@ -8700,262 +5315,68 @@ fn mime_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct LedgerEvidence {
-    context_manifest: ContextManifest,
-    permission_ledger: PermissionLedger,
-}
-
-impl LedgerEvidence {
-    fn apply_event(&mut self, record: &EventRecord) {
-        match &record.event {
-            OrchestratorEvent::ContextSelected { slices, .. } => {
-                for slice in slices {
-                    self.context_manifest.sources.push(ContextSource {
-                        kind: "index".into(),
-                        id: slice.file_path.display().to_string(),
-                        summary: if slice.symbol_name.is_empty() {
-                            "selected code context".into()
-                        } else {
-                            format!("{} ({:?})", slice.symbol_name, slice.origin)
-                        },
-                        token_count: Some(slice.token_count as u64),
-                    });
-                }
-            }
-            OrchestratorEvent::PromptManifest { manifest, .. } => {
-                self.context_manifest.buckets.add_prompt_manifest(manifest);
-            }
-            OrchestratorEvent::McpToolApproved {
-                server_id,
-                tool_name,
-            } => self.permission_ledger.records.push(PermissionRecord {
-                action: "mcp".into(),
-                scope: format!("{server_id}.{tool_name}"),
-                approved: true,
-                decision: "approved by workspace trust or user approval".into(),
-            }),
-            OrchestratorEvent::McpToolDenied {
-                server_id,
-                tool_name,
-                reason,
-            } => self.permission_ledger.records.push(PermissionRecord {
-                action: "mcp".into(),
-                scope: format!("{server_id}.{tool_name}"),
-                approved: false,
-                decision: reason.clone(),
-            }),
-            _ => {}
-        }
-    }
-}
-
-fn outcome_ledger_from_state_with_evidence(
-    task_id: TaskId,
-    state: &GlobalState,
-    evidence: &LedgerEvidence,
-) -> Option<OutcomeLedger> {
+fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<OutcomeLedger> {
     let handoff = state.handoff_packet.clone()?;
-    let mut context_manifest = evidence.context_manifest.clone();
-    let permission_ledger = evidence.permission_ledger.clone();
-    context_manifest.buckets.cached_tokens = context_manifest
-        .buckets
-        .cached_tokens
-        .saturating_add(handoff.token_usage.cached_tokens);
-    let verify_report = handoff.verification.clone();
-    let summaries = phonton_types::OutcomeSummaries::from_evidence(
-        state.goal_contract.as_ref(),
-        &context_manifest,
-        &permission_ledger,
-        &verify_report,
-        Some(&handoff),
-    );
     Some(OutcomeLedger {
         task_id,
         goal_contract: state.goal_contract.clone(),
-        context_manifest,
-        permission_ledger,
-        verify_report,
-        summaries,
+        context_manifest: ContextManifest::default(),
+        permission_ledger: PermissionLedger::default(),
+        verify_report: handoff.verification.clone(),
         handoff: Some(handoff),
     })
-}
-
-fn state_for_plan_status(plan: &PlannerOutput, task_status: TaskStatus) -> GlobalState {
-    GlobalState {
-        task_status,
-        goal_contract: plan.goal_contract.clone(),
-        handoff_packet: None,
-        active_workers: Vec::new(),
-        tokens_used: 0,
-        tokens_budget: None,
-        estimated_naive_tokens: plan.naive_baseline_tokens,
-        checkpoints: Vec::new(),
-    }
-}
-
-async fn preview_goal_plan(
-    goal_index: usize,
-    task_id: TaskId,
-    text: String,
-    tx: mpsc::Sender<LoopEvent>,
-    store: Arc<std::sync::Mutex<Store>>,
-    working_dir: std::path::PathBuf,
-) {
-    let attachments = prepare_goal_attachments(&text, &working_dir);
-    if let Ok(g) = store.lock() {
-        let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
-    }
-
-    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(&store)).await;
-    let goal = Goal::new(text.clone()).with_attachments(attachments);
-    let plan_result = decompose_with_memory_store(&goal, &memory_store).await;
-    let mut plan = match plan_result {
-        Ok(plan) => plan,
-        Err(err) => {
-            let failed = GlobalState {
-                task_status: TaskStatus::Failed {
-                    reason: format!("plan preview failed: {err}"),
-                    failed_subtask: None,
-                },
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 0,
-                tokens_budget: None,
-                estimated_naive_tokens: 0,
-                checkpoints: Vec::new(),
-            };
-            if let Ok(g) = store.lock() {
-                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
-            }
-            let _ = tx
-                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
-                .await;
-            return;
-        }
-    };
-    apply_workspace_preflight(&mut plan, &working_dir, &text);
-
-    let preview_state = state_for_plan_status(
-        &plan,
-        TaskStatus::NeedsClarification {
-            questions: vec![
-                "Plan preview only. Review the Plan focus, then run /approve to execute or /delete to discard."
-                    .into(),
-            ],
-        },
-    );
-    if let Ok(g) = store.lock() {
-        let _ = g.upsert_task(task_id, &text, &preview_state.task_status, 0);
-    }
-    let _ = tx
-        .send(LoopEvent::StateUpdate(goal_index, Box::new(preview_state)))
-        .await;
 }
 
 async fn spawn_goal(
     goal_index: usize,
     task_id: TaskId,
-    text: String,
+    prompt: SubmittedPrompt,
     direct_task: bool,
-    headless_worker_context: Option<String>,
-    tx: mpsc::Sender<LoopEvent>,
-    store: Arc<std::sync::Mutex<Store>>,
-    sandbox: Arc<Sandbox>,
-    controls: ControlRegistry,
-    cfg: config::Config,
-    working_dir: std::path::PathBuf,
+    tx: &mpsc::Sender<LoopEvent>,
+    store: &Arc<std::sync::Mutex<Store>>,
+    sandbox: &Arc<Sandbox>,
+    controls: &ControlRegistry,
+    cfg: &config::Config,
+    working_dir: &std::path::PathBuf,
 ) {
-    let _ = tx
-        .send(LoopEvent::StateUpdate(
-            goal_index,
-            Box::new(GlobalState {
-                task_status: TaskStatus::Planning,
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 0,
-                tokens_budget: cfg.budget.max_tokens,
-                estimated_naive_tokens: 0,
-                checkpoints: Vec::new(),
-            }),
-        ))
-        .await;
-
-    let attachments = prepare_goal_attachments(&text, &working_dir);
+    let attachments = prepare_prompt_attachments(&prompt, working_dir);
+    let display_text = prompt.display_text.clone();
+    let prompt_artifacts = prompt.prompt_artifacts.clone();
+    let has_main_artifact = prompt_artifacts
+        .iter()
+        .any(|artifact| artifact.role == PromptArtifactRole::MainRequest);
+    let text = if has_main_artifact {
+        display_text.clone()
+    } else {
+        prompt.description.clone()
+    };
     if let Ok(g) = store.lock() {
-        let _ = g.upsert_task(task_id, &text, &TaskStatus::Planning, 0);
+        let _ = g.upsert_task(task_id, &display_text, &TaskStatus::Planning, 0);
     }
-    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(&store)).await;
+    let memory_store = phonton_memory::MemoryStore::new(Arc::clone(store)).await;
 
     let plan_result = if direct_task {
-        Ok(single_task_plan(text.clone(), attachments.clone()))
+        Ok(single_task_plan(
+            text.clone(),
+            attachments.clone(),
+            prompt_artifacts.clone(),
+        ))
     } else {
-        let goal = Goal::new(text.clone()).with_attachments(attachments.clone());
-        decompose_with_memory_store(&goal, &memory_store).await
+        let store_guard = match store.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let goal = Goal::new(text.clone())
+            .with_attachments(attachments.clone())
+            .with_prompt_artifacts(prompt_artifacts.clone());
+        let result = decompose_with_memory(&goal, &store_guard, None).await;
+        drop(store_guard);
+        result
     };
     let mut plan = match plan_result {
         Ok(p) => p,
-        Err(err) => {
-            let failed = GlobalState {
-                task_status: TaskStatus::Failed {
-                    reason: format!("planning failed: {err}"),
-                    failed_subtask: None,
-                },
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 0,
-                tokens_budget: cfg.budget.max_tokens,
-                estimated_naive_tokens: 0,
-                checkpoints: Vec::new(),
-            };
-            if let Ok(g) = store.lock() {
-                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
-            }
-            let _ = tx
-                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
-                .await;
-            return;
-        }
+        Err(_) => return,
     };
-    apply_workspace_preflight(&mut plan, &working_dir, &text);
-    if let Some(context) = headless_worker_context.as_deref() {
-        append_headless_worker_context(&mut plan, context);
-    }
-
-    let planning_state = state_for_plan_status(&plan, TaskStatus::Planning);
-    let _ = tx
-        .send(LoopEvent::StateUpdate(goal_index, Box::new(planning_state)))
-        .await;
-
-    if provider_key_for_run(&cfg.provider).is_none() && provider_requires_key(&cfg.provider.name) {
-        let reason = format!(
-            "provider `{}` needs an API key before dispatch; open /settings or set the provider env var",
-            cfg.provider.name
-        );
-        let failed = GlobalState {
-            task_status: TaskStatus::Failed {
-                reason: reason.clone(),
-                failed_subtask: None,
-            },
-            goal_contract: plan.goal_contract.clone(),
-            handoff_packet: None,
-            active_workers: Vec::new(),
-            tokens_used: 0,
-            tokens_budget: cfg.budget.max_tokens,
-            estimated_naive_tokens: plan.naive_baseline_tokens,
-            checkpoints: Vec::new(),
-        };
-        if let Ok(g) = store.lock() {
-            let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
-        }
-        let _ = tx
-            .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
-            .await;
-        return;
-    }
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
@@ -8974,13 +5395,12 @@ async fn spawn_goal(
     let mut event_rx_ui = event_tx.subscribe();
     let mut event_rx_store = event_tx.subscribe();
 
-    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(&working_dir));
+    let extension_set = load_extensions(&ExtensionLoadOptions::for_workspace(working_dir));
     apply_extension_context_to_plan(&mut plan, &extension_set);
     publish_extension_events(task_id, &extension_set, &event_tx);
-    let context_mentions_for_events = resolve_context_mentions_for_prompt(&text, &working_dir);
 
     let naive = plan.naive_baseline_tokens;
-    let semantic_context = build_semantic_context(&working_dir).await;
+    let semantic_context = build_semantic_context(working_dir).await;
     let mcp_runtime = if extension_set.mcp_servers.is_empty() {
         None
     } else {
@@ -8988,124 +5408,61 @@ async fn spawn_goal(
         Some(Arc::new(
             phonton_mcp::McpRuntime::new(
                 extension_set.mcp_servers.clone(),
-                ExecutionGuard::new_with_mode(working_dir.clone(), cfg.permissions.mode),
+                ExecutionGuard::new(working_dir.clone()),
             )
             .with_approver(approver)
             .with_event_sink(task_id, event_tx.clone()),
         ))
     };
 
-    let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) =
-        provider_key_for_run(&cfg.provider)
-    {
-        let provider_name = cfg.provider.name.clone();
-        let account_id = cfg.provider.account_id.clone();
-        let base_url = cfg.provider.base_url.clone();
-        // CRITICAL: when the user (or auto-detect) picked a specific model,
-        // honour it for *every* tier. The previous behaviour was to call
-        // `model_for_tier(provider, tier)` and silently override the chosen
-        // model with the hard-coded tier default — so a Gemini key that
-        // only has access to `gemma-4-31b-it` would 404 the moment goal
-        // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
-        // model and worked; goals didn't, and the gap was invisible.
-        let configured_model = cfg.provider.model.clone();
-        let validation_model = configured_model.clone().unwrap_or_else(|| {
-            phonton_providers::model_for_tier(&provider_name, phonton_types::ModelTier::Cheap)
-        });
-        let validation_model_for_canary = validation_model.clone();
-        let Some(provider_template) = make_api_provider_config(
-            &provider_name,
-            api_key.clone(),
-            validation_model,
-            account_id.clone(),
-            base_url.clone(),
-        ) else {
-            let reason = provider_config_failure_message(&provider_name);
-            let failed = GlobalState {
-                task_status: TaskStatus::Failed {
-                    reason: reason.clone(),
-                    failed_subtask: None,
-                },
-                goal_contract: plan.goal_contract.clone(),
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 0,
-                tokens_budget: None,
-                estimated_naive_tokens: plan.naive_baseline_tokens,
-                checkpoints: Vec::new(),
+    let dispatcher: Arc<dyn WorkerDispatcher> =
+        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
+            let provider_name = cfg.provider.name.clone();
+            let account_id = cfg.provider.account_id.clone();
+            let base_url = cfg.provider.base_url.clone();
+            // CRITICAL: when the user (or auto-detect) picked a specific model,
+            // honour it for *every* tier. The previous behaviour was to call
+            // `model_for_tier(provider, tier)` and silently override the chosen
+            // model with the hard-coded tier default — so a Gemini key that
+            // only has access to `gemma-4-31b-it` would 404 the moment goal
+            // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
+            // model and worked; goals didn't, and the gap was invisible.
+            let configured_model = cfg.provider.model.clone();
+
+            let factory = move |tier: phonton_types::ModelTier| {
+                let model = configured_model
+                    .clone()
+                    .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
+                let provider_cfg = make_api_provider_config(
+                    &provider_name,
+                    api_key.clone(),
+                    model,
+                    account_id.clone(),
+                    base_url.clone(),
+                )
+                .expect("unknown provider config");
+                provider_for(provider_cfg)
             };
-            if let Ok(g) = store.lock() {
-                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+
+            let guard = ExecutionGuard::new(working_dir.clone());
+            let mut d =
+                phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                    .with_task_id(task_id)
+                    .with_memory(memory_store.clone());
+            if let Some(ctx) = semantic_context.clone() {
+                d = d.with_semantic_context(ctx);
             }
-            let _ = tx
-                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
-                .await;
-            return;
-        };
-
-        if let Err(reason) = ensure_provider_diff_contract_cached(
-            &provider_name,
-            &validation_model_for_canary,
-            &api_key,
-            account_id.clone(),
-            base_url.clone(),
-            cfg.provider.allow_unverified_model,
-        )
-        .await
-        {
-            let failed = GlobalState {
-                    task_status: TaskStatus::Failed {
-                        reason: format!(
-                            "provider/model blocked before dispatch: {reason}. Run `phonton providers doctor --configured --canary diff` or pick a verified model in /settings."
-                        ),
-                        failed_subtask: None,
-                    },
-                    goal_contract: plan.goal_contract.clone(),
-                    handoff_packet: None,
-                    active_workers: Vec::new(),
-                    tokens_used: 0,
-                    tokens_budget: None,
-                    estimated_naive_tokens: plan.naive_baseline_tokens,
-                    checkpoints: Vec::new(),
-                };
-            if let Ok(g) = store.lock() {
-                let _ = g.upsert_task(task_id, &text, &failed.task_status, 0);
+            if let Some(runtime) = mcp_runtime.clone() {
+                d = d.with_mcp_runtime(runtime);
             }
-            let _ = tx
-                .send(LoopEvent::StateUpdate(goal_index, Box::new(failed)))
-                .await;
-            return;
-        }
-
-        let routed_model_override = configured_model
-            .clone()
-            .or_else(|| Some(validation_model_for_canary.clone()));
-        let factory = move |tier: phonton_types::ModelTier| {
-            let model = routed_model_override
-                .clone()
-                .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
-            provider_for(provider_config_with_model(&provider_template, model))
+            Arc::new(d)
+        } else {
+            Arc::new(StubDispatcher::new(sandbox.clone()))
         };
-
-        let guard = ExecutionGuard::new_with_mode(working_dir.clone(), cfg.permissions.mode);
-        let mut d =
-            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
-                .with_task_id(task_id)
-                .with_memory(memory_store.clone());
-        if let Some(ctx) = semantic_context.clone() {
-            d = d.with_semantic_context(ctx);
-        }
-        if let Some(runtime) = mcp_runtime.clone() {
-            d = d.with_mcp_runtime(runtime);
-        }
-        Arc::new(d)
-    } else {
-        Arc::new(StubDispatcher::new(sandbox.clone()))
-    };
 
     // Wire phonton-diff so the orchestrator takes a checkpoint commit
     // after every subtask passes verify.
-    let diff_applier = DiffApplier::open(&working_dir)
+    let diff_applier = DiffApplier::open(working_dir)
         .ok()
         .map(|d| Arc::new(std::sync::Mutex::new(d)));
 
@@ -9152,31 +5509,19 @@ async fn spawn_goal(
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
         .with_memory(memory_store)
-        .with_event_sink(task_id, text.clone(), event_tx)
+        .with_event_sink(task_id, display_text.clone(), event_tx)
         .with_control_channel(ctrl_rx);
     if let Some(da) = diff_applier {
         orch = orch.with_diff_applier(da);
     }
 
     // Drive the orchestrator and forward every `GlobalState` update.
-    let ledger_evidence = Arc::new(std::sync::Mutex::new(LedgerEvidence::default()));
-    let latest_state_for_ledger = Arc::new(std::sync::Mutex::new(None::<GlobalState>));
     let tx_updates = tx.clone();
     let store_for_states = store.clone();
-    let goal_text_for_states = text.clone();
-    let evidence_for_states = Arc::clone(&ledger_evidence);
-    let latest_state_for_states = Arc::clone(&latest_state_for_ledger);
+    let goal_text_for_states = display_text.clone();
     tokio::spawn(async move {
         while state_rx.changed().await.is_ok() {
             let s = state_rx.borrow().clone();
-            if let Ok(mut latest) = latest_state_for_states.lock() {
-                *latest = Some(s.clone());
-            }
-            let evidence = evidence_for_states
-                .lock()
-                .map(|e| e.clone())
-                .unwrap_or_default();
-            let ledger = outcome_ledger_from_state_with_evidence(task_id, &s, &evidence);
             if let Ok(g) = store_for_states.lock() {
                 let _ = g.upsert_task(
                     task_id,
@@ -9184,7 +5529,7 @@ async fn spawn_goal(
                     &s.task_status,
                     s.tokens_used,
                 );
-                if let Some(ledger) = ledger {
+                if let Some(ledger) = outcome_ledger_from_state(task_id, &s) {
                     let _ = g.upsert_outcome_ledger(&ledger);
                 }
             }
@@ -9200,34 +5545,10 @@ async fn spawn_goal(
 
     // Forward events to the TUI Flight Log.
     let tx_events = tx.clone();
-    let evidence_for_events = Arc::clone(&ledger_evidence);
-    let latest_state_for_events = Arc::clone(&latest_state_for_ledger);
-    let store_for_events = store.clone();
-    let ui_context_mentions = context_mentions_for_events.clone();
     tokio::spawn(async move {
         loop {
             match event_rx_ui.recv().await {
                 Ok(rec) => {
-                    let rec = annotate_prompt_manifest_event(rec, &ui_context_mentions);
-                    let evidence = if let Ok(mut evidence) = evidence_for_events.lock() {
-                        evidence.apply_event(&rec);
-                        evidence.clone()
-                    } else {
-                        LedgerEvidence::default()
-                    };
-                    let latest_state = latest_state_for_events
-                        .lock()
-                        .ok()
-                        .and_then(|state| state.clone());
-                    if let Some(state) = latest_state {
-                        if let Some(ledger) =
-                            outcome_ledger_from_state_with_evidence(task_id, &state, &evidence)
-                        {
-                            if let Ok(g) = store_for_events.lock() {
-                                let _ = g.upsert_outcome_ledger(&ledger);
-                            }
-                        }
-                    }
                     if tx_events
                         .send(LoopEvent::FlightEvent(goal_index, rec))
                         .await
@@ -9245,12 +5566,10 @@ async fn spawn_goal(
     // Persist every event — rusqlite is sync, so hop onto spawn_blocking
     // whenever we have a record to write.
     let store_for_events = store.clone();
-    let store_context_mentions = context_mentions_for_events;
     tokio::spawn(async move {
         loop {
             match event_rx_store.recv().await {
                 Ok(rec) => {
-                    let rec = annotate_prompt_manifest_event(rec, &store_context_mentions);
                     let store = store_for_events.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Ok(g) = store.lock() {
@@ -9400,8 +5719,7 @@ fn current_timestamp_ms() -> u64 {
 mod tests {
     use super::*;
     use phonton_types::{
-        AppliesTo, ContextMentionKind, ContextMentionStatus, ExtensionSource, LLMResponse,
-        McpServerDefinition, McpTransport, TrustLevel,
+        AppliesTo, ExtensionSource, LLMResponse, McpServerDefinition, McpTransport, TrustLevel,
     };
     use ratatui::backend::TestBackend;
     use std::path::{Path, PathBuf};
@@ -9410,14 +5728,8 @@ mod tests {
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
-    fn enter() -> KeyEvent {
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-    }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
-    }
-    fn alt(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
     fn approval_prompt(id: u64) -> PendingMcpApproval {
         PendingMcpApproval {
@@ -9428,211 +5740,6 @@ mod tests {
             permissions: vec![Permission::FsReadWorkspace],
             reason: "read docs from the current workspace".into(),
         }
-    }
-
-    fn buffer_lines(buf: &ratatui::buffer::Buffer, width: usize) -> Vec<String> {
-        buf.content()
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect()
-    }
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-    }
-
-    fn review_ready_event(path: &str) -> EventRecord {
-        EventRecord {
-            task_id: TaskId::new(),
-            timestamp_ms: 1,
-            event: OrchestratorEvent::SubtaskReviewReady {
-                subtask_id: SubtaskId::new(),
-                description: "make chess".into(),
-                tier: ModelTier::Standard,
-                tokens_used: 10,
-                token_usage: TokenUsage::estimated(10),
-                cost: phonton_types::CostSummary::default(),
-                diff_hunks: vec![DiffHunk {
-                    file_path: PathBuf::from(path),
-                    old_start: 1,
-                    old_count: 1,
-                    new_start: 1,
-                    new_count: 2,
-                    lines: vec![
-                        DiffLine::Removed("print('Hello')".into()),
-                        DiffLine::Added("print('Chess')".into()),
-                        DiffLine::Context("return".into()),
-                    ],
-                }],
-                verify_result: VerifyResult::Pass {
-                    layer: VerifyLayer::Syntax,
-                },
-                provider: ProviderKind::OpenAiCompatible,
-                model_name: "fixture".into(),
-            },
-        }
-    }
-
-    fn verify_fail_event(path: &str) -> EventRecord {
-        EventRecord {
-            task_id: TaskId::new(),
-            timestamp_ms: 1,
-            event: OrchestratorEvent::VerifyFail {
-                subtask_id: SubtaskId::new(),
-                layer: VerifyLayer::Syntax,
-                errors: vec![format!(
-                    "[python syntax] {path}:398: unterminated or invalid string"
-                )],
-                attempt: 1,
-            },
-        }
-    }
-
-    fn failed_state(reason: &str) -> GlobalState {
-        GlobalState {
-            task_status: TaskStatus::Failed {
-                reason: reason.into(),
-                failed_subtask: Some(SubtaskId::new()),
-            },
-            goal_contract: None,
-            handoff_packet: None,
-            active_workers: Vec::new(),
-            tokens_used: 123,
-            tokens_budget: None,
-            estimated_naive_tokens: 1000,
-            checkpoints: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn ledger_evidence_records_prompt_context_and_mcp_permissions() {
-        let subtask_id = SubtaskId::new();
-        let mut evidence = LedgerEvidence::default();
-        evidence.apply_event(&EventRecord {
-            task_id: TaskId::new(),
-            timestamp_ms: 1,
-            event: OrchestratorEvent::ContextSelected {
-                subtask_id,
-                slices: vec![phonton_types::ContextAttribution {
-                    file_path: PathBuf::from("src/lib.rs"),
-                    symbol_name: "foo".into(),
-                    origin: phonton_types::SliceOrigin::Semantic,
-                    token_count: 42,
-                }],
-                total_token_count: 42,
-            },
-        });
-        evidence.apply_event(&EventRecord {
-            task_id: TaskId::new(),
-            timestamp_ms: 2,
-            event: OrchestratorEvent::PromptManifest {
-                subtask_id,
-                manifest: PromptContextManifest {
-                    system_tokens: 10,
-                    user_goal_tokens: 6,
-                    code_context_tokens: 42,
-                    omitted_code_tokens: 200,
-                    total_estimated_tokens: 58,
-                    ..PromptContextManifest::default()
-                },
-            },
-        });
-        evidence.apply_event(&EventRecord {
-            task_id: TaskId::new(),
-            timestamp_ms: 3,
-            event: OrchestratorEvent::McpToolApproved {
-                server_id: ExtensionId::new("docs"),
-                tool_name: "read_context".into(),
-            },
-        });
-
-        assert_eq!(evidence.context_manifest.sources.len(), 1);
-        assert_eq!(evidence.context_manifest.sources[0].id, "src/lib.rs");
-        assert_eq!(evidence.context_manifest.buckets.selected_code_tokens, 42);
-        assert_eq!(
-            evidence.context_manifest.buckets.omitted_candidate_tokens,
-            200
-        );
-        assert_eq!(evidence.permission_ledger.records.len(), 1);
-        assert_eq!(
-            evidence.permission_ledger.records[0].scope,
-            "docs.read_context"
-        );
-        assert!(evidence.permission_ledger.records[0].approved);
-    }
-
-    #[test]
-    fn outcome_ledger_can_refresh_after_evidence_arrives_after_handoff() {
-        let task_id = TaskId::new();
-        let subtask_id = SubtaskId::new();
-        let state = GlobalState {
-            task_status: TaskStatus::Reviewing {
-                tokens_used: 12,
-                estimated_savings_tokens: 88,
-            },
-            goal_contract: None,
-            handoff_packet: Some(HandoffPacket {
-                task_id,
-                goal: "record context proof".into(),
-                headline: "Review ready: 1 file(s), 1 verified subtask(s)".into(),
-                changed_files: vec![phonton_types::ChangedFileSummary {
-                    path: PathBuf::from("src/lib.rs"),
-                    added_lines: 1,
-                    removed_lines: 0,
-                    summary: "updated proof ledger".into(),
-                }],
-                generated_artifacts: Vec::new(),
-                diff_stats: phonton_types::DiffStats {
-                    files_changed: 1,
-                    added_lines: 1,
-                    removed_lines: 0,
-                },
-                verification: phonton_types::VerifyReport {
-                    passed: vec!["cargo test".into()],
-                    findings: Vec::new(),
-                    skipped: Vec::new(),
-                },
-                run_commands: Vec::new(),
-                known_gaps: Vec::new(),
-                review_actions: Vec::new(),
-                rollback_points: Vec::new(),
-                token_usage: TokenUsage::estimated(12),
-                influence: phonton_types::InfluenceSummary::default(),
-            }),
-            active_workers: Vec::new(),
-            tokens_used: 12,
-            tokens_budget: None,
-            estimated_naive_tokens: 100,
-            checkpoints: Vec::new(),
-        };
-        let mut evidence = LedgerEvidence::default();
-        let initial = outcome_ledger_from_state_with_evidence(task_id, &state, &evidence)
-            .expect("handoff state should produce a ledger");
-        assert!(initial.context_manifest.sources.is_empty());
-
-        evidence.apply_event(&EventRecord {
-            task_id,
-            timestamp_ms: 1,
-            event: OrchestratorEvent::ContextSelected {
-                subtask_id,
-                slices: vec![phonton_types::ContextAttribution {
-                    file_path: PathBuf::from("src/lib.rs"),
-                    symbol_name: "ledger_refresh".into(),
-                    origin: phonton_types::SliceOrigin::Semantic,
-                    token_count: 12,
-                }],
-                total_token_count: 12,
-            },
-        });
-        let refreshed = outcome_ledger_from_state_with_evidence(task_id, &state, &evidence)
-            .expect("handoff state should refresh a ledger");
-
-        assert_eq!(refreshed.context_manifest.sources.len(), 1);
-        assert_eq!(refreshed.context_manifest.sources[0].id, "src/lib.rs");
-        assert_eq!(refreshed.summaries.context.index_sources, 1);
     }
 
     #[derive(Clone, Default)]
@@ -9763,10 +5870,6 @@ fn extract_id(line: &str) -> Option<String> {
             model: Some("llama3.2:3b".into()),
             account_id: None,
             base_url: None,
-            catalog: None,
-            api_key_source: None,
-            allow_unverified_model: false,
-            keys: std::collections::HashMap::new(),
         };
         assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
 
@@ -9776,10 +5879,6 @@ fn extract_id(line: &str) -> Option<String> {
             model: Some("local-model".into()),
             account_id: None,
             base_url: Some("http://localhost:1234/v1".into()),
-            catalog: None,
-            api_key_source: None,
-            allow_unverified_model: false,
-            keys: std::collections::HashMap::new(),
         };
         assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
     }
@@ -9817,551 +5916,12 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn cloudflare_without_account_reports_config_failure() {
-        let cfg = make_api_provider_config(
-            "cloudflare",
-            "cf-token".into(),
-            "@cf/moonshotai/kimi-k2.6".into(),
-            None,
-            None,
-        );
-        assert!(cfg.is_none());
-        assert!(provider_config_failure_message("cloudflare").contains("Account ID"));
-    }
-
-    #[tokio::test]
-    async fn test_provider_missing_cloudflare_account_reports_account_id() {
-        let err = test_provider(
-            "cloudflare".into(),
-            "cf-token".into(),
-            "@cf/moonshotai/kimi-k2.6".into(),
-            None,
-            None,
-        )
-        .await
-        .expect_err("missing Cloudflare account should fail before network call");
-
-        assert!(err.contains("Account ID"));
-        assert!(!err.contains("unknown provider"));
-    }
-
-    #[test]
-    fn provider_config_template_replaces_model_without_losing_endpoint() {
-        let template = make_api_provider_config(
-            "cloudflare",
-            "cf-token".into(),
-            "@cf/moonshotai/kimi-k2.6".into(),
-            Some("abc123".into()),
-            None,
-        )
-        .expect("cloudflare template should build from account id");
-
-        let updated = provider_config_with_model(&template, "tier-model".into());
-        match updated {
-            ApiProviderConfig::OpenAiCompatible {
-                name,
-                api_key,
-                model,
-                base_url,
-            } => {
-                assert_eq!(name, "cloudflare");
-                assert_eq!(api_key, "cf-token");
-                assert_eq!(model, "tier-model");
-                assert_eq!(
-                    base_url,
-                    "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1"
-                );
-            }
-            other => panic!("unexpected provider config: {other:?}"),
-        }
-    }
-
-    #[test]
     fn typing_a_goal_appends_to_buffer() {
         let mut app = App::default();
         for c in "add fn foo".chars() {
             assert!(app.handle_key(key(c)).is_none());
         }
-        assert_eq!(app.goal_prompt.display_text(), "add fn foo");
-    }
-
-    #[test]
-    fn paste_event_collapses_long_prompt_content() {
-        let mut app = App::default();
-        app.handle_paste("line one\nline two");
-
-        assert_eq!(app.goal_prompt.display_text(), "[paste: 2 lines, 17 chars]");
-    }
-
-    #[test]
-    fn ctrl_v_requests_clipboard_paste() {
-        let mut app = App::default();
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
-
-        assert_eq!(intent, Some(Intent::PasteClipboard));
-    }
-
-    #[test]
-    fn pasted_api_key_redirects_to_settings_before_artifact_creation() {
-        let mut app = App::default();
-
-        app.handle_paste("sk-ant-FAKE_TEST_KEY_123456");
-
-        assert_eq!(app.mode, Mode::Settings);
-        assert_eq!(app.settings.active_field, SettingsField::ApiKey);
-        assert!(app.goal_prompt.display_text().is_empty());
-        assert!(app
-            .settings
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("API key"));
-    }
-
-    #[test]
-    fn bracketless_multiline_paste_burst_collapses_to_one_goal() {
-        let mut keys = Vec::new();
-        for ch in "# Benchmark Prompt".chars() {
-            keys.push(key(ch));
-        }
-        keys.push(enter());
-        keys.push(enter());
-        for ch in "1. Do x".chars() {
-            keys.push(key(ch));
-        }
-        keys.push(enter());
-        for ch in "2. Do y".chars() {
-            keys.push(key(ch));
-        }
-
-        let text = bracketless_paste_text(&keys).expect("burst should become paste text");
-        let mut app = App::default();
-        app.handle_paste(&text);
-
-        assert!(app.goal_prompt.display_text().starts_with("[paste:"));
-        assert!(app.goals.is_empty());
-        assert!(matches!(
-            app.handle_key(enter()),
-            Some(Intent::QueueGoal(goal)) if goal.contains("# Benchmark Prompt")
-        ));
-        assert_eq!(app.goals.len(), 1);
-    }
-
-    #[test]
-    fn short_typing_with_enter_is_not_treated_as_paste() {
-        let keys = vec![key('g'), key('o'), enter()];
-
-        assert!(bracketless_paste_text(&keys).is_none());
-    }
-
-    #[test]
-    fn control_shortcuts_are_not_treated_as_paste() {
-        let keys = vec![ctrl('v'), key('x'), enter(), key('y')];
-
-        assert!(bracketless_paste_text(&keys).is_none());
-    }
-
-    #[test]
-    fn multiline_paste_with_secret_is_blocked() {
-        let mut app = App::default();
-
-        app.handle_paste("goal context\nkey=sk-ant-FAKE_TEST_KEY_123456");
-
-        assert!(app.goal_prompt.display_text().is_empty());
-        assert!(app
-            .command_notice
-            .as_deref()
-            .unwrap_or_default()
-            .contains("blocked"));
-    }
-
-    #[test]
-    fn paste_in_settings_updates_active_field() {
-        let mut app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        app.settings.active_field = SettingsField::ApiKey;
-
-        app.handle_paste("sk-ant-FAKE_TEST_KEY_123456");
-
-        assert_eq!(app.settings.api_key, "sk-ant-FAKE_TEST_KEY_123456");
-    }
-
-    #[test]
-    fn run_command_submission_does_not_queue_goal() {
-        let mut app = App::default();
-        for ch in "/run cargo test".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, Some(Intent::RunCommand("/run cargo test".into())));
-        assert!(app.goals.is_empty());
-    }
-
-    #[test]
-    fn slash_settings_opens_settings_without_queueing_goal() {
-        let mut app = App::default();
-        for ch in "/settings".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, None);
-        assert_eq!(app.mode, Mode::Settings);
-        assert!(app.goals.is_empty());
-    }
-
-    #[test]
-    fn slash_config_alias_opens_settings() {
-        let mut app = App::default();
-        for ch in "/config".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, None);
-        assert_eq!(app.mode, Mode::Settings);
-        assert!(app.goals.is_empty());
-    }
-
-    #[test]
-    fn unknown_slash_command_is_not_queued_as_goal() {
-        let mut app = App::default();
-        for ch in "/settngs".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, None);
-        assert!(app.goals.is_empty());
-        assert!(app
-            .settings
-            .message
-            .as_deref()
-            .unwrap_or("")
-            .contains("Unknown command"));
-    }
-
-    #[test]
-    fn tab_completes_slash_command_prefix() {
-        let mut app = App::default();
-        for ch in "/sett".chars() {
-            app.handle_key(key(ch));
-        }
-
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-
-        assert_eq!(app.goal_prompt.display_text(), "/settings");
-    }
-
-    #[test]
-    fn slash_status_opens_visible_status_surface() {
-        let mut app = App::default();
-        for ch in "/status".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, None);
-        assert_eq!(app.mode, Mode::Ask);
-        assert!(app.ask_answer.as_deref().unwrap_or("").contains("Status"));
-        assert!(app.goals.is_empty());
-    }
-
-    #[test]
-    fn slash_context_opens_context_surface() {
-        let mut app = App::default();
-        app.record_prompt_manifest(phonton_types::PromptContextManifest {
-            system_tokens: 10,
-            user_goal_tokens: 5,
-            memory_tokens: 3,
-            attachment_tokens: 2,
-            code_context_tokens: 0,
-            repo_map_tokens: 0,
-            omitted_code_tokens: 0,
-            context_target_tokens: 3_500,
-            attempt: 1,
-            repair_attempt: false,
-            target_exceeded: false,
-            over_target_tokens: 0,
-            mcp_tool_tokens: 1,
-            context_mention_tokens: 2,
-            context_mentions: Vec::new(),
-            retry_error_tokens: 0,
-            total_estimated_tokens: 21,
-            budget_limit: Some(120_000),
-            compacted_tokens: 0,
-            deduped_tokens: 0,
-        });
-        for ch in "/context".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, None);
-        assert_eq!(app.mode, Mode::Ask);
-        let answer = app.ask_answer.as_deref().unwrap_or("");
-        assert!(answer.contains("Context"));
-        assert!(answer.contains("total: 21"));
-        assert!(app.goals.is_empty());
-    }
-
-    #[test]
-    fn prompt_manifest_event_carries_context_mentions_without_changing_total() {
-        let mention = ContextMention {
-            raw: "@README.md".into(),
-            label: "README.md".into(),
-            kind: ContextMentionKind::File,
-            status: ContextMentionStatus::Resolved,
-            path: Some(PathBuf::from("README.md")),
-            symbol: None,
-            server: None,
-            tool: None,
-            source_bucket: "attachment".into(),
-            estimated_tokens: Some(12),
-            note: Some("42 bytes".into()),
-        };
-        let record = EventRecord {
-            task_id: TaskId::new(),
-            timestamp_ms: 1,
-            event: OrchestratorEvent::PromptManifest {
-                subtask_id: SubtaskId::new(),
-                manifest: PromptContextManifest {
-                    attachment_tokens: 12,
-                    context_mention_tokens: 12,
-                    total_estimated_tokens: 50,
-                    ..PromptContextManifest::default()
-                },
-            },
-        };
-
-        let annotated = annotate_prompt_manifest_event(record, std::slice::from_ref(&mention));
-
-        let OrchestratorEvent::PromptManifest { manifest, .. } = annotated.event else {
-            panic!("expected prompt manifest event");
-        };
-        assert_eq!(manifest.total_estimated_tokens, 50);
-        assert_eq!(manifest.context_mention_tokens, 12);
-        assert_eq!(manifest.context_mentions, vec![mention]);
-    }
-
-    #[test]
-    fn slash_compact_requests_context_compaction() {
-        let mut app = App::default();
-        app.goals.insert(0, GoalEntry::new("make chess".into()));
-        app.goals[0].status = TaskStatus::Running {
-            active_subtasks: Vec::new(),
-            completed: 0,
-            total: 1,
-        };
-
-        for ch in "/compact".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, Some(Intent::CompactContext { goal_index: 0 }));
-        assert_eq!(app.mode, Mode::Ask);
-        assert!(app.ask_answer.as_deref().unwrap_or("").contains("Compact"));
-    }
-
-    #[test]
-    fn slash_stop_requests_selected_goal_cancel() {
-        let mut app = App::default();
-        app.goals.insert(0, GoalEntry::new("make chess".into()));
-        app.goals[0].status = TaskStatus::Running {
-            active_subtasks: Vec::new(),
-            completed: 0,
-            total: 1,
-        };
-
-        for ch in "/stop".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, Some(Intent::StopGoal { goal_index: 0 }));
-        assert!(!matches!(app.goals[0].status, TaskStatus::Queued));
-    }
-
-    #[test]
-    fn slash_permissions_set_updates_mode_and_requests_save() {
-        let mut app = App::default();
-        for ch in "/permissions set read-only".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, Some(Intent::SaveSettings));
-        assert_eq!(
-            app.settings.permission_mode,
-            phonton_types::PermissionMode::ReadOnly
-        );
-        assert!(app
-            .ask_answer
-            .as_deref()
-            .unwrap_or("")
-            .contains("mode: read-only"));
-    }
-
-    #[test]
-    fn slash_model_set_updates_model_and_requests_save() {
-        let mut app = App::default();
-        for ch in "/model set gpt-5-mini".chars() {
-            app.handle_key(key(ch));
-        }
-
-        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(intent, Some(Intent::SaveSettings));
-        assert_eq!(app.settings.model, "gpt-5-mini");
-        assert_eq!(app.mode, Mode::Settings);
-    }
-
-    #[test]
-    fn slash_command_drawer_renders_suggestions() {
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::default();
-        for ch in "/sett".chars() {
-            app.handle_key(key(ch));
-        }
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("/settings"));
-        assert!(dump.contains("provider"));
-    }
-
-    #[test]
-    fn workspace_preflight_adds_npm_verification_and_run_plan() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("package.json"),
-            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"}}"#,
-        )
-        .unwrap();
-        let mut plan = single_task_plan("make chess".into(), Vec::new());
-
-        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
-
-        let contract = plan.goal_contract.unwrap();
-        assert!(contract.verify_plan.iter().any(|step| {
-            step.command
-                .as_ref()
-                .map(|cmd| cmd.command == vec!["npm".to_string(), "run".into(), "build".into()])
-                .unwrap_or(false)
-        }));
-        assert!(contract.verify_plan.iter().any(|step| {
-            step.command
-                .as_ref()
-                .map(|cmd| cmd.command == vec!["npm".to_string(), "test".into()])
-                .unwrap_or(false)
-        }));
-        assert!(contract
-            .run_plan
-            .iter()
-            .any(|cmd| cmd.command == vec!["npm".to_string(), "run".into(), "dev".into()]));
-    }
-
-    #[test]
-    fn workspace_preflight_defaults_stackless_chess_without_clarifying() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut plan = single_task_plan("make chess".into(), Vec::new());
-
-        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
-
-        let contract = plan.goal_contract.unwrap();
-        assert!(contract.clarification_questions.is_empty());
-        assert!(contract
-            .assumptions
-            .iter()
-            .any(|assumption| assumption.contains("defaulting to a self-contained Python")));
-        assert!(contract
-            .likely_files
-            .iter()
-            .any(|path| path == &std::path::PathBuf::from("chess.py")));
-    }
-
-    #[test]
-    fn stackless_chess_preflight_remains_dispatchable_in_goal_mode() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut plan = single_task_plan("make chess".into(), Vec::new());
-
-        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
-
-        let contract = plan.goal_contract.unwrap();
-        assert!(contract.clarification_questions.is_empty());
-        assert!(!contract.run_plan.is_empty());
-        assert!(contract
-            .verify_plan
-            .iter()
-            .any(|step| step.command.is_some()));
-    }
-
-    #[test]
-    fn npm_chess_preflight_is_dispatchable_after_run_and_verify_plan() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("package.json"),
-            r#"{"scripts":{"build":"vite build","test":"vitest","dev":"vite"}}"#,
-        )
-        .unwrap();
-        let mut plan = single_task_plan("make chess".into(), Vec::new());
-
-        apply_workspace_preflight(&mut plan, temp.path(), "make chess");
-
-        let contract = plan.goal_contract.unwrap();
-        assert!(contract.clarification_questions.is_empty());
-        assert!(!contract.run_plan.is_empty());
-        assert!(contract
-            .verify_plan
-            .iter()
-            .any(|step| step.command.is_some()));
-    }
-
-    #[test]
-    fn prompt_history_restores_last_submission_when_input_empty() {
-        let mut app = App::default();
-        for ch in "make chess".chars() {
-            app.handle_key(key(ch));
-        }
-        let _ = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-
-        assert_eq!(app.goal_prompt.display_text(), "make chess");
-    }
-
-    #[test]
-    fn session_snapshot_carries_bounded_prompt_history() {
-        let app = App {
-            prompt_history: vec![
-                "make chess".into(),
-                "make chess".into(),
-                "fix validation".into(),
-            ],
-            ..App::default()
-        };
-
-        let snapshot = app.to_session_snapshot("C:\\workspace".into(), 123);
-
-        assert_eq!(
-            snapshot.prompt_history,
-            vec!["make chess".to_string(), "fix validation".to_string()]
-        );
+        assert_eq!(app.goal_prompt.text(), "add fn foo");
     }
 
     #[test]
@@ -10371,9 +5931,12 @@ fn extract_id(line: &str) -> Option<String> {
             app.handle_key(key(c));
         }
         let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(intent, Some(Intent::QueueGoal("hello".into())));
+        let Some(Intent::QueueGoal(prompt)) = intent else {
+            panic!("expected queued prompt, got {intent:?}");
+        };
+        assert_eq!(prompt.description, "hello");
         assert_eq!(app.goals.len(), 1);
-        assert_eq!(app.goal_prompt.display_text(), "");
+        assert_eq!(app.goal_prompt.text(), "");
     }
 
     #[test]
@@ -10386,10 +5949,10 @@ fn extract_id(line: &str) -> Option<String> {
             app.handle_key(key(c));
         }
         let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            intent,
-            Some(Intent::QueueTask("write one focused test".into()))
-        );
+        let Some(Intent::QueueTask(prompt)) = intent else {
+            panic!("expected queued task prompt, got {intent:?}");
+        };
+        assert_eq!(prompt.description, "write one focused test");
         assert_eq!(app.goals.len(), 1);
     }
 
@@ -10399,6 +5962,45 @@ fn extract_id(line: &str) -> Option<String> {
         let r = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(r.is_none());
         assert_eq!(app.goals.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_v_requests_clipboard_paste() {
+        let mut app = App::default();
+        let intent = app.handle_key(ctrl('v'));
+        assert_eq!(intent, Some(Intent::PasteClipboard));
+    }
+
+    #[test]
+    fn multiline_paste_creates_artifact_without_queueing() {
+        let mut app = App::default();
+        let intent = app.handle_paste("do x\ndo y\ndo z".into());
+
+        assert!(intent.is_none());
+        assert_eq!(app.goal_prompt.text(), "");
+        assert_eq!(app.goal_prompt.artifacts().len(), 1);
+        assert_eq!(
+            app.goal_prompt.artifacts()[0].label,
+            "[paste: 3 lines, 14 chars]"
+        );
+        assert_eq!(app.goals.len(), 0);
+    }
+
+    #[test]
+    fn enter_after_multiline_paste_queues_one_goal() {
+        let mut app = App::default();
+        assert!(app.handle_paste("do x\ndo y\ndo z".into()).is_none());
+
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let Some(Intent::QueueGoal(prompt)) = intent else {
+            panic!("expected one queued prompt, got {intent:?}");
+        };
+        assert_eq!(prompt.description, "do x\ndo y\ndo z");
+        assert_eq!(prompt.display_text, "paste: do x");
+        assert_eq!(prompt.prompt_artifacts.len(), 1);
+        assert_eq!(app.goals.len(), 1);
+        assert_eq!(app.goals[0].description, "paste: do x");
     }
 
     #[test]
@@ -10560,6 +6162,7 @@ fn extract_id(line: &str) -> Option<String> {
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let provider = McpE2eProvider::default();
@@ -10624,207 +6227,6 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn slash_ask_question_emits_ask_intent_without_queueing_goal() {
-        let mut app = App::default();
-        for c in "/ask why tokens?".chars() {
-            app.handle_key(key(c));
-        }
-
-        let intent = app.handle_key(enter());
-
-        assert_eq!(intent, Some(Intent::Ask("why tokens?".into())));
-        assert_eq!(app.mode, Mode::Ask);
-        assert!(app.ask_pending);
-        assert!(app.goals.is_empty());
-    }
-
-    #[test]
-    fn parse_ask_cli_request_accepts_no_workspace_and_json() {
-        let request = parse_ask_cli_request(&[
-            "--no-workspace".into(),
-            "--json".into(),
-            "what".into(),
-            "is".into(),
-            "this?".into(),
-        ])
-        .unwrap();
-
-        assert!(request.no_workspace);
-        assert!(request.json);
-        assert_eq!(request.question, "what is this?");
-    }
-
-    #[test]
-    fn parse_goal_cli_request_accepts_prompt_file_and_headless_flags() {
-        let request = parse_goal_cli_request(&[
-            "--json".into(),
-            "--yes".into(),
-            "--permission-mode".into(),
-            "full-access".into(),
-            "--timeout-seconds".into(),
-            "900".into(),
-            "--prompt-file".into(),
-            "prompt.md".into(),
-        ])
-        .unwrap();
-
-        assert!(request.json);
-        assert!(request.yes);
-        assert_eq!(request.permission_mode, Some(PermissionMode::FullAccess));
-        assert_eq!(request.timeout, Some(Duration::from_secs(900)));
-        assert_eq!(request.prompt_file, Some(PathBuf::from("prompt.md")));
-        assert!(!request.stdin);
-        assert!(request.goal_parts.is_empty());
-    }
-
-    #[test]
-    fn parse_goal_cli_request_rejects_multiple_prompt_sources() {
-        let err =
-            parse_goal_cli_request(&["--stdin".into(), "--prompt-file".into(), "prompt.md".into()])
-                .unwrap_err()
-                .to_string();
-
-        assert!(err.contains("only one prompt source"));
-    }
-
-    #[test]
-    fn headless_baseline_commands_detect_test_first_workspace() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("package.json"), "{}").unwrap();
-
-        let commands =
-            headless_baseline_commands("Run tests first, then fix `src/receipt.js`.", temp.path());
-
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].label, "baseline npm test");
-        assert_eq!(
-            commands[0].command,
-            vec!["npm".to_string(), "test".to_string()]
-        );
-    }
-
-    #[test]
-    fn headless_baseline_uses_windows_command_shims_for_node_tools() {
-        if cfg!(windows) {
-            assert_eq!(headless_spawn_program("npm"), "npm.cmd");
-            assert_eq!(headless_spawn_program("pnpm"), "pnpm.cmd");
-            assert_eq!(headless_spawn_program("yarn"), "yarn.cmd");
-        } else {
-            assert_eq!(headless_spawn_program("npm"), "npm");
-        }
-    }
-
-    #[test]
-    fn headless_baseline_evidence_is_bounded_for_repair_context() {
-        let summary = CommandRunSummary {
-            command: "npm test".into(),
-            exit_code: Some(1),
-            stdout_preview: "x".repeat(900),
-            stderr_preview: "Assertion failed in src/receipt.test.js".into(),
-            duration_ms: Some(1250),
-        };
-
-        let evidence = render_headless_baseline_evidence(&[summary]).unwrap();
-
-        assert!(evidence.contains("Headless baseline test evidence"));
-        assert!(evidence.contains("npm test"));
-        assert!(evidence.contains("exit 1"));
-        assert!(evidence.contains("src/receipt.test.js"));
-        assert!(evidence.chars().count() < 1200);
-        assert!(!evidence.contains(&"x".repeat(400)));
-    }
-
-    #[test]
-    fn headless_baseline_worker_context_preserves_goal_contract_goal() {
-        let mut plan = single_task_plan("fix config loader".into(), Vec::new());
-
-        append_headless_worker_context(&mut plan, "Headless baseline test evidence");
-
-        assert_eq!(
-            plan.goal_contract.as_ref().unwrap().goal,
-            "fix config loader"
-        );
-        assert!(plan.subtasks[0].attachments.iter().any(|attachment| {
-            attachment.path == Path::new(".phonton/headless-baseline.txt")
-                && attachment
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| text.contains("Headless baseline test evidence"))
-        }));
-    }
-
-    #[test]
-    fn ask_answer_scrolls_when_prompt_is_empty() {
-        let mut app = App {
-            mode: Mode::Ask,
-            ask_answer: Some(
-                (0..40)
-                    .map(|n| format!("line {n}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            ..App::default()
-        };
-
-        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert_eq!(app.ask_scroll, 12);
-        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.ask_scroll, 0);
-    }
-
-    #[test]
-    fn ask_context_summary_renders_in_ask_panel() {
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let app = App {
-            mode: Mode::Ask,
-            ask_context_summary: Some("ctx: workspace 3 files, ~900 tok".into()),
-            ask_answer: Some("Use README.md for the overview.".into()),
-            ..App::default()
-        };
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-
-        assert!(dump.contains("ctx: workspace 3 files"));
-        assert!(dump.contains("README.md"));
-    }
-
-    #[test]
-    fn ask_rich_text_renderer_keeps_markdown_shape() {
-        let lines = render_rich_text_lines("# Head\n- item\n```rust\nfn main() {}\n```");
-
-        assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0].spans[0].content, "# Head");
-        assert_eq!(lines[1].spans[0].content, "- item");
-        assert_eq!(lines[3].spans[0].content, "fn main() {}");
-    }
-
-    #[test]
-    fn ask_rich_text_renderer_applies_inline_markdown_formatting() {
-        let lines = render_rich_text_lines("Use **bold** and `code` plus *italics*.");
-
-        assert_eq!(line_text(&lines[0]), "Use bold and code plus italics.");
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|span| span.content == "bold"
-                    && span.style.add_modifier.contains(Modifier::BOLD))
-        );
-        assert!(lines[0]
-            .spans
-            .iter()
-            .any(|span| span.content == "code" && span.style.fg == Some(ACCENT_HI)));
-        assert!(lines[0]
-            .spans
-            .iter()
-            .any(|span| span.content == "italics"
-                && span.style.add_modifier.contains(Modifier::ITALIC)));
-    }
-
-    #[test]
     fn esc_from_ask_returns_to_goal_without_quitting() {
         let mut app = App::default();
         app.handle_key(ctrl(';'));
@@ -10835,59 +6237,11 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn esc_from_goal_opens_quit_confirmation() {
+    fn esc_from_goal_quits() {
         let mut app = App::default();
         let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(r, None);
-        assert!(!app.should_quit);
-        assert!(app.quit_confirmation_open);
-    }
-
-    #[test]
-    fn ctrl_c_opens_quit_confirmation_without_quitting() {
-        let mut app = App::default();
-        let r = app.handle_key(ctrl('c'));
-        assert_eq!(r, None);
-        assert!(!app.should_quit);
-        assert!(app.quit_confirmation_open);
-    }
-
-    #[test]
-    fn quit_confirmation_enter_emits_quit() {
-        let mut app = App::default();
-        app.handle_key(ctrl('c'));
-        let r = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(r, Some(Intent::Quit));
         assert!(app.should_quit);
-        assert!(!app.quit_confirmation_open);
-    }
-
-    #[test]
-    fn quit_confirmation_esc_cancels() {
-        let mut app = App::default();
-        app.handle_key(ctrl('c'));
-        let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(r, None);
-        assert!(!app.should_quit);
-        assert!(!app.quit_confirmation_open);
-    }
-
-    #[test]
-    fn resume_flag_parses_to_tui_launch() {
-        let args = vec!["-r".to_string()];
-        assert_eq!(
-            launch_options_from_args(&args),
-            Some(LaunchOptions {
-                resume_last_session: true
-            })
-        );
-        let args = vec!["--resume".to_string()];
-        assert_eq!(
-            launch_options_from_args(&args),
-            Some(LaunchOptions {
-                resume_last_session: true
-            })
-        );
     }
 
     #[test]
@@ -10904,513 +6258,6 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.selected, 2); // clamp
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.selected, 1);
-    }
-
-    #[test]
-    fn alt_goal_shortcuts_switch_even_with_prompt_text() {
-        let mut app = App::default();
-        app.goals
-            .extend(["a", "b", "c"].iter().map(|s| GoalEntry::new((*s).into())));
-        app.selected = 1;
-        app.goal_prompt.set_text("draft goal");
-
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
-        assert_eq!(app.selected, 2);
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
-        assert_eq!(app.selected, 1);
-        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
-        assert_eq!(app.selected, 0);
-        assert_eq!(app.goal_prompt.display_text(), "draft goal");
-    }
-
-    #[test]
-    fn goal_switcher_selects_filtered_goal() {
-        let mut app = App::default();
-        app.goals.extend(
-            ["make chess", "write docs"]
-                .iter()
-                .map(|s| GoalEntry::new((*s).into())),
-        );
-
-        for ch in "/goals".chars() {
-            app.handle_key(key(ch));
-        }
-        assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            None
-        );
-        assert!(app.goal_switcher.open);
-
-        for ch in "docs".chars() {
-            app.handle_key(key(ch));
-        }
-        assert_eq!(app.goal_switcher.filtered_indices(&app.goals), vec![1]);
-        assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            None
-        );
-        assert_eq!(app.selected, 1);
-        assert!(!app.goal_switcher.open);
-    }
-
-    #[test]
-    fn review_hunks_default_to_receipt_and_can_cycle_focus() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-
-        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Receipt);
-        app.handle_key(alt('f'));
-        assert_eq!(app.focus_view, FocusView::Problems);
-    }
-
-    #[test]
-    fn slash_plan_preview_requires_approval_before_execution() {
-        let mut app = App::default();
-        let intent = app.apply_slash_action(SlashAction::PreviewPlan("make chess".into()));
-        let Intent::PreviewPlan {
-            goal_index,
-            task_id,
-            text,
-        } = intent.expect("preview intent")
-        else {
-            panic!("expected preview intent");
-        };
-        assert_eq!(goal_index, 0);
-        assert_eq!(text, "make chess");
-        assert_eq!(app.goals[0].task_id, task_id);
-        assert!(app.goals[0].plan_preview);
-        assert_eq!(app.focus_view, FocusView::Plan);
-
-        app.apply_state(
-            0,
-            GlobalState {
-                task_status: TaskStatus::NeedsClarification {
-                    questions: vec!["Plan preview only. Run /approve.".into()],
-                },
-                goal_contract: Some(Goal::new("make chess").contract()),
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 0,
-                tokens_budget: None,
-                estimated_naive_tokens: 0,
-                checkpoints: Vec::new(),
-            },
-        );
-        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Plan);
-        assert!(app.focus_text().contains("goal: make chess"));
-        assert!(app.focus_text().contains("Verify"));
-
-        let approve = app
-            .apply_slash_action(SlashAction::ApprovePlan)
-            .expect("approve intent");
-        let Intent::ApprovePlan {
-            goal_index,
-            task_id,
-            text,
-        } = approve
-        else {
-            panic!("expected approve intent");
-        };
-        assert_eq!(goal_index, 0);
-        assert_eq!(task_id, app.goals[0].task_id);
-        assert_eq!(text, "make chess");
-        assert!(!app.goals[0].plan_preview);
-        assert_eq!(app.goals[0].status, TaskStatus::Queued);
-    }
-
-    #[test]
-    fn failed_goal_defaults_to_problems_focus() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(
-            0,
-            EventRecord {
-                task_id: TaskId::new(),
-                timestamp_ms: 1,
-                event: OrchestratorEvent::Thinking {
-                    subtask_id: SubtaskId::new(),
-                    model_name: "kimi-k2.6".into(),
-                },
-            },
-        );
-        app.apply_event(0, verify_fail_event("chess.py"));
-        app.apply_state(0, failed_state("syntax verification failed"));
-
-        assert_eq!(
-            app.active_focus_view_for_current_goal(),
-            FocusView::Problems
-        );
-        assert!(app.focus_text().contains("[python syntax] chess.py"));
-        assert!(app.focus_text().contains("Kimi was used"));
-    }
-
-    #[test]
-    fn problems_focus_prioritizes_changed_excerpt_for_diagnostic_file() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(
-            0,
-            EventRecord {
-                task_id: TaskId::new(),
-                timestamp_ms: 1,
-                event: OrchestratorEvent::SubtaskReviewReady {
-                    subtask_id: SubtaskId::new(),
-                    description: "generated chess slice".into(),
-                    tier: ModelTier::Standard,
-                    tokens_used: 10,
-                    token_usage: TokenUsage::estimated(10),
-                    cost: phonton_types::CostSummary::default(),
-                    diff_hunks: vec![
-                        DiffHunk {
-                            file_path: PathBuf::from("src/chessRules.ts"),
-                            old_start: 0,
-                            old_count: 0,
-                            new_start: 1,
-                            new_count: 1,
-                            lines: vec![DiffLine::Added("export const rules = true".into())],
-                        },
-                        DiffHunk {
-                            file_path: PathBuf::from("src/App.tsx"),
-                            old_start: 0,
-                            old_count: 0,
-                            new_start: 1,
-                            new_count: 1,
-                            lines: vec![DiffLine::Added("```tsx".into())],
-                        },
-                    ],
-                    verify_result: VerifyResult::Fail {
-                        layer: VerifyLayer::Syntax,
-                        errors: vec!["[typescript syntax] src/App.tsx:1:1 invalid syntax".into()],
-                        attempt: 1,
-                    },
-                    provider: ProviderKind::OpenAiCompatible,
-                    model_name: "fixture".into(),
-                },
-            },
-        );
-        app.apply_event(
-            0,
-            EventRecord {
-                task_id: TaskId::new(),
-                timestamp_ms: 2,
-                event: OrchestratorEvent::VerifyFail {
-                    subtask_id: SubtaskId::new(),
-                    layer: VerifyLayer::Syntax,
-                    errors: vec!["[typescript syntax] src/App.tsx:1:1 invalid syntax".into()],
-                    attempt: 1,
-                },
-            },
-        );
-        app.apply_state(0, failed_state("syntax verification failed"));
-
-        let text = app.focus_text();
-
-        assert!(text.contains("file: src/App.tsx"), "{text}");
-        assert!(!text.contains("file: src/chessRules.ts"), "{text}");
-        assert!(text.contains("+```tsx"), "{text}");
-    }
-
-    #[test]
-    fn problems_shortcuts_open_and_retry_failed_goal() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, verify_fail_event("chess.py"));
-        app.apply_state(0, failed_state("syntax verification failed"));
-        app.focus_view = FocusView::Receipt;
-
-        assert_eq!(app.handle_key(alt('p')), None);
-        assert_eq!(app.focus_view, FocusView::Problems);
-
-        match app.handle_key(alt('r')) {
-            Some(Intent::QueueGoal(prompt)) => {
-                assert!(prompt.contains("Repair the previous failed Phonton goal"));
-                assert!(prompt.contains("[python syntax] chess.py"));
-            }
-            other => panic!("expected retry repair goal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn diff_shortcut_opens_code_focus_without_typing() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.focus_view = FocusView::Receipt;
-
-        assert_eq!(app.handle_key(alt('d')), None);
-        assert_eq!(app.focus_view, FocusView::Code);
-        assert!(app.goal_prompt.is_empty());
-        assert!(app.focus_text().contains("+print('Chess')"));
-    }
-
-    #[test]
-    fn bare_focus_shortcut_letters_type_into_empty_prompt() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-
-        for ch in "fdpr".chars() {
-            app.handle_key(key(ch));
-        }
-
-        assert_eq!(app.goal_prompt.display_text(), "fdpr");
-        assert_eq!(app.focus_view, FocusView::Receipt);
-    }
-
-    #[test]
-    fn prompt_bar_renders_static_caret_rectangle() {
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::default();
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let lines = buffer_lines(&buf, 80);
-        let input_y = lines
-            .iter()
-            .position(|line| line.contains("GOAL"))
-            .expect("input row should include the mode badge");
-        let prompt_marker_x = (0..80)
-            .find(|x| buf.content()[input_y * 80 + *x].symbol() == "›")
-            .expect("input row should include the prompt marker");
-        let prompt_x = prompt_marker_x + 2;
-        let caret = &buf.content()[input_y * 80 + prompt_x];
-
-        assert_eq!(caret.bg, ACCENT);
-    }
-
-    #[test]
-    fn code_focus_text_preserves_diff_markers() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.focus_view = FocusView::Code;
-
-        let text = app.focus_text();
-
-        assert!(text.contains("Code"));
-        assert!(text.contains("files 1"));
-        assert!(text.contains("+1 -1"));
-        assert!(text.contains("chess.py"));
-        assert!(text.contains("+print('Chess')"));
-        assert!(text.contains("-print('Hello')"));
-    }
-
-    #[test]
-    fn focus_tabs_do_not_wrap_diff_hint_at_compact_width() {
-        let backend = TestBackend::new(88, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.focus_view = FocusView::Receipt;
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let lines = buffer_lines(&buf, 88);
-
-        assert!(
-            !lines.iter().any(|line| line.trim() == "diff"),
-            "focus shortcut hint should not wrap to an orphaned line: {lines:#?}"
-        );
-    }
-
-    #[test]
-    fn receipt_focus_tabs_fit_common_right_pane_width() {
-        let mut lines = Vec::new();
-        append_focus_tabs(&mut lines, FocusView::Receipt);
-        let text = line_text(&lines[1]);
-
-        assert!(
-            text.chars().count() <= 96,
-            "receipt focus tabs should fit without wrapping the d diff hint: {text}"
-        );
-    }
-
-    #[test]
-    fn page_keys_scroll_active_code_focus_when_prompt_empty() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.focus_view = FocusView::Code;
-
-        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-        assert!(app.focus_scroll > 0);
-
-        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(app.focus_scroll, 0);
-    }
-
-    #[test]
-    fn mouse_wheel_scrolls_active_focus_surface() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.focus_view = FocusView::Code;
-
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 10,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert!(app.focus_scroll > 0);
-
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 10,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.focus_scroll, 0);
-    }
-
-    #[test]
-    fn flight_log_pageup_from_tail_shows_older_events() {
-        let backend = TestBackend::new(120, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let task_id = TaskId::new();
-        let mut goal = GoalEntry::new("inspect log".into());
-        for n in 0..30 {
-            goal.flight_log.push(EventRecord {
-                task_id,
-                timestamp_ms: n * 1000,
-                event: OrchestratorEvent::TaskStarted {
-                    task_id,
-                    goal: format!("log-entry-{n:02}"),
-                    subtask_count: 1,
-                },
-            });
-        }
-        let mut app = App {
-            flight_log_open: true,
-            ..App::default()
-        };
-        app.goals.push(goal);
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let tail_dump: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(tail_dump.contains("log-entry-29"));
-        assert!(!tail_dump.contains("log-entry-05"));
-
-        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let scrolled_dump: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-
-        assert!(
-            scrolled_dump.contains("log-entry-05"),
-            "PageUp from tail mode should move to older Flight Log events"
-        );
-    }
-
-    #[test]
-    fn artifact_chip_style_is_colorful_and_stable() {
-        let paste = artifact_chip_color("[paste: 30 lines, 1.5k chars]");
-        let image = artifact_chip_color("[image: board.png]");
-
-        assert_eq!(paste, artifact_chip_color("[paste: 30 lines, 1.5k chars]"));
-        assert_ne!(paste, Color::White);
-        assert_ne!(image, Color::White);
-    }
-
-    #[test]
-    fn copy_and_rerun_build_expected_intents() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.push_command_run(CommandRunSummary {
-            command: "python chess.py".into(),
-            exit_code: Some(0),
-            stdout_preview: "ok".into(),
-            stderr_preview: String::new(),
-            duration_ms: Some(42),
-        });
-        app.focus_view = FocusView::Code;
-
-        for ch in "/copy".chars() {
-            app.handle_key(key(ch));
-        }
-        match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
-            Some(Intent::CopyFocus(text)) => assert!(text.contains("chess.py")),
-            other => panic!("expected copy intent, got {other:?}"),
-        }
-
-        for ch in "/rerun".chars() {
-            app.handle_key(key(ch));
-        }
-        assert_eq!(
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(Intent::RunCommand("/run python chess.py".into()))
-        );
-    }
-
-    #[test]
-    fn command_completion_does_not_move_code_focus() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.focus_view = FocusView::Code;
-
-        app.push_command_run(CommandRunSummary {
-            command: "python chess.py".into(),
-            exit_code: Some(0),
-            stdout_preview: "ok".into(),
-            stderr_preview: String::new(),
-            duration_ms: Some(42),
-        });
-
-        assert_eq!(app.active_focus_view_for_current_goal(), FocusView::Code);
-    }
-
-    #[test]
-    fn focus_text_payloads_cover_plan_receipt_context_tokens_code_commands_and_log() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_event(0, review_ready_event("chess.py"));
-        app.push_command_run(CommandRunSummary {
-            command: "python chess.py".into(),
-            exit_code: Some(0),
-            stdout_preview: "ok".into(),
-            stderr_preview: String::new(),
-            duration_ms: Some(42),
-        });
-
-        app.focus_view = FocusView::Plan;
-        assert!(app.focus_text().contains("Plan"));
-
-        app.focus_view = FocusView::Receipt;
-        assert!(app.focus_text().contains("Receipt"));
-
-        app.focus_view = FocusView::Problems;
-        assert!(app.focus_text().contains("Problems"));
-
-        app.focus_view = FocusView::Code;
-        assert!(app.focus_text().contains("chess.py"));
-
-        app.focus_view = FocusView::Commands;
-        assert!(app.focus_text().contains("python chess.py"));
-
-        app.focus_view = FocusView::Context;
-        assert!(app.focus_text().contains("Context"));
-
-        app.focus_view = FocusView::Tokens;
-        assert!(app.focus_text().contains("Tokens"));
-
-        app.focus_view = FocusView::Log;
-        assert!(app.focus_text().contains("review-ready"));
     }
 
     #[test]
@@ -11438,166 +6285,6 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn app_session_snapshot_restores_goals_and_inputs() {
-        let mut app = App::default();
-        let task_id = TaskId::new();
-        let snapshot = phonton_types::SessionSnapshot {
-            workspace: "C:\\workspace".into(),
-            saved_at: 123,
-            selected_goal: 0,
-            goal_input: "draft follow-up".into(),
-            ask_input: "summarize state".into(),
-            ask_answer: Some("resume support is pending".into()),
-            prompt_history: vec!["ship session resume".into()],
-            best_savings_pct: Some(80),
-            goals: vec![phonton_types::SessionGoalSnapshot {
-                description: "ship session resume".into(),
-                status: TaskStatus::Queued,
-                state: None,
-                task_id,
-                flight_log: Vec::new(),
-            }],
-            totals: phonton_types::SessionTotals::default(),
-        };
-
-        app.restore_session_snapshot(snapshot);
-
-        assert_eq!(app.goals.len(), 1);
-        assert_eq!(app.goals[0].description, "ship session resume");
-        assert_eq!(app.goals[0].task_id, task_id);
-        assert_eq!(app.goal_prompt.display_text(), "draft follow-up");
-        assert_eq!(app.ask_prompt.display_text(), "summarize state");
-        assert_eq!(app.ask_answer.as_deref(), Some("resume support is pending"));
-        assert_eq!(app.prompt_history, vec!["ship session resume"]);
-        assert_eq!(app.best_savings_pct, Some(80));
-    }
-
-    #[test]
-    fn settings_sync_persists_cloudflare_account_id() {
-        let mut cfg = config::Config::default();
-        let mut settings = SettingsState::new(&cfg);
-        settings.provider = "cloudflare".into();
-        settings.model = "@cf/moonshotai/kimi-k2.6".into();
-        settings.api_key = "cf-token".into();
-        settings.account_id = "account-123".into();
-        settings.base_url.clear();
-        settings.max_tokens = "12345".into();
-        settings.max_usd_cents = "99".into();
-
-        apply_settings_to_config(&settings, &mut cfg);
-
-        assert_eq!(cfg.provider.name, "cloudflare");
-        assert_eq!(
-            cfg.provider.model.as_deref(),
-            Some("@cf/moonshotai/kimi-k2.6")
-        );
-        assert_eq!(cfg.provider.api_key.as_deref(), Some("cf-token"));
-        assert_eq!(cfg.provider.account_id.as_deref(), Some("account-123"));
-        assert_eq!(cfg.provider.base_url, None);
-        assert_eq!(cfg.budget.max_tokens, Some(12345));
-        assert_eq!(cfg.budget.max_usd_cents, Some(99));
-    }
-
-    #[test]
-    fn worker_label_hides_memory_preamble() {
-        let description =
-            "# Prior context from memory\n- Honour previous decisions\n\nImplement chess board";
-        assert_eq!(
-            worker_display_description(description),
-            "Implement chess board"
-        );
-        assert_eq!(
-            worker_display_description("Write integration tests\nwith details"),
-            "Write integration tests"
-        );
-    }
-
-    #[test]
-    fn session_totals_sum_tokens_and_estimated_savings() {
-        let mut app = App::default();
-        app.goals.push(GoalEntry {
-            description: "done".into(),
-            status: TaskStatus::Done {
-                tokens_used: 250,
-                wall_time_ms: 1,
-            },
-            state: Some(GlobalState {
-                task_status: TaskStatus::Done {
-                    tokens_used: 250,
-                    wall_time_ms: 1,
-                },
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 250,
-                tokens_budget: None,
-                estimated_naive_tokens: 1_000,
-                checkpoints: Vec::new(),
-            }),
-            task_id: TaskId::new(),
-            flight_log: Vec::new(),
-            plan_preview: false,
-            context_mentions: Vec::new(),
-            checkpoint_cursor: None,
-        });
-        app.goals.push(GoalEntry {
-            description: "failed".into(),
-            status: TaskStatus::Failed {
-                reason: "verify failed".into(),
-                failed_subtask: None,
-            },
-            state: Some(GlobalState {
-                task_status: TaskStatus::Failed {
-                    reason: "verify failed".into(),
-                    failed_subtask: None,
-                },
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 100,
-                tokens_budget: None,
-                estimated_naive_tokens: 300,
-                checkpoints: Vec::new(),
-            }),
-            task_id: TaskId::new(),
-            flight_log: Vec::new(),
-            plan_preview: false,
-            context_mentions: Vec::new(),
-            checkpoint_cursor: None,
-        });
-        app.best_savings_pct = Some(75);
-
-        let totals = app.session_totals();
-
-        assert_eq!(totals.goals, 2);
-        assert_eq!(totals.completed, 1);
-        assert_eq!(totals.failed, 1);
-        assert_eq!(totals.tokens_used, 350);
-        assert_eq!(totals.naive_baseline_tokens, 1_300);
-        assert_eq!(totals.estimated_tokens_saved, 950);
-        assert_eq!(totals.best_savings_pct, Some(75));
-    }
-
-    #[test]
-    fn exit_receipt_includes_estimated_token_savings() {
-        let receipt = render_exit_receipt(&phonton_types::SessionTotals {
-            goals: 2,
-            completed: 1,
-            failed: 0,
-            reviewing: 1,
-            tokens_used: 350,
-            naive_baseline_tokens: 1_300,
-            estimated_tokens_saved: 950,
-            best_savings_pct: Some(75),
-        });
-
-        assert!(receipt.contains("Session saved"));
-        assert!(receipt.contains("tokens used: 350"));
-        assert!(receipt.contains("estimated saved vs naive: 950"));
-        assert!(receipt.contains("best savings: 75%"));
-    }
-
-    #[test]
     fn renders_without_panicking_on_empty_state() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -11609,86 +6296,23 @@ fn extract_id(line: &str) -> Option<String> {
     fn splash_logo_is_compact_and_shadowed() {
         let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
+        assert!(max_width < 64, "logo should stay compact for the splash");
         assert!(
-            LOGO[0].contains("██████╗"),
-            "logo should use the standard ANSI Shadow wordmark"
-        );
-        assert!(
-            LOGO.last().unwrap_or(&"").contains("░▒▓"),
-            "logo should keep the soft glow strip"
+            LOGO.iter().any(|row| row.contains('░')),
+            "logo should carry its own pixel shadow layer"
         );
     }
 
     #[test]
-    fn renders_shadow_logo_on_wide_splash() {
+    fn renders_new_logo_on_wide_splash() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::default();
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("██████"));
-        assert!(dump.contains("╚═════╝"));
-        assert!(dump.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
-    }
-
-    #[test]
-    fn wide_splash_logo_is_stable_across_ticks() {
-        let backend = TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::default();
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let first = format!("{:?}", terminal.backend().buffer());
-
-        app.spinner_frame = 64;
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let second = format!("{:?}", terminal.backend().buffer());
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn renders_version_on_compact_header() {
-        let backend = TestBackend::new(64, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::default();
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("agentic dev environment"));
-        assert!(dump.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
-    }
-
-    #[test]
-    fn compact_header_animates_after_goal_exists() {
-        let backend = TestBackend::new(64, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let first = format!("{:?}", terminal.backend().buffer());
-
-        app.spinner_frame = 64;
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let second = format!("{:?}", terminal.backend().buffer());
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn tui_render_keeps_native_cursor_hidden() {
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::default();
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-
-        let backend_debug = format!("{:?}", terminal.backend());
-        assert!(
-            backend_debug.contains("cursor: false"),
-            "TUI should not request a native terminal cursor because it blinks over the prompt/header: {backend_debug}"
-        );
+        assert!(dump.contains("█████"));
+        assert!(dump.contains("░░░░"));
     }
 
     #[test]
@@ -11704,51 +6328,6 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(dump.contains("MCP Approval"));
         assert!(dump.contains("read_file"));
         assert!(dump.contains("Enter/Y approve"));
-    }
-
-    #[test]
-    fn quit_confirmation_renders_session_summary() {
-        let backend = TestBackend::new(120, 34);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App {
-            quit_confirmation_open: true,
-            best_savings_pct: Some(75),
-            ..App::default()
-        };
-        app.goals.push(GoalEntry {
-            description: "done".into(),
-            status: TaskStatus::Done {
-                tokens_used: 250,
-                wall_time_ms: 1,
-            },
-            state: Some(GlobalState {
-                task_status: TaskStatus::Done {
-                    tokens_used: 250,
-                    wall_time_ms: 1,
-                },
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 250,
-                tokens_budget: None,
-                estimated_naive_tokens: 1000,
-                checkpoints: Vec::new(),
-            }),
-            task_id: TaskId::new(),
-            flight_log: Vec::new(),
-            plan_preview: false,
-            context_mentions: Vec::new(),
-            checkpoint_cursor: None,
-        });
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("End Session"));
-        assert!(dump.contains("Goals"));
-        assert!(dump.contains("Tokens"));
-        assert!(dump.contains("Efficiency"));
-        assert!(dump.contains("phonton -r"));
     }
 
     #[test]
@@ -11832,6 +6411,8 @@ fn extract_id(line: &str) -> Option<String> {
                     rollback_points: Vec::new(),
                     token_usage: TokenUsage::estimated(240),
                     influence: phonton_types::InfluenceSummary::default(),
+                    screenshot_path: None,
+                    rendering_summary: None,
                 }),
                 active_workers: Vec::new(),
                 tokens_used: 240,
@@ -11848,47 +6429,6 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(dump.contains("Changed files"));
         assert!(dump.contains("chess.py"));
         assert!(dump.contains("Known gaps"));
-    }
-
-    #[test]
-    fn trust_demo_explains_contract_verification_receipt_and_memory() {
-        let demo = render_trust_demo();
-
-        assert!(demo.contains("GoalContract"));
-        assert!(demo.contains("Verification Caught"));
-        assert!(demo.contains("Review Receipt"));
-        assert!(demo.contains("Memory Prompt"));
-        assert!(demo.contains("phonton plan"));
-    }
-
-    #[test]
-    fn renders_failed_goal_reason() {
-        let backend = TestBackend::new(120, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut app = App::default();
-        app.goals.push(GoalEntry::new("make chess".into()));
-        app.apply_state(
-            0,
-            GlobalState {
-                task_status: TaskStatus::Failed {
-                    reason: "Cloudflare requires an Account ID".into(),
-                    failed_subtask: None,
-                },
-                goal_contract: None,
-                handoff_packet: None,
-                active_workers: Vec::new(),
-                tokens_used: 0,
-                tokens_budget: None,
-                estimated_naive_tokens: 35000,
-                checkpoints: Vec::new(),
-            },
-        );
-
-        terminal.draw(|f| render(f, &app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("Failure"));
-        assert!(dump.contains("Cloudflare requires an Account ID"));
     }
 
     #[test]

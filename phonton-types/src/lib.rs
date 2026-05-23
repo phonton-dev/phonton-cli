@@ -2,7 +2,6 @@
 //!
 //! Rule: if a type crosses a crate boundary, it lives here. Nothing else does.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -23,7 +22,7 @@ pub use extensions::{
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
     BudgetDecision, BudgetLimits, CostSummary, LLMResponse, ModelMetricsSnapshot, ModelPricing,
-    ModelPricingRegistry, PricingEntry, ProviderConfig, ProviderError, ProviderKind, TokenUsage,
+    ProviderConfig, ProviderError, ProviderKind, TokenUsage,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,39 +113,16 @@ pub enum ModelTier {
 /// down to `Cheap`; `CoreLogic` is left alone so frontier models stay
 /// reserved for the work that actually needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TaskClass {
     /// Generated docs, stubs, type aliases, trivial wiring.
-    #[serde(alias = "Boilerplate")]
     Boilerplate,
     /// Unit/integration tests. Routine output, cheap models suffice.
-    #[serde(alias = "Tests")]
     Tests,
     /// Documentation prose.
-    #[serde(alias = "Docs")]
     Docs,
     /// Novel algorithmic or architectural work — the one tier that still
     /// justifies a frontier model.
-    #[serde(alias = "CoreLogic")]
     CoreLogic,
-    /// A defect fix with an existing expected behavior.
-    #[serde(alias = "BugFix")]
-    BugFix,
-    /// A feature added to an existing project surface.
-    #[serde(alias = "ExistingProjectFeature")]
-    ExistingProjectFeature,
-    /// New tests or test harness work.
-    #[serde(alias = "TestGeneration")]
-    TestGeneration,
-    /// Behavior-preserving code restructuring.
-    #[serde(alias = "Refactor")]
-    Refactor,
-    /// A generated application, game, or broad greenfield artifact.
-    #[serde(alias = "GeneratedAppGame")]
-    GeneratedAppGame,
-    /// Release validation, packaging, tagging, or publishing checks.
-    #[serde(alias = "ReleaseCheck")]
-    ReleaseCheck,
 }
 
 impl fmt::Display for TaskClass {
@@ -156,12 +132,6 @@ impl fmt::Display for TaskClass {
             TaskClass::Tests => "tests",
             TaskClass::Docs => "docs",
             TaskClass::CoreLogic => "core-logic",
-            TaskClass::BugFix => "bug_fix",
-            TaskClass::ExistingProjectFeature => "existing_project_feature",
-            TaskClass::TestGeneration => "test_generation",
-            TaskClass::Refactor => "refactor",
-            TaskClass::GeneratedAppGame => "generated_app_game",
-            TaskClass::ReleaseCheck => "release_check",
         };
         f.write_str(s)
     }
@@ -178,209 +148,19 @@ impl fmt::Display for TaskClass {
 /// so the orchestrator can call it without pulling in the planner crate
 /// and its provider/memory dependencies.
 pub fn classify_task(description: &str) -> TaskClass {
-    classify_intent(description).task_class
-}
-
-/// Coarse ambiguity estimate for a user goal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AmbiguityLevel {
-    /// The goal names a clear target and expected behavior.
-    Low,
-    /// The goal is actionable but leaves meaningful choices.
-    Medium,
-    /// The goal is too vague to execute safely without a question.
-    High,
-}
-
-/// Estimated blast radius of a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum BlastRadius {
-    /// One file or artifact.
-    File,
-    /// One crate/package/module.
-    Crate,
-    /// Multiple crates/packages or workspace-level behavior.
-    Workspace,
-    /// Release, publishing, or repository state outside normal edits.
-    Release,
-}
-
-/// Runtime proof required by the task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RuntimeRisk {
-    /// No runtime proof expected.
-    None,
-    /// Basic command/build execution is enough.
-    Low,
-    /// Runtime behavior should be exercised.
-    Medium,
-    /// Browser/game/app behavior must be checked before verified success.
-    High,
-}
-
-/// Token waste risk before execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TokenRisk {
-    /// Small prompt and repair surface.
-    Low,
-    /// Bounded but non-trivial context or repair risk.
-    Medium,
-    /// Broad or ambiguous work that can burn tokens without verified value.
-    High,
-}
-
-/// Planner action selected by intent classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum IntentAction {
-    /// Ask the user a question before planning execution.
-    AskClarifyingQuestion,
-    /// Show a plan/contract before dispatch.
-    PreviewPlan,
-    /// Safe to dispatch directly when the user asks to run.
-    ExecuteDirectTask,
-    /// Refuse or block because the request is unsafe or too underspecified.
-    RefuseUnsafeOrUnderspecified,
-}
-
-/// Structured preflight classification for a top-level goal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IntentClassification {
-    /// Benchmark/workload class.
-    pub task_class: TaskClass,
-    /// Confidence as 0-100 to keep ledgers stable across platforms.
-    pub confidence_percent: u8,
-    /// How much clarification the request still needs.
-    pub ambiguity: AmbiguityLevel,
-    /// Estimated code/release surface touched.
-    pub blast_radius: BlastRadius,
-    /// Runtime proof risk.
-    pub runtime_risk: RuntimeRisk,
-    /// Token waste risk.
-    pub token_risk: TokenRisk,
-    /// Recommended next action before worker dispatch.
-    pub recommended_action: IntentAction,
-}
-
-/// Build a structured intent classification for a goal or subtask.
-pub fn classify_intent(description: &str) -> IntentClassification {
     let d = description.to_ascii_lowercase();
-    let word_count = d.split_whitespace().count();
-
-    if word_count <= 2 && !d.contains("chess") {
-        return IntentClassification {
-            task_class: TaskClass::CoreLogic,
-            confidence_percent: 45,
-            ambiguity: AmbiguityLevel::High,
-            blast_radius: BlastRadius::Workspace,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::High,
-            recommended_action: IntentAction::AskClarifyingQuestion,
-        };
-    }
-
-    if contains_any(&d, &["delete all", "wipe", "exfiltrate", "steal token"]) {
-        return IntentClassification {
-            task_class: TaskClass::CoreLogic,
-            confidence_percent: 70,
-            ambiguity: AmbiguityLevel::High,
-            blast_radius: BlastRadius::Workspace,
-            runtime_risk: RuntimeRisk::High,
-            token_risk: TokenRisk::High,
-            recommended_action: IntentAction::RefuseUnsafeOrUnderspecified,
-        };
-    }
-
-    if is_generated_app_goal(&d) {
-        return IntentClassification {
-            task_class: TaskClass::GeneratedAppGame,
-            confidence_percent: 85,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::File,
-            runtime_risk: RuntimeRisk::High,
-            token_risk: TokenRisk::High,
-            recommended_action: IntentAction::PreviewPlan,
-        };
-    }
-
-    if contains_any(
-        &d,
-        &[
-            "release",
-            "publish",
-            "tag",
-            "npm pack",
-            "cargo publish",
-            "changelog",
-            "release notes",
-        ],
-    ) {
-        return IntentClassification {
-            task_class: TaskClass::ReleaseCheck,
-            confidence_percent: 82,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::Release,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::Medium,
-            recommended_action: IntentAction::PreviewPlan,
-        };
-    }
-
-    if contains_any(
-        &d,
-        &["fix", "bug", "failing", "failure", "regression", "panic"],
-    ) {
-        return IntentClassification {
-            task_class: TaskClass::BugFix,
-            confidence_percent: 80,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::Crate,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::Medium,
-            recommended_action: IntentAction::PreviewPlan,
-        };
-    }
-
-    if contains_any(&d, &["refactor", "restructure", "rename module", "extract"]) {
-        return IntentClassification {
-            task_class: TaskClass::Refactor,
-            confidence_percent: 78,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::Workspace,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::Medium,
-            recommended_action: IntentAction::PreviewPlan,
-        };
-    }
 
     if d.contains("test") || d.contains("unit-test") || d.contains("integration test") {
-        return IntentClassification {
-            task_class: TaskClass::TestGeneration,
-            confidence_percent: 86,
-            ambiguity: AmbiguityLevel::Low,
-            blast_radius: BlastRadius::Crate,
-            runtime_risk: RuntimeRisk::Low,
-            token_risk: TokenRisk::Low,
-            recommended_action: IntentAction::ExecuteDirectTask,
-        };
+        return TaskClass::Tests;
     }
-
     if d.contains("docstring")
         || d.contains("doc comment")
         || d.contains("readme")
         || d.contains("markdown")
         || d.contains("changelog")
     {
-        return IntentClassification {
-            task_class: TaskClass::Docs,
-            confidence_percent: 88,
-            ambiguity: AmbiguityLevel::Low,
-            blast_radius: BlastRadius::File,
-            runtime_risk: RuntimeRisk::None,
-            token_risk: TokenRisk::Low,
-            recommended_action: IntentAction::ExecuteDirectTask,
-        };
+        return TaskClass::Docs;
     }
-
     if d.contains("rename")
         || d.contains("format")
         || d.contains("derive ")
@@ -391,80 +171,14 @@ pub fn classify_intent(description: &str) -> IntentClassification {
         || d.contains("add field")
         || d.contains("add a field")
     {
-        return IntentClassification {
-            task_class: TaskClass::Boilerplate,
-            confidence_percent: 84,
-            ambiguity: AmbiguityLevel::Low,
-            blast_radius: BlastRadius::File,
-            runtime_risk: RuntimeRisk::Low,
-            token_risk: TokenRisk::Low,
-            recommended_action: IntentAction::ExecuteDirectTask,
-        };
+        return TaskClass::Boilerplate;
     }
-
-    if contains_any(&d, &["dag", "executor", "backpressure", "algorithm"]) {
-        return IntentClassification {
-            task_class: TaskClass::CoreLogic,
-            confidence_percent: 74,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::Workspace,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::Medium,
-            recommended_action: IntentAction::PreviewPlan,
-        };
-    }
-
-    if contains_any(&d, &["add", "implement", "support", "feature", "create"]) {
-        return IntentClassification {
-            task_class: TaskClass::ExistingProjectFeature,
-            confidence_percent: 76,
-            ambiguity: AmbiguityLevel::Medium,
-            blast_radius: BlastRadius::Crate,
-            runtime_risk: RuntimeRisk::Medium,
-            token_risk: TokenRisk::Medium,
-            recommended_action: IntentAction::PreviewPlan,
-        };
-    }
-
-    IntentClassification {
-        task_class: TaskClass::CoreLogic,
-        confidence_percent: 70,
-        ambiguity: AmbiguityLevel::Medium,
-        blast_radius: BlastRadius::Workspace,
-        runtime_risk: RuntimeRisk::Medium,
-        token_risk: TokenRisk::Medium,
-        recommended_action: IntentAction::PreviewPlan,
-    }
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-fn is_generated_app_goal(description: &str) -> bool {
-    let has_build_verb = contains_any(description, &["make", "build", "create", "generate"]);
-    let has_generated_target = contains_any(
-        description,
-        &[
-            " app",
-            "game",
-            "chess",
-            "html",
-            "website",
-            "web page",
-            "single page",
-        ],
-    );
-    let generated_acceptance_slice =
-        description.contains("acceptance slice") && has_generated_target;
-    (has_build_verb && has_generated_target) || generated_acceptance_slice
+    TaskClass::CoreLogic
 }
 
 /// The effective tier to dispatch a subtask at, given its planner-assigned
 /// tier and its classified workload. Core logic keeps its tier; boilerplate,
-/// tests, and docs are floored at `Cheap`. Generated app/game work is capped
-/// at `Standard` because it should be decomposed into acceptance slices before
-/// dispatch instead of spending frontier tokens on one broad attempt.
+/// tests, and docs are floored at `Cheap`.
 ///
 /// The cost-aware half of the orchestrator's routing decision. The
 /// latency-aware half (driven by `phonton_providers::ModelMetrics`) lives
@@ -472,21 +186,11 @@ fn is_generated_app_goal(description: &str) -> bool {
 /// existing `escalate` path.
 pub fn effective_tier(planned: ModelTier, class: TaskClass) -> ModelTier {
     match class {
-        TaskClass::CoreLogic
-        | TaskClass::BugFix
-        | TaskClass::ExistingProjectFeature
-        | TaskClass::Refactor
-        | TaskClass::ReleaseCheck => planned,
-        TaskClass::GeneratedAppGame => match planned {
-            ModelTier::Frontier => ModelTier::Standard,
-            other => other,
+        TaskClass::CoreLogic => planned,
+        TaskClass::Boilerplate | TaskClass::Tests | TaskClass::Docs => match planned {
+            ModelTier::Local | ModelTier::Cheap => planned,
+            ModelTier::Standard | ModelTier::Frontier => ModelTier::Cheap,
         },
-        TaskClass::Boilerplate | TaskClass::Tests | TaskClass::Docs | TaskClass::TestGeneration => {
-            match planned {
-                ModelTier::Local | ModelTier::Cheap => planned,
-                ModelTier::Standard | ModelTier::Frontier => ModelTier::Cheap,
-            }
-        }
     }
 }
 
@@ -548,13 +252,10 @@ pub enum TaskStatus {
         /// Specific subtask that caused the failure, if localised.
         failed_subtask: Option<SubtaskId>,
     },
-    /// Planning found unanswered contract questions that should be resolved
-    /// before workers spend provider tokens or edit files.
-    NeedsClarification {
-        /// Questions the user should answer before resubmitting the goal.
-        questions: Vec<String>,
-    },
     /// Run halted because a `BudgetGuard` ceiling was crossed. Not terminal —
+    /// the UI presents a "Approve to continue?" prompt; the user can raise
+    /// the limit and resubmit. Distinct from `Failed` so the UI renders it
+    /// in amber rather than red.
     Paused {
         /// Which limit tripped — `"tokens"` or `"usd"`.
         limit: String,
@@ -565,79 +266,6 @@ pub enum TaskStatus {
     },
     /// User rejected the produced diff. Task is terminal.
     Rejected,
-}
-
-// ---------------------------------------------------------------------------
-// Session snapshots
-// ---------------------------------------------------------------------------
-
-/// Persisted snapshot of one interactive CLI session for a workspace.
-///
-/// This is the durable "remember" surface for resuming the local ADE loop.
-/// It contains only review-safe UI state and typed task evidence, not private
-/// terminal handles or provider credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSnapshot {
-    /// Canonical workspace key this snapshot belongs to.
-    pub workspace: String,
-    /// Unix timestamp in seconds when the snapshot was saved.
-    pub saved_at: u64,
-    /// Selected goal index when the session ended.
-    pub selected_goal: usize,
-    /// Draft goal text that had not been submitted yet.
-    pub goal_input: String,
-    /// Draft Ask-mode text.
-    pub ask_input: String,
-    /// Last Ask-mode answer shown in the side panel.
-    pub ask_answer: Option<String>,
-    /// Recent submitted prompt history, newest last, for Up/Down recall after resume.
-    #[serde(default)]
-    pub prompt_history: Vec<String>,
-    /// Highest observed savings percentage for this session.
-    pub best_savings_pct: Option<i64>,
-    /// Top-level goals visible in the TUI.
-    pub goals: Vec<SessionGoalSnapshot>,
-    /// Precomputed receipt totals for fast exit display and later inspection.
-    pub totals: SessionTotals,
-}
-
-/// Persisted view of one top-level goal in a [`SessionSnapshot`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionGoalSnapshot {
-    /// Original goal text.
-    pub description: String,
-    /// Last known lifecycle status.
-    pub status: TaskStatus,
-    /// Last broadcast task state when available.
-    pub state: Option<GlobalState>,
-    /// Stable task id used to correlate history and Flight Log events.
-    pub task_id: TaskId,
-    /// Flight Log events observed for the goal.
-    pub flight_log: Vec<EventRecord>,
-}
-
-/// Token and lifecycle totals shown when a saved session exits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionTotals {
-    /// Number of top-level goals in the session snapshot.
-    pub goals: usize,
-    /// Number of goals that reached `Done`.
-    pub completed: usize,
-    /// Number of goals that reached `Failed`.
-    pub failed: usize,
-    /// Number of goals awaiting review.
-    pub reviewing: usize,
-    /// Total actual tokens used across visible goals.
-    pub tokens_used: u64,
-    /// Total estimated naive baseline tokens across visible goals.
-    pub naive_baseline_tokens: u64,
-    /// Estimated token delta versus the naive baseline.
-    ///
-    /// Positive values mean estimated tokens saved. Negative values mean the
-    /// session used more tokens than the baseline estimate.
-    pub estimated_tokens_saved: i64,
-    /// Best observed savings percentage in the session.
-    pub best_savings_pct: Option<i64>,
 }
 
 /// Lifecycle state of a single subtask inside a task's DAG.
@@ -769,156 +397,6 @@ impl From<&CodeSlice> for ContextAttribution {
     }
 }
 
-/// A planned context source category for one provider call.
-///
-/// This is different from [`ContextSource`]: `ContextPlanItem` is built before
-/// the model call and records what Phonton intended to include, omit, or cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ContextPlanKind {
-    /// The current user goal or subtask.
-    Goal,
-    /// Contract or quality-floor text.
-    Contract,
-    /// Compact file/symbol orientation for the repository.
-    RepoMap,
-    /// Concrete symbol or file slice selected for the worker.
-    CodeSlice,
-    /// Persistent memory selected for this task.
-    Memory,
-    /// User-pasted text, images, or mentioned files.
-    Attachment,
-    /// Compact verifier/provider diagnostics for a repair attempt.
-    RetryDiagnostic,
-    /// MCP/tool instructions or tool result context.
-    Tool,
-}
-
-/// One planned context item, included or omitted, for a provider call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextPlanItem {
-    /// Source category.
-    pub kind: ContextPlanKind,
-    /// Stable source id, usually a path, symbol name, or synthetic bucket id.
-    pub id: String,
-    /// Review-safe summary of why this item matters.
-    pub summary: String,
-    /// Estimated token cost for this item.
-    pub estimated_tokens: u64,
-    /// True when the item is included in the provider prompt.
-    pub included: bool,
-    /// Short reason for inclusion or omission.
-    pub reason: String,
-}
-
-/// Bounded context plan for a single worker/provider call.
-///
-/// `PromptContextManifest` records the final token buckets after rendering.
-/// `ContextPlan` records the budget decision that led to those buckets. This
-/// makes token efficiency inspectable instead of relying on hidden heuristics.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextPlan {
-    /// Hard context limit when known.
-    #[serde(default)]
-    pub budget_limit: Option<u64>,
-    /// Target prompt budget chosen by Phonton's context compiler.
-    #[serde(default)]
-    pub target_tokens: u64,
-    /// Estimated tokens from fixed prompt sections before code context.
-    #[serde(default)]
-    pub fixed_tokens: u64,
-    /// Estimated tokens spent on compact repository map lines.
-    #[serde(default)]
-    pub repo_map_tokens: u64,
-    /// Estimated tokens spent on selected code context.
-    #[serde(default)]
-    pub selected_code_tokens: u64,
-    /// Estimated candidate code tokens intentionally omitted.
-    #[serde(default)]
-    pub omitted_code_tokens: u64,
-    /// Total prompt estimate after the context decision.
-    #[serde(default)]
-    pub estimated_total_tokens: u64,
-    /// True when required context forced the estimate above the selected target.
-    #[serde(default)]
-    pub target_exceeded: bool,
-    /// Estimated tokens above the selected target when [`Self::target_exceeded`] is true.
-    #[serde(default)]
-    pub over_target_tokens: u64,
-    /// Included and omitted context items.
-    #[serde(default)]
-    pub items: Vec<ContextPlanItem>,
-}
-
-/// Kind of context target referenced by a user with `@...` syntax.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextMentionKind {
-    /// A single file in the active workspace.
-    File,
-    /// A directory in the active workspace, represented by a bounded summary.
-    Directory,
-    /// A symbol or named code entity.
-    Symbol,
-    /// A configured MCP server.
-    McpServer,
-    /// A tool exposed by a configured MCP server.
-    McpTool,
-    /// The mention was syntactically recognized but did not match a known target.
-    Unknown,
-}
-
-/// Resolution state for a user-authored `@...` context mention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextMentionStatus {
-    /// Mention resolved and can influence context without extra approval.
-    Resolved,
-    /// Mention could not be resolved in the active workspace or capability set.
-    Unresolved,
-    /// Mention resolved to a known target but cannot be used by this surface.
-    Unsupported,
-    /// Mention resolved to a capability that requires explicit approval.
-    PermissionGated,
-}
-
-/// Typed record for one user-authored `@...` context mention.
-///
-/// The CLI owns filesystem and MCP lookup, but this shape crosses crate
-/// boundaries through prompt manifests, handoff evidence, and future desktop
-/// surfaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextMention {
-    /// Original mention text, including the leading `@`.
-    pub raw: String,
-    /// User-facing normalized label.
-    pub label: String,
-    /// Mention category.
-    pub kind: ContextMentionKind,
-    /// Resolution outcome.
-    pub status: ContextMentionStatus,
-    /// Workspace-relative path for file or directory mentions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    /// Symbol name for `@symbol:` mentions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-    /// MCP server id for `@mcp:` mentions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server: Option<String>,
-    /// MCP tool name for `@mcp:server/tool` mentions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<String>,
-    /// Prompt manifest bucket this mention contributes to.
-    pub source_bucket: String,
-    /// Local tokenizer estimate for the context carried by this mention.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimated_tokens: Option<u64>,
-    /// Review-safe resolution note for preflight, `/context`, and receipts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-}
-
 /// Provenance of a [`CodeSlice`].
 ///
 /// Recorded so downstream consumers (planner, worker) can reason about
@@ -1017,6 +495,48 @@ impl PromptAttachment {
     }
 }
 
+/// Maximum text carried inside one prompt artifact.
+pub const MAX_PROMPT_ARTIFACT_CHARS: usize = 32_000;
+
+/// Structured prompt artifact category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptArtifactKind {
+    /// Text pasted into the CLI prompt bar.
+    PastedText,
+}
+
+/// How a prompt artifact should influence the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PromptArtifactRole {
+    /// The artifact is the user's primary request.
+    MainRequest,
+    /// The artifact is supporting context for the typed request.
+    Context,
+}
+
+/// Structured prompt context that is not a workspace file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptArtifact {
+    /// Stable prompt-local identifier such as `paste-1`.
+    pub id: String,
+    /// Artifact category.
+    pub kind: PromptArtifactKind,
+    /// Whether this artifact is the request or supporting context.
+    pub role: PromptArtifactRole,
+    /// Compact label shown in the TUI prompt bar.
+    pub label: String,
+    /// Original character count before truncation.
+    pub original_chars: usize,
+    /// Original logical line count before truncation.
+    pub original_lines: usize,
+    /// Text payload carried to planner/worker context.
+    pub text: String,
+    /// True when `text` is capped below the original paste.
+    pub truncated: bool,
+    /// User/model-visible note for truncation or skipped data.
+    pub note: Option<String>,
+}
+
 /// Render prompt attachments as deterministic text context.
 ///
 /// Text files are inlined. Images are described by path/MIME/size and may also
@@ -1060,6 +580,40 @@ pub fn render_prompt_attachments(attachments: &[PromptAttachment]) -> String {
     out
 }
 
+/// Render non-file prompt artifacts as deterministic text context.
+pub fn render_prompt_artifacts(artifacts: &[PromptArtifact]) -> String {
+    if artifacts.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("# Prompt artifacts\n");
+    for artifact in artifacts {
+        let kind = match artifact.kind {
+            PromptArtifactKind::PastedText => "pasted-text",
+        };
+        let role = match artifact.role {
+            PromptArtifactRole::MainRequest => "main-request",
+            PromptArtifactRole::Context => "context",
+        };
+        out.push_str(&format!(
+            "## {} ({kind}, {role}, {} lines, {} chars)\n",
+            artifact.id, artifact.original_lines, artifact.original_chars
+        ));
+        if let Some(note) = &artifact.note {
+            out.push_str("note: ");
+            out.push_str(note);
+            out.push('\n');
+        }
+        out.push_str("<prompt-artifact>\n");
+        out.push_str(&artifact.text);
+        if !artifact.text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("</prompt-artifact>\n\n");
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
@@ -1082,6 +636,9 @@ pub struct Subtask {
     /// User-mentioned files/images inherited from the top-level goal.
     #[serde(default)]
     pub attachments: Vec<PromptAttachment>,
+    /// Prompt artifacts inherited from the top-level goal.
+    #[serde(default)]
+    pub prompt_artifacts: Vec<PromptArtifact>,
     /// Current lifecycle state.
     pub status: SubtaskStatus,
 }
@@ -1142,12 +699,8 @@ pub enum VerifyLayer {
     WorkspaceCheck,
     /// `cargo test` — never automatic; user-triggered.
     Test,
-    /// Launch or execute the generated artifact enough to catch runtime errors.
-    RuntimeSmoke,
-    /// Browser DOM assertion for generated web artifacts.
-    BrowserDomCheck,
-    /// Browser/user interaction assertion for generated web artifacts.
-    InteractionCheck,
+    /// Headless browser verification using Playwright.
+    BrowserCheck,
 }
 
 /// Outcome of running `phonton-verify` over a worker's diff hunks.
@@ -1361,53 +914,6 @@ pub struct QualityFloor {
     pub criteria: Vec<String>,
 }
 
-/// One independently verifiable slice of a broad goal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcceptanceSlice {
-    /// Stable short id such as `board` or `reset`.
-    pub id: String,
-    /// User-facing criterion this slice must satisfy.
-    pub criterion: String,
-    /// Artifact this slice primarily applies to.
-    #[serde(default)]
-    pub artifact_path: Option<PathBuf>,
-    /// Verification steps that can prove this slice.
-    #[serde(default)]
-    pub verify_plan: Vec<VerifyStepSpec>,
-}
-
-/// Token and repair policy selected before dispatch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenPolicy {
-    /// First-attempt provider token cap when Phonton should avoid broad waste.
-    #[serde(default)]
-    pub first_attempt_cap_tokens: Option<u64>,
-    /// Whether a broad semantic repair is allowed after a large failure.
-    #[serde(default = "default_allow_broad_repair")]
-    pub allow_broad_repair: bool,
-    /// Whether repair workers should receive only missing acceptance criteria.
-    #[serde(default)]
-    pub repair_only_missing_criteria: bool,
-    /// Human-readable policy notes surfaced in plan/review views.
-    #[serde(default)]
-    pub notes: Vec<String>,
-}
-
-impl Default for TokenPolicy {
-    fn default() -> Self {
-        Self {
-            first_attempt_cap_tokens: None,
-            allow_broad_repair: true,
-            repair_only_missing_criteria: false,
-            notes: Vec::new(),
-        }
-    }
-}
-
-fn default_allow_broad_repair() -> bool {
-    true
-}
-
 /// Visible definition of done for a top-level goal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalContract {
@@ -1415,16 +921,10 @@ pub struct GoalContract {
     pub goal: String,
     /// Inferred task class.
     pub task_class: TaskClass,
-    /// Structured preflight classification.
-    #[serde(default)]
-    pub intent: Option<IntentClassification>,
     /// Confidence as 0-100 to avoid float drift across serialized records.
     pub confidence_percent: u8,
     /// Concrete acceptance criteria.
     pub acceptance_criteria: Vec<String>,
-    /// Acceptance criteria split into bounded verification slices.
-    #[serde(default)]
-    pub acceptance_slices: Vec<AcceptanceSlice>,
     /// Expected files, commands, docs, or generated artifacts.
     pub expected_artifacts: Vec<ExpectedArtifact>,
     /// Paths the planner expects to touch.
@@ -1439,9 +939,6 @@ pub struct GoalContract {
     pub clarification_questions: Vec<String>,
     /// Assumptions Phonton is making if it proceeds.
     pub assumptions: Vec<String>,
-    /// Token and repair policy for this goal.
-    #[serde(default)]
-    pub token_policy: TokenPolicy,
 }
 
 /// Summary of a context source that influenced a run.
@@ -1457,255 +954,11 @@ pub struct ContextSource {
     pub token_count: Option<u64>,
 }
 
-/// Prompt/context token buckets used by `/why-tokens`, review, and benchmarks.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextBucketSummary {
-    /// Tokens from selected repository code slices.
-    #[serde(default)]
-    pub selected_code_tokens: u64,
-    /// Candidate repository tokens intentionally omitted.
-    #[serde(default)]
-    pub omitted_candidate_tokens: u64,
-    /// Tokens from persistent memory.
-    #[serde(default)]
-    pub memory_tokens: u64,
-    /// Tokens from skills or steering quality modules.
-    #[serde(default)]
-    pub skill_tokens: u64,
-    /// Tokens from user prompt artifacts or attachments.
-    #[serde(default)]
-    pub artifact_tokens: u64,
-    /// Tokens from verifier or retry diagnostics.
-    #[serde(default)]
-    pub retry_diagnostic_tokens: u64,
-    /// Tokens from MCP/tool output.
-    #[serde(default)]
-    pub tool_output_tokens: u64,
-    /// Attribution-only tokens from user-authored `@...` mentions.
-    ///
-    /// These tokens are already represented in the concrete artifact/tool/code
-    /// buckets that carried the content. This field exists so receipts can
-    /// show how much prompt context came from explicit user addressing without
-    /// counting those tokens twice.
-    #[serde(default)]
-    pub context_mention_tokens: u64,
-    /// Tokens removed by context deduplication.
-    #[serde(default)]
-    pub deduped_tokens: u64,
-    /// Provider-side cached input tokens.
-    #[serde(default)]
-    pub cached_tokens: u64,
-}
-
-impl ContextBucketSummary {
-    /// Fold one prompt manifest into the durable context bucket summary.
-    pub fn add_prompt_manifest(&mut self, manifest: &PromptContextManifest) {
-        self.selected_code_tokens = self.selected_code_tokens.saturating_add(
-            manifest
-                .code_context_tokens
-                .saturating_add(manifest.repo_map_tokens),
-        );
-        self.omitted_candidate_tokens = self
-            .omitted_candidate_tokens
-            .saturating_add(manifest.omitted_code_tokens);
-        self.memory_tokens = self.memory_tokens.saturating_add(manifest.memory_tokens);
-        self.artifact_tokens = self
-            .artifact_tokens
-            .saturating_add(manifest.attachment_tokens);
-        self.retry_diagnostic_tokens = self
-            .retry_diagnostic_tokens
-            .saturating_add(manifest.retry_error_tokens);
-        self.tool_output_tokens = self
-            .tool_output_tokens
-            .saturating_add(manifest.mcp_tool_tokens);
-        self.context_mention_tokens = self
-            .context_mention_tokens
-            .saturating_add(manifest.context_mention_tokens);
-        self.deduped_tokens = self.deduped_tokens.saturating_add(manifest.deduped_tokens);
-    }
-}
-
 /// Manifest of what influenced the model during a task.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextManifest {
     /// Review-safe source list.
     pub sources: Vec<ContextSource>,
-    /// Token buckets by source.
-    #[serde(default)]
-    pub buckets: ContextBucketSummary,
-}
-
-/// Estimated token shape of one prompt sent to a provider.
-///
-/// These values are deliberately approximate. Provider-reported usage is
-/// still the billing source of truth; this manifest exists to make prompt
-/// composition and avoidable context waste visible in the Flight Log.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromptContextManifest {
-    /// Tokens attributed to the provider system prompt.
-    #[serde(default)]
-    pub system_tokens: u64,
-    /// Tokens attributed to the current user goal/subtask.
-    #[serde(default)]
-    pub user_goal_tokens: u64,
-    /// Tokens attributed to prior context or memory.
-    #[serde(default)]
-    pub memory_tokens: u64,
-    /// Tokens attributed to user-mentioned attachments.
-    #[serde(default)]
-    pub attachment_tokens: u64,
-    /// Tokens attributed to selected repository code context.
-    #[serde(default)]
-    pub code_context_tokens: u64,
-    /// Tokens attributed to the compact repository map.
-    #[serde(default)]
-    pub repo_map_tokens: u64,
-    /// Candidate code-context tokens intentionally omitted by the compiler.
-    #[serde(default)]
-    pub omitted_code_tokens: u64,
-    /// Target prompt budget selected by the context compiler.
-    #[serde(default)]
-    pub context_target_tokens: u64,
-    /// One-based provider attempt index for this prompt.
-    #[serde(default = "default_prompt_attempt")]
-    pub attempt: u8,
-    /// True when this prompt is a repair/retry attempt.
-    #[serde(default)]
-    pub repair_attempt: bool,
-    /// True when required context forced the prompt estimate above the target.
-    #[serde(default)]
-    pub target_exceeded: bool,
-    /// Estimated tokens above the selected context target.
-    #[serde(default)]
-    pub over_target_tokens: u64,
-    /// Tokens attributed to MCP/tool instructions and results.
-    #[serde(default)]
-    pub mcp_tool_tokens: u64,
-    /// Attribution-only tokens from user-authored `@...` mentions.
-    ///
-    /// Do not add this to [`Self::total_estimated_tokens`]. Mentioned file
-    /// payloads are already counted in [`Self::attachment_tokens`], mentioned
-    /// MCP capability context is already counted in [`Self::mcp_tool_tokens`],
-    /// and mentioned code context is already counted in repository buckets.
-    #[serde(default)]
-    pub context_mention_tokens: u64,
-    /// Resolved mention rows associated with this prompt, when captured by the
-    /// CLI before dispatch.
-    ///
-    /// This is metadata for audit and receipt surfaces. The concrete prompt
-    /// cost remains represented by the section token buckets above.
-    #[serde(default)]
-    pub context_mentions: Vec<ContextMention>,
-    /// Tokens attributed to retry/verification error context.
-    #[serde(default)]
-    pub retry_error_tokens: u64,
-    /// Sum of the approximate section buckets above.
-    #[serde(default)]
-    pub total_estimated_tokens: u64,
-    /// Configured prompt/context budget limit when known.
-    #[serde(default)]
-    pub budget_limit: Option<u64>,
-    /// Approximate tokens removed by context compaction before this prompt.
-    #[serde(default)]
-    pub compacted_tokens: u64,
-    /// Approximate tokens removed by context deduplication before this prompt.
-    #[serde(default)]
-    pub deduped_tokens: u64,
-}
-
-fn default_prompt_attempt() -> u8 {
-    1
-}
-
-/// Origin for a workspace trust record.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WorkspaceTrustSource {
-    /// Loaded from the legacy `trusted_workspaces.json` path list.
-    LegacyJson,
-    /// Loaded from the structured trust JSON record list.
-    #[default]
-    JsonRecord,
-    /// Loaded from the SQLite store mirror.
-    Store,
-    /// Granted by `PHONTON_TRUST_ALL`.
-    EnvOverride,
-}
-
-impl std::fmt::Display for WorkspaceTrustSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value = match self {
-            Self::LegacyJson => "legacy-json",
-            Self::JsonRecord => "json-record",
-            Self::Store => "store",
-            Self::EnvOverride => "env-override",
-        };
-        f.write_str(value)
-    }
-}
-
-/// Persistent trust metadata for one workspace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceTrustRecord {
-    /// Canonical absolute workspace path.
-    pub canonical_path: String,
-    /// Human-readable workspace label.
-    pub display_name: String,
-    /// Unix timestamp when trust was first granted.
-    pub trusted_at: u64,
-    /// Unix timestamp when this workspace was last opened.
-    pub last_seen_at: u64,
-    /// Permission mode active when trust was recorded or last mirrored.
-    pub permission_mode: PermissionMode,
-    /// Where this record came from.
-    pub source: WorkspaceTrustSource,
-}
-
-/// Local execution permission posture for shell, filesystem, and network work.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionMode {
-    /// Keep the default guard behavior: safe workspace actions run, risky
-    /// actions require approval or are blocked.
-    #[default]
-    Ask,
-    /// Allow reads but block writes and require approval for command/network
-    /// activity.
-    ReadOnly,
-    /// Allow normal workspace writes and allowlisted commands; keep risky
-    /// shell/network activity approval-gated.
-    WorkspaceWrite,
-    /// Allow all non-sensitive actions inside the local sandbox guard.
-    FullAccess,
-}
-
-impl PermissionMode {
-    /// Stable user/config spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PermissionMode::Ask => "ask",
-            PermissionMode::ReadOnly => "read-only",
-            PermissionMode::WorkspaceWrite => "workspace-write",
-            PermissionMode::FullAccess => "full-access",
-        }
-    }
-
-    /// Parse a user-facing permission mode.
-    pub fn parse(input: &str) -> Option<Self> {
-        match input.trim().to_ascii_lowercase().as_str() {
-            "ask" | "default" => Some(PermissionMode::Ask),
-            "read-only" | "readonly" | "read" => Some(PermissionMode::ReadOnly),
-            "workspace-write" | "workspace" | "write" => Some(PermissionMode::WorkspaceWrite),
-            "full-access" | "full" | "danger" => Some(PermissionMode::FullAccess),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for PermissionMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Record of one privileged action request.
@@ -1832,472 +1085,12 @@ pub struct HandoffPacket {
     pub token_usage: TokenUsage,
     /// Influence summary.
     pub influence: InfluenceSummary,
-}
-
-/// Deterministic summary of the accepted goal contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanSummary {
-    /// Contracted goal text.
-    pub goal: String,
-    /// Inferred task class.
-    pub task_class: TaskClass,
-    /// Confidence as 0-100.
-    pub confidence_percent: u8,
-    /// Number of acceptance criteria.
-    pub acceptance_criteria: usize,
-    /// Number of bounded acceptance slices.
-    pub acceptance_slices: usize,
-    /// Number of expected artifacts.
-    pub expected_artifacts: usize,
-    /// Number of likely files.
-    pub likely_files: usize,
-    /// Number of planned verification steps.
-    pub verify_steps: usize,
-    /// Number of planned run commands.
-    pub run_steps: usize,
-    /// Number of quality-floor criteria.
-    pub quality_floor_criteria: usize,
-    /// Number of assumptions made before execution.
-    pub assumptions: usize,
-    /// Number of unanswered clarification questions.
-    pub clarification_questions: usize,
-    /// Stable token/repair policy description.
-    pub token_policy: String,
-}
-
-impl PlanSummary {
-    /// Build a deterministic summary from a goal contract.
-    pub fn from_contract(contract: &GoalContract) -> Self {
-        let cap = contract
-            .token_policy
-            .first_attempt_cap_tokens
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "none".into());
-        let repair = if contract.token_policy.allow_broad_repair {
-            "broad-repair"
-        } else if contract.token_policy.repair_only_missing_criteria {
-            "missing-criteria-repair"
-        } else {
-            "repair-limited"
-        };
-        Self {
-            goal: contract.goal.clone(),
-            task_class: contract.task_class,
-            confidence_percent: contract.confidence_percent,
-            acceptance_criteria: contract.acceptance_criteria.len(),
-            acceptance_slices: contract.acceptance_slices.len(),
-            expected_artifacts: contract.expected_artifacts.len(),
-            likely_files: contract.likely_files.len(),
-            verify_steps: contract.verify_plan.len(),
-            run_steps: contract.run_plan.len(),
-            quality_floor_criteria: contract.quality_floor.criteria.len(),
-            assumptions: contract.assumptions.len(),
-            clarification_questions: contract.clarification_questions.len(),
-            token_policy: format!("first_attempt_cap={cap}; {repair}"),
-        }
-    }
-}
-
-/// Deterministic summary of work produced by a task.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkSummary {
-    /// Files changed.
-    pub files_changed: u32,
-    /// Added lines.
-    pub added_lines: u32,
-    /// Removed lines.
-    pub removed_lines: u32,
-    /// Generated artifact count.
-    pub generated_artifacts: usize,
-    /// Review action count.
-    pub review_actions: usize,
-    /// Rollback point count.
-    pub rollback_points: usize,
-    /// Known gap count.
-    pub known_gaps: usize,
-}
-
-/// Deterministic summary of verification evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationSummary {
-    /// Stable status label; "verified-by-checks" never means generally correct.
-    pub status: String,
-    /// Passed checks.
-    pub passed: usize,
-    /// Findings that require review.
-    pub findings: usize,
-    /// Skipped checks.
-    pub skipped: usize,
-    /// First few review-safe findings.
-    pub primary_findings: Vec<String>,
-}
-
-impl Default for VerificationSummary {
-    fn default() -> Self {
-        Self {
-            status: "unverified".into(),
-            passed: 0,
-            findings: 0,
-            skipped: 0,
-            primary_findings: Vec::new(),
-        }
-    }
-}
-
-impl VerificationSummary {
-    /// Build a deterministic summary from a verification report.
-    pub fn from_report(report: &VerifyReport) -> Self {
-        let status = if !report.findings.is_empty() {
-            "findings"
-        } else if !report.passed.is_empty() {
-            "verified-by-checks"
-        } else if !report.skipped.is_empty() {
-            "skipped"
-        } else {
-            "unverified"
-        };
-        Self {
-            status: status.into(),
-            passed: report.passed.len(),
-            findings: report.findings.len(),
-            skipped: report.skipped.len(),
-            primary_findings: report.findings.iter().take(3).cloned().collect(),
-        }
-    }
-}
-
-/// Deterministic failure summary for failed or partially verified runs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FailureSummary {
-    /// Short primary issue to show in Problems/Receipt surfaces.
-    pub primary_issue: String,
-    /// Suggested next action derived from typed evidence.
-    pub next_action: String,
-}
-
-/// Deterministic token and cost-shape summary.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenSummary {
-    /// Provider-reported input tokens when known.
-    pub provider_input_tokens: u64,
-    /// Provider-reported output tokens when known.
-    pub provider_output_tokens: u64,
-    /// Provider-reported cached input tokens when known.
-    pub cached_tokens: u64,
-    /// Provider cache-creation tokens when known.
-    pub cache_creation_tokens: u64,
-    /// Total tokens used for budget accounting.
-    pub total_tokens: u64,
-    /// True if token usage is estimated.
-    pub estimated: bool,
-    /// Selected source code context tokens.
-    pub selected_code_tokens: u64,
-    /// Candidate code tokens intentionally omitted.
-    pub omitted_candidate_tokens: u64,
-    /// Retry diagnostic prompt tokens.
-    pub retry_diagnostic_tokens: u64,
-    /// Tokens removed by deduplication.
-    pub deduped_tokens: u64,
-}
-
-impl TokenSummary {
-    /// Build a token summary from provider usage and context attribution.
-    pub fn from_usage_and_context(usage: TokenUsage, context: &ContextManifest) -> Self {
-        Self {
-            provider_input_tokens: usage.input_tokens,
-            provider_output_tokens: usage.output_tokens,
-            cached_tokens: usage.cached_tokens,
-            cache_creation_tokens: usage.cache_creation_tokens,
-            total_tokens: usage.budget_tokens(),
-            estimated: usage.estimated,
-            selected_code_tokens: context.buckets.selected_code_tokens,
-            omitted_candidate_tokens: context.buckets.omitted_candidate_tokens,
-            retry_diagnostic_tokens: context.buckets.retry_diagnostic_tokens,
-            deduped_tokens: context.buckets.deduped_tokens,
-        }
-    }
-}
-
-/// Deterministic summary of context and memory influence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextSummary {
-    /// Total context sources.
-    pub source_count: usize,
-    /// Memory sources.
-    pub memory_sources: usize,
-    /// Index/code sources.
-    pub index_sources: usize,
-    /// Skill or steering sources.
-    pub skill_sources: usize,
-    /// MCP/tool sources.
-    pub tool_sources: usize,
-    /// Selected source code context tokens.
-    pub selected_code_tokens: u64,
-    /// Candidate code tokens intentionally omitted.
-    pub omitted_candidate_tokens: u64,
-    /// Persistent memory tokens.
-    pub memory_tokens: u64,
-    /// Artifact/attachment tokens.
-    pub artifact_tokens: u64,
-    /// Retry diagnostic tokens.
-    pub retry_diagnostic_tokens: u64,
-    /// MCP/tool output tokens.
-    pub tool_output_tokens: u64,
-    /// Attribution-only tokens from user-authored `@...` mentions.
+    /// Path to browser verification screenshot when available.
     #[serde(default)]
-    pub context_mention_tokens: u64,
-}
-
-impl ContextSummary {
-    /// Build a context summary from the durable manifest.
-    pub fn from_manifest(manifest: &ContextManifest) -> Self {
-        let mut summary = Self {
-            source_count: manifest.sources.len(),
-            selected_code_tokens: manifest.buckets.selected_code_tokens,
-            omitted_candidate_tokens: manifest.buckets.omitted_candidate_tokens,
-            memory_tokens: manifest.buckets.memory_tokens,
-            artifact_tokens: manifest.buckets.artifact_tokens,
-            retry_diagnostic_tokens: manifest.buckets.retry_diagnostic_tokens,
-            tool_output_tokens: manifest.buckets.tool_output_tokens,
-            context_mention_tokens: manifest.buckets.context_mention_tokens,
-            ..Self::default()
-        };
-        for source in &manifest.sources {
-            match source.kind.as_str() {
-                "memory" => summary.memory_sources += 1,
-                "index" | "code" | "semantic-index" => summary.index_sources += 1,
-                "skill" | "steering" => summary.skill_sources += 1,
-                "mcp" | "tool" => summary.tool_sources += 1,
-                _ => {}
-            }
-        }
-        summary
-    }
-}
-
-/// Deterministic summary of the handoff packet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandoffSummary {
-    /// One-line result.
-    pub headline: String,
-    /// Files changed.
-    pub files_changed: u32,
-    /// Added lines.
-    pub added_lines: u32,
-    /// Removed lines.
-    pub removed_lines: u32,
-    /// Generated artifacts.
-    pub generated_artifacts: usize,
-    /// Run commands.
-    pub run_commands: usize,
-    /// Known gaps.
-    pub known_gaps: usize,
-    /// Review actions.
-    pub review_actions: usize,
-    /// Rollback points.
-    pub rollback_points: usize,
-}
-
-impl HandoffSummary {
-    /// Build a deterministic summary from a handoff packet.
-    pub fn from_handoff(handoff: &HandoffPacket) -> Self {
-        Self {
-            headline: handoff.headline.clone(),
-            files_changed: handoff.diff_stats.files_changed,
-            added_lines: handoff.diff_stats.added_lines,
-            removed_lines: handoff.diff_stats.removed_lines,
-            generated_artifacts: handoff.generated_artifacts.len(),
-            run_commands: handoff.run_commands.len(),
-            known_gaps: handoff.known_gaps.len(),
-            review_actions: handoff.review_actions.len(),
-            rollback_points: handoff.rollback_points.len(),
-        }
-    }
-}
-
-/// Deterministic summary bundle exported with proof/review/history data.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutcomeSummaries {
-    /// Plan/contract summary when a contract was accepted.
-    pub plan: Option<PlanSummary>,
-    /// Work summary derived from the handoff.
-    pub work: WorkSummary,
-    /// Verification evidence summary.
-    pub verification: VerificationSummary,
-    /// Failure or partial-verification summary when evidence requires attention.
-    pub failure: Option<FailureSummary>,
-    /// Token summary.
-    pub token: TokenSummary,
-    /// Context influence summary.
-    pub context: ContextSummary,
-    /// Handoff summary when a handoff exists.
-    pub handoff: Option<HandoffSummary>,
-}
-
-impl OutcomeSummaries {
-    /// Build deterministic summaries from typed task evidence.
-    pub fn from_evidence(
-        contract: Option<&GoalContract>,
-        context: &ContextManifest,
-        _permissions: &PermissionLedger,
-        verify_report: &VerifyReport,
-        handoff: Option<&HandoffPacket>,
-    ) -> Self {
-        let usage = handoff.map(|h| h.token_usage).unwrap_or_default();
-        let work = handoff
-            .map(|h| WorkSummary {
-                files_changed: h.diff_stats.files_changed,
-                added_lines: h.diff_stats.added_lines,
-                removed_lines: h.diff_stats.removed_lines,
-                generated_artifacts: h.generated_artifacts.len(),
-                review_actions: h.review_actions.len(),
-                rollback_points: h.rollback_points.len(),
-                known_gaps: h.known_gaps.len(),
-            })
-            .unwrap_or_default();
-        let failure = verify_report
-            .findings
-            .first()
-            .cloned()
-            .or_else(|| handoff.and_then(|h| h.known_gaps.first().cloned()))
-            .map(|primary_issue| FailureSummary {
-                primary_issue,
-                next_action:
-                    "Review the finding, run the listed verification command, then retry or repair."
-                        .into(),
-            });
-        Self {
-            plan: contract.map(PlanSummary::from_contract),
-            work,
-            verification: VerificationSummary::from_report(verify_report),
-            failure,
-            token: TokenSummary::from_usage_and_context(usage, context),
-            context: ContextSummary::from_manifest(context),
-            handoff: handoff.map(HandoffSummary::from_handoff),
-        }
-    }
-}
-
-/// Final benchmarkable run status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BenchmarkFinalStatus {
-    /// Task completed and all required verification passed.
-    VerifiedSuccess,
-    /// Task produced partial or reviewable output but not full verification.
-    Partial,
-    /// Task failed.
-    Failed,
-    /// Task cannot be claimed as verified.
-    Unverified,
-}
-
-/// Source class for token data included in a benchmark export.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BenchmarkTokenUsageSource {
-    /// Token counts came from provider-reported usage metadata.
-    ProviderReported,
-    /// The run made no provider call, for example a local deterministic template.
-    NoProviderCall,
-    /// Token counts are local estimates and not suitable for claims.
-    Estimated,
-    /// Token source could not be established from the evidence.
-    #[default]
-    Unavailable,
-}
-
-/// Execution mode inferred from the events that produced a benchmark export.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BenchmarkExecutionMode {
-    /// At least one provider model call produced the measured output.
-    Provider,
-    /// The run used Phonton's deterministic local template path.
-    LocalTemplate,
-    /// The run mixed provider calls with local-template output.
-    Mixed,
-    /// The exporter could not infer the execution mode.
-    #[default]
-    Unknown,
-}
-
-/// Exportable benchmark evidence for one completed Phonton run.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BenchmarkRunExport {
-    /// Benchmark task class.
-    pub task_class: TaskClass,
-    /// Original user goal.
-    pub goal: String,
-    /// Git commit of the fixture repository when known.
-    pub repo_commit: String,
-    /// Provider that served the final model call.
-    pub provider: String,
-    /// Model that served the final model call.
-    pub model: String,
-    /// Inferred execution mode for benchmark comparability.
+    pub screenshot_path: Option<PathBuf>,
+    /// Summary of visual rendering checks when available.
     #[serde(default)]
-    pub execution_mode: BenchmarkExecutionMode,
-    /// Whether token fields came from provider usage, estimates, or no provider call.
-    #[serde(default)]
-    pub token_usage_source: BenchmarkTokenUsageSource,
-    /// True only when this run may be included in provider-token efficiency claims.
-    #[serde(default)]
-    pub token_claim_eligible: bool,
-    /// Number of provider-call evidence events observed for this run.
-    #[serde(default)]
-    pub provider_call_count: u64,
-    /// Benchmark caveats that consumers must carry into reports.
-    #[serde(default)]
-    pub benchmark_warnings: Vec<String>,
-    /// Provider-reported input tokens.
-    pub input_tokens: u64,
-    /// Provider-reported output tokens.
-    pub output_tokens: u64,
-    /// Provider-reported cached input tokens.
-    pub cached_tokens: u64,
-    /// Provider-reported prompt cache creation tokens.
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    /// Estimated USD cost.
-    pub cost_usd: f64,
-    /// Context contribution by source.
-    pub context_buckets: ContextBucketSummary,
-    /// Deterministic proof summaries derived from typed facts.
-    #[serde(default)]
-    pub summaries: OutcomeSummaries,
-    /// Verification summary keyed by check name.
-    pub verification: BTreeMap<String, String>,
-    /// Quality gate summary keyed by gate name.
-    pub quality_gates: BTreeMap<String, String>,
-    /// Stable id of the handoff packet for this run.
-    pub handoff_packet_id: String,
-    /// Benchmarkable final status.
-    pub final_status: BenchmarkFinalStatus,
-}
-
-/// Exportable proof bundle for one completed Phonton run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProofBundleExport {
-    /// Task id.
-    pub task_id: TaskId,
-    /// Original or contracted goal text.
-    pub goal: String,
-    /// Goal contract that governed the run.
-    pub goal_contract: Option<GoalContract>,
-    /// Context that influenced the run.
-    pub context_manifest: ContextManifest,
-    /// Permission/audit evidence for privileged actions.
-    pub permission_ledger: PermissionLedger,
-    /// Verification report attached to the run.
-    pub verify_report: VerifyReport,
-    /// Human-review handoff packet.
-    pub handoff_packet: HandoffPacket,
-    /// Deterministic proof summaries derived from typed facts.
-    #[serde(default)]
-    pub summaries: OutcomeSummaries,
-    /// Final status suitable for proof/benchmark consumers.
-    pub final_status: BenchmarkFinalStatus,
+    pub rendering_summary: Option<String>,
 }
 
 /// Durable evidence record for one task run.
@@ -2313,9 +1106,6 @@ pub struct OutcomeLedger {
     pub permission_ledger: PermissionLedger,
     /// Verification report.
     pub verify_report: VerifyReport,
-    /// Deterministic summaries derived from typed facts.
-    #[serde(default)]
-    pub summaries: OutcomeSummaries,
     /// Handoff packet when available.
     pub handoff: Option<HandoffPacket>,
 }
@@ -2325,322 +1115,4 @@ pub struct OutcomeLedger {
 pub struct MemoryUpdate {
     /// Records that should be written if accepted.
     pub records: Vec<MemoryRecord>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prompt_context_manifest_backfills_new_budget_fields() {
-        let raw = r#"{
-            "system_tokens": 10,
-            "user_goal_tokens": 5,
-            "memory_tokens": 3,
-            "attachment_tokens": 2,
-            "mcp_tool_tokens": 1,
-            "retry_error_tokens": 0,
-            "total_estimated_tokens": 21
-        }"#;
-
-        let manifest: PromptContextManifest = serde_json::from_str(raw).unwrap();
-
-        assert_eq!(manifest.system_tokens, 10);
-        assert_eq!(manifest.code_context_tokens, 0);
-        assert_eq!(manifest.compacted_tokens, 0);
-        assert_eq!(manifest.deduped_tokens, 0);
-        assert_eq!(manifest.budget_limit, None);
-        assert_eq!(manifest.attempt, 1);
-        assert!(!manifest.repair_attempt);
-        assert!(!manifest.target_exceeded);
-        assert_eq!(manifest.over_target_tokens, 0);
-        assert_eq!(manifest.context_mention_tokens, 0);
-        assert!(manifest.context_mentions.is_empty());
-    }
-
-    #[test]
-    fn context_mentions_serialize_stable_resolution_shape() {
-        let mention = ContextMention {
-            raw: "@mcp:github/create_issue".into(),
-            label: "github/create_issue".into(),
-            kind: ContextMentionKind::McpTool,
-            status: ContextMentionStatus::PermissionGated,
-            path: None,
-            symbol: None,
-            server: Some("github".into()),
-            tool: Some("create_issue".into()),
-            source_bucket: "mcp".into(),
-            estimated_tokens: Some(32),
-            note: Some("mutating MCP tool requires approval".into()),
-        };
-
-        let value = serde_json::to_value(&mention).unwrap();
-
-        assert_eq!(value["kind"], "mcp_tool");
-        assert_eq!(value["status"], "permission_gated");
-        assert_eq!(value["server"], "github");
-        assert_eq!(value["tool"], "create_issue");
-        assert_eq!(value["estimated_tokens"], 32);
-
-        let round_trip: ContextMention = serde_json::from_value(value).unwrap();
-        assert_eq!(round_trip, mention);
-    }
-
-    #[test]
-    fn workspace_trust_record_serializes_permission_mode() {
-        let record = WorkspaceTrustRecord {
-            canonical_path: "/repo/phonton".into(),
-            display_name: "phonton".into(),
-            trusted_at: 1,
-            last_seen_at: 2,
-            permission_mode: PermissionMode::WorkspaceWrite,
-            source: WorkspaceTrustSource::JsonRecord,
-        };
-
-        let value = serde_json::to_value(record).unwrap();
-
-        assert_eq!(value["permission_mode"], "workspace-write");
-        assert_eq!(value["source"], "json-record");
-    }
-
-    #[test]
-    fn intent_classifier_marks_generated_web_games_as_high_risk_previews() {
-        let intent = classify_intent("make chess in html");
-
-        assert_eq!(intent.task_class, TaskClass::GeneratedAppGame);
-        assert_eq!(intent.runtime_risk, RuntimeRisk::High);
-        assert_eq!(intent.token_risk, TokenRisk::High);
-        assert_eq!(intent.recommended_action, IntentAction::PreviewPlan);
-        assert!(intent.confidence_percent >= 80);
-    }
-
-    #[test]
-    fn intent_classifier_keeps_acceptance_slices_as_generated_app_work() {
-        let intent = classify_intent(
-            "Vite React chess app acceptance slice 1/7: scaffold package.json and src/App.tsx",
-        );
-
-        assert_eq!(intent.task_class, TaskClass::GeneratedAppGame);
-        assert_eq!(intent.token_risk, TokenRisk::High);
-    }
-
-    #[test]
-    fn intent_classifier_prioritizes_refactor_over_test_mentions() {
-        let intent = classify_intent(
-            "Refactor src/receipt.js into smaller helpers, preserve behavior, and run npm test.",
-        );
-
-        assert_eq!(intent.task_class, TaskClass::Refactor);
-        assert_eq!(intent.runtime_risk, RuntimeRisk::Medium);
-    }
-
-    #[test]
-    fn context_buckets_are_serialized_for_benchmark_exports() {
-        let buckets = ContextBucketSummary {
-            selected_code_tokens: 1200,
-            omitted_candidate_tokens: 4300,
-            memory_tokens: 100,
-            skill_tokens: 20,
-            artifact_tokens: 30,
-            retry_diagnostic_tokens: 40,
-            tool_output_tokens: 50,
-            context_mention_tokens: 25,
-            deduped_tokens: 60,
-            cached_tokens: 70,
-        };
-        let manifest = ContextManifest {
-            sources: Vec::new(),
-            buckets,
-        };
-
-        let value = serde_json::to_value(manifest).unwrap();
-
-        assert_eq!(value["buckets"]["selected_code_tokens"], 1200);
-        assert_eq!(value["buckets"]["omitted_candidate_tokens"], 4300);
-        assert_eq!(value["buckets"]["context_mention_tokens"], 25);
-        assert_eq!(value["buckets"]["cached_tokens"], 70);
-    }
-
-    #[test]
-    fn outcome_summaries_backfill_context_mention_tokens() {
-        let raw = r#"{
-            "work": {
-                "files_changed": 0,
-                "added_lines": 0,
-                "removed_lines": 0,
-                "generated_artifacts": 0,
-                "review_actions": 0,
-                "rollback_points": 0,
-                "known_gaps": 0
-            },
-            "verification": {
-                "status": "unverified",
-                "passed": 0,
-                "findings": 0,
-                "skipped": 0,
-                "primary_findings": []
-            },
-            "token": {
-                "provider_input_tokens": 0,
-                "provider_output_tokens": 0,
-                "cached_tokens": 0,
-                "cache_creation_tokens": 0,
-                "total_tokens": 0,
-                "estimated": false,
-                "selected_code_tokens": 0,
-                "omitted_candidate_tokens": 0,
-                "retry_diagnostic_tokens": 0,
-                "deduped_tokens": 0
-            },
-            "context": {
-                "source_count": 0,
-                "memory_sources": 0,
-                "index_sources": 0,
-                "skill_sources": 0,
-                "tool_sources": 0,
-                "selected_code_tokens": 0,
-                "omitted_candidate_tokens": 0,
-                "memory_tokens": 0,
-                "artifact_tokens": 0,
-                "retry_diagnostic_tokens": 0,
-                "tool_output_tokens": 0
-            }
-        }"#;
-
-        let summaries: OutcomeSummaries = serde_json::from_str(raw).unwrap();
-
-        assert_eq!(summaries.context.context_mention_tokens, 0);
-    }
-
-    #[test]
-    fn outcome_summaries_are_deterministic_from_typed_evidence() {
-        let task_id = TaskId::new();
-        let contract = GoalContract {
-            goal: "make a web chess board".into(),
-            task_class: TaskClass::GeneratedAppGame,
-            intent: None,
-            confidence_percent: 82,
-            acceptance_criteria: vec!["render an 8x8 board".into(), "reset works".into()],
-            acceptance_slices: vec![AcceptanceSlice {
-                id: "board".into(),
-                criterion: "render an 8x8 board".into(),
-                artifact_path: Some(PathBuf::from("src/App.tsx")),
-                verify_plan: vec![VerifyStepSpec {
-                    name: "browser DOM check".into(),
-                    layer: Some(VerifyLayer::BrowserDomCheck),
-                    command: None,
-                }],
-            }],
-            expected_artifacts: vec![ExpectedArtifact {
-                path: Some(PathBuf::from("src/App.tsx")),
-                description: "React chess surface".into(),
-            }],
-            likely_files: vec![PathBuf::from("src/App.tsx")],
-            verify_plan: vec![VerifyStepSpec {
-                name: "npm run build".into(),
-                layer: Some(VerifyLayer::Test),
-                command: Some(RunCommand {
-                    label: "Build".into(),
-                    command: vec!["npm".into(), "run".into(), "build".into()],
-                    cwd: None,
-                }),
-            }],
-            run_plan: vec![RunCommand {
-                label: "Dev".into(),
-                command: vec!["npm".into(), "run".into(), "dev".into()],
-                cwd: None,
-            }],
-            quality_floor: QualityFloor {
-                criteria: vec!["No syntax-valid placeholders".into()],
-            },
-            clarification_questions: Vec::new(),
-            assumptions: vec!["Use the existing Vite stack".into()],
-            token_policy: TokenPolicy {
-                first_attempt_cap_tokens: Some(5_000),
-                allow_broad_repair: false,
-                repair_only_missing_criteria: true,
-                notes: vec!["Small acceptance slices".into()],
-            },
-        };
-        let mut context = ContextManifest::default();
-        context.sources.push(ContextSource {
-            kind: "index".into(),
-            id: "src/App.tsx".into(),
-            summary: "App component".into(),
-            token_count: Some(180),
-        });
-        context.buckets.selected_code_tokens = 180;
-        context.buckets.omitted_candidate_tokens = 2_000;
-        context.buckets.cached_tokens = 50;
-        let handoff = HandoffPacket {
-            task_id,
-            goal: contract.goal.clone(),
-            headline: "Review ready: 1 file, 1 verified subtask".into(),
-            changed_files: vec![ChangedFileSummary {
-                path: PathBuf::from("src/App.tsx"),
-                added_lines: 20,
-                removed_lines: 2,
-                summary: "board UI".into(),
-            }],
-            generated_artifacts: Vec::new(),
-            diff_stats: DiffStats {
-                files_changed: 1,
-                added_lines: 20,
-                removed_lines: 2,
-            },
-            verification: VerifyReport {
-                passed: vec!["npm run build".into()],
-                findings: vec!["Runtime/browser verification was planned but not recorded.".into()],
-                skipped: Vec::new(),
-            },
-            run_commands: contract.run_plan.clone(),
-            known_gaps: vec!["Runtime/browser verification was planned but not recorded.".into()],
-            review_actions: Vec::new(),
-            rollback_points: Vec::new(),
-            token_usage: TokenUsage {
-                input_tokens: 1_000,
-                output_tokens: 300,
-                cached_tokens: 50,
-                cache_creation_tokens: 0,
-                estimated: false,
-            },
-            influence: InfluenceSummary {
-                index_slices: vec!["src/App.tsx :: App".into()],
-                ..InfluenceSummary::default()
-            },
-        };
-
-        let summaries = OutcomeSummaries::from_evidence(
-            Some(&contract),
-            &context,
-            &PermissionLedger::default(),
-            &handoff.verification,
-            Some(&handoff),
-        );
-
-        assert_eq!(summaries.plan.as_ref().unwrap().acceptance_criteria, 2);
-        assert_eq!(summaries.plan.as_ref().unwrap().confidence_percent, 82);
-        assert_eq!(summaries.context.source_count, 1);
-        assert_eq!(summaries.context.selected_code_tokens, 180);
-        assert_eq!(summaries.token.provider_input_tokens, 1_000);
-        assert_eq!(summaries.token.cached_tokens, 50);
-        assert_eq!(summaries.handoff.as_ref().unwrap().files_changed, 1);
-        assert_eq!(summaries.verification.findings, 1);
-        assert_eq!(
-            summaries.failure.as_ref().unwrap().primary_issue,
-            "Runtime/browser verification was planned but not recorded."
-        );
-    }
-
-    #[test]
-    fn task_class_serializes_benchmark_names_and_reads_legacy_names() {
-        assert_eq!(
-            serde_json::to_value(TaskClass::BugFix).unwrap(),
-            serde_json::json!("bug_fix")
-        );
-        assert_eq!(
-            serde_json::from_str::<TaskClass>("\"CoreLogic\"").unwrap(),
-            TaskClass::CoreLogic
-        );
-    }
 }

@@ -12,7 +12,6 @@ const repo = "phonton-dev/phonton-cli";
 const version = packageJson.version;
 const tag = process.env.PHONTON_RELEASE_TAG || (version.includes("nightly") ? "nightly" : `v${version}`);
 const vendorDir = path.join(__dirname, "vendor");
-const markerPath = path.join(vendorDir, "version.json");
 
 const targets = {
   "linux-x64": {
@@ -56,20 +55,6 @@ download(url, archivePath)
     if (process.platform !== "win32") {
       fs.chmodSync(binaryPath, 0o755);
     }
-    fs.writeFileSync(
-      markerPath,
-      `${JSON.stringify(
-        {
-          version,
-          tag,
-          asset: target.asset,
-          platform: process.platform,
-          arch: process.arch,
-        },
-        null,
-        2,
-      )}\n`,
-    );
     console.log(`Installed Phonton CLI ${tag} for ${process.platform}-${process.arch}`);
   })
   .catch((error) => {

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use phonton_extensions::{load_extensions, DiagnosticSeverity, ExtensionLoadOptions};
-use phonton_providers::{probe_diff_contract, provider_for};
+use phonton_providers::provider_for;
 use phonton_types::{ExtensionKind, Permission};
 use serde::Serialize;
 
@@ -492,7 +492,11 @@ async fn probe_completion(
     let provider_impl = provider_for(cfg);
     let probe = tokio::time::timeout(
         Duration::from_secs(60),
-        probe_diff_contract(provider_impl.as_ref()),
+        provider_impl.call(
+            "You are a terse assistant. Respond only with JSON.",
+            "Return exactly {\"ok\":true} as JSON.",
+            &[],
+        ),
     )
     .await;
 
@@ -501,7 +505,7 @@ async fn probe_completion(
             checks,
             "provider.completion",
             Severity::Ok,
-            "Provider diff canary works",
+            "Provider completion adapter works",
             format!(
                 "{} via {} (input {}, output {}, cached {}, cache_create {})",
                 resp.model_name,
@@ -517,7 +521,7 @@ async fn probe_completion(
             checks,
             "provider.completion",
             Severity::Fail,
-            "Provider diff canary returned empty content",
+            "Provider completion returned empty content",
             format!("{} via {}", resp.model_name, resp.provider),
             Some("Check the configured model name and provider account access.".into()),
         ),
@@ -525,10 +529,10 @@ async fn probe_completion(
             checks,
             "provider.completion",
             Severity::Fail,
-            "Provider diff canary failed",
+            "Provider completion call failed",
             e.to_string(),
             Some(
-                "Pick a model that can return parseable unified diffs, or run `phonton providers doctor --configured --canary diff`."
+                "Check model name, API key, account quota, and chat/completions compatibility."
                     .into(),
             ),
         ),
@@ -910,14 +914,7 @@ fn provider_key_hint(provider: &str) -> String {
         "openrouter" => {
             "Set OPENROUTER_API_KEY or provider.api_key in ~/.phonton/config.toml.".into()
         }
-        "gemini" | "google" => {
-            "Set GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, or provider.api_key."
-                .into()
-        }
-        "opencode" | "opencode-go" => {
-            "Set OPENCODE_API_KEY, provider.api_key, or provider.api_key_source = \"opencode\"."
-                .into()
-        }
+        "gemini" => "Set GEMINI_API_KEY, GOOGLE_API_KEY, or provider.api_key.".into(),
         "agentrouter" => "Set AGENTROUTER_API_KEY or provider.api_key.".into(),
         "cloudflare" => {
             "Set CLOUDFLARE_API_TOKEN plus CLOUDFLARE_ACCOUNT_ID, or provider.api_key plus provider.base_url.".into()

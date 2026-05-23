@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use petgraph::graph::{DiGraph, NodeIndex};
 use phonton_types::{
@@ -49,15 +49,6 @@ pub const MAX_RETRIES_PER_TIER: u8 = 1;
 
 /// Escalations permitted before the orchestrator surfaces a hard failure.
 pub const MAX_ESCALATIONS: u8 = 3;
-
-/// Repair attempts permitted when task-specific quality gates fail after
-/// ordinary syntax/build/test verification has passed.
-pub const MAX_QUALITY_REPAIR_ATTEMPTS: u8 = 1;
-
-/// Provider tokens above which broad post-verification quality repair must be
-/// explicit. This prevents an already-expensive generated-code attempt from
-/// silently doubling cost after syntax/build checks have passed.
-pub const QUALITY_AUTO_REPAIR_TOKEN_CEILING: u64 = 8_000;
 
 /// Deprecated — budget pauses now produce `TaskStatus::Paused` directly.
 /// Kept for any downstream code that may still substring-match the old sentinel.
@@ -223,12 +214,6 @@ pub trait WorkerDispatcher: Send + Sync + 'static {
         attempt: u8,
         msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
     ) -> Result<SubtaskResult>;
-
-    /// Request a best-effort compression pass on the dispatcher's shared
-    /// context window. Dispatchers without shared context return `Ok(false)`.
-    async fn compact_context(&self) -> Result<bool> {
-        Ok(false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,14 +455,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut tokens_used: u64 = 0;
         let mut task_status = TaskStatus::Planning;
         let mut failure: Option<(SubtaskId, String)> = None;
-        let mut cancelled = false;
         // Budget-pause: (triggering_subtask_id, limit_name, observed, ceiling).
         // Set when BudgetGuard fires; produces TaskStatus::Paused at the end.
         let mut paused: Option<(SubtaskId, String, u64, u64)> = None;
         let mut checkpoints: Vec<Checkpoint> = Vec::new();
         let mut checkpointed: HashSet<SubtaskId> = HashSet::new();
         let mut next_seq: u32 = 1;
-        let mut quality_repair_attempts: u8 = 0;
 
         // Channel for worker-to-orchestrator intermediate messages.
         let (worker_msg_tx, mut worker_msg_rx) = mpsc::channel::<OrchestratorMessage>(32);
@@ -509,24 +492,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
             let any_active = runtimes.values().any(|r| r.is_active());
             if !any_active && joinset.is_empty() {
-                if failure.is_none() && paused.is_none() && !cancelled {
-                    let quality_failures = self.quality_gate_failures(&plan, &runtimes);
-                    if !quality_failures.is_empty()
-                        && quality_repair_attempts < MAX_QUALITY_REPAIR_ATTEMPTS
-                        && should_auto_repair_quality(&plan, tokens_used)
-                        && self.redispatch_quality_gate_repair(
-                            &plan,
-                            &quality_failures,
-                            &mut runtimes,
-                            &mut checkpointed,
-                            &mut joinset,
-                            worker_msg_tx.clone(),
-                        )
-                    {
-                        quality_repair_attempts = quality_repair_attempts.saturating_add(1);
-                        continue;
-                    }
-                }
                 // Nothing in flight and nothing scheduled — terminal.
                 break;
             }
@@ -576,13 +541,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                             });
                             continue;
                         }
-                        Some(OrchestratorMessage::PromptManifest { id, manifest }) => {
-                            self.emit(OrchestratorEvent::PromptManifest {
-                                subtask_id: id,
-                                manifest,
-                            });
-                            continue;
-                        }
                         Some(OrchestratorMessage::SubtaskProgress { id, tokens_so_far }) => {
                             if let Some(rt) = runtimes.get_mut(&id) {
                                 rt.tokens_used = tokens_so_far;
@@ -598,45 +556,26 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         None => std::future::pending().await,
                     }
                 } => {
-                    match msg {
-                        Some(OrchestratorMessage::RollbackRequest { to_seq }) => {
-                            joinset.abort_all();
-                            let requeued = self.handle_rollback(
-                                to_seq,
-                                &mut runtimes,
-                                &mut checkpoints,
-                                &mut checkpointed,
-                                &mut next_seq,
-                            );
-                            self.emit(OrchestratorEvent::RollbackPerformed {
-                                task_id: self.task_id,
-                                to_seq,
-                                requeued_subtasks: requeued,
-                            });
-                            continue;
-                        }
-                        Some(OrchestratorMessage::CompactContext) => {
-                            let compacted = self.dispatcher.compact_context().await.unwrap_or(false);
-                            self.emit(OrchestratorEvent::ContextCompacted {
-                                task_id: self.task_id,
-                                compacted,
-                            });
-                            continue;
-                        }
-                        Some(OrchestratorMessage::UserCancelled) => {
-                            cancelled = true;
-                            joinset.abort_all();
-                            None
-                        }
-                        _ => joinset.join_next().await,
+                    if let Some(OrchestratorMessage::RollbackRequest { to_seq }) = msg {
+                        joinset.abort_all();
+                        let requeued = self.handle_rollback(
+                            to_seq,
+                            &mut runtimes,
+                            &mut checkpoints,
+                            &mut checkpointed,
+                            &mut next_seq,
+                        );
+                        self.emit(OrchestratorEvent::RollbackPerformed {
+                            task_id: self.task_id,
+                            to_seq,
+                            requeued_subtasks: requeued,
+                        });
+                        continue;
                     }
+                    joinset.join_next().await
                 }
                 j = joinset.join_next() => j,
             };
-
-            if cancelled {
-                break;
-            }
 
             let Some(joined) = joined else {
                 break;
@@ -647,6 +586,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     warn!(error = %join_err, "worker task panicked or was cancelled");
                     continue;
                 }
+            };
+
+            let cost_telemetry = match &dispatch_outcome {
+                Ok(sr) => Some((sr.provider, sr.model_name.clone(), sr.token_usage)),
+                Err(_) => None,
             };
 
             // 4. Route through verify, possibly re-dispatch.
@@ -697,39 +641,25 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     if let Some(diff) = &self.diff_applier {
                         // Git-backed path: apply hunks → stage → checkpoint commit.
                         let checkpoint = match diff.lock() {
-                            Ok(mut d) => match checkpoint_verified_hunks(
-                                &mut d,
-                                self.task_id,
-                                sid,
-                                seq,
-                                &desc,
-                                &hunks,
-                            ) {
-                                Ok(c) => Some(c),
-                                Err(e) => {
-                                    let reason = format!("{e:#}");
-                                    warn!(error = %reason, subtask = %sid, "checkpoint verified hunks failed");
-                                    fail_subtask(&mut runtimes, sid, reason.clone());
-                                    if failure.is_none() {
-                                        failure = Some((sid, reason));
+                            Ok(mut d) => {
+                                if let Err(e) = d.apply_verified_hunks(&hunks) {
+                                    warn!(error = %e, subtask = %sid, "apply_verified_hunks failed");
+                                }
+                                match d.commit_checkpoint(self.task_id, sid, seq, &desc) {
+                                    Ok(c) => Some(c),
+                                    Err(e) => {
+                                        warn!(error = %e, subtask = %sid, "checkpoint commit failed");
+                                        None
                                     }
-                                    joinset.abort_all();
-                                    None
                                 }
-                            },
+                            }
                             Err(e) => {
-                                let reason = format!("diff applier mutex poisoned: {e}");
-                                warn!(error = %reason, "diff applier mutex poisoned");
-                                fail_subtask(&mut runtimes, sid, reason.clone());
-                                if failure.is_none() {
-                                    failure = Some((sid, reason));
-                                }
-                                joinset.abort_all();
+                                warn!(error = %e, "diff applier mutex poisoned");
                                 None
                             }
                         };
+                        checkpointed.insert(sid);
                         if let Some(c) = checkpoint {
-                            checkpointed.insert(sid);
                             self.emit(OrchestratorEvent::CheckpointCreated {
                                 task_id: self.task_id,
                                 subtask_id: sid,
@@ -741,17 +671,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     } else {
                         // No git repo — write files directly to disk so the
                         // user sees output even without a git repository.
-                        if let Err(e) = apply_hunks_direct(&hunks, &self.working_dir) {
-                            let reason = format!("failed to apply verified diff: {e:#}");
-                            warn!(error = %reason, subtask = %sid, "direct hunk application failed");
-                            fail_subtask(&mut runtimes, sid, reason.clone());
-                            if failure.is_none() {
-                                failure = Some((sid, reason));
-                            }
-                            joinset.abort_all();
-                        } else {
-                            checkpointed.insert(sid);
-                        }
+                        apply_hunks_direct(&hunks, &self.working_dir);
+                        checkpointed.insert(sid);
                     }
                 }
             }
@@ -774,33 +695,49 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 }
             }
 
-            // BudgetGuard: USD/token ceiling enforcement. Charge the delta
-            // tokens observed since the last iteration, tagged with the
-            // provider/model from the subtask that just completed so the
-            // pricing table lookup succeeds when the caller registered
-            // a price for that model.
+            // BudgetGuard: USD/token ceiling enforcement. Charge the tokens
+            // from the subtask result directly (exact model pricing).
             if let Some(guard) = &self.budget_guard {
                 if failure.is_none() && paused.is_none() {
                     if let Ok(mut g) = guard.lock() {
                         let already = g.tokens_used();
                         let delta = tokens_used.saturating_sub(already);
                         if delta > 0 {
-                            let (charge_provider, charge_model, usage) = runtimes
-                                .get(&id)
-                                .map(|r| (r.provider, r.model_name.clone(), r.token_usage))
-                                .unwrap_or((
-                                    ProviderKind::Anthropic,
-                                    String::new(),
-                                    TokenUsage::estimated(delta),
-                                ));
-                            let input = if usage.budget_tokens() > 0 {
-                                usage
-                                    .input_tokens
-                                    .saturating_add(usage.cache_creation_tokens)
-                            } else {
-                                delta
-                            };
-                            let output = usage.output_tokens;
+                            let (charge_provider, charge_model, input, output) =
+                                match &cost_telemetry {
+                                    Some((provider, model_name, token_usage)) => {
+                                        let inp = token_usage
+                                            .input_tokens
+                                            .saturating_add(token_usage.cache_creation_tokens);
+                                        let out = token_usage.output_tokens;
+                                        if inp == 0 && out == 0 {
+                                            // fallback to delta when usage not reported
+                                            (*provider, model_name.clone(), delta, 0)
+                                        } else {
+                                            (*provider, model_name.clone(), inp, out)
+                                        }
+                                    }
+                                    None => {
+                                        let (p, m, usage) = runtimes
+                                            .get(&id)
+                                            .map(|r| {
+                                                (r.provider, r.model_name.clone(), r.token_usage)
+                                            })
+                                            .unwrap_or((
+                                                ProviderKind::Anthropic,
+                                                String::new(),
+                                                TokenUsage::estimated(delta),
+                                            ));
+                                        let inp = if usage.budget_tokens() > 0 {
+                                            usage
+                                                .input_tokens
+                                                .saturating_add(usage.cache_creation_tokens)
+                                        } else {
+                                            delta
+                                        };
+                                        (p, m, inp, usage.output_tokens)
+                                    }
+                                };
                             let _ = g.charge(charge_provider, &charge_model, input, output);
                         }
                         if let BudgetDecision::Pause {
@@ -832,25 +769,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // 5. Final task status. Paused takes priority over a simultaneous
         //    failure (the pause aborted the joinset so any failure that
         //    raced in is noise). Real failures take priority over nothing.
-        let mut quality_failures = if failure.is_none() && paused.is_none() && !cancelled {
-            self.quality_gate_failures(&plan, &runtimes)
-        } else {
-            Vec::new()
-        };
-        if !quality_failures.is_empty() {
-            if let Some(reason) = quality_auto_repair_skip_reason(&plan, tokens_used) {
-                quality_failures.push(reason);
-            }
-        }
-
-        let terminal = if cancelled {
-            self.emit(OrchestratorEvent::TaskFailed {
-                task_id: self.task_id,
-                reason: "cancelled by user".into(),
-                failed_subtask: None,
-            });
-            TaskStatus::Rejected
-        } else if let Some((_, limit, observed, ceiling)) = paused {
+        let terminal = if let Some((_, limit, observed, ceiling)) = paused {
             TaskStatus::Paused {
                 limit,
                 observed,
@@ -865,17 +784,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             TaskStatus::Failed {
                 reason,
                 failed_subtask: Some(fid),
-            }
-        } else if !quality_failures.is_empty() {
-            let reason = format!("quality gate failed: {}", quality_failures.join("; "));
-            self.emit(OrchestratorEvent::TaskFailed {
-                task_id: self.task_id,
-                reason: reason.clone(),
-                failed_subtask: None,
-            });
-            TaskStatus::Failed {
-                reason,
-                failed_subtask: None,
             }
         } else {
             self.emit(OrchestratorEvent::TaskCompleted {
@@ -1147,9 +1055,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     subtask_id: id,
                     reason,
                     attempt,
-                    token_usage: rt.token_usage,
-                    provider: Some(rt.provider),
-                    model_name: rt.model_name.clone(),
                 });
                 return Ok(());
             }
@@ -1245,9 +1150,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                                 subtask_id: id,
                                 reason,
                                 attempt: rt.attempts_at_tier,
-                                token_usage: rt.token_usage,
-                                provider: Some(rt.provider),
-                                model_name: rt.model_name.clone(),
                             });
                             (false, false)
                         } else {
@@ -1295,19 +1197,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                             subtask_id: id,
                             reason: msg,
                             attempt: rt.attempts_at_tier,
-                            token_usage: rt.token_usage,
-                            provider: Some(rt.provider),
-                            model_name: rt.model_name.clone(),
                         });
                         (false, false)
                     } else {
-                        events.push(OrchestratorEvent::RepairPlanned {
-                            subtask_id: id,
-                            attempt: 1,
-                            tier: rt.subtask.model_tier,
-                            reason: "using verifier diagnostics at escalated tier; no blind retry"
-                                .into(),
-                        });
                         events.push(OrchestratorEvent::VerifyEscalated {
                             subtask_id: id,
                             from: from_tier,
@@ -1334,121 +1226,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         Ok(())
     }
 
-    fn redispatch_quality_gate_repair(
-        &self,
-        plan: &PlannerOutput,
-        failures: &[String],
-        runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>,
-        checkpointed: &mut HashSet<SubtaskId>,
-        joinset: &mut JoinSet<(SubtaskId, Result<SubtaskResult>)>,
-        worker_msg_tx: tokio::sync::mpsc::Sender<OrchestratorMessage>,
-    ) -> bool {
-        let Some(id) = plan
-            .subtasks
-            .iter()
-            .find(|subtask| {
-                runtimes
-                    .get(&subtask.id)
-                    .map(|rt| rt.is_done() && !rt.diff_hunks.is_empty())
-                    .unwrap_or(false)
-            })
-            .map(|subtask| subtask.id)
-        else {
-            return false;
-        };
-
-        let errors: Vec<String> = failures
-            .iter()
-            .map(|failure| format!("Quality gate: {failure}"))
-            .collect();
-        let attempt = runtimes
-            .get(&id)
-            .map(|rt| rt.attempts_at_tier.saturating_add(1))
-            .unwrap_or(1);
-
-        if let Some(rt) = runtimes.get_mut(&id) {
-            rt.verify_result = Some(VerifyResult::Fail {
-                layer: VerifyLayer::Test,
-                errors: errors.clone(),
-                attempt,
-            });
-            rt.prior_errors = errors.clone();
-            rt.status = SubtaskStatus::Ready;
-            rt.is_thinking = false;
-        }
-        checkpointed.remove(&id);
-        self.emit(OrchestratorEvent::VerifyFail {
-            subtask_id: id,
-            layer: VerifyLayer::Test,
-            errors,
-            attempt,
-        });
-        self.spawn_worker(runtimes, id, joinset, worker_msg_tx);
-        true
-    }
-
-    fn quality_gate_failures(
-        &self,
-        plan: &PlannerOutput,
-        runtimes: &HashMap<SubtaskId, SubtaskRuntime>,
-    ) -> Vec<String> {
-        let Some(contract) = &plan.goal_contract else {
-            return Vec::new();
-        };
-        if !is_chess_goal_text(&contract.goal) && !is_chess_goal_text(&self.goal_text) {
-            return Vec::new();
-        }
-
-        let mut added_lines = 0usize;
-        let mut added_text = String::new();
-        for rt in runtimes.values() {
-            for hunk in &rt.diff_hunks {
-                for line in &hunk.lines {
-                    if let DiffLine::Added(text) = line {
-                        added_lines = added_lines.saturating_add(1);
-                        added_text.push_str(text);
-                        added_text.push('\n');
-                    }
-                }
-            }
-        }
-        let lower = added_text.to_ascii_lowercase();
-        let mut failures = Vec::new();
-        if added_lines < 80 {
-            failures.push(format!(
-                "playable chess requires substantial implementation; only {added_lines} added line(s) were produced"
-            ));
-        }
-        let piece_hits = chess_piece_evidence_count(&added_text);
-        if piece_hits < 4 {
-            failures.push("playable chess must represent named chess pieces".into());
-        }
-        if !(lower.contains("board") || lower.contains("chessboard")) {
-            failures.push("playable chess must represent an 8x8 board".into());
-        }
-        if !(lower.contains("turn") && lower.contains("move")) {
-            failures.push("playable chess must include turn and move handling".into());
-        }
-        if !(lower.contains("legal") || lower.contains("valid")) {
-            failures.push("playable chess must include legal or valid move checks".into());
-        }
-        if !(lower.contains("reset") || lower.contains("new game") || lower.contains("new_game")) {
-            failures.push("playable chess must include reset or new-game behavior".into());
-        }
-        if contract.run_plan.is_empty() {
-            failures.push("playable chess requires a concrete run command".into());
-        }
-        if !contract
-            .verify_plan
-            .iter()
-            .any(|step| step.command.is_some())
-        {
-            failures
-                .push("playable chess requires a concrete build/test/verification command".into());
-        }
-        failures
-    }
-
     fn build_handoff_packet(
         &self,
         plan: &PlannerOutput,
@@ -1470,7 +1247,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut verified = Vec::new();
         let mut findings = Vec::new();
         let mut reached_test_layer = false;
-        let mut reached_runtime_layer = false;
 
         for rt in runtimes.values() {
             usage.input_tokens = usage
@@ -1491,12 +1267,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             match &rt.verify_result {
                 Some(VerifyResult::Pass { layer }) => {
                     reached_test_layer |= *layer == VerifyLayer::Test;
-                    reached_runtime_layer |= is_runtime_layer(*layer);
-                    verified.push(verification_pass_label(
-                        plan.goal_contract.as_ref(),
-                        *layer,
-                        &clean_desc,
-                    ));
+                    verified.push(format!("{clean_desc} passed {}", verify_layer_name(*layer)));
                 }
                 Some(VerifyResult::Fail { errors, layer, .. }) => {
                     let detail = if errors.is_empty() {
@@ -1504,21 +1275,18 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     } else {
                         errors.join("; ")
                     };
-                    findings.push(verification_failure_label(
-                        plan.goal_contract.as_ref(),
-                        *layer,
-                        &clean_desc,
-                        &detail,
+                    findings.push(format!(
+                        "{clean_desc} failed {}: {detail}",
+                        verify_layer_name(*layer)
                     ));
                 }
                 Some(VerifyResult::Escalate { reason }) => {
                     findings.push(format!("{clean_desc} escalated: {reason}"));
                 }
                 None if rt.is_failed() => {
-                    findings.push(subtask_failure_label(
-                        plan.goal_contract.as_ref(),
-                        &clean_desc,
-                        &failure_reason(&rt.status),
+                    findings.push(format!(
+                        "{clean_desc} failed: {}",
+                        failure_reason(&rt.status)
                     ));
                 }
                 None => {}
@@ -1544,20 +1312,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
 
         if usage.budget_tokens() == 0 && tokens_used > 0 {
             usage = TokenUsage::estimated(tokens_used);
-        }
-
-        for failure in self.quality_gate_failures(plan, runtimes) {
-            findings.push(format!("Quality gate: {failure}"));
-        }
-        let planned_runtime = plan.goal_contract.as_ref().is_some_and(|contract| {
-            contract
-                .verify_plan
-                .iter()
-                .any(|step| step.layer.map(is_runtime_layer).unwrap_or(false))
-        });
-        let missing_runtime_proof = planned_runtime && !reached_runtime_layer;
-        if missing_runtime_proof {
-            findings.push("Runtime/browser verification was planned but not recorded.".into());
         }
 
         verified.sort();
@@ -1616,9 +1370,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         }
         if !reached_test_layer {
             known_gaps.push("No explicit test layer was recorded by this run.".into());
-        }
-        if missing_runtime_proof {
-            known_gaps.push("Runtime/browser verification was planned but not recorded.".into());
         }
         if checkpoints.is_empty() && !changed_files.is_empty() {
             known_gaps.push("No git rollback checkpoint was recorded.".into());
@@ -1679,8 +1430,36 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             TaskStatus::Failed { reason, .. } => {
                 format!("Task failed before review: {}", short_text(reason, 96))
             }
-            TaskStatus::Rejected => "Task cancelled by user before review".into(),
             _ => "Task state updated".into(),
+        };
+
+        let mut rendering_summary = None;
+        for rt in runtimes.values() {
+            if let Some(VerifyResult::Pass { layer }) = &rt.verify_result {
+                if *layer == VerifyLayer::BrowserCheck {
+                    rendering_summary = Some(
+                        "Browser rendering check passed successfully with Playwright verification."
+                            .to_string(),
+                    );
+                }
+            }
+            if let Some(VerifyResult::Fail { layer, errors, .. }) = &rt.verify_result {
+                if *layer == VerifyLayer::BrowserCheck {
+                    rendering_summary = Some(format!(
+                        "Browser rendering check failed: {}",
+                        errors.join("; ")
+                    ));
+                }
+            }
+        }
+
+        let screenshot_file = self.working_dir.join("phonton-screenshot.png");
+        let (screenshot_path, rendering_summary) = if screenshot_file.is_file() {
+            let summary = rendering_summary
+                .unwrap_or_else(|| "Screenshot evidence captured successfully.".to_string());
+            (Some(screenshot_file), Some(summary))
+        } else {
+            (None, rendering_summary)
         };
 
         HandoffPacket {
@@ -1705,6 +1484,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             rollback_points,
             token_usage: usage,
             influence: InfluenceSummary::default(),
+            screenshot_path,
+            rendering_summary,
         }
     }
 }
@@ -1717,175 +1498,6 @@ fn compact_description(description: &str) -> String {
         .unwrap_or(description)
         .trim()
         .to_string()
-}
-
-fn verification_pass_label(
-    contract: Option<&GoalContract>,
-    layer: VerifyLayer,
-    clean_desc: &str,
-) -> String {
-    if let Some(label) =
-        contract.and_then(|contract| planned_verification_command_label(contract, layer))
-    {
-        return format!("{label} passed");
-    }
-
-    let layer_name = verify_layer_name(layer);
-    if looks_like_prompt_tail(clean_desc) {
-        format!("{layer_name} verification passed")
-    } else {
-        format!("{clean_desc} passed {layer_name}")
-    }
-}
-
-fn verification_failure_label(
-    contract: Option<&GoalContract>,
-    layer: VerifyLayer,
-    clean_desc: &str,
-    detail: &str,
-) -> String {
-    if let Some(label) =
-        contract.and_then(|contract| planned_verification_command_label(contract, layer))
-    {
-        return format!("{label} failed: {detail}");
-    }
-
-    let layer_name = verify_layer_name(layer);
-    if looks_like_prompt_tail(clean_desc) {
-        format!("{layer_name} verification failed: {detail}")
-    } else {
-        format!("{clean_desc} failed {layer_name}: {detail}")
-    }
-}
-
-fn subtask_failure_label(
-    contract: Option<&GoalContract>,
-    clean_desc: &str,
-    reason: &str,
-) -> String {
-    if let Some(label) = contract
-        .and_then(|contract| planned_verification_command_label(contract, VerifyLayer::Test))
-    {
-        return format!("{label} failed: {reason}");
-    }
-
-    if looks_like_prompt_tail(clean_desc) {
-        format!("task failed: {reason}")
-    } else {
-        format!("{clean_desc} failed: {reason}")
-    }
-}
-
-fn planned_verification_command_label(
-    contract: &GoalContract,
-    layer: VerifyLayer,
-) -> Option<String> {
-    let layer_name = verify_layer_name(layer);
-    let matching = contract.verify_plan.iter().find_map(|step| {
-        let label = step
-            .command
-            .as_ref()
-            .and_then(command_label)
-            .filter(|label| !label.trim().is_empty())?;
-        let step_matches_layer = step.layer == Some(layer);
-        let name = step.name.to_ascii_lowercase();
-        let label_lower = label.to_ascii_lowercase();
-        let text_matches_layer = name.contains(layer_name)
-            || label_lower.contains(layer_name)
-            || (layer == VerifyLayer::Test && label_lower.contains("test"));
-        if step_matches_layer || text_matches_layer {
-            Some(label)
-        } else {
-            None
-        }
-    });
-
-    if matching.is_some() {
-        return matching;
-    }
-
-    if layer == VerifyLayer::Test {
-        return contract
-            .verify_plan
-            .iter()
-            .find_map(|step| step.command.as_ref().and_then(command_label));
-    }
-
-    None
-}
-
-fn command_label(command: &phonton_types::RunCommand) -> Option<String> {
-    let label = command.label.trim();
-    if !label.is_empty() {
-        return Some(label.to_string());
-    }
-    if command.command.is_empty() {
-        None
-    } else {
-        Some(command.command.join(" "))
-    }
-}
-
-fn looks_like_prompt_tail(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.starts_with('-')
-        || trimmed.len() > 96
-        || trimmed.ends_with(':')
-        || trimmed
-            .to_ascii_lowercase()
-            .contains("expected final state")
-}
-
-fn is_chess_goal_text(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("chess")
-        && (lower.contains("make") || lower.contains("build") || lower.contains("create"))
-}
-
-fn should_auto_repair_quality(plan: &PlannerOutput, tokens_used: u64) -> bool {
-    quality_auto_repair_skip_reason(plan, tokens_used).is_none()
-}
-
-fn quality_auto_repair_skip_reason(plan: &PlannerOutput, tokens_used: u64) -> Option<String> {
-    if let Some(contract) = plan.goal_contract.as_ref() {
-        if !contract.token_policy.allow_broad_repair {
-            return Some(
-                "automatic broad quality repair disabled by token policy; use /retry to repair missing acceptance criteria with compact diagnostics"
-                    .into(),
-            );
-        }
-        if is_chess_goal_text(&contract.goal)
-            && tokens_used
-                >= contract
-                    .token_policy
-                    .first_attempt_cap_tokens
-                    .unwrap_or(QUALITY_AUTO_REPAIR_TOKEN_CEILING)
-        {
-            return Some(format!(
-                "automatic quality repair skipped after {tokens_used} tokens to protect budget; use /retry to repair with compact diagnostics"
-            ));
-        }
-    }
-    None
-}
-
-fn chess_piece_evidence_count(text: &str) -> usize {
-    let lower = text.to_ascii_lowercase();
-    [
-        ("king", ["'k'", "\"k\"", "`k`"], ['♔', '♚']),
-        ("queen", ["'q'", "\"q\"", "`q`"], ['♕', '♛']),
-        ("rook", ["'r'", "\"r\"", "`r`"], ['♖', '♜']),
-        ("bishop", ["'b'", "\"b\"", "`b`"], ['♗', '♝']),
-        ("knight", ["'n'", "\"n\"", "`n`"], ['♘', '♞']),
-        ("pawn", ["'p'", "\"p\"", "`p`"], ['♙', '♟']),
-    ]
-    .iter()
-    .filter(|(name, aliases, glyphs)| {
-        lower.contains(*name)
-            || aliases.iter().any(|alias| lower.contains(alias))
-            || glyphs.iter().any(|glyph| text.contains(*glyph))
-    })
-    .count()
 }
 
 fn short_text(text: &str, max_chars: usize) -> String {
@@ -1904,17 +1516,8 @@ fn verify_layer_name(layer: VerifyLayer) -> &'static str {
         VerifyLayer::CrateCheck => "crate check",
         VerifyLayer::WorkspaceCheck => "workspace check",
         VerifyLayer::Test => "test",
-        VerifyLayer::RuntimeSmoke => "runtime smoke",
-        VerifyLayer::BrowserDomCheck => "browser DOM check",
-        VerifyLayer::InteractionCheck => "interaction check",
+        VerifyLayer::BrowserCheck => "browser check",
     }
-}
-
-fn is_runtime_layer(layer: VerifyLayer) -> bool {
-    matches!(
-        layer,
-        VerifyLayer::RuntimeSmoke | VerifyLayer::BrowserDomCheck | VerifyLayer::InteractionCheck
-    )
 }
 
 /// Try to bump `rt`'s tier by one step. Returns `false` if already at the
@@ -1971,27 +1574,10 @@ fn failure_reason(status: &SubtaskStatus) -> String {
     }
 }
 
-fn checkpoint_verified_hunks(
-    diff: &mut phonton_diff::DiffApplier,
-    task_id: TaskId,
-    subtask_id: SubtaskId,
-    seq: u32,
-    description: &str,
-    hunks: &[phonton_types::DiffHunk],
-) -> Result<Checkpoint> {
-    diff.apply_verified_hunks(hunks)
-        .context("failed to apply verified diff")?;
-    diff.commit_checkpoint(task_id, subtask_id, seq, description)
-        .context("failed to checkpoint verified diff")
-}
-
 /// Fallback diff application for projects without a git repository.
 /// Writes new files and applies simple line-based patches directly to disk.
 /// Silently skips hunks whose parent directory can't be created.
-fn apply_hunks_direct(
-    hunks: &[phonton_types::DiffHunk],
-    working_dir: &std::path::Path,
-) -> Result<()> {
+fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path::Path) {
     use phonton_types::DiffLine;
     use std::collections::BTreeMap;
 
@@ -2004,8 +1590,7 @@ fn apply_hunks_direct(
         let full = working_dir.join(rel_path);
         // Create parent dirs if needed.
         if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating parent directory {}", parent.display()))?;
+            let _ = std::fs::create_dir_all(parent);
         }
 
         let is_new = file_hunks
@@ -2027,86 +1612,36 @@ fn apply_hunks_direct(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            std::fs::write(&full, content)
-                .with_context(|| format!("writing {}", full.display()))?;
+            let _ = std::fs::write(&full, content);
         } else {
-            let original = std::fs::read_to_string(&full)
-                .with_context(|| format!("reading {}", full.display()))?;
-            let updated = reconstruct_direct_existing_file(&original, &file_hunks)
-                .with_context(|| format!("reconstructing {}", full.display()))?;
-            std::fs::write(&full, updated)
-                .with_context(|| format!("writing {}", full.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn reconstruct_direct_existing_file(
-    original: &str,
-    hunks: &[&phonton_types::DiffHunk],
-) -> Option<String> {
-    use phonton_types::DiffLine;
-
-    let mut original_lines = split_direct_lines(original);
-    let mut output = Vec::new();
-    let mut cursor = 0usize;
-    let mut ordered = hunks.to_vec();
-    ordered.sort_by_key(|hunk| hunk.old_start);
-
-    for hunk in ordered {
-        let start = hunk.old_start.saturating_sub(1) as usize;
-        if start < cursor || start > original_lines.len() {
-            return None;
-        }
-        output.extend(original_lines[cursor..start].iter().cloned());
-        cursor = start;
-
-        for line in &hunk.lines {
-            match line {
-                DiffLine::Context(text) => {
-                    let existing = original_lines.get(cursor)?;
-                    if normalize_direct_line(existing) != normalize_direct_line(text) {
-                        return None;
-                    }
-                    output.push(existing.clone());
-                    cursor = cursor.saturating_add(1);
-                }
-                DiffLine::Removed(text) => {
-                    let existing = original_lines.get(cursor)?;
-                    if normalize_direct_line(existing) != normalize_direct_line(text) {
-                        return None;
-                    }
-                    cursor = cursor.saturating_add(1);
-                }
-                DiffLine::Added(text) => output.push(text.clone()),
+            // Existing file — apply line patches naively.
+            let Ok(original) = std::fs::read_to_string(&full) else {
+                continue;
+            };
+            let mut out_lines: Vec<String> = original.lines().map(String::from).collect();
+            // Apply hunks in reverse order so line offsets don't shift.
+            let mut sorted = file_hunks.clone();
+            sorted.sort_by_key(|h| std::cmp::Reverse(h.new_start));
+            for hunk in sorted {
+                let start = hunk.new_start.saturating_sub(1) as usize;
+                let remove = hunk.old_count as usize;
+                let added: Vec<String> = hunk
+                    .lines
+                    .iter()
+                    .filter_map(|l| {
+                        if let DiffLine::Added(s) = l {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let end = (start + remove).min(out_lines.len());
+                out_lines.splice(start..end, added);
             }
+            let _ = std::fs::write(&full, out_lines.join("\n"));
         }
     }
-
-    output.extend(original_lines.drain(cursor..));
-    Some(join_direct_lines(&output))
-}
-
-fn split_direct_lines(source: &str) -> Vec<String> {
-    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines = normalized
-        .split('\n')
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if normalized.ends_with('\n') && lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    lines
-}
-
-fn join_direct_lines(lines: &[String]) -> String {
-    let mut source = lines.join("\n");
-    source.push('\n');
-    source
-}
-
-fn normalize_direct_line(line: &str) -> &str {
-    line.strip_suffix('\r').unwrap_or(line)
 }
 
 // ---------------------------------------------------------------------------
@@ -2238,8 +1773,7 @@ fn task_status_from(
 mod tests {
     use super::*;
     use phonton_types::{
-        CoverageSummary, DiffHunk, DiffLine, GoalContract, QualityFloor, RunCommand, Subtask,
-        SubtaskId, SubtaskStatus, TaskClass, VerifyLayer, VerifyStepSpec,
+        CoverageSummary, DiffHunk, DiffLine, Subtask, SubtaskId, SubtaskStatus, VerifyLayer,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2312,6 +1846,7 @@ mod tests {
             model_tier: ModelTier::Cheap,
             dependencies: deps,
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         }
     }
@@ -2368,63 +1903,13 @@ mod tests {
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = orch.run_task(plan, empty_state()).await.unwrap();
-        assert!(
-            matches!(status, TaskStatus::Reviewing { .. }),
-            "unexpected status: {status:?}"
-        );
+        assert!(matches!(status, TaskStatus::Reviewing { .. }));
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         // Linear: first dispatch must be a, then b, then c.
         assert_eq!(calls[0].0, a.id);
         assert_eq!(calls[1].0, b.id);
         assert_eq!(calls[2].0, c.id);
-    }
-
-    #[tokio::test]
-    async fn user_cancel_rejects_running_task() {
-        struct SleepingDispatcher;
-
-        #[async_trait]
-        impl WorkerDispatcher for SleepingDispatcher {
-            async fn dispatch(
-                &self,
-                _subtask: Subtask,
-                _prior_errors: Vec<String>,
-                _attempt: u8,
-                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
-            ) -> Result<SubtaskResult> {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                Err(anyhow!("unexpected wake"))
-            }
-        }
-
-        let a = subtask("long run", vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: None,
-        };
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel(4);
-        let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::new(SleepingDispatcher))
-            .with_working_dir(tmp.path())
-            .with_control_channel(control_rx);
-        let run = tokio::spawn(async move { orch.run_task(plan, empty_state()).await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        control_tx
-            .send(OrchestratorMessage::UserCancelled)
-            .await
-            .unwrap();
-
-        let status = tokio::time::timeout(std::time::Duration::from_secs(2), run)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        assert!(matches!(status, TaskStatus::Rejected));
     }
 
     #[tokio::test]
@@ -2452,10 +1937,7 @@ mod tests {
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
 
         let status = orch.run_task(plan, state_tx).await.unwrap();
-        assert!(
-            matches!(status, TaskStatus::Reviewing { .. }),
-            "unexpected status: {status:?}"
-        );
+        assert!(matches!(status, TaskStatus::Reviewing { .. }));
 
         let state = state_rx.borrow().clone();
         let handoff = state
@@ -2471,641 +1953,6 @@ mod tests {
             .passed
             .iter()
             .any(|line| line.contains("passed")));
-    }
-
-    #[tokio::test]
-    async fn runtime_verify_plan_without_runtime_result_is_a_known_gap() {
-        let a = subtask("create web UI", vec![]);
-        let contract = GoalContract {
-            goal: "make a web dashboard".into(),
-            task_class: TaskClass::GeneratedAppGame,
-            intent: None,
-            confidence_percent: 90,
-            acceptance_criteria: vec!["render a board".into()],
-            acceptance_slices: Vec::new(),
-            expected_artifacts: Vec::new(),
-            likely_files: Vec::new(),
-            verify_plan: vec![VerifyStepSpec {
-                name: "browser DOM check".into(),
-                layer: Some(VerifyLayer::BrowserDomCheck),
-                command: None,
-            }],
-            run_plan: Vec::new(),
-            quality_floor: QualityFloor {
-                criteria: Vec::new(),
-            },
-            clarification_questions: Vec::new(),
-            assumptions: Vec::new(),
-            token_policy: Default::default(),
-        };
-        let plan = PlannerOutput {
-            subtasks: vec![a],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(contract),
-        };
-        let (state_tx, state_rx) = watch::channel(GlobalState {
-            task_status: TaskStatus::Queued,
-            goal_contract: None,
-            handoff_packet: None,
-            active_workers: Vec::new(),
-            tokens_used: 0,
-            tokens_budget: None,
-            estimated_naive_tokens: 0,
-            checkpoints: Vec::new(),
-        });
-        let dispatcher = Arc::new(TrivialDispatcher::new());
-        let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-
-        let status = orch.run_task(plan, state_tx).await.unwrap();
-        assert!(matches!(status, TaskStatus::Reviewing { .. }));
-
-        let state = state_rx.borrow().clone();
-        let handoff = state.handoff_packet.expect("handoff packet");
-        assert!(handoff
-            .known_gaps
-            .iter()
-            .any(|gap| gap.contains("Runtime/browser verification was planned but not recorded")));
-        assert!(handoff
-            .verification
-            .findings
-            .iter()
-            .any(|finding| finding
-                .contains("Runtime/browser verification was planned but not recorded")));
-    }
-
-    #[test]
-    fn trivial_chess_output_fails_quality_gate_before_review() {
-        let a = subtask("make chess", vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a.clone()],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(GoalContract {
-                goal: "make chess".into(),
-                task_class: TaskClass::CoreLogic,
-                intent: None,
-                confidence_percent: 60,
-                acceptance_criteria: vec!["Produce playable chess.".into()],
-                acceptance_slices: Vec::new(),
-                expected_artifacts: Vec::new(),
-                likely_files: Vec::new(),
-                verify_plan: vec![VerifyStepSpec {
-                    name: "make".into(),
-                    layer: None,
-                    command: Some(RunCommand {
-                        label: "make".into(),
-                        command: vec!["make".into()],
-                        cwd: None,
-                    }),
-                }],
-                run_plan: vec![RunCommand {
-                    label: "Run chess".into(),
-                    command: vec![".\\chess.exe".into()],
-                    cwd: None,
-                }],
-                quality_floor: QualityFloor {
-                    criteria: vec!["Playable chess".into()],
-                },
-                clarification_questions: Vec::new(),
-                assumptions: Vec::new(),
-                token_policy: Default::default(),
-            }),
-        };
-        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
-        runtime.status = SubtaskStatus::Done {
-            tokens_used: 100,
-            diff_hunk_count: 1,
-        };
-        runtime.diff_hunks = vec![DiffHunk {
-            file_path: PathBuf::from("chess.c"),
-            old_start: 1,
-            old_count: 0,
-            new_start: 1,
-            new_count: 6,
-            lines: vec![
-                DiffLine::Added("#include <stdio.h>".into()),
-                DiffLine::Added("".into()),
-                DiffLine::Added("int main(void) {".into()),
-                DiffLine::Added("    printf(\"Chess\\n\");".into()),
-                DiffLine::Added("    return 0;".into()),
-                DiffLine::Added("}".into()),
-            ],
-        }];
-        let mut runtimes = HashMap::new();
-        runtimes.insert(a.id, runtime);
-        let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(dispatcher);
-
-        let failures = orch.quality_gate_failures(&plan, &runtimes);
-
-        assert!(failures
-            .iter()
-            .any(|failure| failure.contains("only 6 added line")));
-        assert!(failures
-            .iter()
-            .any(|failure| failure.contains("named chess pieces")));
-    }
-
-    #[test]
-    fn handoff_verification_prefers_planned_command_over_prompt_tail() {
-        let prompt = "# Benchmark Prompt\n\nFix the config loader.\n\nExpected final state:\n\n- The final response lists the verification command and any known gaps.";
-        let a = subtask(prompt, vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a.clone()],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(GoalContract {
-                goal: prompt.into(),
-                task_class: TaskClass::BugFix,
-                intent: None,
-                confidence_percent: 80,
-                acceptance_criteria: vec!["npm test passes".into()],
-                acceptance_slices: Vec::new(),
-                expected_artifacts: Vec::new(),
-                likely_files: Vec::new(),
-                verify_plan: vec![VerifyStepSpec {
-                    name: "npm test".into(),
-                    layer: Some(VerifyLayer::Test),
-                    command: Some(RunCommand {
-                        label: "npm test".into(),
-                        command: vec!["npm".into(), "test".into()],
-                        cwd: None,
-                    }),
-                }],
-                run_plan: Vec::new(),
-                quality_floor: QualityFloor {
-                    criteria: vec!["Verification outcome is surfaced honestly.".into()],
-                },
-                clarification_questions: Vec::new(),
-                assumptions: Vec::new(),
-                token_policy: Default::default(),
-            }),
-        };
-        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
-        runtime.status = SubtaskStatus::Done {
-            tokens_used: 100,
-            diff_hunk_count: 1,
-        };
-        runtime.verify_result = Some(VerifyResult::Pass {
-            layer: VerifyLayer::Test,
-        });
-        runtime.diff_hunks = vec![DiffHunk {
-            file_path: PathBuf::from("src/config.js"),
-            old_start: 1,
-            old_count: 1,
-            new_start: 1,
-            new_count: 1,
-            lines: vec![
-                DiffLine::Removed("export function loadConfig() {}".into()),
-                DiffLine::Added(
-                    "export function loadConfig(raw, env) { return { raw, env }; }".into(),
-                ),
-            ],
-        }];
-        let mut runtimes = HashMap::new();
-        runtimes.insert(a.id, runtime);
-        let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(dispatcher);
-
-        let handoff = orch.build_handoff_packet(
-            &plan,
-            &runtimes,
-            &TaskStatus::Reviewing {
-                tokens_used: 100,
-                estimated_savings_tokens: 0,
-            },
-            100,
-            &[],
-        );
-
-        assert_eq!(handoff.verification.passed, vec!["npm test passed"]);
-        assert!(!handoff.verification.passed[0].contains("final response"));
-    }
-
-    #[test]
-    fn handoff_failure_prefers_planned_command_over_prompt_tail() {
-        let prompt = "# Benchmark Prompt\n\nRefactor the receipt renderer.\n\nExpected final state:\n\n- The final response lists the verification command and any known gaps.";
-        let a = subtask(prompt, vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a.clone()],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(GoalContract {
-                goal: prompt.into(),
-                task_class: TaskClass::Refactor,
-                intent: None,
-                confidence_percent: 80,
-                acceptance_criteria: vec!["npm test passes".into()],
-                acceptance_slices: Vec::new(),
-                expected_artifacts: Vec::new(),
-                likely_files: Vec::new(),
-                verify_plan: vec![VerifyStepSpec {
-                    name: "npm test".into(),
-                    layer: None,
-                    command: Some(RunCommand {
-                        label: "npm test".into(),
-                        command: vec!["npm".into(), "test".into()],
-                        cwd: None,
-                    }),
-                }],
-                run_plan: Vec::new(),
-                quality_floor: QualityFloor {
-                    criteria: vec!["Verification outcome is surfaced honestly.".into()],
-                },
-                clarification_questions: Vec::new(),
-                assumptions: Vec::new(),
-                token_policy: Default::default(),
-            }),
-        };
-        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
-        runtime.status = SubtaskStatus::Failed {
-            reason: "verify failed 4 attempts at standard".into(),
-            attempt: 4,
-        };
-        let mut runtimes = HashMap::new();
-        runtimes.insert(a.id, runtime);
-        let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(dispatcher);
-
-        let handoff = orch.build_handoff_packet(
-            &plan,
-            &runtimes,
-            &TaskStatus::Failed {
-                reason: "verify failed 4 attempts at standard".into(),
-                failed_subtask: Some(a.id),
-            },
-            100,
-            &[],
-        );
-
-        assert_eq!(
-            handoff.verification.findings,
-            vec!["npm test failed: verify failed 4 attempts at standard"]
-        );
-        assert!(!handoff.verification.findings[0].contains("final response"));
-    }
-
-    fn chess_contract(goal: &str) -> GoalContract {
-        GoalContract {
-            goal: goal.into(),
-            task_class: TaskClass::CoreLogic,
-            intent: None,
-            confidence_percent: 60,
-            acceptance_criteria: vec!["Produce playable chess.".into()],
-            acceptance_slices: Vec::new(),
-            expected_artifacts: Vec::new(),
-            likely_files: Vec::new(),
-            verify_plan: vec![VerifyStepSpec {
-                name: "python compile".into(),
-                layer: None,
-                command: Some(RunCommand {
-                    label: "python -m py_compile chess.py".into(),
-                    command: vec![
-                        "python".into(),
-                        "-m".into(),
-                        "py_compile".into(),
-                        "chess.py".into(),
-                    ],
-                    cwd: None,
-                }),
-            }],
-            run_plan: vec![RunCommand {
-                label: "Run chess".into(),
-                command: vec!["python".into(), "chess.py".into()],
-                cwd: None,
-            }],
-            quality_floor: QualityFloor {
-                criteria: vec!["Playable chess".into()],
-            },
-            clarification_questions: Vec::new(),
-            assumptions: Vec::new(),
-            token_policy: Default::default(),
-        }
-    }
-
-    fn chess_hunk(include_reset: bool) -> DiffHunk {
-        let mut lines = vec![
-            "BOARD_SIZE = 8".to_string(),
-            "PIECES = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn']".to_string(),
-            "class ChessGame:".to_string(),
-            "    def __init__(self):".to_string(),
-            "        self.board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]"
-                .to_string(),
-            "        self.turn = 'white'".to_string(),
-            "        self.move_history = []".to_string(),
-            "    def legal_move(self, start, end):".to_string(),
-            "        return self.valid_move(start, end)".to_string(),
-            "    def valid_move(self, start, end):".to_string(),
-            "        return start != end and all(0 <= value < BOARD_SIZE for value in (*start, *end))"
-                .to_string(),
-            "    def move(self, start, end):".to_string(),
-            "        if not self.legal_move(start, end):".to_string(),
-            "            return False".to_string(),
-            "        self.turn = 'black' if self.turn == 'white' else 'white'".to_string(),
-            "        self.move_history.append((start, end))".to_string(),
-            "        return True".to_string(),
-        ];
-        if include_reset {
-            lines.extend([
-                "    def reset_game(self):".to_string(),
-                "        self.board = [[None for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)]"
-                    .to_string(),
-                "        self.turn = 'white'".to_string(),
-                "        self.move_history.clear()".to_string(),
-            ]);
-        } else {
-            lines.extend([
-                "    def start_position(self):".to_string(),
-                "        return self.board".to_string(),
-            ]);
-        }
-        while lines.len() < 90 {
-            lines.push(format!(
-                "# board turn move legal valid playable chess filler {}",
-                lines.len()
-            ));
-        }
-
-        DiffHunk {
-            file_path: PathBuf::from("chess.py"),
-            old_start: 1,
-            old_count: 0,
-            new_start: 1,
-            new_count: lines.len() as u32,
-            lines: lines.into_iter().map(DiffLine::Added).collect(),
-        }
-    }
-
-    fn chess_symbol_piece_hunk() -> DiffHunk {
-        let mut hunk = chess_hunk(true);
-        hunk.lines[1] = DiffLine::Added(
-            "PIECES = {'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙', 'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'}"
-                .into(),
-        );
-        hunk
-    }
-
-    #[test]
-    fn chess_quality_gate_accepts_symbol_piece_maps() {
-        let a = subtask("make chess", vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a.clone()],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(chess_contract("make chess")),
-        };
-        let mut runtime = SubtaskRuntime::new(a.clone(), NodeIndex::new(0));
-        runtime.status = SubtaskStatus::Done {
-            tokens_used: 100,
-            diff_hunk_count: 1,
-        };
-        runtime.diff_hunks = vec![chess_symbol_piece_hunk()];
-        let mut runtimes = HashMap::new();
-        runtimes.insert(a.id, runtime);
-        let dispatcher = Arc::new(TrivialDispatcher::new());
-        let orch = Orchestrator::new(dispatcher);
-
-        let failures = orch.quality_gate_failures(&plan, &runtimes);
-
-        assert!(
-            !failures
-                .iter()
-                .any(|failure| failure.contains("named chess pieces")),
-            "unexpected failures: {failures:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn quality_gate_failure_redispatches_repair_once() {
-        struct ChessRepairDispatcher {
-            prior_errors: Mutex<Vec<Vec<String>>>,
-        }
-
-        #[async_trait]
-        impl WorkerDispatcher for ChessRepairDispatcher {
-            async fn dispatch(
-                &self,
-                subtask: Subtask,
-                prior_errors: Vec<String>,
-                _attempt: u8,
-                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
-            ) -> Result<SubtaskResult> {
-                let include_reset = !prior_errors.is_empty();
-                self.prior_errors.lock().unwrap().push(prior_errors);
-                let hunks = vec![chess_hunk(include_reset)];
-                Ok(SubtaskResult {
-                    id: subtask.id,
-                    status: SubtaskStatus::Done {
-                        tokens_used: 100,
-                        diff_hunk_count: hunks.len(),
-                    },
-                    diff_hunks: hunks,
-                    model_tier: subtask.model_tier,
-                    verify_result: VerifyResult::Pass {
-                        layer: VerifyLayer::Syntax,
-                    },
-                    provider: ProviderKind::Anthropic,
-                    model_name: "test-model".into(),
-                    token_usage: TokenUsage {
-                        input_tokens: 50,
-                        output_tokens: 50,
-                        ..TokenUsage::default()
-                    },
-                })
-            }
-        }
-
-        let a = subtask("make chess", vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(chess_contract("make chess")),
-        };
-        let dispatcher = Arc::new(ChessRepairDispatcher {
-            prior_errors: Mutex::new(Vec::new()),
-        });
-        let tmp = tempfile::tempdir().expect("temp workspace");
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
-
-        assert!(
-            matches!(status, TaskStatus::Reviewing { .. }),
-            "unexpected status: {status:?}"
-        );
-        let calls = dispatcher.prior_errors.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].is_empty());
-        assert!(calls[1].iter().any(|error| error.contains("reset")));
-    }
-
-    #[tokio::test]
-    async fn expensive_quality_gate_failure_does_not_auto_repair() {
-        struct ExpensiveFailingDispatcher {
-            calls: Mutex<u8>,
-        }
-
-        #[async_trait]
-        impl WorkerDispatcher for ExpensiveFailingDispatcher {
-            async fn dispatch(
-                &self,
-                subtask: Subtask,
-                _prior_errors: Vec<String>,
-                _attempt: u8,
-                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
-            ) -> Result<SubtaskResult> {
-                *self.calls.lock().unwrap() += 1;
-                let hunks = vec![chess_hunk(false)];
-                Ok(SubtaskResult {
-                    id: subtask.id,
-                    status: SubtaskStatus::Done {
-                        tokens_used: 9_500,
-                        diff_hunk_count: hunks.len(),
-                    },
-                    diff_hunks: hunks,
-                    model_tier: subtask.model_tier,
-                    verify_result: VerifyResult::Pass {
-                        layer: VerifyLayer::Syntax,
-                    },
-                    provider: ProviderKind::Cloudflare,
-                    model_name: "@cf/moonshotai/kimi-k2.6".into(),
-                    token_usage: TokenUsage {
-                        input_tokens: 3_000,
-                        output_tokens: 6_500,
-                        ..TokenUsage::default()
-                    },
-                })
-            }
-        }
-
-        let a = subtask("make chess", vec![]);
-        let plan = PlannerOutput {
-            subtasks: vec![a],
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(chess_contract("make chess")),
-        };
-        let dispatcher = Arc::new(ExpensiveFailingDispatcher {
-            calls: Mutex::new(0),
-        });
-        let tmp = tempfile::tempdir().expect("temp workspace");
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
-
-        let TaskStatus::Failed { reason, .. } = status else {
-            panic!("unexpected status: {status:?}");
-        };
-        assert!(reason.contains("automatic quality repair skipped"));
-        assert_eq!(*dispatcher.calls.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn token_policy_can_disable_broad_quality_repair() {
-        let mut contract = chess_contract("make chess in html");
-        contract.token_policy.allow_broad_repair = false;
-        let plan = PlannerOutput {
-            subtasks: Vec::new(),
-            estimated_total_tokens: 0,
-            naive_baseline_tokens: 0,
-            coverage_summary: CoverageSummary::default(),
-            goal_contract: Some(contract),
-        };
-
-        let reason = quality_auto_repair_skip_reason(&plan, 10)
-            .expect("token policy should disable broad repair");
-
-        assert!(reason.contains("token policy"));
-    }
-
-    #[test]
-    fn direct_hunk_application_uses_old_file_coordinates() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("index.html"), "one\ntwo\nthree\nfour\n")
-            .expect("write fixture");
-        let hunk = DiffHunk {
-            file_path: PathBuf::from("index.html"),
-            old_start: 2,
-            old_count: 1,
-            new_start: 2,
-            new_count: 2,
-            lines: vec![
-                DiffLine::Context("two".into()),
-                DiffLine::Added("two and a half".into()),
-            ],
-        };
-
-        apply_hunks_direct(&[hunk], temp.path()).unwrap();
-
-        let updated = std::fs::read_to_string(temp.path().join("index.html")).unwrap();
-        assert_eq!(updated, "one\ntwo\ntwo and a half\nthree\nfour\n");
-    }
-
-    #[test]
-    fn checkpoint_verified_hunks_reports_apply_failures() {
-        let temp = tempfile::tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(temp.path())
-            .status()
-            .expect("git init");
-        std::process::Command::new("git")
-            .args(["config", "user.email", "phonton-test@local"])
-            .current_dir(temp.path())
-            .status()
-            .expect("git config email");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Phonton Test"])
-            .current_dir(temp.path())
-            .status()
-            .expect("git config name");
-        std::fs::write(temp.path().join("index.js"), "export const ok = true;\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(temp.path())
-            .status()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-q", "-m", "seed"])
-            .current_dir(temp.path())
-            .status()
-            .expect("git commit");
-
-        let hunk = DiffHunk {
-            file_path: PathBuf::from("index.js"),
-            old_start: 99,
-            old_count: 1,
-            new_start: 99,
-            new_count: 1,
-            lines: vec![
-                DiffLine::Removed("export const ok = true;".into()),
-                DiffLine::Added("export const ok = false;".into()),
-            ],
-        };
-        let mut diff = phonton_diff::DiffApplier::open(temp.path()).unwrap();
-
-        let err = checkpoint_verified_hunks(
-            &mut diff,
-            TaskId::new(),
-            SubtaskId::new(),
-            1,
-            "bad apply",
-            &[hunk],
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("failed to apply verified diff"));
     }
 
     #[tokio::test]
@@ -3183,22 +2030,91 @@ mod tests {
         let dispatcher = Arc::new(BrokenDispatcher {
             calls: Mutex::new(Vec::new()),
         });
-        let (events_tx, mut events_rx) = broadcast::channel(32);
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher))
-            .with_working_dir(tmp.path())
-            .with_event_sink(TaskId::new(), "busted", events_tx);
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let status = orch.run_task(plan, empty_state()).await.unwrap();
         assert!(matches!(status, TaskStatus::Failed { .. }));
         let calls = dispatcher.calls.lock().unwrap();
         // At minimum: retries at initial tier plus at least one escalation.
         assert!(calls.len() >= 2);
         assert!(calls.iter().any(|t| *t != ModelTier::Cheap));
+    }
+
+    #[tokio::test]
+    async fn emits_repair_planned_before_retry_dispatch() {
+        struct BrokenDispatcher;
+
+        #[async_trait]
+        impl WorkerDispatcher for BrokenDispatcher {
+            async fn dispatch(
+                &self,
+                subtask: Subtask,
+                _prior_errors: Vec<String>,
+                _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
+            ) -> Result<SubtaskResult> {
+                let hunks = vec![DiffHunk {
+                    file_path: PathBuf::from("phonton-types/src/stub.rs"),
+                    old_start: 1,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 1,
+                    lines: vec![DiffLine::Added("fn broken( -> {".into())],
+                }];
+                Ok(SubtaskResult {
+                    id: subtask.id,
+                    status: SubtaskStatus::Done {
+                        tokens_used: 10,
+                        diff_hunk_count: hunks.len(),
+                    },
+                    diff_hunks: hunks,
+                    model_tier: subtask.model_tier,
+                    verify_result: VerifyResult::Pass {
+                        layer: VerifyLayer::Syntax,
+                    },
+                    provider: ProviderKind::Anthropic,
+                    model_name: "test-broken".into(),
+                    token_usage: TokenUsage {
+                        input_tokens: 10,
+                        ..TokenUsage::default()
+                    },
+                })
+            }
+        }
+
+        let task_id = TaskId::new();
+        let a = subtask("busted", vec![]);
+        let plan = PlannerOutput {
+            subtasks: vec![a],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+        };
+        let (events_tx, mut events_rx) = broadcast::channel(32);
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::new(BrokenDispatcher))
+            .with_working_dir(tmp.path())
+            .with_event_sink(task_id, "busted", events_tx);
+
+        let _ = orch.run_task(plan, empty_state()).await.unwrap();
+
         let mut saw_repair = false;
         while let Ok(record) = events_rx.try_recv() {
-            if let OrchestratorEvent::RepairPlanned { reason, .. } = record.event {
+            if let OrchestratorEvent::RepairPlanned {
+                reason,
+                tier,
+                attempt,
+                ..
+            } = record.event
+            {
                 saw_repair = true;
                 assert!(reason.contains("verifier diagnostics"));
+                assert!(attempt >= 1);
+                assert!(matches!(
+                    tier,
+                    ModelTier::Cheap | ModelTier::Standard | ModelTier::Frontier
+                ));
             }
         }
         assert!(saw_repair, "expected RepairPlanned event in flight log");
@@ -3325,6 +2241,7 @@ mod tests {
             model_tier: ModelTier::Frontier,
             dependencies: vec![],
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let plan = PlannerOutput {
@@ -3376,6 +2293,7 @@ mod tests {
             model_tier: ModelTier::Cheap,
             dependencies: vec![id_b],
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let b = Subtask {
@@ -3384,6 +2302,7 @@ mod tests {
             model_tier: ModelTier::Cheap,
             dependencies: vec![id_a],
             attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         };
         let plan = PlannerOutput {

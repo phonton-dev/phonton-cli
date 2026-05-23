@@ -5,14 +5,13 @@
 //! estimate before execution.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use anyhow::Result;
 use phonton_planner::{decompose, decompose_with_memory, Goal};
-use phonton_types::{GoalContract, PlannerOutput, RunCommand, SubtaskId};
+use phonton_types::{PlannerOutput, SubtaskId};
 use serde::Serialize;
 
-use crate::{contract_preflight::apply_workspace_preflight, open_persistent_store};
+use crate::open_persistent_store;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanOptions {
@@ -40,7 +39,6 @@ pub struct PlanRequest {
 #[derive(Debug, Clone, Serialize)]
 struct PlanReport {
     goal: String,
-    goal_contract: Option<GoalContract>,
     memory_enabled: bool,
     memory_influence_count: usize,
     coverage_warnings: Vec<String>,
@@ -107,7 +105,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     let mut goal = Goal::new(request.goal.clone());
     goal.no_tests = request.options.no_tests;
 
-    let mut plan = if request.options.use_memory {
+    let plan = if request.options.use_memory {
         match open_persistent_store() {
             Ok(store) => decompose_with_memory(&goal, &store, None).await?,
             Err(e) => {
@@ -118,12 +116,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
     } else {
         decompose(&goal)
     };
-    let working_dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    apply_workspace_preflight(&mut plan, &working_dir, &request.goal);
 
     let report = PlanReport {
         goal: request.goal,
-        goal_contract: plan.goal_contract.clone(),
         memory_enabled: request.options.use_memory,
         memory_influence_count: memory_influence_count(&plan),
         coverage_warnings: coverage_warnings(&plan),
@@ -141,44 +136,28 @@ pub async fn run(args: &[String]) -> Result<i32> {
 }
 
 fn print_text_report(report: &PlanReport) {
-    print!("{}", format_text_report(report));
-}
-
-fn format_text_report(report: &PlanReport) -> String {
-    let mut out = String::new();
-    writeln!(out, "Phonton plan preview").ok();
-    writeln!(out, "goal:   {}", report.goal).ok();
-    writeln!(
-        out,
+    println!("Phonton plan preview");
+    println!("goal:   {}", report.goal);
+    println!(
         "memory: {}",
         if report.memory_enabled {
             "enabled"
         } else {
             "disabled"
         }
-    )
-    .ok();
-    writeln!(
-        out,
+    );
+    println!(
         "tokens: estimated {} / naive baseline {}",
         report.plan.estimated_total_tokens, report.plan.naive_baseline_tokens
-    )
-    .ok();
-    writeln!(
-        out,
+    );
+    println!(
         "coverage: {} new functions, {} tests planned",
         report.plan.coverage_summary.new_functions, report.plan.coverage_summary.tests_planned
-    )
-    .ok();
+    );
     for warning in &report.coverage_warnings {
-        writeln!(out, "warning: {warning}").ok();
+        println!("warning: {warning}");
     }
-    writeln!(out).ok();
-
-    if let Some(contract) = &report.goal_contract {
-        append_goal_contract(&mut out, contract);
-        writeln!(out).ok();
-    }
+    println!();
 
     let id_to_index: HashMap<SubtaskId, usize> = report
         .plan
@@ -200,155 +179,25 @@ fn format_text_report(report: &PlanReport) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        writeln!(
-            out,
+        println!(
             "{}. [{:?}] {}",
             idx + 1,
             subtask.model_tier,
             first_line(&subtask.description)
-        )
-        .ok();
-        writeln!(out, "   id: {}", subtask.id).ok();
-        writeln!(out, "   depends_on: {deps}").ok();
+        );
+        println!("   id: {}", subtask.id);
+        println!("   depends_on: {deps}");
         if subtask.description.contains("# Prior context") {
-            writeln!(out, "   memory: applied to this subtask").ok();
+            println!("   memory: applied to this subtask");
         }
         let areas = expected_touched_areas(&subtask.description);
         if !areas.is_empty() {
-            writeln!(out, "   expected areas: {}", areas.join(", ")).ok();
+            println!("   expected areas: {}", areas.join(", "));
         }
     }
 
-    writeln!(out).ok();
-    writeln!(
-        out,
-        "Preview only: no files were changed and no worker was dispatched."
-    )
-    .ok();
-    out
-}
-
-fn append_goal_contract(out: &mut String, contract: &GoalContract) {
-    writeln!(out, "GoalContract").ok();
-    writeln!(
-        out,
-        "  class: {} ({}% confidence)",
-        contract.task_class, contract.confidence_percent
-    )
-    .ok();
-    if let Some(intent) = &contract.intent {
-        writeln!(
-            out,
-            "  intent: {:?}; ambiguity {:?}; blast {:?}; runtime {:?}; token {:?}",
-            intent.recommended_action,
-            intent.ambiguity,
-            intent.blast_radius,
-            intent.runtime_risk,
-            intent.token_risk
-        )
-        .ok();
-    }
-    append_string_list(out, "  acceptance:", &contract.acceptance_criteria);
-    if !contract.acceptance_slices.is_empty() {
-        writeln!(out, "  acceptance slices:").ok();
-        for slice in &contract.acceptance_slices {
-            match &slice.artifact_path {
-                Some(path) => writeln!(
-                    out,
-                    "    - {}: {} ({})",
-                    slice.id,
-                    slice.criterion,
-                    path.display()
-                )
-                .ok(),
-                None => writeln!(out, "    - {}: {}", slice.id, slice.criterion).ok(),
-            };
-        }
-    }
-    if contract.expected_artifacts.is_empty() {
-        writeln!(out, "  expected artifacts: none inferred").ok();
-    } else {
-        writeln!(out, "  expected artifacts:").ok();
-        for artifact in &contract.expected_artifacts {
-            match &artifact.path {
-                Some(path) => {
-                    writeln!(out, "    - {} ({})", artifact.description, path.display()).ok()
-                }
-                None => writeln!(out, "    - {}", artifact.description).ok(),
-            };
-        }
-    }
-    if contract.likely_files.is_empty() {
-        writeln!(out, "  likely files: none inferred").ok();
-    } else {
-        writeln!(
-            out,
-            "  likely files: {}",
-            contract
-                .likely_files
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .ok();
-    }
-    if contract.verify_plan.is_empty() {
-        writeln!(out, "  verify plan: no verifier inferred yet").ok();
-    } else {
-        writeln!(out, "  verify plan:").ok();
-        for step in &contract.verify_plan {
-            let command = step
-                .command
-                .as_ref()
-                .map(format_command)
-                .unwrap_or_else(|| "manual check".into());
-            writeln!(out, "    - {}: {}", step.name, command).ok();
-        }
-    }
-    if contract.run_plan.is_empty() {
-        writeln!(out, "  run plan: no run command inferred yet").ok();
-    } else {
-        writeln!(out, "  run plan:").ok();
-        for command in &contract.run_plan {
-            writeln!(out, "    - {}: {}", command.label, format_command(command)).ok();
-        }
-    }
-    append_string_list(out, "  quality floor:", &contract.quality_floor.criteria);
-    writeln!(
-        out,
-        "  token policy: first_attempt_cap={}, broad_repair={}, surgical_repair={}",
-        contract
-            .token_policy
-            .first_attempt_cap_tokens
-            .map(|tokens| tokens.to_string())
-            .unwrap_or_else(|| "none".into()),
-        contract.token_policy.allow_broad_repair,
-        contract.token_policy.repair_only_missing_criteria
-    )
-    .ok();
-    append_string_list(out, "  token notes:", &contract.token_policy.notes);
-    append_string_list(out, "  assumptions:", &contract.assumptions);
-    append_string_list(out, "  clarifications:", &contract.clarification_questions);
-}
-
-fn append_string_list(out: &mut String, label: &str, items: &[String]) {
-    if items.is_empty() {
-        writeln!(out, "{label} none").ok();
-        return;
-    }
-    writeln!(out, "{label}").ok();
-    for item in items {
-        writeln!(out, "    - {item}").ok();
-    }
-}
-
-fn format_command(command: &RunCommand) -> String {
-    let mut text = command.command.join(" ");
-    if let Some(cwd) = &command.cwd {
-        text.push_str(&format!("  (cwd: {})", cwd.display()));
-    }
-    text
+    println!();
+    println!("Preview only: no files were changed and no worker was dispatched.");
 }
 
 fn subtask_reports(plan: &PlannerOutput) -> Vec<PlanSubtaskReport> {
@@ -443,34 +292,5 @@ mod tests {
             first_line("# Prior context\n- x\n\nImplement thing"),
             "# Prior context"
         );
-    }
-
-    #[test]
-    fn text_report_includes_visible_goal_contract_sections() {
-        let plan = PlannerOutput {
-            subtasks: Vec::new(),
-            estimated_total_tokens: 1200,
-            naive_baseline_tokens: 4000,
-            coverage_summary: phonton_types::CoverageSummary::default(),
-            goal_contract: Some(Goal::new("make chess").contract()),
-        };
-        let report = PlanReport {
-            goal: "make chess".into(),
-            goal_contract: plan.goal_contract.clone(),
-            memory_enabled: false,
-            memory_influence_count: 0,
-            coverage_warnings: Vec::new(),
-            subtasks: subtask_reports(&plan),
-            plan,
-        };
-
-        let text = format_text_report(&report);
-
-        assert!(text.contains("GoalContract"));
-        assert!(text.contains("acceptance:"));
-        assert!(text.contains("verify plan:"));
-        assert!(text.contains("run plan:"));
-        assert!(text.contains("quality floor:"));
-        assert!(text.contains("Preview only"));
     }
 }

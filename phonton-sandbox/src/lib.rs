@@ -7,13 +7,11 @@
 //! On every platform, guard decisions are authoritative — `Block` is never
 //! overridden.
 
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use phonton_types::PermissionMode;
 use tokio::process::Command;
 
 #[cfg(target_os = "windows")]
@@ -104,22 +102,12 @@ pub enum GuardDecision {
 #[derive(Debug, Clone)]
 pub struct ExecutionGuard {
     project_root: PathBuf,
-    permission_mode: PermissionMode,
 }
 
 impl ExecutionGuard {
     /// Construct a guard scoped to `project_root`.
     pub fn new(project_root: PathBuf) -> Self {
-        Self::new_with_mode(project_root, PermissionMode::Ask)
-    }
-
-    /// Construct a guard scoped to `project_root` with an explicit permission
-    /// posture.
-    pub fn new_with_mode(project_root: PathBuf, permission_mode: PermissionMode) -> Self {
-        Self {
-            project_root,
-            permission_mode,
-        }
+        Self { project_root }
     }
 
     /// Project root this guard was constructed with.
@@ -127,29 +115,19 @@ impl ExecutionGuard {
         &self.project_root
     }
 
-    /// Active permission posture.
-    pub fn permission_mode(&self) -> PermissionMode {
-        self.permission_mode
-    }
-
     /// Evaluate a tool call. The returned [`GuardDecision`] is the only
     /// signal the worker uses to decide whether to proceed.
     pub fn evaluate(&self, call: &ToolCall) -> GuardDecision {
         match call {
             ToolCall::Read { path } | ToolCall::Write { path, .. } => {
-                let policy_path = self.policy_path(path);
-                if let Some(reason) = blocked_path(path).or_else(|| blocked_path(&policy_path)) {
+                if let Some(reason) = blocked_path(path) {
                     return GuardDecision::Block { reason };
                 }
             }
             ToolCall::Run { .. } | ToolCall::Bash { .. } => {
                 for arg in arg_iter(call) {
                     if looks_like_path(arg) {
-                        let raw_path = Path::new(arg);
-                        let policy_path = self.policy_path(raw_path);
-                        if let Some(reason) =
-                            blocked_path(raw_path).or_else(|| blocked_path(&policy_path))
-                        {
+                        if let Some(reason) = blocked_path(Path::new(arg)) {
                             return GuardDecision::Block { reason };
                         }
                     }
@@ -169,11 +147,6 @@ impl ExecutionGuard {
                 }
             }
             ToolCall::Write { path, .. } => {
-                if self.permission_mode == PermissionMode::ReadOnly {
-                    return GuardDecision::Block {
-                        reason: "read-only permission mode blocks file writes".into(),
-                    };
-                }
                 if self.is_inside_root(path) {
                     GuardDecision::Allow
                 } else {
@@ -183,20 +156,9 @@ impl ExecutionGuard {
                 }
             }
             ToolCall::Run { program, args } => {
-                if self.permission_mode == PermissionMode::ReadOnly {
-                    return GuardDecision::Approve {
-                        reason: format!(
-                            "read-only permission mode requires approval to run `{program}`"
-                        ),
-                    };
-                }
                 if !is_allowed_program(program) {
-                    return if self.permission_mode == PermissionMode::FullAccess {
-                        GuardDecision::Allow
-                    } else {
-                        GuardDecision::Approve {
-                            reason: format!("program `{program}` is not on the allowlist"),
-                        }
+                    return GuardDecision::Approve {
+                        reason: format!("program `{program}` is not on the allowlist"),
                     };
                 }
                 if is_destructive_program(program) {
@@ -212,60 +174,23 @@ impl ExecutionGuard {
                 }
                 GuardDecision::Allow
             }
-            ToolCall::Bash { command } => {
-                if self.permission_mode == PermissionMode::FullAccess {
-                    GuardDecision::Allow
-                } else if self.permission_mode == PermissionMode::ReadOnly {
-                    GuardDecision::Approve {
-                        reason: format!(
-                            "read-only permission mode requires approval for shell: {command}"
-                        ),
-                    }
-                } else {
-                    GuardDecision::Approve {
-                        reason: format!("arbitrary bash requires approval: {command}"),
-                    }
-                }
-            }
-            ToolCall::Network { url } => {
-                if self.permission_mode == PermissionMode::FullAccess {
-                    GuardDecision::Allow
-                } else {
-                    GuardDecision::Approve {
-                        reason: format!("network request to {url} requires approval"),
-                    }
-                }
-            }
+            ToolCall::Bash { command } => GuardDecision::Approve {
+                reason: format!("arbitrary bash requires approval: {command}"),
+            },
+            ToolCall::Network { url } => GuardDecision::Approve {
+                reason: format!("network request to {url} requires approval"),
+            },
         }
     }
 
     fn is_inside_root(&self, path: &Path) -> bool {
-        self.policy_path(path)
-            .starts_with(lexical_normalize(&self.project_root))
-    }
-
-    fn policy_path(&self, path: &Path) -> PathBuf {
         let abs = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.project_root.join(path)
         };
-        lexical_normalize(&abs)
+        abs.starts_with(&self.project_root)
     }
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
 }
 
 fn is_allowed_program(program: &str) -> bool {
@@ -294,19 +219,27 @@ fn looks_like_path(s: &str) -> bool {
 fn blocked_path(path: &Path) -> Option<String> {
     let s = path.to_string_lossy();
     let lower = s.to_ascii_lowercase();
-    let lower_slash = lower.replace('\\', "/");
 
-    for needle in ["/.ssh/", "/.aws/", "/.config/anthropic", "/.env"] {
-        if lower_slash.contains(needle) {
+    for needle in [
+        "/.ssh/",
+        "\\.ssh\\",
+        "/.aws/",
+        "\\.aws\\",
+        "/.config/anthropic",
+        "\\.config\\anthropic",
+        "/.env",
+        "\\.env",
+    ] {
+        if lower.contains(needle) {
             return Some(format!("blocked: sensitive path {s}"));
         }
     }
-    if lower_slash.ends_with("/.env") || lower_slash == ".env" {
+    if lower.ends_with("/.env") || lower.ends_with("\\.env") || lower == ".env" {
         return Some(format!("blocked: sensitive path {s}"));
     }
 
     for prefix in ["/etc/", "/usr/", "/bin/", "/sbin/", "/boot/"] {
-        if lower_slash.starts_with(prefix) {
+        if lower.starts_with(prefix) {
             return Some(format!("blocked: system path {s}"));
         }
     }
@@ -343,17 +276,8 @@ impl Sandbox {
     /// Create a new sandbox bound to `project_root`. Typically the
     /// orchestrator's working directory.
     pub fn new(project_root: PathBuf, task_id: String) -> Self {
-        Self::new_with_mode(project_root, task_id, PermissionMode::Ask)
-    }
-
-    /// Create a sandbox with an explicit local permission posture.
-    pub fn new_with_mode(
-        project_root: PathBuf,
-        task_id: String,
-        permission_mode: PermissionMode,
-    ) -> Self {
         Self {
-            guard: ExecutionGuard::new_with_mode(project_root, permission_mode),
+            guard: ExecutionGuard::new(project_root),
             task_id,
         }
     }
@@ -431,14 +355,7 @@ impl Sandbox {
                         if let Ok(process_handle) =
                             OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
                         {
-                            if let Err(err) = AssignProcessToJobObject(job, process_handle) {
-                                tracing::warn!(
-                                    task_id = %self.task_id,
-                                    error = %err,
-                                    "{}",
-                                    job_assignment_warning_text(&err.to_string())
-                                );
-                            }
+                            let _ = AssignProcessToJobObject(job, process_handle);
                             let _ = windows::Win32::Foundation::CloseHandle(process_handle);
                         }
                         job_wrapper = Some(JobHandle(job));
@@ -512,13 +429,6 @@ fn apply_env_scrub(cmd: &mut Command) {
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn job_assignment_warning_text(error: &str) -> String {
-    format!(
-        "Windows job-object assignment failed ({error}); this can happen inside a nested Windows Job Object. Continuing with tokio kill_on_drop for the direct child, but descendant process cleanup is not guaranteed."
-    )
-}
-
 // ---------------------------------------------------------------------------
 // CrateLock — coarse-grained per-crate exclusion for `cargo` invocations
 // ---------------------------------------------------------------------------
@@ -545,7 +455,6 @@ pub struct CrateLock {
     inner: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     >,
-    lock_dir: Option<std::sync::Arc<PathBuf>>,
 }
 
 /// RAII guard returned by [`CrateLock::acquire`].
@@ -555,7 +464,6 @@ pub struct CrateLock {
 /// the same crate is woken. Carries the crate name only for logging.
 pub struct CrateLockGuard {
     _inner: tokio::sync::OwnedMutexGuard<()>,
-    _file: Option<FileLockGuard>,
     krate: String,
 }
 
@@ -570,17 +478,6 @@ impl CrateLock {
     /// Construct an empty registry.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Construct a registry that also uses lock files in `lock_dir`.
-    ///
-    /// This extends the in-process mutex to sibling Phonton processes pointed
-    /// at the same worktree lock directory.
-    pub fn new_with_dir(lock_dir: PathBuf) -> Self {
-        Self {
-            inner: Default::default(),
-            lock_dir: Some(std::sync::Arc::new(lock_dir)),
-        }
     }
 
     /// Acquire the per-crate mutex for `crate_name`.
@@ -600,11 +497,9 @@ impl CrateLock {
                 .clone()
         };
         let owned = mutex.lock_owned().await;
-        let file = self.acquire_file_lock(crate_name).await;
         tracing::debug!(crate_name, "crate-lock acquired");
         CrateLockGuard {
             _inner: owned,
-            _file: file,
             krate: crate_name.to_string(),
         }
     }
@@ -623,85 +518,11 @@ impl CrateLock {
                 .clone()
         };
         let owned = mutex.try_lock_owned().ok()?;
-        let file = match self.try_file_lock(crate_name) {
-            Some(FileLockAttempt::Acquired(file)) => Some(file),
-            Some(FileLockAttempt::Busy) => return None,
-            Some(FileLockAttempt::Unavailable) | None => None,
-        };
         Some(CrateLockGuard {
             _inner: owned,
-            _file: file,
             krate: crate_name.to_string(),
         })
     }
-
-    async fn acquire_file_lock(&self, crate_name: &str) -> Option<FileLockGuard> {
-        self.lock_dir.as_ref()?;
-        loop {
-            match self.try_file_lock(crate_name) {
-                Some(FileLockAttempt::Acquired(lock)) => return Some(lock),
-                Some(FileLockAttempt::Busy) => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Some(FileLockAttempt::Unavailable) | None => return None,
-            }
-        }
-    }
-
-    fn try_file_lock(&self, crate_name: &str) -> Option<FileLockAttempt> {
-        let lock_dir = self.lock_dir.as_ref()?;
-        if std::fs::create_dir_all(lock_dir.as_ref()).is_err() {
-            tracing::warn!(crate_name, "crate file lock directory unavailable");
-            return Some(FileLockAttempt::Unavailable);
-        }
-        let path = lock_dir.join(format!("{}.lock", sanitize_lock_name(crate_name)));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => {
-                let _ = file.set_len(0);
-                Some(FileLockAttempt::Acquired(FileLockGuard {
-                    path,
-                    _file: file,
-                }))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                Some(FileLockAttempt::Busy)
-            }
-            Err(err) => {
-                tracing::warn!(crate_name, error = %err, "crate file lock unavailable");
-                Some(FileLockAttempt::Unavailable)
-            }
-        }
-    }
-}
-
-enum FileLockAttempt {
-    Acquired(FileLockGuard),
-    Busy,
-    Unavailable,
-}
-
-struct FileLockGuard {
-    path: PathBuf,
-    _file: File,
-}
-
-impl Drop for FileLockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn sanitize_lock_name(crate_name: &str) -> String {
-    crate_name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -738,56 +559,6 @@ mod tests {
         let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
         let d = g.evaluate(&ToolCall::Read {
             path: PathBuf::from("/work/proj/src/lib.rs"),
-        });
-        assert_eq!(d, GuardDecision::Allow);
-    }
-
-    #[test]
-    fn parent_traversal_outside_root_requires_approval() {
-        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
-        let d = g.evaluate(&ToolCall::Read {
-            path: PathBuf::from("../outside.txt"),
-        });
-        assert!(matches!(d, GuardDecision::Approve { .. }));
-    }
-
-    #[test]
-    fn read_only_blocks_workspace_writes() {
-        let g =
-            ExecutionGuard::new_with_mode(PathBuf::from("/work/proj"), PermissionMode::ReadOnly);
-        let d = g.evaluate(&ToolCall::Write {
-            path: PathBuf::from("/work/proj/src/lib.rs"),
-            content: "x".into(),
-        });
-
-        assert!(matches!(d, GuardDecision::Block { .. }));
-    }
-
-    #[test]
-    fn full_access_allows_bash_after_sensitive_path_filter() {
-        let g =
-            ExecutionGuard::new_with_mode(PathBuf::from("/work/proj"), PermissionMode::FullAccess);
-        let d = g.evaluate(&ToolCall::Bash {
-            command: "npm test && npm run build".into(),
-        });
-
-        assert_eq!(d, GuardDecision::Allow);
-    }
-
-    #[test]
-    fn parent_traversal_to_system_path_is_blocked_after_normalization() {
-        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
-        let d = g.evaluate(&ToolCall::Read {
-            path: PathBuf::from("../../etc/passwd"),
-        });
-        assert!(matches!(d, GuardDecision::Block { .. }));
-    }
-
-    #[test]
-    fn parent_traversal_back_inside_root_is_allowed() {
-        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
-        let d = g.evaluate(&ToolCall::Read {
-            path: PathBuf::from("src/../Cargo.toml"),
         });
         assert_eq!(d, GuardDecision::Allow);
     }
@@ -840,31 +611,6 @@ mod tests {
         drop(g1);
         // After release, the waiter completes promptly.
         h.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn crate_lock_file_scope_blocks_independent_registries() {
-        let dir = env::temp_dir().join(format!("phonton-crate-lock-test-{}", std::process::id()));
-        let lock_a = CrateLock::new_with_dir(dir.clone());
-        let lock_b = CrateLock::new_with_dir(dir.clone());
-
-        let guard = lock_a.acquire("phonton-types").await;
-
-        assert!(
-            lock_b.try_acquire("phonton-types").is_none(),
-            "second registry should observe file lock held by first registry"
-        );
-
-        drop(guard);
-        assert!(lock_b.try_acquire("phonton-types").is_some());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn windows_job_assignment_warning_names_nested_job_fallback() {
-        let warning = job_assignment_warning_text("Access is denied");
-        assert!(warning.contains("nested Windows Job Object"));
-        assert!(warning.contains("kill_on_drop"));
     }
 
     #[test]

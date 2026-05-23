@@ -159,6 +159,30 @@ Execute commands directly from your shell or use the interactive Ratatui TUI das
 * **`phonton extensions`**: Manage extension packs. Install MCP servers, custom profiles, or steering guides.
   * Install an MCP recipe: `phonton extensions install github`
 
+### 🎹 Interactive TUI Keyboard Shortcuts
+
+| Shortcut | Description |
+|---|---|
+| **`Ctrl+C` / `Esc`** | Safe session quit (with resume receipt) |
+| **`Alt+F`** | Cycle focus panels (Receipt, Code, Problems, Commands, Log) |
+| **`Ctrl+↑` / `Ctrl+↓`** | Navigate checkpoints / time-travel rollback list |
+| **`r`** | Perform point-in-time rollback to the selected checkpoint |
+| **`Tab`** | Open autocomplete suggestions / command drawer |
+
+---
+
+## 🏗️ Crate Architecture
+
+Phonton is structured as a modular workspace designed for local-first reliability:
+
+* **`phonton-cli`**: RATATUI-powered terminal dashboard.
+* **`phonton-planner`**: Decomposes user goals into structured subtask DAGs.
+* **`phonton-orchestrator`**: Execution engine, budget tracker, and parallel worker manager.
+* **`phonton-verify`**: Compilation, Tree-sitter syntax, memory checklist, and test gates.
+* **`phonton-worker`**: Patch-generation call loops and LLM tool execution policy.
+* **`phonton-index`**: HNSW-backed high-speed vector index for local code semantics.
+* **`phonton-memory`**: Local SQLite database storing conventions, constraints, and decisions.
+
 ---
 
 ## 🏁 Release Channels
