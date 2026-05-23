@@ -4,6 +4,23 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.17.1 - DeepSeek-TUI Benchmark Enrolment
+
+### Added
+- Officially integrates and supports **Hunter Bown's DeepSeek-TUI (v0.8.39)** directly in the benchmark setup and capture harness across all active benchmark suites.
+
+### Fixed
+- Hardened formatting boundaries across Rust changed files to prevent CI checklist checker regression errors.
+
+## 0.17.0 - Dynamic Keys, Credentials Autopilot & HNSW Vector Memory
+
+### Added
+- **Dynamic Key Map:** Configure multiple provider API keys inside `config.toml` under the `[provider.keys]` section.
+- **Dynamic Key Resolver:** Dynamically resolves `{PROVIDER}_API_KEY` environment variables (e.g. `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`) and maps provider tiers to model defaults.
+- **Credentials Autopilot:** Command `phonton providers import-opencode` scans standard app folders, parses credentials, and safely merges them into config.
+- **High-Speed HNSW Semantic Search:** Local vector similarity queries in under 160µs query latency using `usearch` and `fastembed` with `all-MiniLM-L6-v2`.
+- **AST Syntax Preflight Check:** Layer 1 tree-sitter AST validation checking changed files for syntax errors before committing.
+
 ## 0.16.2 - Benchmark-Honest Headless Runs
 
 ### Added
