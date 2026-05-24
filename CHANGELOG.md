@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.3 - Solid-Block TUI Splash & Silent Embedder Downloads
+
+### Fixed
+
+- Replaced double-line box-drawing characters in the TUI splash logo with a robust, solid block-character wordmark to resolve visual font rendering bugs and vertical line overlaps.
+- Added strict suppression to standard output progress indicators during sentence-embedding ONNX model downloads to prevent input line corruption in TUI sessions.
+
 ## 0.19.2 - TUI Version Display & Auto-Update Engine
 
 ### Added
