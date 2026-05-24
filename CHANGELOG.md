@@ -4,6 +4,16 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.5 - Confidence Gate for Under-Specified Goals
+
+### Added
+
+- **Goal Contract Confidence Gate**: Implemented a robust confidence and clarification questions gate in `phonton-orchestrator`'s `run_task` loop. If a goal's confidence is under `70%` or carries unanswered clarification questions (such as broad, stackless goals like `"make chess"`), the orchestrator immediately halts execution, surfaces the clarification questions under the `Problems` focus, and outputs a clear `TaskStatus::Failed` to protect provider token budgets.
+
+### Fixed
+
+- **Token Waste Prevention**: Stopped the worker loop from executing broad under-specified placeholders blindly, saving up to 12.4k+ tokens on unproductive placeholder stubs.
+
 ## 0.19.4 - Double-Line Splash Logo & RAII Browser Verifier Polish
 
 ### Added

@@ -446,6 +446,46 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             goal: self.goal_text.clone(),
             subtask_count: plan.subtasks.len(),
         });
+
+        // 1.5. Confidence Gate: fail task if confidence is too low or clarification questions exist.
+        if let Some(contract) = &plan.goal_contract {
+            if contract.confidence_percent < 70 || !contract.clarification_questions.is_empty() {
+                let questions = contract.clarification_questions.join("; ");
+                let reason = format!(
+                    "Goal confidence is too low ({}%) due to under-specified requirements. Clarification required: {}",
+                    contract.confidence_percent,
+                    if questions.is_empty() { "None" } else { &questions }
+                );
+                self.emit(OrchestratorEvent::TaskFailed {
+                    task_id: self.task_id,
+                    reason: reason.clone(),
+                    failed_subtask: None,
+                });
+                let status = TaskStatus::Failed {
+                    reason: reason.clone(),
+                    failed_subtask: None,
+                };
+                let handoff = self.build_handoff_packet(
+                    &plan,
+                    &runtimes,
+                    &status,
+                    0,
+                    &[],
+                );
+                let extras = BroadcastExtras {
+                    tokens_budget: self.tokens_budget,
+                    estimated_naive_tokens: self.estimated_naive_tokens,
+                    checkpoints: &[],
+                    goal_contract: Some(contract),
+                    plan_graph: Some(&plan.plan_graph),
+                    index_backend: self.index_backend.as_deref(),
+                    handoff_packet: Some(&handoff),
+                };
+                broadcast(&state_tx, &status, &runtimes, 0, extras);
+                return Ok(status);
+            }
+        }
+
         let mut last_milestone: u64 = 0;
 
         // 2. Mark subtasks with no deps as Ready so the first scheduler
@@ -2654,5 +2694,45 @@ mod tests {
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
         let r = orch.run_task(plan, empty_state()).await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn confidence_gate_halts_low_confidence_goal() {
+        use phonton_types::{GoalContract, QualityFloor, TaskClass};
+
+        let a = subtask("make chess", vec![]);
+        let contract = GoalContract {
+            goal: "make chess".into(),
+            task_class: TaskClass::CoreLogic,
+            confidence_percent: 60, // under 70% threshold
+            acceptance_criteria: vec![],
+            expected_artifacts: vec![],
+            likely_files: vec![],
+            verify_plan: vec![],
+            run_plan: vec![],
+            quality_floor: QualityFloor { criteria: vec![] },
+            clarification_questions: vec![
+                "What exact behavior or artifact should Phonton produce?".into(),
+            ],
+            assumptions: vec![],
+        };
+        let plan = PlannerOutput {
+            subtasks: vec![a.clone()],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: Some(contract),
+            plan_graph: Default::default(),
+        };
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let status = orch.run_task(plan, empty_state()).await.unwrap();
+
+        assert!(
+            matches!(status, TaskStatus::Failed { ref reason, .. } if reason.contains("Goal confidence is too low (60%)")),
+            "expected Low Confidence Failure, got {:?}",
+            status
+        );
     }
 }
