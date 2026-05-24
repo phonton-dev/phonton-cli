@@ -124,12 +124,13 @@ const LOGO_ROW_PHASE: f32 = 0.085;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "█████░  █   █░  ████░  █   █░ █████░  ████░  █   █░",
-    "█   █░  █   █░ █    █░ ██  █░   █  ░ █    █░ ██  █░",
-    "█████░  █████░ █    █░ █ █ █░   █  ░ █    █░ █ █ █░",
-    "█    ░  █   █░ █    █░ █  ██░   █  ░ █    █░ █  ██░",
-    "█    ░  █   █░  ████░  █   █░   █  ░  ████░  █   █░",
-    " ░░░░    ░   ░   ░░░░    ░   ░    ░     ░░░░    ░   ░",
+    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
+    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
+    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
+    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
+    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
 ];
 
 const LOGO_WIDTH_THRESHOLD: u16 = 72;
@@ -208,7 +209,8 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len().max(1) as f32;
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let wave = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
+    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
 
     for (i, ch) in chars.into_iter().enumerate() {
         if ch == ' ' {
@@ -217,31 +219,65 @@ fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
         }
 
         let x = i as f32 / n;
-        let style = if matches!(ch, '░' | '▒' | '▓') {
-            let shadow_t = ((x + phase * 0.45 + row_idx as f32 * 0.025).fract() - 0.5).abs();
-            let lift = (0.18 - shadow_t).max(0.0) / 0.18;
-            Style::default().fg(grad(LOGO_SHADOW, GRAD_B, lift * 0.26))
-        } else {
-            let base = logo_grad((x * 0.82 + phase * 0.74 + row_idx as f32 * 0.04).fract());
-            let distance = (x - wave).abs().min(1.0 - (x - wave).abs());
-            let glint = if distance < 0.075 {
-                (1.0 - distance / 0.075) * 0.55
-            } else {
-                0.0
-            };
-            let breathing = ((phase * std::f32::consts::TAU
-                + x * std::f32::consts::TAU * 1.4
-                + row_idx as f32 * 0.65)
-                .sin()
-                + 1.0)
-                * 0.07;
-            Style::default()
-                .fg(grad(
-                    base_rgb(base),
-                    LOGO_GLOW,
-                    (glint + breathing).clamp(0.0, 0.62),
-                ))
-                .add_modifier(Modifier::BOLD)
+        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
+        let base_color = base_rgb(base);
+        let dist = |w: f32| -> f32 {
+            let raw = (x - w).abs();
+            raw.min(1.0 - raw)
+        };
+        let d_a = dist(wave_a);
+        let d_b = dist(wave_b);
+
+        let style = match ch {
+            '░' | '▒' | '▓' => {
+                let body = match ch {
+                    '▓' => 0.55,
+                    '▒' => 0.32,
+                    _ => 0.16,
+                };
+                let glow = if d_a < 0.14 {
+                    (1.0 - d_a / 0.14) * 0.45
+                } else {
+                    0.0
+                };
+                Style::default().fg(grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9)))
+            }
+            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
+                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
+                let lift = if d_a < 0.07 {
+                    (1.0 - d_a / 0.07) * 0.35
+                } else {
+                    0.0
+                };
+                Style::default()
+                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
+                    .add_modifier(Modifier::BOLD)
+            }
+            _ => {
+                let glint_a = if d_a < 0.08 {
+                    (1.0 - d_a / 0.08) * 0.65
+                } else {
+                    0.0
+                };
+                let glint_b = if d_b < 0.05 {
+                    (1.0 - d_b / 0.05) * 0.45
+                } else {
+                    0.0
+                };
+                let breathing = ((phase * std::f32::consts::TAU
+                    + x * std::f32::consts::TAU * 1.4
+                    + row_idx as f32 * 0.65)
+                    .sin()
+                    + 1.0)
+                    * 0.08;
+                Style::default()
+                    .fg(grad(
+                        base_color,
+                        LOGO_GLOW,
+                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
+                    ))
+                    .add_modifier(Modifier::BOLD)
+            }
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
@@ -6926,23 +6962,26 @@ fn extract_id(line: &str) -> Option<String> {
     fn splash_logo_is_compact_and_shadowed() {
         let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
-        assert!(max_width < 64, "logo should stay compact for the splash");
         assert!(
-            LOGO.iter().any(|row| row.contains('░')),
-            "logo should carry its own pixel shadow layer"
+            LOGO[0].contains("██████╗"),
+            "logo should use the standard ANSI Shadow wordmark"
+        );
+        assert!(
+            LOGO.last().unwrap_or(&"").contains("░▒▓"),
+            "logo should keep the soft glow strip"
         );
     }
 
     #[test]
-    fn renders_new_logo_on_wide_splash() {
+    fn renders_shadow_logo_on_wide_splash() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::default();
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("█████"));
-        assert!(dump.contains("░░░░"));
+        assert!(dump.contains("██████"));
+        assert!(dump.contains("╚═════╝"));
     }
 
     #[test]

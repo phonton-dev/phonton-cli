@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.1 - Shadow Logo Restore
+
+### Fixed
+
+- Restored the standard ANSI Shadow Phonton ASCII splash logo with the full 7-line block-border wordmark and `░▒▓█...▓▒░` glow strip.
+- Upgraded the `logo_line` shader to dual-wave shimmer with separate styling for block borders (`╔═╗║╝╚`), shadow glyphs (`░▒▓`), and solid fills.
+
 ## 0.19.0 - Swarm Plans, Index Backends & MCP Capability Preview
 
 ### Added
