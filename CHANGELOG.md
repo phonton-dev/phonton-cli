@@ -4,6 +4,17 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.4 - Double-Line Splash Logo & RAII Browser Verifier Polish
+
+### Added
+
+- **RAII Browser Check Guard**: Implemented a robust `BrowserCheckGuard` struct in `phonton-verify/src/browser.rs` to guarantee clean deletion of temporary files (`phonton-server.js` and `phonton-playwright.js`) and prompt shutdown of background static server child processes across all exit paths, eliminating zombie background Node process leaks on the host system.
+
+### Fixed
+
+- **Reverted Splash Logo to Double-Line Wordmark**: Reverted the TUI splash logo to the classic 7-line box-drawing shadow glyph wordmark (`██████╗` / `╚═╝`) as requested.
+- **Removed Shimmer Animation**: Set the scanline shimmer phase to a static `0.0` inside `render_splash`, completely removing animation refresh glitches while preserving the premium color gradient.
+
 ## 0.19.3 - Solid-Block TUI Splash & Silent Embedder Downloads
 
 ### Fixed

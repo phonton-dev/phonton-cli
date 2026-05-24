@@ -119,16 +119,18 @@ const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
 const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
 
 const UI_TICK_MS: u64 = 80;
+#[allow(dead_code)]
 const LOGO_SHIMMER_SPEED: f32 = 0.018;
 const LOGO_ROW_PHASE: f32 = 0.085;
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 const LOGO: &[&str] = &[
-    "    ████▄  ██  ██   ████   ██  ██  ██████   ████   ██  ██     ",
-    "    ██  ██ ██  ██  ██  ██  ███ ██    ██    ██  ██  ███ ██     ",
-    "    ████▀  ██████  ██  ██  ██ ███    ██    ██  ██  ██ ███     ",
-    "    ██     ██  ██  ██  ██  ██  ██    ██    ██  ██  ██  ██     ",
-    "    ██     ██  ██   ████   ██  ██    ██     ████   ██  ██     ",
+    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
+    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
+    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
+    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
+    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
     "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
 ];
 
@@ -2098,10 +2100,9 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
-    // Slowly drifting phase so the logo gets a deliberate scanline shimmer
-    // without turning the whole splash into a fast flashing surface.
-    let phase = (app.spinner_frame as f32) * LOGO_SHIMMER_SPEED;
+fn render_splash(frame: &mut Frame, area: Rect, _app: &App) {
+    // We set phase to 0.0 to render a gorgeous, static gradient without animation shimmer
+    let phase = 0.0;
     if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
         let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 1);
         lines.push(Line::raw(""));
@@ -7067,8 +7068,8 @@ fn extract_id(line: &str) -> Option<String> {
         let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
         assert!(
-            LOGO[0].contains("████▄"),
-            "logo should use the standard block wordmark"
+            LOGO[0].contains("██████╗"),
+            "logo should use the standard ANSI Shadow wordmark"
         );
         assert!(
             LOGO.last().unwrap_or(&"").contains("░▒▓"),
@@ -7084,8 +7085,8 @@ fn extract_id(line: &str) -> Option<String> {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("████▄"));
         assert!(dump.contains("██████"));
+        assert!(dump.contains("╚═════╝"));
     }
 
     #[test]

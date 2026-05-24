@@ -175,10 +175,11 @@ const { chromium } = require('playwright');
     std::fs::write(&server_script, server_content)?;
     std::fs::write(&playwright_script, playwright_content)?;
 
-    // Helper to cleanup temporary scripts
-    let cleanup = || {
-        let _ = std::fs::remove_file(&server_script);
-        let _ = std::fs::remove_file(&playwright_script);
+    // Create the scope guard to guarantee cleanup of files and child process on any exit path.
+    let mut guard = BrowserCheckGuard {
+        server_script: &server_script,
+        playwright_script: &playwright_script,
+        server_child: None,
     };
 
     // 3. Start the background Node static file server
@@ -192,7 +193,6 @@ const { chromium } = require('playwright');
     {
         Ok(child) => child,
         Err(e) => {
-            cleanup();
             return Ok(Some(VerifyResult::Fail {
                 layer: VerifyLayer::BrowserCheck,
                 errors: vec![format!("failed to spawn node background server: {e}")],
@@ -201,11 +201,15 @@ const { chromium } = require('playwright');
         }
     };
 
-    // 4. Discover the port the server bound to from its stdout
-    let stdout = server_child.stdout.take().ok_or_else(|| {
-        cleanup();
-        anyhow!("failed to read node server stdout")
-    })?;
+    // Discover the port the server bound to from its stdout
+    let stdout = server_child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to read node server stdout"))?;
+
+    // Arm the guard with the child process to prevent background zombie process leaks
+    guard.server_child = Some(server_child);
+
     let mut reader = BufReader::new(stdout).lines();
 
     let port_discovery = tokio::time::timeout(Duration::from_secs(5), async {
@@ -221,8 +225,6 @@ const { chromium } = require('playwright');
     let port = match port_discovery {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
-            let _ = server_child.kill().await;
-            cleanup();
             return Ok(Some(VerifyResult::Fail {
                 layer: VerifyLayer::BrowserCheck,
                 errors: vec![format!("node server failed to start: {e}")],
@@ -230,8 +232,6 @@ const { chromium } = require('playwright');
             }));
         }
         Err(_) => {
-            let _ = server_child.kill().await;
-            cleanup();
             return Ok(Some(VerifyResult::Fail {
                 layer: VerifyLayer::BrowserCheck,
                 errors: vec!["node server port discovery timed out after 5s".into()],
@@ -299,9 +299,10 @@ const { chromium } = require('playwright');
 
     let playwright_output = tokio::time::timeout(Duration::from_secs(45), playwright_cmd).await;
 
-    // Shutdown background server
-    let _ = server_child.kill().await;
-    cleanup();
+    // Shutdown background server explicitly (otherwise the guard will kill it on drop)
+    if let Some(mut child) = guard.server_child.take() {
+        let _ = child.kill().await;
+    }
 
     let output = match playwright_output {
         Ok(Ok(out)) => out,
@@ -432,4 +433,20 @@ fn package_json_looks_browser_runnable(path: &Path) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+struct BrowserCheckGuard<'a> {
+    server_script: &'a Path,
+    playwright_script: &'a Path,
+    server_child: Option<tokio::process::Child>,
+}
+
+impl<'a> Drop for BrowserCheckGuard<'a> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.server_script);
+        let _ = std::fs::remove_file(self.playwright_script);
+        if let Some(mut child) = self.server_child.take() {
+            let _ = child.start_kill();
+        }
+    }
 }
