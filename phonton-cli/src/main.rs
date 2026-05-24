@@ -746,6 +746,7 @@ impl Default for App {
             },
             index: crate::config::IndexConfig::default(),
             permissions: crate::config::PermissionsConfig::default(),
+            general: crate::config::GeneralConfig::default(),
         };
         Self::new(&default_cfg)
     }
@@ -2404,12 +2405,20 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(7)])
+        .constraints([Constraint::Min(1), Constraint::Length(8)])
         .split(area);
 
     frame.render_widget(list, chunks[0]);
 
     let sys_info = vec![
+        Line::from(vec![
+            Span::styled(" V ", Style::default().fg(SUCCESS)),
+            Span::styled("version   ", Style::default().fg(MUTED)),
+            Span::styled(
+                concat!("v", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(ACCENT_HI),
+            ),
+        ]),
         Line::from(vec![
             Span::styled(" ◆ ", Style::default().fg(ACCENT)),
             Span::styled("provider  ", Style::default().fg(MUTED)),
@@ -5055,6 +5064,56 @@ async fn main() -> Result<()> {
     // Load configuration first so the rest of startup can use it.
     let mut cfg = config::load().unwrap_or_default();
 
+    // Start background auto-update check
+    let pending_update = Arc::new(std::sync::Mutex::new(None));
+    let pending_update_clone = pending_update.clone();
+    let enable_update = cfg.general.enable_auto_update;
+    tokio::spawn(async move {
+        if !enable_update {
+            return;
+        }
+        if std::env::var("CI").is_ok() || std::env::var("INTEGRATION_TESTS").is_ok() {
+            return;
+        }
+        // Wait a short moment to let main TUI startup finish cleanly without contention
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let res = match client
+            .get("https://registry.npmjs.org/phonton-cli/latest")
+            .header("User-Agent", "phonton-cli-auto-update")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct NpmLatest {
+            version: String,
+        }
+
+        let latest: NpmLatest = match res.json().await {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+
+        let current = env!("CARGO_PKG_VERSION");
+        if is_newer_version(&latest.version, current) {
+            if let Ok(mut guard) = pending_update_clone.lock() {
+                *guard = Some(latest.version);
+            }
+        }
+    });
+
     // First-run / no-model-set flow: probe the configured key for a
     // working model before we even draw the TUI. Bounded to ~6 seconds
     // (discovery + up to 3 tiny pings) so cold start stays snappy. If
@@ -5149,6 +5208,32 @@ async fn main() -> Result<()> {
         SetCursorStyle::DefaultUserShape,
     )?;
     terminal.show_cursor()?;
+
+    // Perform auto update if a new version was found in the background
+    if let Ok(guard) = pending_update.lock() {
+        if let Some(ref version) = *guard {
+            println!(
+                "\n\x1b[32m[System] A new version of Phonton is available (v{}). Auto-updating globally via npm...\x1b[0m",
+                version
+            );
+            let status = if cfg!(windows) {
+                std::process::Command::new("powershell")
+                    .args([
+                        "-Command",
+                        "Start-Sleep -Seconds 2; npm install -g phonton-cli@latest",
+                    ])
+                    .spawn()
+            } else {
+                std::process::Command::new("sh")
+                    .args(["-c", "sleep 2 && npm install -g phonton-cli@latest"])
+                    .spawn()
+            };
+            if let Ok(mut child) = status {
+                let _ = child.try_wait();
+            }
+        }
+    }
+
     result
 }
 
@@ -6329,6 +6414,26 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Option<(u32, u32, u32)> {
+        let clean = v.trim_start_matches('v');
+        let parts: Vec<&str> = clean.split('.').collect();
+        if parts.len() >= 3 {
+            let major = parts[0].parse().ok()?;
+            let minor = parts[1].parse().ok()?;
+            let patch = parts[2].parse().ok()?;
+            Some((major, minor, patch))
+        } else {
+            None
+        }
+    };
+    if let (Some(l), Some(c)) = (parse(latest), parse(current)) {
+        l > c
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

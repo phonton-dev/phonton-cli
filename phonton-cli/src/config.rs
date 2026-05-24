@@ -52,6 +52,10 @@ pub struct Config {
     /// fail to load when new permission modes are introduced.
     #[serde(default)]
     pub permissions: PermissionsConfig,
+
+    /// General CLI settings.
+    #[serde(default)]
+    pub general: GeneralConfig,
 }
 
 /// `[provider]` table.
@@ -139,6 +143,27 @@ pub struct IndexConfig {
 pub struct PermissionsConfig {
     /// Default approval mode, e.g. `ask`.
     pub mode: Option<String>,
+}
+
+/// `[general]` table.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[allow(dead_code)]
+pub struct GeneralConfig {
+    /// Whether to check and auto-update Phonton CLI globally.
+    #[serde(default = "default_enable_auto_update", alias = "enableAutoUpdate")]
+    pub enable_auto_update: bool,
+}
+
+fn default_enable_auto_update() -> bool {
+    true
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            enable_auto_update: default_enable_auto_update(),
+        }
+    }
 }
 
 impl Default for IndexConfig {
@@ -393,5 +418,27 @@ mode = "ask"
             allow_unverified_model: None,
         };
         assert_eq!(resolve_api_key(&cfg).as_deref(), Some("from-config"));
+    }
+
+    #[test]
+    fn parses_general_config() {
+        let raw = r#"
+[general]
+enable_auto_update = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.general.enable_auto_update);
+
+        // Test camelCase alias
+        let raw_camel = r#"
+[general]
+enableAutoUpdate = false
+"#;
+        let cfg_camel: Config = toml::from_str(raw_camel).unwrap();
+        assert!(!cfg_camel.general.enable_auto_update);
+
+        // Test default
+        let cfg_default: Config = toml::from_str("").unwrap();
+        assert!(cfg_default.general.enable_auto_update);
     }
 }

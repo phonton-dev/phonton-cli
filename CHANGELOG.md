@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.2 - TUI Version Display & Auto-Update Engine
+
+### Added
+
+- Added Phonton CLI version number display to the TUI sidebar "System" panel.
+- Added general configuration setting `general.enable_auto_update` (also aliased to camelCase `enableAutoUpdate` to mirror Gemini CLI).
+- Added an asynchronous background auto-update engine that queries the npm registry at startup and schedules a global detached background npm update upon clean TUI exit (solving Windows file lock issues).
+
 ## 0.19.1 - Shadow Logo Restore
 
 ### Fixed

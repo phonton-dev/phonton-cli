@@ -2093,9 +2093,9 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "numkong"
-version = "7.6.0"
+version = "7.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a75e386ad4a252e96357fd400ed9b5c7afea048447f2fb0906652b47cf2aaa87"
+checksum = "b58d4bb97df102ebdde66a352a20c0bc65c7c407ee9bef12ebe317edc2458a55"
 dependencies = [
  "cc",
 ]
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "anyhow",
  "async-trait",
