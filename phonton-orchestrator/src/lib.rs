@@ -465,13 +465,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     reason: reason.clone(),
                     failed_subtask: None,
                 };
-                let handoff = self.build_handoff_packet(
-                    &plan,
-                    &runtimes,
-                    &status,
-                    0,
-                    &[],
-                );
+                let handoff = self.build_handoff_packet(&plan, &runtimes, &status, 0, &[]);
                 let extras = BroadcastExtras {
                     tokens_budget: self.tokens_budget,
                     estimated_naive_tokens: self.estimated_naive_tokens,

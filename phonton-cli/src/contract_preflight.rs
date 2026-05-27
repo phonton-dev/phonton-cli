@@ -1,9 +1,19 @@
 use std::path::{Path, PathBuf};
 
 use phonton_types::{
-    AcceptanceSlice, CoverageSummary, ExpectedArtifact, ModelTier, PlannerOutput, RunCommand,
-    Subtask, SubtaskId, SubtaskStatus, TokenPolicy, VerifyStepSpec,
+    CoverageSummary, ExpectedArtifact, ModelTier, PlannerOutput, PromptAttachment,
+    PromptAttachmentKind, RunCommand, Subtask, SubtaskId, SubtaskStatus, VerifyStepSpec,
 };
+
+const PREFLIGHT_TEXT_ATTACHMENT_LIMIT: usize = 40_000;
+const PREFLIGHT_TEST_ATTACHMENT_LIMIT: usize = 8;
+
+#[derive(Clone)]
+struct AcceptanceSlice {
+    id: String,
+    criterion: String,
+    artifact_path: Option<PathBuf>,
+}
 
 /// Apply local workspace signals to a visible goal contract.
 ///
@@ -27,6 +37,10 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
     let package_json = working_dir.join("package.json");
     if package_json.is_file() {
         stack_detected = true;
+        attach_preflight_context(
+            &mut plan.subtasks,
+            collect_node_preflight_attachments(working_dir),
+        );
         if let Ok(text) = std::fs::read_to_string(&package_json) {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                 let scripts = value.get("scripts").and_then(|scripts| scripts.as_object());
@@ -186,6 +200,97 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
     }
 }
 
+fn collect_node_preflight_attachments(working_dir: &Path) -> Vec<PromptAttachment> {
+    let mut attachments = Vec::new();
+    push_text_attachment(
+        &mut attachments,
+        working_dir,
+        &working_dir.join("package.json"),
+    );
+
+    let mut test_files = Vec::new();
+    for dir_name in ["test", "tests"] {
+        collect_test_files(&working_dir.join(dir_name), &mut test_files);
+    }
+    test_files.sort();
+    for path in test_files.into_iter().take(PREFLIGHT_TEST_ATTACHMENT_LIMIT) {
+        push_text_attachment(&mut attachments, working_dir, &path);
+    }
+    attachments
+}
+
+fn collect_test_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_test_files(&path, out);
+        } else if file_type.is_file()
+            && matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
+            )
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn push_text_attachment(attachments: &mut Vec<PromptAttachment>, root: &Path, path: &Path) {
+    if attachments
+        .iter()
+        .any(|attachment| root.join(&attachment.path) == path)
+    {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let truncated = bytes.len() > PREFLIGHT_TEXT_ATTACHMENT_LIMIT;
+    let text_bytes = if truncated {
+        &bytes[..PREFLIGHT_TEXT_ATTACHMENT_LIMIT]
+    } else {
+        bytes.as_slice()
+    };
+    let text = String::from_utf8_lossy(text_bytes).into_owned();
+    let display_path = path
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf());
+    attachments.push(PromptAttachment {
+        path: display_path,
+        kind: PromptAttachmentKind::Text,
+        mime_type: Some("text/plain".into()),
+        size_bytes: bytes.len() as u64,
+        text: Some(text),
+        data_base64: None,
+        truncated,
+        note: truncated.then(|| "preflight context truncated".into()),
+    });
+}
+
+fn attach_preflight_context(subtasks: &mut [Subtask], attachments: Vec<PromptAttachment>) {
+    if attachments.is_empty() {
+        return;
+    }
+    for subtask in subtasks {
+        for attachment in &attachments {
+            if !subtask
+                .attachments
+                .iter()
+                .any(|existing| existing.path == attachment.path)
+            {
+                subtask.attachments.push(attachment.clone());
+            }
+        }
+    }
+}
+
 fn wants_vite_react_app(lower_goal: &str) -> bool {
     lower_goal.contains("vite")
         && lower_goal.contains("react")
@@ -275,27 +380,21 @@ fn apply_empty_vite_react_chess_plan(
             .any(|parts| parts == ["python", "-m", "http.server"])
     });
 
-    let verify_plan = contract.verify_plan.clone();
-    contract.acceptance_slices = vite_react_chess_acceptance_slices(verify_plan);
-    contract.token_policy = TokenPolicy {
-        first_attempt_cap_tokens: Some(7_000),
-        allow_broad_repair: false,
-        repair_only_missing_criteria: true,
-        notes: vec![
-            "Scaffold the explicit Vite/React stack; do not simplify to static HTML.".into(),
-            "Use bounded slices and preserve passing npm test/build after each slice.".into(),
-        ],
-    };
+    contract.assumptions.extend([
+        "Scaffold the explicit Vite/React stack; do not simplify to static HTML.".into(),
+        "Use bounded slices and preserve passing npm test/build after each slice.".into(),
+    ]);
 
     let attachments = plan
         .subtasks
         .first()
         .map(|subtask| subtask.attachments.clone())
         .unwrap_or_default();
+    let acceptance_slices = vite_react_chess_acceptance_slices(contract.verify_plan.clone());
     plan.subtasks = preflight_acceptance_slice_subtasks(
         goal_text,
         "Vite React chess app",
-        &contract.acceptance_slices,
+        &acceptance_slices,
         attachments,
     );
     plan.estimated_total_tokens = (plan.subtasks.len() as u64).saturating_mul(1_000);
@@ -353,31 +452,25 @@ fn apply_existing_vite_react_chess_plan(plan: &mut PlannerOutput, goal_text: &st
             .any(|parts| parts == ["python", "-m", "http.server"])
     });
 
-    let verify_plan = contract.verify_plan.clone();
-    contract.acceptance_slices = existing_vite_react_chess_acceptance_slices(verify_plan);
-    contract.token_policy = TokenPolicy {
-        first_attempt_cap_tokens: Some(5_000),
-        allow_broad_repair: false,
-        repair_only_missing_criteria: true,
-        notes: vec![
-            "Use the existing Vite/React stack; avoid package/index rewrites on the first pass."
-                .into(),
-            "Seed the chess rules/test boundary locally before provider UI slices to avoid high-token generated-app syntax churn."
-                .into(),
-            "Use bounded source/test slices and preserve passing npm test/build after each slice."
-                .into(),
-        ],
-    };
+    contract.assumptions.extend([
+        "Use the existing Vite/React stack; avoid package/index rewrites on the first pass."
+            .into(),
+        "Seed the chess rules/test boundary locally before provider UI slices to avoid high-token generated-app syntax churn."
+            .into(),
+        "Use bounded source/test slices and preserve passing npm test/build after each slice.".into(),
+    ]);
 
     let attachments = plan
         .subtasks
         .first()
         .map(|subtask| subtask.attachments.clone())
         .unwrap_or_default();
+    let acceptance_slices =
+        existing_vite_react_chess_acceptance_slices(contract.verify_plan.clone());
     plan.subtasks = preflight_acceptance_slice_subtasks(
         goal_text,
         "Existing Vite React chess app",
-        &contract.acceptance_slices,
+        &acceptance_slices,
         attachments,
     );
     plan.estimated_total_tokens = plan.subtasks.len().saturating_sub(1) as u64 * 850;
@@ -388,7 +481,7 @@ fn apply_existing_vite_react_chess_plan(plan: &mut PlannerOutput, goal_text: &st
     };
 }
 
-fn vite_react_chess_acceptance_slices(verify_plan: Vec<VerifyStepSpec>) -> Vec<AcceptanceSlice> {
+fn vite_react_chess_acceptance_slices(_verify_plan: Vec<VerifyStepSpec>) -> Vec<AcceptanceSlice> {
     [
         (
             "scaffold",
@@ -431,13 +524,12 @@ fn vite_react_chess_acceptance_slices(verify_plan: Vec<VerifyStepSpec>) -> Vec<A
         id: id.into(),
         criterion: criterion.into(),
         artifact_path: Some(PathBuf::from(artifact)),
-        verify_plan: verify_plan.clone(),
     })
     .collect()
 }
 
 fn existing_vite_react_chess_acceptance_slices(
-    verify_plan: Vec<VerifyStepSpec>,
+    _verify_plan: Vec<VerifyStepSpec>,
 ) -> Vec<AcceptanceSlice> {
     [
         (
@@ -466,7 +558,6 @@ fn existing_vite_react_chess_acceptance_slices(
         id: id.into(),
         criterion: criterion.into(),
         artifact_path: Some(PathBuf::from(artifact)),
-        verify_plan: verify_plan.clone(),
     })
     .collect()
 }
@@ -519,6 +610,7 @@ fn preflight_acceptance_slice_subtasks(
             model_tier: ModelTier::Standard,
             dependencies: previous.into_iter().collect(),
             attachments: attachments.clone(),
+            prompt_artifacts: Vec::new(),
             status: SubtaskStatus::Queued,
         });
         previous = Some(id);
@@ -720,6 +812,39 @@ Expected final state:
     }
 
     #[test]
+    fn npm_workspace_attaches_package_and_tests_as_preflight_context() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("test")).unwrap();
+        std::fs::write(
+            temp.path().join("test").join("receipt.test.js"),
+            "import test from 'node:test';\n",
+        )
+        .unwrap();
+
+        let mut plan = plan_for("refactor `src/receipt.js` and add tests");
+        apply_workspace_preflight(
+            &mut plan,
+            temp.path(),
+            "refactor `src/receipt.js` and add tests",
+        );
+
+        let subtask = plan.subtasks.first().expect("subtask");
+        assert!(subtask
+            .attachments
+            .iter()
+            .any(|attachment| attachment.path == Path::new("package.json")));
+        assert!(subtask
+            .attachments
+            .iter()
+            .any(|attachment| attachment.path == Path::new("test/receipt.test.js")));
+    }
+
+    #[test]
     fn empty_chess_workspace_defaults_to_terminal_python_game() {
         let temp = tempfile::tempdir().unwrap();
         let mut plan = plan_for("make chess");
@@ -816,12 +941,11 @@ Expected final state:
             .acceptance_criteria
             .iter()
             .any(|criterion| criterion.contains("Vite, TypeScript, and React")));
-        assert!(contract
-            .acceptance_slices
+        let acceptance_slices = vite_react_chess_acceptance_slices(contract.verify_plan.clone());
+        assert!(acceptance_slices
             .iter()
             .any(|slice| slice.criterion.contains("game-state/rules boundary tests")));
-        let scaffold_slice = contract
-            .acceptance_slices
+        let scaffold_slice = acceptance_slices
             .iter()
             .find(|slice| slice.id == "scaffold")
             .expect("vite chess contract should include scaffold slice");
@@ -850,7 +974,7 @@ Expected final state:
             .command
             .windows(3)
             .any(|parts| parts == ["python", "-m", "http.server"])));
-        assert_eq!(plan.subtasks.len(), contract.acceptance_slices.len());
+        assert_eq!(plan.subtasks.len(), acceptance_slices.len());
         assert!(plan
             .subtasks
             .iter()
@@ -900,11 +1024,9 @@ Expected final state:
         apply_workspace_preflight(&mut plan, temp.path(), PLAYABLE_CHESS_BENCHMARK_PROMPT);
 
         let contract = plan.goal_contract.as_ref().unwrap();
-        assert!(contract
-            .acceptance_slices
-            .iter()
-            .any(|slice| slice.id == "scaffold"));
-        assert_eq!(plan.subtasks.len(), contract.acceptance_slices.len());
+        let acceptance_slices = vite_react_chess_acceptance_slices(contract.verify_plan.clone());
+        assert!(acceptance_slices.iter().any(|slice| slice.id == "scaffold"));
+        assert_eq!(plan.subtasks.len(), acceptance_slices.len());
         assert!(plan.subtasks.iter().all(|subtask| {
             subtask
                 .description
@@ -945,11 +1067,10 @@ Expected final state:
         apply_workspace_preflight(&mut plan, temp.path(), goal);
 
         let contract = plan.goal_contract.as_ref().unwrap();
-        assert!(contract
-            .acceptance_slices
-            .iter()
-            .any(|slice| slice.id == "board_ui"
-                && slice.artifact_path.as_deref() == Some(Path::new("src/App.tsx"))));
+        let acceptance_slices =
+            existing_vite_react_chess_acceptance_slices(contract.verify_plan.clone());
+        assert!(acceptance_slices.iter().any(|slice| slice.id == "board_ui"
+            && slice.artifact_path.as_deref() == Some(Path::new("src/App.tsx"))));
         assert!(plan
             .subtasks
             .iter()

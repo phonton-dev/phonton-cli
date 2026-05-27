@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.19.5"
+version = "0.19.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2468,7 +2468,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tree-sitter",
+ "tree-sitter-python",
  "tree-sitter-rust",
+ "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -2490,6 +2492,7 @@ dependencies = [
  "regex",
  "reqwest",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

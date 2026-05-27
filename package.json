@@ -1,7 +1,7 @@
 {
   "name": "phonton-cli",
-  "version": "0.19.5",
-  "description": "Local-first agentic development terminal with context packs, source handles, and verification gates.",
+  "version": "0.19.6",
+  "description": "Local-first ADE CLI for planned, verified, reviewable code changes.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/phonton-dev/phonton-cli#readme",
   "repository": {
@@ -23,21 +23,27 @@
     "npm/bin/phonton.js",
     "npm/install.js",
     "npm/test-wrapper.js",
+    "assets/readme/phonton-cli-logo.png",
+    "assets/readme/phonton-cli-hero.png",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE"
   ],
   "keywords": [
     "ai",
-    "agent",
-    "coding-agent",
+    "ade",
+    "agentic-development",
     "cli",
     "terminal",
     "rust",
     "developer-tools",
     "local-first",
     "code-review",
-    "verification"
+    "verification",
+    "handoff",
+    "memory",
+    "byok",
+    "mcp"
   ],
   "engines": {
     "node": ">=18"

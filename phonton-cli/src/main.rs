@@ -36,6 +36,7 @@
 
 mod benchmark_cli;
 mod config;
+mod contract_preflight;
 mod doctor;
 mod extensions_cli;
 mod mcp_cli;
@@ -351,6 +352,8 @@ pub enum Mode {
     History,
     /// Command palette for quick actions.
     CommandPalette,
+    /// Suspended to answer clarification questions.
+    Clarify,
 }
 
 /// Lightweight ambient status for the local semantic index / Nexus config.
@@ -581,6 +584,16 @@ pub struct App {
     pub prompt_artifacts_open: bool,
     /// Cursor into pending prompt artifacts.
     pub prompt_artifact_selected: usize,
+    /// Interactive clarification goal index
+    pub clarifying_goal_idx: Option<usize>,
+    /// Active clarification question index
+    pub clarifying_question_idx: usize,
+    /// Answers gathered so far
+    pub clarifying_answers: Vec<String>,
+    /// Live typing buffer for answers
+    pub clarifying_buffer: String,
+    /// Caret position inside clarifying_buffer
+    pub clarifying_cursor: usize,
 }
 
 impl App {
@@ -613,6 +626,11 @@ impl App {
             mcp_approval_selected: 0,
             prompt_artifacts_open: false,
             prompt_artifact_selected: 0,
+            clarifying_goal_idx: None,
+            clarifying_question_idx: 0,
+            clarifying_answers: Vec::new(),
+            clarifying_buffer: String::new(),
+            clarifying_cursor: 0,
         }
     }
 
@@ -842,8 +860,20 @@ impl App {
             }
             if matches!(
                 self.mode,
-                Mode::Ask | Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+                Mode::Ask
+                    | Mode::Settings
+                    | Mode::Memory
+                    | Mode::History
+                    | Mode::CommandPalette
+                    | Mode::Clarify
             ) {
+                if self.mode == Mode::Clarify {
+                    self.clarifying_goal_idx = None;
+                    self.clarifying_question_idx = 0;
+                    self.clarifying_answers.clear();
+                    self.clarifying_buffer.clear();
+                    self.clarifying_cursor = 0;
+                }
                 self.mode = Mode::Goal;
                 return None;
             }
@@ -855,7 +885,12 @@ impl App {
         if matches!(key.code, KeyCode::Char('?'))
             && !matches!(
                 self.mode,
-                Mode::Ask | Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+                Mode::Ask
+                    | Mode::Settings
+                    | Mode::Memory
+                    | Mode::History
+                    | Mode::CommandPalette
+                    | Mode::Clarify
             )
             && self.goal_prompt.is_empty()
         {
@@ -870,7 +905,10 @@ impl App {
 
         // Handle '/' as the command trigger (like gemini cli / slash commands)
         if matches!(key.code, KeyCode::Char('/'))
-            && !matches!(self.mode, Mode::CommandPalette | Mode::Ask | Mode::Settings)
+            && !matches!(
+                self.mode,
+                Mode::CommandPalette | Mode::Ask | Mode::Settings | Mode::Clarify
+            )
             && self.goal_prompt.is_empty()
         {
             self.prev_mode = self.mode;
@@ -889,7 +927,12 @@ impl App {
         if is_l
             && !matches!(
                 self.mode,
-                Mode::Ask | Mode::Settings | Mode::Memory | Mode::History | Mode::CommandPalette
+                Mode::Ask
+                    | Mode::Settings
+                    | Mode::Memory
+                    | Mode::History
+                    | Mode::CommandPalette
+                    | Mode::Clarify
             )
         {
             self.flight_log_open = !self.flight_log_open;
@@ -975,6 +1018,112 @@ impl App {
             Mode::Settings => self.handle_settings_key(key),
             Mode::Memory | Mode::History => None,
             Mode::CommandPalette => self.handle_palette_key(key),
+            Mode::Clarify => self.handle_clarify_key(key),
+        }
+    }
+
+    fn handle_clarify_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return Some(Intent::Quit);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Goal;
+                self.clarifying_goal_idx = None;
+                self.clarifying_question_idx = 0;
+                self.clarifying_answers.clear();
+                self.clarifying_buffer.clear();
+                self.clarifying_cursor = 0;
+                None
+            }
+            KeyCode::Enter => {
+                let ans = self.clarifying_buffer.trim().to_string();
+                if ans.is_empty() {
+                    return None;
+                }
+                self.clarifying_answers.push(ans);
+                self.clarifying_buffer.clear();
+                self.clarifying_cursor = 0;
+
+                let goal_idx = self.clarifying_goal_idx.unwrap_or(self.selected);
+                let questions = if let Some(g) = self.goals.get(goal_idx) {
+                    if let Some(state) = &g.state {
+                        if let Some(contract) = &state.goal_contract {
+                            contract.clarification_questions.clone()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                if self.clarifying_question_idx + 1 < questions.len() {
+                    self.clarifying_question_idx += 1;
+                } else {
+                    // All answered! Rerun planning.
+                    let goal_idx = self.clarifying_goal_idx.unwrap_or(self.selected);
+                    if let Some(g) = self.goals.get_mut(goal_idx) {
+                        let original_desc = g.description.clone();
+                        let mut refined = original_desc;
+                        refined.push_str("\n\nRefined requirements:");
+                        for (q, a) in questions.iter().zip(&self.clarifying_answers) {
+                            refined.push_str(&format!("\n- Q: {}\n  A: {}", q, a));
+                        }
+                        g.description = refined.clone();
+
+                        // Clear the failed status and previous checkpoints/states so it runs clean
+                        g.status = TaskStatus::Queued;
+                        g.state = None;
+                        g.checkpoint_cursor = None;
+                        g.flight_log.clear();
+
+                        let prompt = SubmittedPrompt {
+                            description: refined.clone(),
+                            display_text: refined,
+                            prompt_artifacts: Vec::new(),
+                        };
+
+                        // We reset clarify state
+                        self.mode = Mode::Goal;
+                        self.clarifying_goal_idx = None;
+                        self.clarifying_question_idx = 0;
+                        self.clarifying_answers.clear();
+                        self.clarifying_buffer.clear();
+                        self.clarifying_cursor = 0;
+
+                        // Rerun the goal!
+                        return Some(Intent::QueueGoal(prompt));
+                    }
+                    self.mode = Mode::Goal;
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                self.clarifying_cursor =
+                    delete_char_before(&mut self.clarifying_buffer, self.clarifying_cursor);
+                None
+            }
+            KeyCode::Left => {
+                self.clarifying_cursor = self.clarifying_cursor.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                if self.clarifying_cursor < self.clarifying_buffer.chars().count() {
+                    self.clarifying_cursor += 1;
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                self.clarifying_cursor =
+                    insert_char_at(&mut self.clarifying_buffer, self.clarifying_cursor, c);
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1052,6 +1201,12 @@ impl App {
             }
             Mode::Settings => {}
             Mode::Memory | Mode::History => {}
+            Mode::Clarify => {
+                for c in prompt_buffer::normalize_paste(&text).chars() {
+                    self.clarifying_cursor =
+                        insert_char_at(&mut self.clarifying_buffer, self.clarifying_cursor, c);
+                }
+            }
         }
         None
     }
@@ -1235,6 +1390,27 @@ impl App {
     }
 
     fn handle_goal_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        // Intercept 'c' or 'C' when prompt is empty to start clarification if questions exist.
+        if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && self.goal_prompt.is_empty()
+        {
+            if let Some(g) = self.goals.get(self.selected) {
+                if let Some(state) = &g.state {
+                    if let Some(contract) = &state.goal_contract {
+                        if !contract.clarification_questions.is_empty() {
+                            self.mode = Mode::Clarify;
+                            self.clarifying_goal_idx = Some(self.selected);
+                            self.clarifying_question_idx = 0;
+                            self.clarifying_answers.clear();
+                            self.clarifying_buffer.clear();
+                            self.clarifying_cursor = 0;
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+
         // Ctrl+Up / Ctrl+Down navigate the checkpoint picker inside the
         // currently selected goal.  'r' triggers a rollback to the
         // cursor-highlighted checkpoint.
@@ -2208,6 +2384,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Esc", key),
             Span::styled(" close", txt),
         ],
+        Mode::Clarify => vec![
+            Span::styled("Enter", key),
+            Span::styled(" submit answer  ", txt),
+            sep.clone(),
+            Span::styled("Esc", key),
+            Span::styled(" cancel clarification", txt),
+        ],
     };
 
     let p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
@@ -2627,6 +2810,119 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(p, area);
         return;
     };
+
+    let mut show_clarify = false;
+    let mut questions = Vec::new();
+    if let Some(state) = &g.state {
+        if let Some(contract) = &state.goal_contract {
+            if !contract.clarification_questions.is_empty() {
+                show_clarify = true;
+                questions = contract.clarification_questions.clone();
+            }
+        }
+    }
+
+    if show_clarify {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "goal: ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(g.description.clone()),
+        ]));
+        lines.push(Line::raw(""));
+
+        if app.mode == Mode::Clarify {
+            lines.push(Line::from(Span::styled(
+                "📝 Interactive Clarification Questionnaire",
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+
+            // Render previous answered questions
+            for (idx, (q, a)) in questions.iter().zip(&app.clarifying_answers).enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  Q{}: ", idx + 1), Style::default().fg(MUTED)),
+                    Span::styled(q.clone(), Style::default().fg(MUTED)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  Answer: ", Style::default().fg(SUCCESS)),
+                    Span::styled(a.clone(), Style::default().fg(SUCCESS)),
+                ]));
+                lines.push(Line::raw(""));
+            }
+
+            // Render current question
+            let q_idx = app.clarifying_question_idx;
+            if q_idx < questions.len() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  Question {} of {}:", q_idx + 1, questions.len()),
+                    Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                )]));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  ▸ ",
+                        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        questions[q_idx].clone(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  Your Answer: ", Style::default().fg(ACCENT_HI)),
+                    Span::styled(
+                        app.clarifying_buffer.clone(),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled("█", Style::default().fg(pulse_color)),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "⚠️  Requirements Clarification Required",
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  Goal confidence is too low ({}%) due to under-specified requirements.",
+                    g.state
+                        .as_ref()
+                        .and_then(|s| s.goal_contract.as_ref())
+                        .map(|c| c.confidence_percent)
+                        .unwrap_or(0)
+                ),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  Phonton needs clarification on the following questions:",
+                Style::default().fg(ACCENT),
+            )));
+            for (idx, q) in questions.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {}. ", idx + 1),
+                        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(q.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "  [ Press 'C' to start answering clarification questions & proceed ]",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
+        frame.render_widget(p, area);
+        return;
+    }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
@@ -3282,6 +3578,14 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             &[][..],
             None,
         ),
+        Mode::Clarify => (
+            "?",
+            " CLARIFY ",
+            app.clarifying_buffer.as_str(),
+            app.clarifying_cursor,
+            &[][..],
+            None,
+        ),
     };
 
     let mode_style = match app.mode {
@@ -3309,11 +3613,15 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             .bg(ACCENT)
             .fg(BG_PANEL)
             .add_modifier(Modifier::BOLD),
+        Mode::Clarify => Style::default()
+            .bg(WARN)
+            .fg(BG_PANEL)
+            .add_modifier(Modifier::BOLD),
     };
 
     let border_color = match app.mode {
         Mode::Ask => VIOLET,
-        Mode::Task => WARN,
+        Mode::Task | Mode::Clarify => WARN,
         Mode::Memory | Mode::History => SUCCESS,
         _ => ACCENT,
     };
@@ -4755,6 +5063,7 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
             );
         }
     };
+    contract_preflight::apply_workspace_preflight(&mut plan, &working_dir, &opts.goal_text);
 
     let (state_tx, _state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
@@ -5871,7 +6180,71 @@ fn extract_file_mentions(text: &str) -> Vec<String> {
         }
     }
 
+    for raw in extract_path_mentions(text) {
+        if !mentions.iter().any(|mention| mention == &raw) {
+            mentions.push(raw);
+        }
+    }
+
     mentions
+}
+
+fn extract_path_mentions(text: &str) -> Vec<String> {
+    let mut mentions = Vec::new();
+    for raw in text.split_whitespace() {
+        let cleaned = raw
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '`' | '"'
+                        | '\''
+                        | ','
+                        | ';'
+                        | ':'
+                        | '.'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                )
+            })
+            .replace('\\', "/");
+        if looks_like_file_path(&cleaned) && !mentions.iter().any(|mention| mention == &cleaned) {
+            mentions.push(cleaned);
+        }
+    }
+    mentions
+}
+
+fn looks_like_file_path(raw: &str) -> bool {
+    if raw.is_empty() || raw.contains("://") {
+        return false;
+    }
+    let Some(extension) = Path::new(raw).extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "rs" | "py"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "json"
+            | "toml"
+            | "md"
+            | "css"
+            | "html"
+            | "yml"
+            | "yaml"
+    )
 }
 
 fn load_prompt_attachment(
@@ -6079,6 +6452,7 @@ async fn spawn_goal(
         Ok(p) => p,
         Err(_) => return,
     };
+    contract_preflight::apply_workspace_preflight(&mut plan, working_dir, &text);
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
@@ -6762,6 +7136,27 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn goal_mentions_attach_backtick_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("src");
+        std::fs::create_dir(&src)?;
+        std::fs::write(src.join("config.js"), "module.exports = { port: 3000 };\n")?;
+
+        let attachments =
+            prepare_goal_attachments("Fix `src/config.js` without changing tests.", temp.path());
+
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].path, PathBuf::from("src/config.js"));
+        assert_eq!(attachments[0].kind, PromptAttachmentKind::Text);
+        assert!(attachments[0]
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("3000"));
+        Ok(())
+    }
+
+    #[test]
     fn quoted_goal_mentions_support_spaces() -> Result<()> {
         let temp = tempfile::tempdir()?;
         std::fs::write(temp.path().join("notes file.md"), "# Notes\n")?;
@@ -7236,7 +7631,108 @@ fn extract_id(line: &str) -> Option<String> {
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("add function foo"));
-        // Rendered savings line shows "vs Σ <baseline>" — match the live wording.
         assert!(dump.contains("vs Σ 500") || dump.contains("baseline: 500"));
+    }
+
+    #[test]
+    fn interactive_clarification_loop_works() {
+        let mut app = App::default();
+        let mut g = GoalEntry::new("make chess".into());
+        
+        // Mock a state with a goal contract that has clarification questions
+        let contract = phonton_types::GoalContract {
+            goal: "make chess".into(),
+            task_class: phonton_types::TaskClass::CoreLogic,
+            confidence_percent: 50,
+            acceptance_criteria: vec![],
+            expected_artifacts: vec![],
+            likely_files: vec![],
+            verify_plan: vec![],
+            run_plan: vec![],
+            quality_floor: phonton_types::QualityFloor { criteria: vec![] },
+            clarification_questions: vec![
+                "What board theme?".to_string(),
+                "Enable AI opponent?".to_string(),
+            ],
+            assumptions: vec![],
+        };
+        
+        let state = GlobalState {
+            task_status: TaskStatus::Failed {
+                reason: "Under-specified requirements".to_string(),
+                failed_subtask: None,
+            },
+            goal_contract: Some(contract),
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: None,
+            active_workers: vec![],
+            tokens_used: 100,
+            tokens_budget: None,
+            estimated_naive_tokens: 400,
+            checkpoints: vec![],
+        };
+        
+        g.state = Some(state);
+        g.status = TaskStatus::Failed {
+            reason: "Under-specified requirements".to_string(),
+            failed_subtask: None,
+        };
+        
+        app.goals.push(g);
+        app.selected = 0;
+        app.mode = Mode::Goal;
+        
+        // Press 'c' to enter Mode::Clarify
+        let intent1 = app.handle_key(key('c'));
+        assert!(intent1.is_none());
+        assert_eq!(app.mode, Mode::Clarify);
+        assert_eq!(app.clarifying_goal_idx, Some(0));
+        assert_eq!(app.clarifying_question_idx, 0);
+        
+        // Type answer to first question: "glass"
+        for c in "glass".chars() {
+            app.handle_key(key(c));
+        }
+        assert_eq!(app.clarifying_buffer, "glass");
+        
+        // Press Enter to submit first answer
+        let intent2 = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(intent2.is_none());
+        assert_eq!(app.clarifying_question_idx, 1);
+        assert_eq!(app.clarifying_answers, vec!["glass".to_string()]);
+        assert_eq!(app.clarifying_buffer, "");
+        
+        // Type answer to second question: "no"
+        for c in "no".chars() {
+            app.handle_key(key(c));
+        }
+        
+        // Press Enter to submit final answer and trigger re-queue
+        let intent3 = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(intent3.is_some());
+        
+        if let Some(Intent::QueueGoal(submitted)) = intent3 {
+            assert!(submitted.description.contains("make chess"));
+            assert!(submitted.description.contains("Refined requirements:"));
+            assert!(submitted.description.contains("- Q: What board theme?\n  A: glass"));
+            assert!(submitted.description.contains("- Q: Enable AI opponent?\n  A: no"));
+            
+            // Check that the original goal entry description was updated
+            let updated_goal = &app.goals[0];
+            assert!(updated_goal.description.contains("Refined requirements:"));
+            assert_eq!(updated_goal.status, TaskStatus::Queued);
+            assert!(updated_goal.state.is_none());
+            assert!(updated_goal.flight_log.is_empty());
+        } else {
+            panic!("Expected Intent::QueueGoal");
+        }
+        
+        // Check app state reset
+        assert_eq!(app.mode, Mode::Goal);
+        assert_eq!(app.clarifying_goal_idx, None);
+        assert_eq!(app.clarifying_question_idx, 0);
+        assert!(app.clarifying_answers.is_empty());
+        assert!(app.clarifying_buffer.is_empty());
     }
 }

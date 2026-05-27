@@ -478,6 +478,43 @@ impl Worker {
             let verdict = phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
             match verdict {
                 VerifyResult::Pass { layer } => {
+                    let missing_required_files =
+                        missing_required_touch_files(&subtask, &hunks, self.guard.project_root());
+                    if !missing_required_files.is_empty() {
+                        let errors = missing_required_files
+                            .iter()
+                            .map(|path| {
+                                format!(
+                                    "required target file `{}` was mentioned for this task but was not changed",
+                                    path.display()
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        last_layer = VerifyLayer::WorkspaceCheck;
+                        let signature = diagnostic_signature(last_layer, &errors);
+                        let repeated_signature_count =
+                            update_repeated_signature_count(&mut last_signature, &signature);
+                        last_errors = errors;
+                        if repeated_signature_count >= SAME_DIAGNOSTIC_LIMIT {
+                            return Ok(failed_result(
+                                subtask.id,
+                                model_tier,
+                                VerifyResult::Fail {
+                                    layer: last_layer,
+                                    errors: vec![format!(
+                                        "same target-file diagnostic repeated {SAME_DIAGNOSTIC_LIMIT} times; stopped before blind retry: {signature}"
+                                    )],
+                                    attempt,
+                                },
+                                token_usage,
+                                attempt,
+                                last_provider,
+                                last_model_name,
+                            ));
+                        }
+                        continue;
+                    }
+
                     // Success! Record this exchange in the shared context manager.
                     // This is what allows subsequent subtasks to "remember"
                     // what this subtask did.
@@ -1069,14 +1106,26 @@ fn build_surgical_repair_context(
     out.push_str("# Subtask (Acceptance Criteria)\n");
     out.push_str(&subtask.description);
     out.push_str("\n\n");
+    let attachment_context = phonton_types::render_prompt_attachments(&subtask.attachments);
+    if !attachment_context.is_empty() {
+        out.push_str(&attachment_context);
+        out.push('\n');
+    }
+    let artifact_context = phonton_types::render_prompt_artifacts(&subtask.prompt_artifacts);
+    if !artifact_context.is_empty() {
+        out.push_str(&artifact_context);
+        out.push('\n');
+    }
 
     // Extract target files mentioned in prior_errors
     let mut target_files = std::collections::HashSet::new();
     for err in prior_errors {
         for word in err.split(|c: char| c.is_whitespace() || c == ':') {
             if word.ends_with(".rs")
+                || word.ends_with(".py")
                 || word.ends_with(".js")
                 || word.ends_with(".ts")
+                || word.ends_with(".tsx")
                 || word.ends_with(".html")
                 || word.ends_with(".json")
                 || word.ends_with(".toml")
@@ -1144,9 +1193,130 @@ fn build_surgical_repair_context(
     }
 
     out.push_str("\n# CRITICAL\n");
-    out.push_str("Output the UNIFIED DIFF to fix the above errors. Avoid full-file rewrites. Start with `--- a/` or `--- /dev/null`. NO PROSE.\n");
+    out.push_str("Output the UNIFIED DIFF to fix the above errors. If the verifier reported stale hunk context for a small target file, replace that whole file with one unified-diff hunk. Start with `--- a/` or `--- /dev/null`. NO PROSE.\n");
 
     out
+}
+
+fn missing_required_touch_files(
+    subtask: &Subtask,
+    hunks: &[DiffHunk],
+    project_root: &Path,
+) -> Vec<PathBuf> {
+    let required = required_touch_files(&subtask.description);
+    if required.is_empty() {
+        return Vec::new();
+    }
+    required
+        .into_iter()
+        .filter(|required_path| {
+            required_path_is_enforceable(required_path, project_root)
+                && !hunks
+                    .iter()
+                    .any(|hunk| path_matches_required(&hunk.file_path, required_path))
+        })
+        .collect()
+}
+
+fn required_path_is_enforceable(required_path: &Path, project_root: &Path) -> bool {
+    safe_relative_path(required_path)
+        .map(|path| project_root.join(path).exists())
+        .unwrap_or(false)
+}
+
+fn required_touch_files(description: &str) -> Vec<PathBuf> {
+    let lower = description.to_ascii_lowercase();
+    let should_require = lower.contains("artifact:")
+        || lower.contains("artifacts:")
+        || lower.contains("fix")
+        || lower.contains("repair")
+        || lower.contains("refactor")
+        || lower.contains("edit")
+        || lower.contains("replace")
+        || lower.contains("create")
+        || lower.contains("implement");
+    if !should_require {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    for raw in description.split_whitespace() {
+        let cleaned = raw
+            .trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '`' | '"'
+                        | '\''
+                        | ','
+                        | ';'
+                        | ':'
+                        | '.'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                )
+            })
+            .replace('\\', "/");
+        if looks_like_source_path(&cleaned) {
+            let path = PathBuf::from(cleaned);
+            if !files.iter().any(|existing| existing == &path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn looks_like_source_path(raw: &str) -> bool {
+    if raw.is_empty() || raw.contains("://") {
+        return false;
+    }
+    if safe_relative_path(Path::new(raw)).is_none() {
+        return false;
+    }
+    matches!(
+        Path::new(raw).extension().and_then(|ext| ext.to_str()),
+        Some("rs")
+            | Some("py")
+            | Some("js")
+            | Some("jsx")
+            | Some("ts")
+            | Some("tsx")
+            | Some("json")
+            | Some("toml")
+            | Some("css")
+            | Some("html")
+    )
+}
+
+fn safe_relative_path(path: &Path) -> Option<&Path> {
+    if path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(path)
+}
+
+fn path_matches_required(actual: &Path, required: &Path) -> bool {
+    actual == required
+        || actual.ends_with(required)
+        || required.ends_with(actual)
+        || actual.to_string_lossy().replace('\\', "/")
+            == required.to_string_lossy().replace('\\', "/")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1727,6 +1897,114 @@ mod tests {
         assert!(prompt.contains("# Prompt artifacts"));
         assert_eq!(prompt.matches("do x").count(), 1);
         assert_eq!(prompt.matches("do y").count(), 1);
+    }
+
+    #[test]
+    fn surgical_repair_prompt_keeps_attachment_context() {
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: "Repair `broken_code.py`".into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: vec![phonton_types::PromptAttachment {
+                path: PathBuf::from("broken_code.py"),
+                kind: phonton_types::PromptAttachmentKind::Text,
+                mime_type: Some("text/x-python".into()),
+                size_bytes: 36,
+                text: Some("def f():\n    value = 1\nreturn value\n".into()),
+                data_base64: None,
+                truncated: false,
+                note: None,
+            }],
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let prompt = build_surgical_repair_context(
+            &subtask,
+            &[],
+            &[],
+            &["broken_code.py hunk at old line 1 does not match worktree context".into()],
+            None,
+            &[],
+        );
+
+        assert!(prompt.contains("broken_code.py"));
+        assert!(prompt.contains("return value"));
+        assert!(prompt.contains("replace that whole file"));
+    }
+
+    #[test]
+    fn required_touch_files_detects_missing_repair_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        for file in ["broken_code.py", "broken_code.ts", "broken_code.rs"] {
+            std::fs::write(temp.path().join(file), "broken").unwrap();
+        }
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description:
+                "Detect and repair syntax errors in `broken_code.py`, `broken_code.ts`, and `broken_code.rs`."
+                    .into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("broken_code.rs"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("let ratio = ;".into()),
+                DiffLine::Added("let ratio = value as f32 / total as f32;".into()),
+            ],
+        }];
+
+        let missing = missing_required_touch_files(&subtask, &hunks, temp.path());
+
+        assert!(missing.contains(&PathBuf::from("broken_code.py")));
+        assert!(missing.contains(&PathBuf::from("broken_code.ts")));
+        assert!(!missing.contains(&PathBuf::from("broken_code.rs")));
+    }
+
+    #[test]
+    fn required_touch_files_ignores_absent_and_rooted_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/config.js"),
+            "export const ok = true;\n",
+        )
+        .unwrap();
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description:
+                "Fix `src/config.js`; ignore stale context mentioning `src/App.tsx` and `/App.css`."
+                    .into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/config.js"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("export const ok = true;".into()),
+                DiffLine::Added("export const ok = false;".into()),
+            ],
+        }];
+
+        let missing = missing_required_touch_files(&subtask, &hunks, temp.path());
+
+        assert!(missing.is_empty());
     }
 
     #[test]

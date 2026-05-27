@@ -14,7 +14,8 @@
 pub mod browser;
 pub use browser::verify_browser_check;
 
-use std::path::Path;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -56,7 +57,7 @@ pub async fn verify_diff_with_memory(
     }
     let mut pass_layer = VerifyLayer::PatchApply;
 
-    if let Some(fail) = verify_syntax(hunks) {
+    if let Some(fail) = verify_syntax_with_worktree(hunks, Some(working_dir)) {
         return Ok(fail);
     }
 
@@ -67,27 +68,36 @@ pub async fn verify_diff_with_memory(
     }
 
     let packages = touched_packages(hunks);
+    let patched_worktree = if command_verification_relevant(hunks, working_dir) {
+        Some(patched_verification_worktree(hunks, working_dir)?)
+    } else {
+        None
+    };
+    let command_dir = patched_worktree
+        .as_ref()
+        .map(|temp| temp.path())
+        .unwrap_or(working_dir);
 
-    if let Some(fail) = verify_crate_check(&packages, working_dir).await? {
+    if let Some(fail) = verify_crate_check(&packages, command_dir).await? {
         return Ok(fail);
     }
 
-    if let Some(fail) = verify_workspace_check(working_dir).await? {
+    if let Some(fail) = verify_workspace_check(command_dir).await? {
         return Ok(fail);
     }
 
-    if let Some(fail) = verify_test(&packages, working_dir).await? {
+    if let Some(fail) = verify_test(&packages, command_dir).await? {
         return Ok(fail);
     }
 
-    if let Some(node_result) = verify_node_test(working_dir).await? {
+    if let Some(node_result) = verify_node_test(command_dir).await? {
         match node_result {
             VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => return Ok(node_result),
             VerifyResult::Pass { layer } => pass_layer = layer,
         }
     }
 
-    if let Some(browser_result) = verify_browser_check(working_dir).await? {
+    if let Some(browser_result) = verify_browser_check(command_dir).await? {
         match browser_result {
             VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => {
                 return Ok(browser_result);
@@ -97,6 +107,102 @@ pub async fn verify_diff_with_memory(
     }
 
     Ok(VerifyResult::Pass { layer: pass_layer })
+}
+
+fn command_verification_relevant(hunks: &[DiffHunk], working_dir: &Path) -> bool {
+    find_cargo_workspace(working_dir).is_some()
+        || working_dir.join("package.json").is_file()
+        || working_dir.join("index.html").is_file()
+        || hunks.iter().any(|hunk| {
+            let path = hunk.file_path.as_path();
+            let name = path.file_name().and_then(|name| name.to_str());
+            matches!(name, Some("Cargo.toml" | "package.json" | "index.html"))
+                || matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("rs" | "js" | "jsx" | "ts" | "tsx" | "html" | "css")
+                )
+        })
+}
+
+fn patched_verification_worktree(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+) -> Result<tempfile::TempDir> {
+    let temp = tempfile::tempdir()?;
+    copy_workspace_contents(working_dir, temp.path())?;
+    apply_hunks_to_worktree(hunks, working_dir, temp.path())?;
+    Ok(temp)
+}
+
+fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let src_path = entry.path();
+        let dst_path = dest.join(&file_name);
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if should_skip_verification_copy_dir(&file_name) {
+                continue;
+            }
+            copy_workspace_contents(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_verification_copy_dir(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git"
+            | "target"
+            | "node_modules"
+            | ".next"
+            | ".nuxt"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".vite"
+            | "dist"
+            | "coverage"
+    )
+}
+
+fn apply_hunks_to_worktree(hunks: &[DiffHunk], source_root: &Path, dest_root: &Path) -> Result<()> {
+    for (path, file_hunks) in group_hunks_by_file(hunks) {
+        let Some(dest_path) = safe_join(dest_root, path) else {
+            anyhow::bail!(
+                "diff target path `{}` is absolute or escapes the workspace",
+                path.display()
+            );
+        };
+        let content = post_diff_source(source_root, path, &file_hunks)?;
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(dest_path, content)?;
+    }
+    Ok(())
+}
+
+fn safe_join(root: &Path, rel: &Path) -> Option<PathBuf> {
+    if rel.is_absolute() {
+        return None;
+    }
+    let mut out = root.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Layer 0: prove each modified-file hunk can be located in the current
@@ -236,32 +342,56 @@ fn npm_command() -> &'static str {
 
 /// Layer 1: tree-sitter parse of each hunk's post-diff view.
 pub fn verify_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
-    let mut parser = Parser::new();
-    if parser.set_language(&tree_sitter_rust::language()).is_err() {
-        return Some(VerifyResult::Escalate {
-            reason: "failed to load tree-sitter-rust grammar".into(),
-        });
-    }
+    verify_syntax_with_worktree(hunks, None)
+}
 
+fn verify_syntax_with_worktree(
+    hunks: &[DiffHunk],
+    working_dir: Option<&Path>,
+) -> Option<VerifyResult> {
     let mut errors = Vec::new();
-    for hunk in hunks {
-        if !is_rust_path(&hunk.file_path) {
+    for (path, file_hunks) in group_hunks_by_file(hunks) {
+        let Some(language) = syntax_language_for_path(path) else {
             continue;
+        };
+        let snippet = match working_dir {
+            Some(root) => match post_diff_source(root, path, &file_hunks) {
+                Ok(source) => source,
+                Err(e) => {
+                    errors.push(format!(
+                        "could not reconstruct post-diff file {} for syntax check: {e}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            },
+            None => file_hunks
+                .iter()
+                .map(|hunk| reconstruct_new_side(hunk))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let mut parser = Parser::new();
+        if set_parser_language(&mut parser, language).is_err() {
+            return Some(VerifyResult::Escalate {
+                reason: format!("failed to load {} grammar", language.label()),
+            });
         }
-        let snippet = reconstruct_new_side(hunk);
         let Some(tree) = parser.parse(&snippet, None) else {
-            errors.push(format!(
-                "tree-sitter could not parse hunk in {}",
-                hunk.file_path.display()
-            ));
+            errors.push(format!("tree-sitter could not parse {}", path.display()));
             continue;
         };
         if tree.root_node().has_error() || contains_error_node(tree.root_node()) {
             errors.push(format!(
-                "syntax error in hunk targeting {} (lines {}..{})",
-                hunk.file_path.display(),
-                hunk.new_start,
-                hunk.new_start + hunk.new_count
+                "syntax error in post-diff content targeting {}",
+                path.display()
+            ));
+        } else if matches!(language, SyntaxLanguage::Python)
+            && has_top_level_python_return(&snippet)
+        {
+            errors.push(format!(
+                "syntax error in post-diff content targeting {}: top-level return statement",
+                path.display()
             ));
         }
     }
@@ -275,6 +405,124 @@ pub fn verify_syntax(hunks: &[DiffHunk]) -> Option<VerifyResult> {
             attempt: 1,
         })
     }
+}
+
+#[derive(Clone, Copy)]
+enum SyntaxLanguage {
+    Rust,
+    Python,
+    TypeScript,
+    Tsx,
+}
+
+impl SyntaxLanguage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rust => "tree-sitter-rust",
+            Self::Python => "tree-sitter-python",
+            Self::TypeScript => "tree-sitter-typescript",
+            Self::Tsx => "tree-sitter-tsx",
+        }
+    }
+}
+
+fn set_parser_language(
+    parser: &mut Parser,
+    language: SyntaxLanguage,
+) -> std::result::Result<(), tree_sitter::LanguageError> {
+    match language {
+        SyntaxLanguage::Rust => parser.set_language(&tree_sitter_rust::language()),
+        SyntaxLanguage::Python => parser.set_language(&tree_sitter_python::language()),
+        SyntaxLanguage::TypeScript => {
+            parser.set_language(&tree_sitter_typescript::language_typescript())
+        }
+        SyntaxLanguage::Tsx => parser.set_language(&tree_sitter_typescript::language_tsx()),
+    }
+}
+
+fn syntax_language_for_path(path: &Path) -> Option<SyntaxLanguage> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => Some(SyntaxLanguage::Rust),
+        Some("py") => Some(SyntaxLanguage::Python),
+        Some("ts") | Some("js") | Some("mjs") | Some("cjs") => Some(SyntaxLanguage::TypeScript),
+        Some("tsx") | Some("jsx") => Some(SyntaxLanguage::Tsx),
+        _ => None,
+    }
+}
+
+fn has_top_level_python_return(source: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !line.starts_with(char::is_whitespace)
+            && (trimmed == "return" || trimmed.starts_with("return "))
+    })
+}
+
+fn group_hunks_by_file(hunks: &[DiffHunk]) -> Vec<(&Path, Vec<&DiffHunk>)> {
+    let mut by_file = std::collections::BTreeMap::<&Path, Vec<&DiffHunk>>::new();
+    for hunk in hunks {
+        by_file
+            .entry(hunk.file_path.as_path())
+            .or_default()
+            .push(hunk);
+    }
+    by_file.into_iter().collect()
+}
+
+fn post_diff_source(root: &Path, path: &Path, hunks: &[&DiffHunk]) -> Result<String> {
+    if hunks.iter().all(|hunk| hunk_old_side(hunk).is_empty()) {
+        return Ok(hunks
+            .iter()
+            .map(|hunk| reconstruct_new_side(hunk))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    let full_path = root.join(path);
+    let original = std::fs::read_to_string(&full_path)?;
+    let trailing_newline = original.ends_with('\n');
+    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+    let mut sorted = hunks.to_vec();
+    sorted.sort_by_key(|hunk| std::cmp::Reverse(hunk.old_start));
+
+    for hunk in sorted {
+        let start = hunk.old_start.saturating_sub(1) as usize;
+        let old = hunk_old_side(hunk);
+        if start + old.len() > lines.len() {
+            anyhow::bail!(
+                "{} hunk at old line {} spans past end of file",
+                path.display(),
+                hunk.old_start
+            );
+        }
+        let actual = &lines[start..start + old.len()];
+        if !actual
+            .iter()
+            .zip(old.iter())
+            .all(|(actual, expected)| old_line_matches(actual, expected))
+        {
+            anyhow::bail!(
+                "{} hunk at old line {} does not match worktree context",
+                path.display(),
+                hunk.old_start
+            );
+        }
+
+        let mut replacement = Vec::new();
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Context(s) | DiffLine::Added(s) => replacement.push(s.clone()),
+                DiffLine::Removed(_) => {}
+            }
+        }
+        lines.splice(start..start + old.len(), replacement);
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Layer 1.5 — Decision Check.
@@ -673,13 +921,6 @@ fn record_quote(r: &MemoryRecord) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn is_rust_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("rs"))
-        .unwrap_or(false)
-}
-
 fn hunk_old_side(hunk: &DiffHunk) -> Vec<&str> {
     hunk.lines
         .iter()
@@ -913,6 +1154,47 @@ mod tests {
     }
 
     #[test]
+    fn syntax_fail_on_broken_python() {
+        let h = hunk(
+            "broken_code.py",
+            vec![
+                DiffLine::Added("def calculate_sum(a, b):".into()),
+                DiffLine::Added("    result = a + b".into()),
+                DiffLine::Added("return result".into()),
+            ],
+        );
+
+        match verify_syntax(&[h]) {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::Syntax,
+                ..
+            }) => {}
+            other => panic!("expected Python syntax fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_fail_on_broken_typescript() {
+        let h = hunk(
+            "broken_code.ts",
+            vec![
+                DiffLine::Added("function getUserInfo(userId: string) {".into()),
+                DiffLine::Added("  return {".into()),
+                DiffLine::Added("    id: userId,".into()),
+                DiffLine::Added("    name: \"Test User\"".into()),
+            ],
+        );
+
+        match verify_syntax(&[h]) {
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::Syntax,
+                ..
+            }) => {}
+            other => panic!("expected TypeScript syntax fail, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn patch_apply_fails_when_context_does_not_match_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -1049,6 +1331,58 @@ mod tests {
             Some(VerifyResult::Pass {
                 layer: VerifyLayer::Test
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_diff_runs_node_tests_against_candidate_diff() {
+        if std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        std::fs::write(
+            tmp.path().join("src").join("config.js"),
+            "export const value = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("test").join("config.test.js"),
+            "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { value } from '../src/config.js';\ntest('uses patched value', () => assert.equal(value, 2));\n",
+        )
+        .unwrap();
+
+        let h = DiffHunk {
+            file_path: PathBuf::from("src/config.js"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("export const value = 1;".into()),
+                DiffLine::Added("export const value = 2;".into()),
+            ],
+        };
+
+        assert_eq!(
+            verify_diff(&[h], tmp.path()).await.unwrap(),
+            VerifyResult::Pass {
+                layer: VerifyLayer::Test
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("src").join("config.js")).unwrap(),
+            "export const value = 1;\n"
         );
     }
 

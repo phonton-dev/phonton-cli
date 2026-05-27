@@ -4,6 +4,14 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.6 - Interactive Clarification Questionnaire
+
+### Added
+
+- **Interactive Clarification Questionnaire**: Introduced `Mode::Clarify` to guide users step-by-step in answering outstanding requirements questions when a goal's confidence is under `70%`.
+- **Dynamic Prompts & Rerun**: Users can answer clarification questions directly in the TUI, which appends answers to the goal description and triggers a clean planning rerun (wiping stale checkpoints and flight logs).
+- **Unit Test Coverage**: Added a comprehensive TUI test verifying keyboard event routing, buffer editing, answer stacking, and re-queue intent generation.
+
 ## 0.19.5 - Confidence Gate for Under-Specified Goals
 
 ### Added
@@ -12,7 +20,7 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
-- **Token Waste Prevention**: Stopped the worker loop from executing broad under-specified placeholders blindly, saving up to 12.4k+ tokens on unproductive placeholder stubs.
+- **Token Waste Prevention**: Stopped the worker loop from executing broad under-specified placeholders blindly. The regression fixture covers an observed 12,456-token placeholder loop; do not use that fixture result as a broad public token-efficiency claim.
 
 ## 0.19.4 - Double-Line Splash Logo & RAII Browser Verifier Polish
 
