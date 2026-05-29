@@ -1,26 +1,17 @@
-function resolveString(raw, env, rawKey, envKey, fallback) {
-  const hasRaw = Object.prototype.hasOwnProperty.call(raw, rawKey);
-  const value = hasRaw ? raw[rawKey] : env[envKey] ?? fallback;
-  if (typeof value !== "string") {
-    throw new Error(`${rawKey} must be a string`);
+function readTrimmedString(value) {
+  if (value === undefined || value === null) {
+    return undefined;
   }
-  const trimmed = value.trim();
-  if (hasRaw && trimmed === "") {
-    throw new Error(`${rawKey} cannot be blank`);
-  }
-  return trimmed || fallback;
+  const trimmed = String(value).trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function resolveMaxRetries(raw, env) {
-  const hasRaw = Object.prototype.hasOwnProperty.call(raw, "maxRetries");
-  const value = hasRaw ? raw.maxRetries : env.MAX_RETRIES ?? 2;
-  const parsed =
-    typeof value === "number" && Number.isInteger(value)
-      ? value
-      : typeof value === "string" && value.trim() !== ""
-        ? Number(value)
-        : value;
-
+function readMaxRetries(value, envValue) {
+  const raw = value ?? envValue ?? 2;
+  if (raw === "" || raw === undefined || raw === null) {
+    return 2;
+  }
+  const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < 0 || parsed > 10) {
     throw new Error("maxRetries must be an integer from 0 through 10");
   }
@@ -28,9 +19,23 @@ function resolveMaxRetries(raw, env) {
 }
 
 export function loadConfig(raw = {}, env = process.env) {
+  const explicitProvider = readTrimmedString(raw.provider);
+  const explicitModel = readTrimmedString(raw.model);
+
+  if (Object.prototype.hasOwnProperty.call(raw, "provider") && !explicitProvider) {
+    throw new Error("provider must not be blank");
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, "model") && !explicitModel) {
+    throw new Error("model must not be blank");
+  }
+
+  const provider = explicitProvider ?? readTrimmedString(env.PROVIDER) ?? "openai";
+  const model = explicitModel ?? readTrimmedString(env.MODEL) ?? "gpt-4o-mini";
+  const maxRetries = readMaxRetries(raw.maxRetries, env.MAX_RETRIES);
+
   return {
-    provider: resolveString(raw, env, "provider", "PROVIDER", "openai"),
-    model: resolveString(raw, env, "model", "MODEL", "gpt-4o-mini"),
-    maxRetries: resolveMaxRetries(raw, env),
+    provider,
+    model,
+    maxRetries,
   };
 }

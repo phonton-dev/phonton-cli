@@ -4,6 +4,19 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.19.7 - Local Template Dispatch And Launch Benchmark Harness
+
+### Fixed
+
+- Restored `phonton-worker` local template dispatch for existing-Vite chess rules seed, syntax preflight repair, and receipt refactor slices. Templates under `phonton-worker/src/templates/` are applied with zero provider tokens unless `PHONTON_DISABLE_LOCAL_SEEDS=1`.
+- Chess rules test seed no longer imports `vitest`; self-executing assertions keep `npm test` deterministic during verification.
+- Added `phonton_memory::tests::benchmark_latency_concurrent` so `C:\benchmark-phonton` memory-latency capture can run `cargo test` successfully.
+
+### Notes
+
+- Provider-only benchmark runs must set `PHONTON_DISABLE_LOCAL_SEEDS=1`; those runs are reliability evidence, not token-comparison evidence.
+- Public efficiency claims still require `token_claim_eligible` artifacts per suite.
+
 ## 0.19.6 - Interactive Clarification Questionnaire
 
 ### Added

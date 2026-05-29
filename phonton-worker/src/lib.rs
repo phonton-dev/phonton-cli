@@ -50,6 +50,8 @@ pub use phonton_sandbox::{ExecutionGuard, GuardDecision, ToolCall};
 /// Production [`WorkerDispatcher`] bridge from orchestrator to worker.
 pub mod dispatcher;
 
+mod local_templates;
+
 /// Maximum verification attempts before escalating model tier.
 pub const MAX_ATTEMPTS: u8 = 3;
 
@@ -252,6 +254,29 @@ impl Worker {
         prior_errors: Vec<String>,
     ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
+        if prior_errors.is_empty() {
+            if let Some(result) =
+                local_templates::try_dispatch(&subtask, self.guard.project_root(), model_tier)
+                    .await?
+            {
+                if matches!(result.verify_result, VerifyResult::Pass { .. }) {
+                    if let Err(e) = self.persist_decisions(&subtask) {
+                        warn!(error = %e, "failed to persist subtask decisions");
+                    }
+                    if let Some(memory) = &self.memory {
+                        let rec = MemoryRecord::Decision {
+                            title: subtask.description.clone(),
+                            body: format!("completed via local template: {}", subtask.description),
+                            task_id: self.task_id,
+                        };
+                        if let Err(e) = memory.record(rec).await {
+                            warn!(error = %e, "failed to record completion memory");
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+        }
         let system_prompt = base_system_prompt();
 
         let relevant_slices: Vec<CodeSlice> = if prior_errors.is_empty() {

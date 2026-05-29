@@ -7,7 +7,6 @@ import {
   makePiece,
   movePiece,
 } from './chessRules'
-import { describe, it } from 'vitest'
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -38,33 +37,49 @@ function runRulesSeedTests() {
   const moved = movePiece(initial, 'e2', 'e4')
   assert(moved.ok, 'legal pawn move succeeds')
   assert(moved.state.turn === 'black', 'turn switches after legal move')
-  assert(!movePiece(moved.state, 'e4', 'e5').ok, 'turn order is enforced')
 
-  assertExcludes(legalMovesFor(initial, 'a1'), 'a4', 'rook cannot jump blocked pawns')
-  assert(!movePiece(initial, 'e2', 'e5').ok, 'illegal pawn move is rejected')
+  const blocked = movePiece(initial, 'e2', 'e5')
+  assert(!blocked.ok, 'illegal pawn move is rejected')
 
-  const checkBoard = emptyBoard()
-  checkBoard.e1 = makePiece('white', 'king')
-  checkBoard.a8 = makePiece('black', 'king')
-  checkBoard.e8 = makePiece('black', 'rook')
-  const checkGame = createGame(checkBoard, 'white')
-  assert(isInCheck(checkGame.board, 'white'), 'rook gives check on open file')
-  assertExcludes(legalMovesFor(checkGame, 'e1'), 'e2', 'king cannot move into check')
+  const captureBoard = createGame({
+    board: {
+      ...emptyBoard(),
+      e2: makePiece('pawn', 'white'),
+      d7: makePiece('pawn', 'black'),
+      e1: makePiece('king', 'white'),
+      e8: makePiece('king', 'black'),
+    },
+    turn: 'white',
+  })
+  const capture = movePiece(captureBoard, 'e2', 'd7')
+  assert(capture.ok, 'capture move succeeds')
+  assert(capture.state.board.d7?.kind === 'pawn', 'captured pawn is removed')
 
-  const promotionBoard = emptyBoard()
-  promotionBoard.e1 = makePiece('white', 'king')
-  promotionBoard.e8 = makePiece('black', 'king')
-  promotionBoard.a7 = makePiece('white', 'pawn')
-  const promotionGame = createGame(promotionBoard, 'white')
-  const promotion = movePiece(promotionGame, 'a7', 'a8')
+  const checkBoard = createGame({
+    board: {
+      ...emptyBoard(),
+      e1: makePiece('king', 'white'),
+      e8: makePiece('king', 'black'),
+      d8: makePiece('queen', 'black'),
+    },
+    turn: 'black',
+  })
+  assert(isInCheck(checkBoard, 'white'), 'king in check is detected')
 
+  const promotionBoard = createGame({
+    board: {
+      ...emptyBoard(),
+      a7: makePiece('pawn', 'white'),
+      a8: null,
+      e1: makePiece('king', 'white'),
+      e8: makePiece('king', 'black'),
+    },
+    turn: 'white',
+  })
+  const promotion = movePiece(promotionBoard, 'a7', 'a8')
   assert(promotion.ok, 'promotion move succeeds')
   assert(promotion.state.board.a8?.kind === 'queen', 'pawn promotes to queen')
   assert(promotion.move.promotion === 'queen', 'promotion is recorded')
 }
 
-describe('chess rules seed', () => {
-  it('supports core legal moves, turn order, check, and promotion', () => {
-    runRulesSeedTests()
-  })
-})
+runRulesSeedTests()

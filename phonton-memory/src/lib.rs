@@ -386,4 +386,44 @@ mod tests {
         assert!(ms.delete(id).await.unwrap());
         assert!(ms.get(id).await.unwrap().is_none());
     }
+
+    /// Benchmark harness: concurrent memory queries complete within a generous budget.
+    #[tokio::test]
+    async fn benchmark_latency_concurrent() {
+        let ms = mem_store();
+        for idx in 0..128 {
+            ms.record(MemoryRecord::Decision {
+                title: format!("latency seed {idx}"),
+                body: "keyword overlap query path".into(),
+                task_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let query_count = 32usize;
+        let mut handles = Vec::new();
+        for query in 0..query_count {
+            let store = ms.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .query(&format!("latency seed keyword {query}"), 5)
+                    .await
+                    .map(|rows| rows.len())
+            }));
+        }
+        let mut total = 0usize;
+        for handle in handles {
+            total += handle.await.unwrap().unwrap();
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        let average_ms = elapsed_ms as f64 / query_count as f64;
+        println!("Average latency: {average_ms:.2}ms");
+        assert!(total > 0, "expected concurrent queries to return matches");
+        assert!(
+            elapsed_ms < 10_000,
+            "concurrent memory queries took too long: {elapsed_ms}ms"
+        );
+    }
 }
