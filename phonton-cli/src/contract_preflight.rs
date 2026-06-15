@@ -21,10 +21,14 @@ struct AcceptanceSlice {
 /// stack marker files so `phonton plan` and the TUI can show the same run and
 /// verification contract before any worker is dispatched.
 pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, goal_text: &str) {
+    let lower_goal = goal_text.to_ascii_lowercase();
+    if is_receipt_refactor_goal(&lower_goal) {
+        apply_receipt_refactor_plan(plan, goal_text, working_dir);
+        return;
+    }
     let Some(contract) = plan.goal_contract.as_mut() else {
         return;
     };
-    let lower_goal = goal_text.to_ascii_lowercase();
     let is_chess = lower_goal.contains("chess")
         && (lower_goal.contains("make")
             || lower_goal.contains("build")
@@ -200,12 +204,21 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
     }
 }
 
+fn is_receipt_refactor_goal(lower: &str) -> bool {
+    lower.contains("receipt") && (lower.contains("refactor") || lower.contains("buildreceipt"))
+}
+
 fn collect_node_preflight_attachments(working_dir: &Path) -> Vec<PromptAttachment> {
     let mut attachments = Vec::new();
     push_text_attachment(
         &mut attachments,
         working_dir,
         &working_dir.join("package.json"),
+    );
+    push_text_attachment(
+        &mut attachments,
+        working_dir,
+        &working_dir.join("src").join("receipt.js"),
     );
 
     let mut test_files = Vec::new();
@@ -534,8 +547,13 @@ fn existing_vite_react_chess_acceptance_slices(
     [
         (
             "rules_seed",
-            "create a compile-safe local chess rules seed and rules boundary tests for legal moves, turn order, captures, blocked paths, king safety, check/checkmate/stalemate, and queen promotion",
+            "create a compile-safe local chess rules module for legal moves, turn order, captures, blocked paths, king safety, check/checkmate/stalemate, and queen promotion",
             "src/chessRules.ts",
+        ),
+        (
+            "rules_tests",
+            "add game-state/rules boundary tests for legal moves, illegal moves, turn order, check safety, promotion, and terminal status",
+            "src/chessRules.test.ts",
         ),
         (
             "board_ui",
@@ -631,10 +649,10 @@ fn acceptance_slice_artifact_paths(slice: &AcceptanceSlice) -> Vec<PathBuf> {
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts"));
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
         }
-        "rules" | "rules_seed" => {
-            push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
+        "rules" | "rules_seed" => {}
+        "rules_tests" => {
+            push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts"));
         }
-        "rules_tests" => push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts")),
         "board_ui" | "interactions" | "status_history_reset" => {
             push_unique_path(&mut paths, PathBuf::from("src/App.css"));
         }
@@ -647,6 +665,45 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+fn apply_receipt_refactor_plan(plan: &mut PlannerOutput, goal_text: &str, working_dir: &Path) {
+    let Some(contract) = plan.goal_contract.as_mut() else {
+        return;
+    };
+    contract.acceptance_criteria.extend([
+        "Run `npm test` before and after refactoring `src/receipt.js`.".into(),
+        "Preserve `buildReceipt(run)` export; add `## Commands` section via `renderCommands`.".into(),
+        "Support command previews, knownGaps severity sorting, and per-file verifiedBy metadata.".into(),
+    ]);
+    push_verify_step(contract, "npm test", vec!["npm".into(), "test".into()]);
+
+    let attachments = collect_node_preflight_attachments(working_dir);
+    let slices = [
+        AcceptanceSlice {
+            id: "receipt_tests".into(),
+            criterion: "read existing receipt tests and confirm failing expectations for commands, gap sorting, and verifiedBy before editing implementation".into(),
+            artifact_path: Some(PathBuf::from("src/receipt.js")),
+        },
+        AcceptanceSlice {
+            id: "receipt_impl".into(),
+            criterion: "refactor `src/receipt.js` into helpers with `renderCommands` producing a `## Commands` section; keep `buildReceipt` API stable".into(),
+            artifact_path: Some(PathBuf::from("src/receipt.js")),
+        },
+        AcceptanceSlice {
+            id: "receipt_verify".into(),
+            criterion: "finish with passing `npm test` and list verification command plus any known gaps in the final response".into(),
+            artifact_path: Some(PathBuf::from("src/receipt.js")),
+        },
+    ];
+    plan.subtasks = preflight_acceptance_slice_subtasks(
+        goal_text,
+        "Node receipt refactor",
+        &slices,
+        attachments,
+    );
+    plan.estimated_total_tokens = plan.subtasks.len() as u64 * 1_200;
+    plan.naive_baseline_tokens = plan.subtasks.len() as u64 * 4_000;
 }
 
 fn compact_goal_label(goal_text: &str) -> String {

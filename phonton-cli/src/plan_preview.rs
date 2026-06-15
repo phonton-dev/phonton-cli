@@ -13,7 +13,7 @@ use phonton_types::{
 };
 use serde::Serialize;
 
-use crate::{config, open_persistent_store};
+use crate::{config, store_util::open_persistent_store};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanOptions {
@@ -39,7 +39,7 @@ pub struct PlanRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct PlanReport {
+pub struct PlanReport {
     goal: String,
     memory_enabled: bool,
     memory_influence_count: usize,
@@ -128,8 +128,20 @@ pub async fn run(args: &[String]) -> Result<i32> {
         decompose(&goal)
     };
 
-    let report = PlanReport {
-        goal: request.goal,
+    let report = build_plan_report(&request, plan).await?;
+
+    if request.options.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_text_report(&report);
+    }
+
+    Ok(0)
+}
+
+pub async fn build_plan_report(request: &PlanRequest, plan: PlannerOutput) -> Result<PlanReport> {
+    Ok(PlanReport {
+        goal: request.goal.clone(),
         memory_enabled: request.options.use_memory,
         memory_influence_count: memory_influence_count(&plan),
         coverage_warnings: coverage_warnings(&plan),
@@ -143,15 +155,32 @@ pub async fn run(args: &[String]) -> Result<i32> {
         plan_graph: plan.plan_graph.clone(),
         subtasks: subtask_reports(&plan),
         plan,
+    })
+}
+
+pub async fn build_plan_for_goal(goal: &str, use_memory: bool, no_tests: bool) -> Result<PlanReport> {
+    let request = PlanRequest {
+        goal: goal.to_string(),
+        options: PlanOptions {
+            json: true,
+            use_memory,
+            no_tests,
+        },
     };
-
-    if request.options.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    let mut goal_obj = Goal::new(request.goal.clone());
+    goal_obj.no_tests = request.options.no_tests;
+    let plan = if request.options.use_memory {
+        match open_persistent_store() {
+            Ok(store) => {
+                let cfg = config::load().unwrap_or_default();
+                decompose_with_memory(&goal_obj, &store, crate::load_ask_provider(&cfg)).await?
+            }
+            Err(_) => decompose(&goal_obj),
+        }
     } else {
-        print_text_report(&report);
-    }
-
-    Ok(0)
+        decompose(&goal_obj)
+    };
+    build_plan_report(&request, plan).await
 }
 
 fn print_text_report(report: &PlanReport) {

@@ -4,6 +4,44 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.20.1 - Tier 2 CLI, benchmark harness, provider routing
+
+### Added
+
+- Persisted pause/resume: `paused_runs` in `phonton-store`, `phonton goal --resume <task-id>`, TUI footer hint when paused.
+- `classify_task_confidence` heuristics; `phonton index watch` for incremental semantic indexing.
+- DeepSeek default pricing in budget guard; `phonton doctor` bench Python check.
+
+### Fixed
+
+- `syntax-preflight-v1` capture resolves Python on Windows (`PHONTON_BENCH_PYTHON`, `py -3`, etc.).
+- Receipt refactor and chess acceptance slices: stronger preflight plans and paired file context.
+- Verify layer surfaces first tree-sitter syntax line in worker retry prompts.
+
+### Notes
+
+- Provider-only RunIndex 38 report: `benchmarks/reports/deepseek-2026-06-01-v0.20.1.md` (benchmark workspace).
+
+## 0.20.0 - Merge-gate messaging and honest execution labels
+
+### Added
+
+- Workspace-aware Ask (`ask_context`) with goal and repo path context.
+- TUI `execution:` line: `provider`, `local-template`, or `mixed` from flight log models.
+- Receipt block prioritized when a handoff exists (before in-flight worker noise).
+- Brain `CURRENT.md`, rewritten vision/positioning, `phonton-dev` getting-started + concepts.
+- DeepSeek provider-only benchmark report (`deepseek-2026-06-01-phonton-v0.19.7.md`).
+
+### Changed
+
+- Public README and site hero emphasize merge gate, not token leaderboard copy.
+- Website `/desktop/` waitlist page (MVP scope only).
+
+### Notes
+
+- Tier 2 backlog: persisted pause/resume, LLM `classify_task`, incremental index.
+- Chess `chess-web-v1` provider-only: see benchmark report after RunIndex 37 capture.
+
 ## 0.19.7 - Local Template Dispatch And Launch Benchmark Harness
 
 ### Fixed

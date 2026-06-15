@@ -15,7 +15,7 @@ use phonton_types::{
 };
 use serde::Serialize;
 
-use crate::open_persistent_store;
+use crate::store_util::open_persistent_store;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewAction {
@@ -38,7 +38,7 @@ pub struct ReviewRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ReviewReport {
+pub struct ReviewReport {
     task_id: String,
     goal: String,
     status: serde_json::Value,
@@ -223,6 +223,16 @@ pub async fn run(args: &[String]) -> Result<i32> {
     Ok(if report.review_items.is_empty() { 1 } else { 0 })
 }
 
+pub async fn fetch_report(task_ref: Option<&str>) -> Result<Option<ReviewReport>> {
+    let store = open_persistent_store()?;
+    let task = resolve_task(&store, task_ref).await?;
+    let Some(task) = task else {
+        return Ok(None);
+    };
+    let events = store.list_events(task.id, 10_000)?;
+    Ok(Some(build_report(task, events)))
+}
+
 async fn resolve_task(
     store: &phonton_store::Store,
     task_ref: Option<&str>,
@@ -370,7 +380,7 @@ fn parse_task_id(raw: &str) -> Result<TaskId> {
     serde_json::from_value(json).map_err(Into::into)
 }
 
-fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
+pub fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport {
     let mut context_by_subtask: std::collections::HashMap<
         String,
         (Vec<ContextAttribution>, usize),

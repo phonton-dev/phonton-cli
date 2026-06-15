@@ -436,6 +436,7 @@ mod tests {
     ) -> HandoffPacket {
         let task_id = phonton_types::TaskId::new();
         HandoffPacket {
+            schema_version: phonton_types::HANDOFF_PACKET_SCHEMA_VERSION.to_string(),
             task_id,
             goal: "fix config".into(),
             headline: "ready".into(),

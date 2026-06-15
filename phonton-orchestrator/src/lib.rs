@@ -28,9 +28,10 @@ use phonton_types::{
     classify_task, effective_tier, BudgetDecision, BudgetLimits, ChangedFileSummary, Checkpoint,
     CostSummary, DiffHunk, DiffLine, DiffStats, EventRecord, GeneratedArtifact, GlobalState,
     GoalContract, HandoffPacket, InfluenceSummary, ModelPricing, ModelTier, OrchestratorEvent,
-    OrchestratorMessage, PlanGraph, PlannerOutput, ProviderKind, ReviewAction, RollbackPoint,
-    Subtask, SubtaskId, SubtaskResult, SubtaskRole, SubtaskStatus, TaskId, TaskStatus, TokenUsage,
-    VerifyLayer, VerifyReport, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
+    OrchestratorMessage, PlanGraph, PlannerOutput, ProviderKind, ResumeCheckpoint, ReviewAction,
+    RollbackPoint, Subtask, SubtaskId, SubtaskResult, SubtaskRole, SubtaskStatus, TaskId,
+    TaskStatus, TokenUsage, VerifyLayer, VerifyReport, VerifyResult, WorkerState,
+    TOKEN_MILESTONE_INTERVAL,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -436,6 +437,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         &self,
         mut plan: PlannerOutput,
         state_tx: watch::Sender<GlobalState>,
+        resume_from: Option<ResumeCheckpoint>,
     ) -> Result<TaskStatus> {
         // 1. Build the DAG and the SubtaskId → NodeIndex lookup.
         normalize_plan_dependencies(&mut plan);
@@ -474,6 +476,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     plan_graph: Some(&plan.plan_graph),
                     index_backend: self.index_backend.as_deref(),
                     handoff_packet: Some(&handoff),
+                    resume_checkpoint: None,
                 };
                 broadcast(&state_tx, &status, &runtimes, 0, extras);
                 return Ok(status);
@@ -485,6 +488,9 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // 2. Mark subtasks with no deps as Ready so the first scheduler
         //    sweep can pick them up.
         for rt in runtimes.values_mut() {
+            if rt.is_done() {
+                continue;
+            }
             if graph
                 .neighbors_directed(rt.node, petgraph::Direction::Incoming)
                 .next()
@@ -495,15 +501,50 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         }
 
         let mut joinset: JoinSet<(SubtaskId, Result<SubtaskResult>)> = JoinSet::new();
-        let mut tokens_used: u64 = 0;
+        let mut tokens_used = resume_from.as_ref().map(|r| r.tokens_used).unwrap_or(0);
         let mut task_status = TaskStatus::Planning;
         let mut failure: Option<(SubtaskId, String)> = None;
         // Budget-pause: (triggering_subtask_id, limit_name, observed, ceiling).
         // Set when BudgetGuard fires; produces TaskStatus::Paused at the end.
         let mut paused: Option<(SubtaskId, String, u64, u64)> = None;
-        let mut checkpoints: Vec<Checkpoint> = Vec::new();
-        let mut checkpointed: HashSet<SubtaskId> = HashSet::new();
-        let mut next_seq: u32 = 1;
+        let mut checkpoints = resume_from
+            .as_ref()
+            .map(|r| r.checkpoints.clone())
+            .unwrap_or_default();
+        let mut checkpointed: HashSet<SubtaskId> = checkpoints
+            .iter()
+            .map(|cp| cp.subtask_id)
+            .collect();
+        let mut next_seq = resume_from
+            .as_ref()
+            .map(|r| r.next_checkpoint_seq)
+            .unwrap_or(1);
+
+        if let Some(resume) = resume_from {
+            for id in &resume.completed_subtask_ids {
+                if let Some(rt) = runtimes.get_mut(id) {
+                    rt.status = SubtaskStatus::Done {
+                        tokens_used: rt.tokens_used,
+                        diff_hunk_count: rt.diff_hunks.len(),
+                    };
+                }
+            }
+            let done_nodes: HashSet<NodeIndex> = runtimes
+                .values()
+                .filter(|rt| rt.is_done())
+                .map(|rt| rt.node)
+                .collect();
+            for rt in runtimes.values_mut() {
+                if matches!(rt.status, SubtaskStatus::Queued) {
+                    let ready = graph
+                        .neighbors_directed(rt.node, petgraph::Direction::Incoming)
+                        .all(|dep_node| done_nodes.contains(&dep_node));
+                    if ready {
+                        rt.status = SubtaskStatus::Ready;
+                    }
+                }
+            }
+        }
 
         // Channel for worker-to-orchestrator intermediate messages.
         let (worker_msg_tx, mut worker_msg_rx) = mpsc::channel::<OrchestratorMessage>(32);
@@ -525,6 +566,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 plan_graph: Some(&plan.plan_graph),
                 index_backend: self.index_backend.as_deref(),
                 handoff_packet: None,
+                resume_checkpoint: None,
             },
         );
 
@@ -555,6 +597,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     plan_graph: Some(&plan.plan_graph),
                     index_backend: self.index_backend.as_deref(),
                     handoff_packet: None,
+                    resume_checkpoint: None,
                 },
             );
 
@@ -849,6 +892,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         };
         let handoff =
             self.build_handoff_packet(&plan, &runtimes, &terminal, tokens_used, &checkpoints);
+        let resume_checkpoint = if matches!(terminal, TaskStatus::Paused { .. }) {
+            Some(build_resume_checkpoint(
+                &runtimes,
+                tokens_used,
+                &checkpoints,
+                next_seq,
+            ))
+        } else {
+            None
+        };
         broadcast(
             &state_tx,
             &terminal,
@@ -862,6 +915,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 plan_graph: Some(&plan.plan_graph),
                 index_backend: self.index_backend.as_deref(),
                 handoff_packet: Some(&handoff),
+                resume_checkpoint,
             },
         );
         Ok(terminal)
@@ -1517,6 +1571,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         };
 
         HandoffPacket {
+            schema_version: phonton_types::HANDOFF_PACKET_SCHEMA_VERSION.to_string(),
             task_id: self.task_id,
             goal,
             headline,
@@ -1937,6 +1992,25 @@ struct BroadcastExtras<'a> {
     plan_graph: Option<&'a PlanGraph>,
     index_backend: Option<&'a str>,
     handoff_packet: Option<&'a HandoffPacket>,
+    resume_checkpoint: Option<ResumeCheckpoint>,
+}
+
+fn build_resume_checkpoint(
+    runtimes: &HashMap<SubtaskId, SubtaskRuntime>,
+    tokens_used: u64,
+    checkpoints: &[Checkpoint],
+    next_checkpoint_seq: u32,
+) -> ResumeCheckpoint {
+    ResumeCheckpoint {
+        completed_subtask_ids: runtimes
+            .values()
+            .filter(|rt| rt.is_done())
+            .map(|rt| rt.subtask.id)
+            .collect(),
+        tokens_used,
+        checkpoints: checkpoints.to_vec(),
+        next_checkpoint_seq,
+    }
 }
 
 fn broadcast(
@@ -1972,6 +2046,7 @@ fn broadcast(
         tokens_budget: extras.tokens_budget,
         estimated_naive_tokens: extras.estimated_naive_tokens,
         checkpoints: extras.checkpoints.to_vec(),
+        resume_checkpoint: extras.resume_checkpoint,
     });
 }
 
@@ -2091,8 +2166,9 @@ mod tests {
             tokens_used: 0,
             tokens_budget: None,
             estimated_naive_tokens: 0,
-            checkpoints: Vec::new(),
-        });
+        checkpoints: Vec::new(),
+        resume_checkpoint: None,
+    });
         tx
     }
 
@@ -2134,7 +2210,7 @@ mod tests {
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
+        let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
@@ -2165,13 +2241,14 @@ mod tests {
             tokens_used: 0,
             tokens_budget: None,
             estimated_naive_tokens: 0,
-            checkpoints: Vec::new(),
-        });
+        checkpoints: Vec::new(),
+        resume_checkpoint: None,
+    });
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
 
-        let status = orch.run_task(plan, state_tx).await.unwrap();
+        let status = orch.run_task(plan, state_tx, None).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
 
         let state = state_rx.borrow().clone();
@@ -2205,7 +2282,7 @@ mod tests {
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
+        let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
         assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
     }
@@ -2269,7 +2346,7 @@ mod tests {
         });
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
+        let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         assert!(matches!(status, TaskStatus::Failed { .. }));
         let calls = dispatcher.calls.lock().unwrap();
         // At minimum: retries at initial tier plus at least one escalation.
@@ -2335,7 +2412,7 @@ mod tests {
             .with_working_dir(tmp.path())
             .with_event_sink(task_id, "busted", events_tx);
 
-        let _ = orch.run_task(plan, empty_state()).await.unwrap();
+        let _ = orch.run_task(plan, empty_state(), None).await.unwrap();
 
         let mut saw_repair = false;
         while let Ok(record) = events_rx.try_recv() {
@@ -2431,7 +2508,7 @@ mod tests {
         });
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let status = timeout(Duration::from_secs(600), orch.run_task(plan, empty_state()))
+        let status = timeout(Duration::from_secs(600), orch.run_task(plan, empty_state(), None))
             .await
             .expect("sequential dispatch would deadlock the barrier")
             .expect("orchestrator returned Err");
@@ -2591,7 +2668,7 @@ mod tests {
         let orch = Orchestrator::new(Arc::clone(&dispatcher))
             .with_working_dir(tmp.path())
             .with_budget_guard(guard);
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
+        let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         match status {
             TaskStatus::Paused { limit, .. } => {
                 assert_eq!(limit, "tokens", "expected token ceiling to trip");
@@ -2624,7 +2701,7 @@ mod tests {
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let _ = orch.run_task(plan, empty_state()).await.unwrap();
+        let _ = orch.run_task(plan, empty_state(), None).await.unwrap();
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         // Recorded tier on dispatch must be the downgraded one.
@@ -2686,7 +2763,7 @@ mod tests {
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let r = orch.run_task(plan, empty_state()).await;
+        let r = orch.run_task(plan, empty_state(), None).await;
         assert!(r.is_err());
     }
 
@@ -2721,7 +2798,7 @@ mod tests {
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let status = orch.run_task(plan, empty_state()).await.unwrap();
+        let status = orch.run_task(plan, empty_state(), None).await.unwrap();
 
         assert!(
             matches!(status, TaskStatus::Failed { ref reason, .. } if reason.contains("Goal confidence is too low (60%)")),

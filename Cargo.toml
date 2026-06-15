@@ -15,6 +15,7 @@ members = [
     "phonton-extensions",
     "phonton-mcp",
     "phonton-cli",
+    "phonton-handoff",
 ]
 resolver = "2"
 

@@ -382,9 +382,11 @@ fn verify_syntax_with_worktree(
             continue;
         };
         if tree.root_node().has_error() || contains_error_node(tree.root_node()) {
+            let detail = first_syntax_error_detail(&tree, &snippet);
             errors.push(format!(
-                "syntax error in post-diff content targeting {}",
-                path.display()
+                "syntax error in post-diff content targeting {}: {}",
+                path.display(),
+                detail
             ));
         } else if matches!(language, SyntaxLanguage::Python)
             && has_top_level_python_return(&snippet)
@@ -1007,6 +1009,32 @@ fn contains_error_node(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+fn first_syntax_error_detail(tree: &tree_sitter::Tree, source: &str) -> String {
+    fn walk(node: Node<'_>, source: &str) -> Option<String> {
+        if node.is_error() || node.is_missing() {
+            let row = node.start_position().row + 1;
+            let col = node.start_position().column + 1;
+            let line = source
+                .lines()
+                .nth(node.start_position().row)
+                .unwrap_or("")
+                .trim();
+            if line.is_empty() {
+                return Some(format!("line {row} col {col}"));
+            }
+            return Some(format!("line {row} col {col}: {line}"));
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(detail) = walk(child, source) {
+                return Some(detail);
+            }
+        }
+        None
+    }
+    walk(tree.root_node(), source).unwrap_or_else(|| "parse tree contains errors".into())
 }
 
 /// Infer the cargo package name for a path inside the workspace.

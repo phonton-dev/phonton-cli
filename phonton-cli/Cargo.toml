@@ -1,6 +1,6 @@
 [package]
 name = "phonton-cli"
-version = "0.19.7"
+version = "0.20.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -39,6 +39,9 @@ reqwest              = { version = "0.12", default-features = false, features = 
 toml                 = "0.8"
 dirs                 = "5"
 clipboard-win       = "5"
+uuid                = { workspace = true }
+axum                = { version = "0.7", features = ["json"] }
+tokio-stream        = { version = "0.1", features = ["sync"] }
 
 [features]
 integration-tests = []

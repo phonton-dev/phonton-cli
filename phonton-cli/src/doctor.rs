@@ -124,6 +124,7 @@ pub async fn build_report(workspace: &Path, opts: DoctorOptions) -> DoctorReport
         "Install the Rust toolchain from rustup.rs and make sure `cargo --version` works.",
         &mut checks,
     );
+    check_bench_python(&mut checks);
     check_cargo_manifest(workspace, &mut checks);
     check_nexus(workspace, &mut checks);
     check_index_backend(&mut checks).await;
@@ -613,6 +614,63 @@ fn check_trust(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
             "Workspace is not trusted yet",
             "first TUI launch will ask for consent",
             Some("Run `phonton` and accept the workspace trust prompt.".into()),
+        );
+    }
+}
+
+fn check_bench_python(checks: &mut Vec<DoctorCheck>) {
+    if let Ok(path) = std::env::var("PHONTON_BENCH_PYTHON") {
+        if !path.trim().is_empty() {
+            push(
+                checks,
+                "bench.python",
+                Severity::Ok,
+                "Benchmark Python is configured",
+                format!("PHONTON_BENCH_PYTHON={path}"),
+                None,
+            );
+            return;
+        }
+    }
+
+    let mut resolved: Option<String> = None;
+    for name in ["python", "python3"] {
+        if let Ok(output) = Command::new(name).args(["--version"]).output() {
+            if output.status.success() {
+                resolved = Some(name.into());
+                break;
+            }
+        }
+    }
+    if resolved.is_none() {
+        if Command::new("py").args(["-3", "--version"]).output().is_ok() {
+            resolved = Some("py -3".into());
+        }
+    }
+
+    if let Some(cmd) = resolved {
+        push(
+            checks,
+            "bench.python",
+            Severity::Ok,
+            "Python available for syntax-preflight benchmarks",
+            cmd,
+            Some(
+                "Optional: set PHONTON_BENCH_PYTHON in your shell profile for a fixed interpreter."
+                    .into(),
+            ),
+        );
+    } else {
+        push(
+            checks,
+            "bench.python",
+            Severity::Warn,
+            "Python not found for syntax-preflight benchmarks",
+            "install Python 3 or set PHONTON_BENCH_PYTHON",
+            Some(
+                "Windows: install Python 3 and/or use `set PHONTON_BENCH_PYTHON=py -3` before benchmark runs."
+                    .into(),
+            ),
         );
     }
 }

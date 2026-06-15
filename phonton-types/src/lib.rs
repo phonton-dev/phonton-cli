@@ -165,8 +165,45 @@ impl fmt::Display for TaskClass {
 /// Heuristic-only, keyword-based. Lives here (not in `phonton-planner`)
 /// so the orchestrator can call it without pulling in the planner crate
 /// and its provider/memory dependencies.
+/// Heuristic confidence for routing and clarification gates (0.0–1.0).
+pub fn classify_task_confidence(description: &str) -> f32 {
+    let d = task_description_without_prior_context(description).to_ascii_lowercase();
+    if is_core_logic_goal(&d) {
+        return 0.88;
+    }
+    match classify_task(description) {
+        TaskClass::CoreLogic => 0.78,
+        TaskClass::Boilerplate | TaskClass::Docs => 0.82,
+        TaskClass::Tests => {
+            if d.contains("acceptance slice") || d.contains("npm test") {
+                0.8
+            } else {
+                0.62
+            }
+        }
+    }
+}
+
+fn is_core_logic_goal(lower: &str) -> bool {
+    lower.contains("acceptance slice")
+        || lower.contains("syntax preflight")
+        || lower.contains("syntax error")
+        || lower.contains("bugfix")
+        || lower.contains("bug fix")
+        || lower.contains("refactor")
+        || lower.contains("implement ")
+        || lower.contains("architecture")
+        || lower.contains("orchestrat")
+        || lower.contains("generated app")
+        || lower.contains("playable")
+}
+
 pub fn classify_task(description: &str) -> TaskClass {
     let d = task_description_without_prior_context(description).to_ascii_lowercase();
+
+    if is_core_logic_goal(&d) {
+        return TaskClass::CoreLogic;
+    }
 
     if is_test_or_verification_task(&d) {
         return TaskClass::Tests;
@@ -284,6 +321,25 @@ pub enum TaskStatus {
     },
     /// User rejected the produced diff. Task is terminal.
     Rejected,
+}
+
+/// Serializable checkpoint for resuming a budget-paused DAG.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeCheckpoint {
+    pub completed_subtask_ids: Vec<SubtaskId>,
+    pub tokens_used: u64,
+    pub checkpoints: Vec<Checkpoint>,
+    pub next_checkpoint_seq: u32,
+}
+
+/// Durable paused-run payload stored by `phonton-store`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PausedRunSnapshot {
+    pub task_id: TaskId,
+    pub goal_text: String,
+    pub working_dir: String,
+    pub planner_output: PlannerOutput,
+    pub resume: ResumeCheckpoint,
 }
 
 /// Lifecycle state of a single subtask inside a task's DAG.
@@ -1330,9 +1386,19 @@ pub struct InfluenceSummary {
     pub extensions: Vec<String>,
 }
 
+/// Current JSON schema version for [`HandoffPacket`] export surfaces.
+pub const HANDOFF_PACKET_SCHEMA_VERSION: &str = "1";
+
+fn default_handoff_schema_version() -> String {
+    HANDOFF_PACKET_SCHEMA_VERSION.to_string()
+}
+
 /// User-facing receipt for a completed or failed task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffPacket {
+    /// Schema version for desktop, vault, and benchmark export consumers.
+    #[serde(default = "default_handoff_schema_version")]
+    pub schema_version: String,
     /// Task id.
     pub task_id: TaskId,
     /// Original goal.

@@ -380,6 +380,7 @@ mod tests {
         assert_eq!(commands_for_task(&task), vec![contract_command]);
 
         ledger.handoff = Some(phonton_types::HandoffPacket {
+            schema_version: phonton_types::HANDOFF_PACKET_SCHEMA_VERSION.to_string(),
             task_id,
             goal: "g".into(),
             headline: "ready".into(),

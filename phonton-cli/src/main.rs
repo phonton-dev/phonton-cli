@@ -34,17 +34,23 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod ask_context;
 mod benchmark_cli;
 mod config;
 mod contract_preflight;
 mod doctor;
+mod index_cli;
 mod extensions_cli;
 mod mcp_cli;
 mod memory_cli;
 mod plan_preview;
 mod prompt_buffer;
 mod review;
+mod serve_cli;
+mod store_util;
 mod trust;
+
+pub(crate) use store_util::open_persistent_store;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -79,10 +85,10 @@ use phonton_store::{Store, TaskRecord};
 use phonton_types::{
     BudgetLimits, ContextManifest, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId,
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
-    OrchestratorMessage, OutcomeLedger, Permission, PermissionLedger, PlannerOutput,
-    PromptArtifact, PromptArtifactRole, PromptAttachment, PromptAttachmentKind,
-    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    OrchestratorMessage, OutcomeLedger, PausedRunSnapshot, Permission, PermissionLedger,
+    PlannerOutput, PromptArtifact, PromptArtifactRole, PromptAttachment, PromptAttachmentKind,
+    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId,
+    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use prompt_buffer::{PromptBuffer, SubmittedPrompt};
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -2315,6 +2321,23 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let dim = Style::default().fg(DIM);
     let sep = Span::styled("  ·  ", dim);
 
+    if let Some(goal) = app.goals.get(app.selected) {
+        if matches!(goal.status, TaskStatus::Paused { .. }) {
+            let hint = Line::from(vec![
+                Span::styled("paused", Style::default().fg(Color::Rgb(255, 200, 0))),
+                Span::styled(
+                    format!("  resume: phonton goal --resume {}", goal.task_id),
+                    txt,
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(hint).alignment(Alignment::Center),
+                area,
+            );
+            return;
+        }
+    }
+
     let spans: Vec<Span<'static>> = match app.mode {
         Mode::Goal | Mode::Task => vec![
             Span::styled("Enter", key),
@@ -2935,6 +2958,13 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::raw(""));
 
     if let Some(state) = &g.state {
+        // Receipt-first: when a handoff exists, show the merge gate summary
+        // before in-flight worker noise.
+        if let Some(handoff) = &state.handoff_packet {
+            append_handoff_lines(&mut lines, handoff);
+            lines.push(Line::raw(""));
+        }
+
         for w in &state.active_workers {
             let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
             spans.push(Span::raw(" "));
@@ -2956,15 +2986,19 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ));
             lines.push(Line::from(spans));
         }
-        lines.push(Line::raw(""));
+        if !state.active_workers.is_empty() {
+            lines.push(Line::raw(""));
+        }
         lines.push(render_savings_line_styled(
             Some(state),
             app.best_savings_pct,
             app.new_best_ticks,
         ));
-
-        if let Some(handoff) = &state.handoff_packet {
-            append_handoff_lines(&mut lines, handoff);
+        if let Some(label) = execution_mode_label(g) {
+            lines.push(Line::from(vec![
+                Span::styled("execution: ", Style::default().fg(MUTED)),
+                Span::styled(label, Style::default().fg(WARN)),
+            ]));
         }
 
         // Checkpoint picker — one line per landed subtask, newest last.
@@ -3011,6 +3045,26 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
     frame.render_widget(p, area);
+}
+
+fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
+    let mut local = false;
+    let mut provider = false;
+    for record in &goal.flight_log {
+        if let OrchestratorEvent::SubtaskReviewReady { model_name, .. } = &record.event {
+            if model_name.contains("local-template") || model_name.contains("stub") {
+                local = true;
+            } else if !model_name.is_empty() {
+                provider = true;
+            }
+        }
+    }
+    match (local, provider) {
+        (true, true) => Some("mixed (local-template + provider)"),
+        (true, false) => Some("local-template — not a provider token-efficiency claim"),
+        (false, true) => Some("provider"),
+        (false, false) => None,
+    }
 }
 
 fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket) {
@@ -3958,15 +4012,6 @@ fn default_store_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
 }
 
-fn open_persistent_store() -> Result<Store> {
-    let path = default_store_path()
-        .ok_or_else(|| anyhow::anyhow!("could not determine ~/.phonton path"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Store::open(path)
-}
-
 fn read_clipboard_text() -> Result<String, String> {
     #[cfg(windows)]
     {
@@ -4065,7 +4110,7 @@ async fn build_semantic_context_with_warnings(
 
 /// Load a provider for ask-mode (stateless Q&A) using the config file or
 /// env vars. Returns `None` when no key is available.
-fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
+pub(crate) fn load_ask_provider(cfg: &config::Config) -> Option<Arc<dyn Provider>> {
     let api_key = provider_key_for_run(&cfg.provider)?;
     let model = cfg
         .provider
@@ -4595,6 +4640,7 @@ fn print_help() {
          skills            Inspect loaded skills\n  \
          steering          Inspect loaded steering rules\n  \
          goal <goal>       Run a noninteractive goal through plan/edit/verify/review\n  \
+         serve             JSON-RPC sidecar API for Phonton Desktop\n  \
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
@@ -4790,6 +4836,13 @@ async fn handle_cli_args() -> Result<bool> {
             }
             Ok(true)
         }
+        "index" => {
+            let code = index_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
         "benchmark" => {
             let code = benchmark_cli::run(&args[1..]).await?;
             if code != 0 {
@@ -4813,6 +4866,13 @@ async fn handle_cli_args() -> Result<bool> {
         }
         "memory" => {
             let code = memory_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "serve" => {
+            let code = serve_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -4858,20 +4918,95 @@ async fn handle_cli_args() -> Result<bool> {
     }
 }
 
+/// Hooks for the desktop/serve JSON-RPC sidecar.
+#[derive(Debug, Default)]
+pub(crate) struct HeadlessGoalHooks {
+    pub fixed_task_id: Option<TaskId>,
+    pub state_tx: Option<watch::Sender<GlobalState>>,
+    pub event_tx: Option<broadcast::Sender<EventRecord>>,
+    pub skip_trust_prompt: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HeadlessGoalOptions {
+pub(crate) struct HeadlessGoalOptions {
     goal_text: String,
     display_text: String,
     json: bool,
     yes: bool,
     direct_task: bool,
     timeout_seconds: u64,
+    resume_task_id: Option<TaskId>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HeadlessGoalResult {
+    pub task_id: TaskId,
+    pub final_state: GlobalState,
+    pub exit_code: i32,
 }
 
 fn print_goal_help() {
     println!(
-        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop."
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id>\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop."
     );
+}
+
+fn apply_budget_pricing(guard: BudgetGuard, cfg: &config::Config) -> BudgetGuard {
+    let provider = cfg.provider.name.as_str();
+    let model = cfg
+        .provider
+        .model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| default_model_for(provider));
+    let kind = match provider {
+        "anthropic" => ProviderKind::Anthropic,
+        "openai" => ProviderKind::OpenAI,
+        "ollama" => ProviderKind::Ollama,
+        "cloudflare" => ProviderKind::Cloudflare,
+        "deepseek" | "openai-compatible" | "xai" | "groq" | "together" | "custom" => {
+            ProviderKind::OpenAiCompatible
+        }
+        _ => ProviderKind::OpenAiCompatible,
+    };
+    if provider == "ollama" {
+        return guard.with_price(
+            ProviderKind::Ollama,
+            &model,
+            ModelPricing {
+                input_usd_micros_per_mtok: 0,
+                output_usd_micros_per_mtok: 0,
+            },
+        );
+    }
+    if provider == "cloudflare" && model == "@cf/moonshotai/kimi-k2.6" {
+        return guard.with_price(
+            ProviderKind::Cloudflare,
+            &model,
+            ModelPricing {
+                input_usd_micros_per_mtok: 950_000,
+                output_usd_micros_per_mtok: 4_000_000,
+            },
+        );
+    }
+    if provider == "deepseek"
+        || (provider == "openai-compatible"
+            && cfg
+                .provider
+                .base_url
+                .as_deref()
+                .is_some_and(|url| url.contains("deepseek")))
+    {
+        return guard.with_price(
+            kind,
+            &model,
+            ModelPricing {
+                input_usd_micros_per_mtok: 270_000,
+                output_usd_micros_per_mtok: 1_100_000,
+            },
+        );
+    }
+    guard
 }
 
 fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
@@ -4881,11 +5016,21 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
     let mut timeout_seconds = 900;
     let mut prompt_file: Option<PathBuf> = None;
     let mut read_stdin = false;
+    let mut resume_task_id: Option<TaskId> = None;
     let mut positionals = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--resume" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--resume requires a task id"))?;
+                let uuid = uuid::Uuid::parse_str(raw)
+                    .map_err(|_| anyhow::anyhow!("--resume task id must be a UUID"))?;
+                resume_task_id = Some(TaskId(uuid));
+            }
             "--json" => json = true,
             "--yes" | "-y" => yes = true,
             "--task" => direct_task = true,
@@ -4928,16 +5073,25 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
         i += 1;
     }
 
+    if resume_task_id.is_some() && (prompt_file.is_some() || read_stdin || !positionals.is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "`--resume` cannot be combined with a new goal prompt"
+        ));
+    }
+
     let source_count = usize::from(prompt_file.is_some())
         + usize::from(read_stdin)
         + usize::from(!positionals.is_empty());
-    if source_count > 1 {
+    if resume_task_id.is_none() && source_count > 1 {
         return Err(anyhow::anyhow!(
             "choose only one goal source: --prompt-file, --stdin, or positional text"
         ));
     }
 
-    let goal_text = if let Some(path) = prompt_file {
+    let goal_text = if resume_task_id.is_some() {
+        String::new()
+    } else if let Some(path) = prompt_file {
         std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?
     } else if read_stdin {
@@ -4952,11 +5106,15 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
     };
 
     let goal_text = goal_text.trim().to_string();
-    if goal_text.is_empty() {
+    if resume_task_id.is_none() && goal_text.is_empty() {
         return Err(anyhow::anyhow!("goal text is empty"));
     }
 
-    let display_text = summarize_goal_display(&goal_text);
+    let display_text = if resume_task_id.is_some() {
+        "resume paused goal".into()
+    } else {
+        summarize_goal_display(&goal_text)
+    };
     Ok(HeadlessGoalOptions {
         goal_text,
         display_text,
@@ -4964,6 +5122,7 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
         yes,
         direct_task,
         timeout_seconds,
+        resume_task_id,
     })
 }
 
@@ -4995,10 +5154,43 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         }
     };
 
+    let result = execute_headless_goal(opts, HeadlessGoalHooks::default()).await?;
+    if result.exit_code != 0 && !result.final_state.handoff_packet.is_some() {
+        // stderr already printed by execute_headless_goal when not json
+    }
+    Ok(result.exit_code)
+}
+
+pub(crate) async fn execute_headless_goal(
+    opts: HeadlessGoalOptions,
+    hooks: HeadlessGoalHooks,
+) -> Result<HeadlessGoalResult> {
     let cfg = config::load().unwrap_or_default();
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if !opts.yes && !trust::prompt_if_needed(&working_dir)? {
-        return Ok(1);
+    if !opts.yes
+        && !hooks.skip_trust_prompt
+        && !trust::prompt_if_needed(&working_dir)?
+    {
+        return Ok(HeadlessGoalResult {
+            task_id: hooks.fixed_task_id.unwrap_or_else(TaskId::new),
+            final_state: GlobalState {
+                task_status: TaskStatus::Failed {
+                    reason: "trust prompt declined".into(),
+                    failed_subtask: None,
+                },
+                goal_contract: None,
+                plan_graph: None,
+                index_backend: None,
+                handoff_packet: None,
+                active_workers: Vec::new(),
+                tokens_used: 0,
+                tokens_budget: None,
+                estimated_naive_tokens: 0,
+                checkpoints: Vec::new(),
+                resume_checkpoint: None,
+            },
+            exit_code: 1,
+        });
     }
 
     let store = Arc::new(std::sync::Mutex::new(open_persistent_store()?));
@@ -5006,9 +5198,43 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         working_dir.clone(),
         "phonton-cli-headless".to_string(),
     ));
-    let task_id = TaskId::new();
+
+    let resume_snapshot = if let Some(resume_id) = opts.resume_task_id {
+        let paused = store
+            .lock()
+            .ok()
+            .and_then(|g| g.load_paused_run(resume_id).ok().flatten());
+        match paused {
+            Some(snapshot) => Some(snapshot),
+            None => {
+                return print_headless_failure(
+                    opts.json,
+                    resume_id,
+                    &opts.display_text,
+                    "no paused run found for that task id",
+                    None,
+                    Some(cfg.index.backend.clone()),
+                    &store,
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let task_id = resume_snapshot
+        .as_ref()
+        .map(|s| s.task_id)
+        .or(hooks.fixed_task_id)
+        .unwrap_or_else(TaskId::new);
+    let resume_from = resume_snapshot.as_ref().map(|s| s.resume.clone());
+    let goal_text_for_run = resume_snapshot
+        .as_ref()
+        .map(|s| s.goal_text.clone())
+        .unwrap_or_else(|| opts.goal_text.clone());
+
     let prompt = SubmittedPrompt {
-        description: opts.goal_text.clone(),
+        description: goal_text_for_run.clone(),
         display_text: opts.display_text.clone(),
         prompt_artifacts: Vec::new(),
     };
@@ -5020,7 +5246,9 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
 
     let memory_store = phonton_memory::MemoryStore::new(Arc::clone(&store)).await;
     let prompt_artifacts = prompt.prompt_artifacts.clone();
-    let plan_result = if opts.direct_task {
+    let plan_result = if let Some(snapshot) = resume_snapshot {
+        Ok(snapshot.planner_output)
+    } else if opts.direct_task {
         Ok(single_task_plan(
             prompt.description.clone(),
             attachments.clone(),
@@ -5063,9 +5291,11 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
             );
         }
     };
-    contract_preflight::apply_workspace_preflight(&mut plan, &working_dir, &opts.goal_text);
+    if resume_from.is_none() {
+        contract_preflight::apply_workspace_preflight(&mut plan, &working_dir, &goal_text_for_run);
+    }
 
-    let (state_tx, _state_rx) = watch::channel(GlobalState {
+    let initial_state = GlobalState {
         task_status: TaskStatus::Planning,
         goal_contract: plan.goal_contract.clone(),
         plan_graph: Some(plan.plan_graph.clone()),
@@ -5076,9 +5306,20 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         tokens_budget: None,
         estimated_naive_tokens: plan.naive_baseline_tokens,
         checkpoints: Vec::new(),
-    });
+        resume_checkpoint: None,
+    };
+    let (state_tx, _state_rx) = match hooks.state_tx {
+        Some(tx) => {
+            let _ = tx.send(initial_state.clone());
+            (tx.clone(), tx.subscribe())
+        }
+        None => watch::channel(initial_state),
+    };
 
-    let (event_tx, _) = broadcast::channel::<EventRecord>(1024);
+    let (event_tx, _) = match hooks.event_tx {
+        Some(tx) => (tx.clone(), tx.subscribe()),
+        None => broadcast::channel::<EventRecord>(1024),
+    };
     let mut event_rx_store = event_tx.subscribe();
     let store_for_events = Arc::clone(&store);
     let event_writer = tokio::spawn(async move {
@@ -5170,28 +5411,7 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         max_tokens: cfg.budget.max_tokens,
         max_usd_micros: cfg.budget.max_usd_micros(),
     };
-    let mut budget_guard = BudgetGuard::new(limits);
-    if let Some(model) = cfg.provider.model.as_deref() {
-        if cfg.provider.name == "ollama" {
-            budget_guard = budget_guard.with_price(
-                ProviderKind::Ollama,
-                model,
-                ModelPricing {
-                    input_usd_micros_per_mtok: 0,
-                    output_usd_micros_per_mtok: 0,
-                },
-            );
-        } else if cfg.provider.name == "cloudflare" && model == "@cf/moonshotai/kimi-k2.6" {
-            budget_guard = budget_guard.with_price(
-                ProviderKind::Cloudflare,
-                model,
-                ModelPricing {
-                    input_usd_micros_per_mtok: 950_000,
-                    output_usd_micros_per_mtok: 4_000_000,
-                },
-            );
-        }
-    }
+    let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), &cfg);
 
     let mut orchestrator = Orchestrator::new(dispatcher)
         .with_naive_baseline(naive)
@@ -5204,7 +5424,7 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         orchestrator = orchestrator.with_diff_applier(diff_applier);
     }
 
-    let run = orchestrator.run_task(plan, state_tx.clone());
+    let run = orchestrator.run_task(plan.clone(), state_tx.clone(), resume_from);
     let run_result = tokio::time::timeout(Duration::from_secs(opts.timeout_seconds), run).await;
     let final_state = match run_result {
         Ok(Ok(_)) => state_tx.borrow().clone(),
@@ -5225,6 +5445,23 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         if let Some(ledger) = outcome_ledger_from_state(task_id, &final_state) {
             let _ = g.upsert_outcome_ledger(&ledger);
         }
+        if let (Some(resume), TaskStatus::Paused { .. }) =
+            (&final_state.resume_checkpoint, &final_state.task_status)
+        {
+            let snapshot = PausedRunSnapshot {
+                task_id,
+                goal_text: goal_text_for_run.clone(),
+                working_dir: working_dir.display().to_string(),
+                planner_output: plan.clone(),
+                resume: resume.clone(),
+            };
+            let _ = g.upsert_paused_run(&snapshot);
+        } else if matches!(
+            final_state.task_status,
+            TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
+        ) {
+            let _ = g.delete_paused_run(task_id);
+        }
     }
 
     drop(event_tx);
@@ -5238,12 +5475,20 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
             headless_status_label(&final_state.task_status),
             task_id
         );
+        if matches!(final_state.task_status, TaskStatus::Paused { .. }) {
+            println!("Resume with: phonton goal --resume {task_id}");
+        }
     }
 
-    Ok(if headless_goal_succeeded(&final_state.task_status) {
+    let exit_code = if headless_goal_succeeded(&final_state.task_status) {
         0
     } else {
         1
+    };
+    Ok(HeadlessGoalResult {
+        task_id,
+        final_state,
+        exit_code,
     })
 }
 
@@ -5255,7 +5500,7 @@ fn print_headless_failure(
     plan_graph: Option<phonton_types::PlanGraph>,
     index_backend: Option<String>,
     store: &Arc<std::sync::Mutex<Store>>,
-) -> Result<i32> {
+) -> Result<HeadlessGoalResult> {
     let state = GlobalState {
         task_status: TaskStatus::Failed {
             reason: reason.to_string(),
@@ -5270,6 +5515,7 @@ fn print_headless_failure(
         tokens_budget: None,
         estimated_naive_tokens: 0,
         checkpoints: Vec::new(),
+        resume_checkpoint: None,
     };
     if let Ok(g) = store.lock() {
         let _ = g.upsert_task(task_id, display_text, &state.task_status, 0);
@@ -5282,7 +5528,11 @@ fn print_headless_failure(
     } else {
         eprintln!("phonton goal: {reason}");
     }
-    Ok(1)
+    Ok(HeadlessGoalResult {
+        task_id,
+        final_state: state,
+        exit_code: 1,
+    })
 }
 
 fn failed_handoff_packet(
@@ -5292,6 +5542,7 @@ fn failed_handoff_packet(
     tokens_used: u64,
 ) -> HandoffPacket {
     HandoffPacket {
+        schema_version: phonton_types::HANDOFF_PACKET_SCHEMA_VERSION.to_string(),
         task_id,
         goal: display_text.to_string(),
         headline: format!("Task failed before review: {}", short(reason, 120)),
@@ -5966,23 +6217,50 @@ async fn run_app<B: Backend>(
                             // a no-op.
                         }
                         Intent::Ask(q) => {
-                            // Stateless ask: no orchestrator involvement,
-                            // no goal context, no memory write.
                             let tx2 = tx.clone();
                             let provider = ask_provider.clone();
+                            let workspace_root = working_dir.clone();
+                            let current_goal = app
+                                .current_goal()
+                                .map(|g| g.description.clone());
                             app.ask_pending = true;
                             app.ask_answer = None;
                             tokio::spawn(async move {
+                                let report = ask_context::build_ask_context(
+                                    ask_context::AskContextRequest {
+                                        question: &q,
+                                        workspace_root: &workspace_root,
+                                        attachments: &[],
+                                        current_goal: current_goal.as_deref(),
+                                        diagnostics: &[],
+                                        max_tokens: ask_context::ASK_CONTEXT_TARGET_TOKENS,
+                                    },
+                                );
                                 let a = match provider {
                                     Some(p) => match p
-                                        .call("You are a helpful coding assistant.", &q, &[])
+                                        .call(
+                                            ask_context::ASK_SYSTEM_PROMPT,
+                                            &report.prompt,
+                                            &[],
+                                        )
                                         .await
                                     {
-                                        Ok(resp) => resp.content,
+                                        Ok(resp) => {
+                                            if report.selected_paths.is_empty() {
+                                                resp.content
+                                            } else {
+                                                format!(
+                                                    "{}\n\n---\ncontext: {} ({} tok est.)",
+                                                    resp.content,
+                                                    report.summary,
+                                                    report.context_tokens
+                                                )
+                                            }
+                                        }
                                         Err(e) => format!("ask failed: {e}"),
                                     },
-                                    None => "Set ANTHROPIC_API_KEY or OPENAI_API_KEY \
-                                        to enable ask mode."
+                                    None => "Configure a provider in ~/.phonton/config.toml \
+                                        (phonton doctor --provider) to enable Ask mode."
                                         .to_string(),
                                 };
                                 let _ = tx2.send(LoopEvent::AskAnswer(a)).await;
@@ -6465,6 +6743,7 @@ async fn spawn_goal(
         tokens_budget: None,
         estimated_naive_tokens: plan.naive_baseline_tokens,
         checkpoints: Vec::new(),
+        resume_checkpoint: None,
     });
 
     // Broadcast channel for structured telemetry. Capacity is generous so
@@ -6559,28 +6838,7 @@ async fn spawn_goal(
         max_tokens: cfg.budget.max_tokens,
         max_usd_micros: cfg.budget.max_usd_micros(),
     };
-    let mut budget_guard = BudgetGuard::new(limits);
-    if let Some(model) = cfg.provider.model.as_deref() {
-        if cfg.provider.name == "ollama" {
-            budget_guard = budget_guard.with_price(
-                ProviderKind::Ollama,
-                model,
-                ModelPricing {
-                    input_usd_micros_per_mtok: 0,
-                    output_usd_micros_per_mtok: 0,
-                },
-            );
-        } else if cfg.provider.name == "cloudflare" && model == "@cf/moonshotai/kimi-k2.6" {
-            budget_guard = budget_guard.with_price(
-                ProviderKind::Cloudflare,
-                model,
-                ModelPricing {
-                    input_usd_micros_per_mtok: 950_000,
-                    output_usd_micros_per_mtok: 4_000_000,
-                },
-            );
-        }
-    }
+    let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), &cfg);
 
     let mut orch = Orchestrator::new(dispatcher)
         .with_naive_baseline(naive)
@@ -6598,6 +6856,8 @@ async fn spawn_goal(
     let tx_updates = tx.clone();
     let store_for_states = store.clone();
     let goal_text_for_states = display_text.clone();
+    let plan_for_pause = plan.clone();
+    let working_dir_for_pause = working_dir.clone();
     tokio::spawn(async move {
         while state_rx.changed().await.is_ok() {
             let s = state_rx.borrow().clone();
@@ -6610,6 +6870,23 @@ async fn spawn_goal(
                 );
                 if let Some(ledger) = outcome_ledger_from_state(task_id, &s) {
                     let _ = g.upsert_outcome_ledger(&ledger);
+                }
+                if let (Some(resume), TaskStatus::Paused { .. }) =
+                    (&s.resume_checkpoint, &s.task_status)
+                {
+                    let snapshot = PausedRunSnapshot {
+                        task_id,
+                        goal_text: goal_text_for_states.clone(),
+                        working_dir: working_dir_for_pause.display().to_string(),
+                        planner_output: plan_for_pause.clone(),
+                        resume: resume.clone(),
+                    };
+                    let _ = g.upsert_paused_run(&snapshot);
+                } else if matches!(
+                    s.task_status,
+                    TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
+                ) {
+                    let _ = g.delete_paused_run(task_id);
                 }
             }
             if tx_updates
@@ -6664,7 +6941,7 @@ async fn spawn_goal(
     });
 
     tokio::spawn(async move {
-        let _ = orch.run_task(plan, state_tx).await;
+        let _ = orch.run_task(plan, state_tx, None).await;
     });
 }
 
@@ -7437,6 +7714,7 @@ fn extract_id(line: &str) -> Option<String> {
             tokens_budget: None,
             estimated_naive_tokens: 1000,
             checkpoints: Vec::new(),
+            resume_checkpoint: None,
         };
         let line = render_savings_line(Some(&s));
         assert!(line.contains("200"));
@@ -7556,6 +7834,7 @@ fn extract_id(line: &str) -> Option<String> {
                 plan_graph: None,
                 index_backend: None,
                 handoff_packet: Some(HandoffPacket {
+                    schema_version: phonton_types::HANDOFF_PACKET_SCHEMA_VERSION.to_string(),
                     task_id: TaskId::new(),
                     goal: "make chess".into(),
                     headline: "Review ready: 1 file(s), 1 verified subtask(s)".into(),
@@ -7590,6 +7869,7 @@ fn extract_id(line: &str) -> Option<String> {
                 tokens_budget: None,
                 estimated_naive_tokens: 1000,
                 checkpoints: Vec::new(),
+                resume_checkpoint: None,
             },
         );
 
@@ -7625,6 +7905,7 @@ fn extract_id(line: &str) -> Option<String> {
                 tokens_budget: None,
                 estimated_naive_tokens: 500,
                 checkpoints: Vec::new(),
+                resume_checkpoint: None,
             },
         );
         terminal.draw(|f| render(f, &app)).unwrap();
@@ -7638,7 +7919,7 @@ fn extract_id(line: &str) -> Option<String> {
     fn interactive_clarification_loop_works() {
         let mut app = App::default();
         let mut g = GoalEntry::new("make chess".into());
-        
+
         // Mock a state with a goal contract that has clarification questions
         let contract = phonton_types::GoalContract {
             goal: "make chess".into(),
@@ -7656,7 +7937,7 @@ fn extract_id(line: &str) -> Option<String> {
             ],
             assumptions: vec![],
         };
-        
+
         let state = GlobalState {
             task_status: TaskStatus::Failed {
                 reason: "Under-specified requirements".to_string(),
@@ -7671,53 +7952,58 @@ fn extract_id(line: &str) -> Option<String> {
             tokens_budget: None,
             estimated_naive_tokens: 400,
             checkpoints: vec![],
+            resume_checkpoint: None,
         };
-        
+
         g.state = Some(state);
         g.status = TaskStatus::Failed {
             reason: "Under-specified requirements".to_string(),
             failed_subtask: None,
         };
-        
+
         app.goals.push(g);
         app.selected = 0;
         app.mode = Mode::Goal;
-        
+
         // Press 'c' to enter Mode::Clarify
         let intent1 = app.handle_key(key('c'));
         assert!(intent1.is_none());
         assert_eq!(app.mode, Mode::Clarify);
         assert_eq!(app.clarifying_goal_idx, Some(0));
         assert_eq!(app.clarifying_question_idx, 0);
-        
+
         // Type answer to first question: "glass"
         for c in "glass".chars() {
             app.handle_key(key(c));
         }
         assert_eq!(app.clarifying_buffer, "glass");
-        
+
         // Press Enter to submit first answer
         let intent2 = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(intent2.is_none());
         assert_eq!(app.clarifying_question_idx, 1);
         assert_eq!(app.clarifying_answers, vec!["glass".to_string()]);
         assert_eq!(app.clarifying_buffer, "");
-        
+
         // Type answer to second question: "no"
         for c in "no".chars() {
             app.handle_key(key(c));
         }
-        
+
         // Press Enter to submit final answer and trigger re-queue
         let intent3 = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(intent3.is_some());
-        
+
         if let Some(Intent::QueueGoal(submitted)) = intent3 {
             assert!(submitted.description.contains("make chess"));
             assert!(submitted.description.contains("Refined requirements:"));
-            assert!(submitted.description.contains("- Q: What board theme?\n  A: glass"));
-            assert!(submitted.description.contains("- Q: Enable AI opponent?\n  A: no"));
-            
+            assert!(submitted
+                .description
+                .contains("- Q: What board theme?\n  A: glass"));
+            assert!(submitted
+                .description
+                .contains("- Q: Enable AI opponent?\n  A: no"));
+
             // Check that the original goal entry description was updated
             let updated_goal = &app.goals[0];
             assert!(updated_goal.description.contains("Refined requirements:"));
@@ -7727,7 +8013,7 @@ fn extract_id(line: &str) -> Option<String> {
         } else {
             panic!("Expected Intent::QueueGoal");
         }
-        
+
         // Check app state reset
         assert_eq!(app.mode, Mode::Goal);
         assert_eq!(app.clarifying_goal_idx, None);

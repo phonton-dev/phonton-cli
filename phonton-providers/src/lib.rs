@@ -12,6 +12,8 @@
 //! prepends a "Low Confidence Context" banner so the model treats the
 //! slices with caution. See `01-architecture/failure-modes.md` Risk 3.
 
+pub mod registry;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;

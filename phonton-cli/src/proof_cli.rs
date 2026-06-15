@@ -128,6 +128,7 @@ mod tests {
     fn task_with_ledger(report: VerifyReport) -> TaskRecord {
         let task_id = TaskId::new();
         let handoff = HandoffPacket {
+            schema_version: phonton_types::HANDOFF_PACKET_SCHEMA_VERSION.to_string(),
             task_id,
             goal: "fix config panic".into(),
             headline: "verified".into(),

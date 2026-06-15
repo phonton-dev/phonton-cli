@@ -162,6 +162,9 @@ pub struct GlobalState {
     /// the first subtask passes verify and is committed.
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    /// Present when [`TaskStatus::Paused`]; used by `phonton goal --resume`.
+    #[serde(default)]
+    pub resume_checkpoint: Option<crate::ResumeCheckpoint>,
 }
 
 /// Live snapshot of a single worker, included in [`GlobalState`].

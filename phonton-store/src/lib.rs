@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use phonton_types::{EventRecord, MemoryRecord, OutcomeLedger, TaskId, TaskStatus};
+use phonton_types::{
+    EventRecord, MemoryRecord, OutcomeLedger, PausedRunSnapshot, TaskId, TaskStatus,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 // ---------------------------------------------------------------------------
@@ -61,6 +63,14 @@ CREATE TABLE IF NOT EXISTS warm_crates (
     crate_name        TEXT PRIMARY KEY,
     last_checked_at   INTEGER NOT NULL,  -- unix seconds
     last_files_hash   TEXT NOT NULL      -- caller-supplied hash of crate sources
+);
+
+CREATE TABLE IF NOT EXISTS paused_runs (
+    task_id      TEXT PRIMARY KEY,
+    goal_text    TEXT NOT NULL,
+    working_dir  TEXT NOT NULL,
+    body_json    TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL
 );
 ";
 
@@ -139,6 +149,48 @@ impl Store {
                 total_tokens as i64
             ],
         )?;
+        Ok(())
+    }
+
+    /// Persist a budget-paused run for `phonton goal --resume`.
+    pub fn upsert_paused_run(&self, snapshot: &PausedRunSnapshot) -> Result<()> {
+        let body = serde_json::to_string(snapshot)?;
+        self.conn.execute(
+            "INSERT INTO paused_runs (task_id, goal_text, working_dir, body_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(task_id) DO UPDATE SET
+                 goal_text = excluded.goal_text,
+                 working_dir = excluded.working_dir,
+                 body_json = excluded.body_json,
+                 updated_at = excluded.updated_at",
+            params![
+                snapshot.task_id.to_string(),
+                snapshot.goal_text,
+                snapshot.working_dir,
+                body,
+                now_secs() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a paused run snapshot, if one exists.
+    pub fn load_paused_run(&self, task_id: TaskId) -> Result<Option<PausedRunSnapshot>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT body_json FROM paused_runs WHERE task_id = ?1")?;
+        let mut rows = stmt.query(params![task_id.to_string()])?;
+        if let Some(row) = rows.next()? {
+            let body: String = row.get(0)?;
+            let snapshot: PausedRunSnapshot = serde_json::from_str(&body)?;
+            return Ok(Some(snapshot));
+        }
+        Ok(None)
+    }
+
+    pub fn delete_paused_run(&self, task_id: TaskId) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM paused_runs WHERE task_id = ?1", params![task_id.to_string()])?;
         Ok(())
     }
 

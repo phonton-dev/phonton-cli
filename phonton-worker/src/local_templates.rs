@@ -85,20 +85,8 @@ fn local_seeds_disabled() -> bool {
 
 fn match_template(description: &str) -> Option<LocalTemplateMatch> {
     let lower = description.to_ascii_lowercase();
-    if is_chess_rules_seed(&lower) {
-        return Some(LocalTemplateMatch {
-            files: &[
-                TemplateFile {
-                    rel_path: "src/chessRules.ts",
-                    contents: include_str!("templates/chessRules.ts"),
-                },
-                TemplateFile {
-                    rel_path: "src/chessRules.test.ts",
-                    contents: include_str!("templates/chessRules.test.ts"),
-                },
-            ],
-        });
-    }
+    // Syntax preflight must win before chess: planner text can mention "rules"
+    // without referring to chessRules.ts.
     if is_syntax_preflight(&lower) {
         return Some(LocalTemplateMatch {
             files: &[
@@ -113,6 +101,20 @@ fn match_template(description: &str) -> Option<LocalTemplateMatch> {
                 TemplateFile {
                     rel_path: "broken_code.rs",
                     contents: include_str!("templates/broken_code.rs"),
+                },
+            ],
+        });
+    }
+    if is_chess_rules_seed(&lower) {
+        return Some(LocalTemplateMatch {
+            files: &[
+                TemplateFile {
+                    rel_path: "src/chessRules.ts",
+                    contents: include_str!("templates/chessRules.ts"),
+                },
+                TemplateFile {
+                    rel_path: "src/chessRules.test.ts",
+                    contents: include_str!("templates/chessRules.test.ts"),
                 },
             ],
         });
@@ -137,6 +139,12 @@ fn match_template(description: &str) -> Option<LocalTemplateMatch> {
 }
 
 fn is_chess_rules_seed(lower: &str) -> bool {
+    if lower.contains("broken_code.py")
+        || lower.contains("broken_code.ts")
+        || lower.contains("broken_code.rs")
+    {
+        return false;
+    }
     lower.contains("compile-safe local chess rules seed")
         || (lower.contains("rules_seed") && lower.contains("chessrules"))
         || (lower.contains("rules boundary tests") && lower.contains("chessrules.ts"))
