@@ -649,7 +649,9 @@ fn acceptance_slice_artifact_paths(slice: &AcceptanceSlice) -> Vec<PathBuf> {
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts"));
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
         }
-        "rules" | "rules_seed" => {}
+        "rules" | "rules_seed" => {
+            push_unique_path(&mut paths, PathBuf::from("src/chessRules.test.ts"));
+        }
         "rules_tests" => {
             push_unique_path(&mut paths, PathBuf::from("src/chessRules.ts"));
         }
@@ -1188,10 +1190,10 @@ Expected final state:
             first.description
         );
         assert!(
-            first.description.contains("slice 1/4")
+            first.description.contains("slice 1/5")
                 && first
                     .description
-                    .contains("compile-safe local chess rules seed"),
+                    .contains("create a compile-safe local chess rules module"),
             "existing Vite chess should start with a local verified rules seed: {}",
             first.description
         );
