@@ -32,7 +32,7 @@ pub fn enrich_ledger(mut ledger: OutcomeLedger, state: &GlobalState) -> OutcomeL
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phonton_types::{DiffStats, InfluenceSummary, TaskStatus, TokenUsage, VerifyReport};
+    use phonton_types::{DiffStats, InfluenceSummary, TokenUsage, VerifyReport};
 
     #[test]
     fn export_includes_schema_version() {

@@ -37,6 +37,7 @@ struct AppState {
 
 #[derive(Clone)]
 struct GoalSession {
+    #[allow(dead_code)]
     task_id: TaskId,
     state_rx: watch::Receiver<GlobalState>,
     event_tx: broadcast::Sender<EventRecord>,
@@ -334,10 +335,9 @@ async fn handle_events_sse(
         Err(_) => None,
     });
 
-    let mut response = Sse::new(stream)
+    Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response();
-    response
+        .into_response()
 }
 
 async fn add_cors(request: Request<Body>, next: Next) -> Response {

@@ -33,6 +33,7 @@ pub(crate) struct AskContextReport {
     pub summary: String,
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_stateless_ask_prompt(question: &str) -> String {
     question.to_string()
 }

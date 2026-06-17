@@ -4,14 +4,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use phonton_store::Store;
 use serde_json::{json, Value};
 
 use crate::config::{self, Config};
 use crate::store_util;
 use crate::trust;
 
-fn mask_config(mut cfg: Config) -> Value {
+fn mask_config(cfg: Config) -> Value {
     let mut value = serde_json::to_value(&cfg).unwrap_or(json!({}));
     if let Some(provider) = value.get_mut("provider").and_then(|p| p.as_object_mut()) {
         if provider.get("api_key").and_then(|v| v.as_str()).is_some() {

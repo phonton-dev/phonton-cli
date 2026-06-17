@@ -4938,7 +4938,9 @@ pub(crate) struct HeadlessGoalOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HeadlessGoalResult {
+    #[allow(dead_code)]
     pub task_id: TaskId,
+    #[allow(dead_code)]
     pub final_state: GlobalState,
     pub exit_code: i32,
 }
@@ -5153,9 +5155,6 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
     };
 
     let result = execute_headless_goal(opts, HeadlessGoalHooks::default()).await?;
-    if result.exit_code != 0 && !result.final_state.handoff_packet.is_some() {
-        // stderr already printed by execute_headless_goal when not json
-    }
     Ok(result.exit_code)
 }
 
@@ -5167,7 +5166,7 @@ pub(crate) async fn execute_headless_goal(
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if !opts.yes && !hooks.skip_trust_prompt && !trust::prompt_if_needed(&working_dir)? {
         return Ok(HeadlessGoalResult {
-            task_id: hooks.fixed_task_id.unwrap_or_else(TaskId::new),
+            task_id: hooks.fixed_task_id.unwrap_or_default(),
             final_state: GlobalState {
                 task_status: TaskStatus::Failed {
                     reason: "trust prompt declined".into(),
@@ -6827,7 +6826,7 @@ async fn spawn_goal(
         max_tokens: cfg.budget.max_tokens,
         max_usd_micros: cfg.budget.max_usd_micros(),
     };
-    let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), &cfg);
+    let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), cfg);
 
     let mut orch = Orchestrator::new(dispatcher)
         .with_naive_baseline(naive)
