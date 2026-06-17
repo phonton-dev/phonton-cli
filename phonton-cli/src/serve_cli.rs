@@ -9,8 +9,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -77,7 +79,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
                      Local JSON-RPC sidecar for Phonton Desktop.\n\
                      POST http://127.0.0.1:{port}/rpc\n\
                      GET  http://127.0.0.1:{port}/events/<task_id> (SSE)\n\n\
-                     Methods: ping, plan.preview, doctor.run, review.get, goal.start, goal.status"
+                     Methods: ping, plan.preview, doctor.run, review.get, goal.start, goal.status,
+                     tasks.list, tasks.get, workspace.info, config.get, config.save, trust.list,
+                     trust.grant, extensions.list, extensions.read, extensions.write, extensions.validate"
                 );
                 return Ok(0);
             }
@@ -111,6 +115,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
         .route("/rpc", post(handle_rpc))
         .route("/events/:task_id", get(handle_events_sse))
         .route("/health", get(|| async { "ok" }))
+        .layer(middleware::from_fn(add_cors))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -200,6 +205,18 @@ async fn dispatch_rpc(state: AppState, method: &str, params: Value) -> Result<Va
         }
         "goal.start" => goal_start(state, params).await,
         "goal.status" => goal_status(state, params).await,
+        "tasks.list" => crate::serve_desktop::tasks_list(params).await,
+        "tasks.get" => crate::serve_desktop::tasks_get(params).await,
+        "workspace.info" => Ok(crate::serve_desktop::workspace_info()?),
+        "config.get" => crate::serve_desktop::config_get().await,
+        "config.path" => crate::serve_desktop::config_path().await,
+        "config.save" => crate::serve_desktop::config_save(params).await,
+        "trust.list" => Ok(crate::serve_desktop::trust_list()?),
+        "trust.grant" => Ok(crate::serve_desktop::trust_grant(params)?),
+        "extensions.list" => Ok(crate::serve_desktop::extensions_list()?),
+        "extensions.read" => Ok(crate::serve_desktop::extensions_read(params)?),
+        "extensions.write" => Ok(crate::serve_desktop::extensions_write(params)?),
+        "extensions.validate" => crate::serve_desktop::extensions_validate().await,
         other => Err(anyhow!("unknown method `{other}`")),
     }
 }
@@ -320,9 +337,32 @@ async fn handle_events_sse(
     let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response();
-    response.headers_mut().insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+    response
+}
+
+async fn add_cors(request: Request<Body>, next: Next) -> Response {
+    if request.method() == Method::OPTIONS {
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+            .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type")
+            .body(Body::empty())
+            .expect("cors preflight response");
+    }
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type"),
     );
     response
 }

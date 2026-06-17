@@ -4,6 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.21.0 - Desktop serve RPC and CORS
+
+### Added
+
+- JSON-RPC methods for Phonton Desktop: `tasks.list`, `tasks.get`, `workspace.info`, `config.get`, `config.save`, `config.path`, `trust.list`, `trust.grant`, `extensions.list`, `extensions.read`, `extensions.write`, `extensions.validate`.
+- CORS headers on all `phonton serve` routes for Tauri webview compatibility.
+
 ## 0.20.1 - Tier 2 CLI, benchmark harness, provider routing
 
 ### Added

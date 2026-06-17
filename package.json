@@ -1,6 +1,6 @@
 {
   "name": "phonton-cli",
-  "version": "0.20.1",
+  "version": "0.21.0",
   "description": "Local-first ADE CLI for planned, verified, reviewable code changes.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/phonton-dev/phonton-cli#readme",

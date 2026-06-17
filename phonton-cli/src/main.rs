@@ -47,6 +47,7 @@ mod plan_preview;
 mod prompt_buffer;
 mod review;
 mod serve_cli;
+mod serve_desktop;
 mod store_util;
 mod trust;
 
