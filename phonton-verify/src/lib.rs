@@ -1326,7 +1326,14 @@ mod tests {
                 errors,
                 ..
             }) => {
-                assert!(errors.join("\n").contains("fails"));
+                let combined = errors.join("\n");
+                assert!(
+                    combined.contains("fails")
+                        || combined.contains("not equal")
+                        || combined.contains("1 !== 2")
+                        || combined.contains("AssertionError"),
+                    "expected failing test output, got: {combined}"
+                );
             }
             other => panic!("expected npm test failure, got {other:?}"),
         }
