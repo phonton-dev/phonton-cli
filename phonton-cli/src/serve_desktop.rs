@@ -115,10 +115,7 @@ fn merge_config_patch(cfg: &mut Config, patch: &Value) -> Result<()> {
 }
 
 pub async fn tasks_list(params: Value) -> Result<Value> {
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
     let store = store_util::open_persistent_store()?;
     let tasks = store.list_tasks(limit).await?;
     let items: Vec<Value> = tasks
@@ -179,8 +176,7 @@ pub fn workspace_info() -> Result<Value> {
 }
 
 pub fn trust_list() -> Result<Value> {
-    let path = dirs::home_dir()
-        .map(|h| h.join(".phonton").join("trusted_workspaces.json"));
+    let path = dirs::home_dir().map(|h| h.join(".phonton").join("trusted_workspaces.json"));
     let trusted = if let Some(p) = path {
         if let Ok(raw) = std::fs::read_to_string(&p) {
             serde_json::from_str::<Value>(&raw)

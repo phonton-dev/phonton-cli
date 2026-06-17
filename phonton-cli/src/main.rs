@@ -39,8 +39,8 @@ mod benchmark_cli;
 mod config;
 mod contract_preflight;
 mod doctor;
-mod index_cli;
 mod extensions_cli;
+mod index_cli;
 mod mcp_cli;
 mod memory_cli;
 mod plan_preview;
@@ -88,8 +88,8 @@ use phonton_types::{
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
     OrchestratorMessage, OutcomeLedger, PausedRunSnapshot, Permission, PermissionLedger,
     PlannerOutput, PromptArtifact, PromptArtifactRole, PromptAttachment, PromptAttachmentKind,
-    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId,
-    SubtaskResult, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
 };
 use prompt_buffer::{PromptBuffer, SubmittedPrompt};
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -2331,10 +2331,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                     txt,
                 ),
             ]);
-            frame.render_widget(
-                Paragraph::new(hint).alignment(Alignment::Center),
-                area,
-            );
+            frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), area);
             return;
         }
     }
@@ -5168,10 +5165,7 @@ pub(crate) async fn execute_headless_goal(
 ) -> Result<HeadlessGoalResult> {
     let cfg = config::load().unwrap_or_default();
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if !opts.yes
-        && !hooks.skip_trust_prompt
-        && !trust::prompt_if_needed(&working_dir)?
-    {
+    if !opts.yes && !hooks.skip_trust_prompt && !trust::prompt_if_needed(&working_dir)? {
         return Ok(HeadlessGoalResult {
             task_id: hooks.fixed_task_id.unwrap_or_else(TaskId::new),
             final_state: GlobalState {
@@ -6221,9 +6215,7 @@ async fn run_app<B: Backend>(
                             let tx2 = tx.clone();
                             let provider = ask_provider.clone();
                             let workspace_root = working_dir.clone();
-                            let current_goal = app
-                                .current_goal()
-                                .map(|g| g.description.clone());
+                            let current_goal = app.current_goal().map(|g| g.description.clone());
                             app.ask_pending = true;
                             app.ask_answer = None;
                             tokio::spawn(async move {
@@ -6239,11 +6231,7 @@ async fn run_app<B: Backend>(
                                 );
                                 let a = match provider {
                                     Some(p) => match p
-                                        .call(
-                                            ask_context::ASK_SYSTEM_PROMPT,
-                                            &report.prompt,
-                                            &[],
-                                        )
+                                        .call(ask_context::ASK_SYSTEM_PROMPT, &report.prompt, &[])
                                         .await
                                     {
                                         Ok(resp) => {

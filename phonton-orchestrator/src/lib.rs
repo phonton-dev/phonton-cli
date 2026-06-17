@@ -511,10 +511,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             .as_ref()
             .map(|r| r.checkpoints.clone())
             .unwrap_or_default();
-        let mut checkpointed: HashSet<SubtaskId> = checkpoints
-            .iter()
-            .map(|cp| cp.subtask_id)
-            .collect();
+        let mut checkpointed: HashSet<SubtaskId> =
+            checkpoints.iter().map(|cp| cp.subtask_id).collect();
         let mut next_seq = resume_from
             .as_ref()
             .map(|r| r.next_checkpoint_seq)
@@ -2166,9 +2164,9 @@ mod tests {
             tokens_used: 0,
             tokens_budget: None,
             estimated_naive_tokens: 0,
-        checkpoints: Vec::new(),
-        resume_checkpoint: None,
-    });
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+        });
         tx
     }
 
@@ -2241,9 +2239,9 @@ mod tests {
             tokens_used: 0,
             tokens_budget: None,
             estimated_naive_tokens: 0,
-        checkpoints: Vec::new(),
-        resume_checkpoint: None,
-    });
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+        });
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
@@ -2508,10 +2506,13 @@ mod tests {
         });
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
-        let status = timeout(Duration::from_secs(600), orch.run_task(plan, empty_state(), None))
-            .await
-            .expect("sequential dispatch would deadlock the barrier")
-            .expect("orchestrator returned Err");
+        let status = timeout(
+            Duration::from_secs(600),
+            orch.run_task(plan, empty_state(), None),
+        )
+        .await
+        .expect("sequential dispatch would deadlock the barrier")
+        .expect("orchestrator returned Err");
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
         assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
     }

@@ -189,8 +189,10 @@ impl Store {
     }
 
     pub fn delete_paused_run(&self, task_id: TaskId) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM paused_runs WHERE task_id = ?1", params![task_id.to_string()])?;
+        self.conn.execute(
+            "DELETE FROM paused_runs WHERE task_id = ?1",
+            params![task_id.to_string()],
+        )?;
         Ok(())
     }
 

@@ -158,7 +158,11 @@ pub async fn build_plan_report(request: &PlanRequest, plan: PlannerOutput) -> Re
     })
 }
 
-pub async fn build_plan_for_goal(goal: &str, use_memory: bool, no_tests: bool) -> Result<PlanReport> {
+pub async fn build_plan_for_goal(
+    goal: &str,
+    use_memory: bool,
+    no_tests: bool,
+) -> Result<PlanReport> {
     let request = PlanRequest {
         goal: goal.to_string(),
         options: PlanOptions {

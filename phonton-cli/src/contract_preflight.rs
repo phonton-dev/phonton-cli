@@ -673,8 +673,10 @@ fn apply_receipt_refactor_plan(plan: &mut PlannerOutput, goal_text: &str, workin
     };
     contract.acceptance_criteria.extend([
         "Run `npm test` before and after refactoring `src/receipt.js`.".into(),
-        "Preserve `buildReceipt(run)` export; add `## Commands` section via `renderCommands`.".into(),
-        "Support command previews, knownGaps severity sorting, and per-file verifiedBy metadata.".into(),
+        "Preserve `buildReceipt(run)` export; add `## Commands` section via `renderCommands`."
+            .into(),
+        "Support command previews, knownGaps severity sorting, and per-file verifiedBy metadata."
+            .into(),
     ]);
     push_verify_step(contract, "npm test", vec!["npm".into(), "test".into()]);
 

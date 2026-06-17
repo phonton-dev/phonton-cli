@@ -643,7 +643,11 @@ fn check_bench_python(checks: &mut Vec<DoctorCheck>) {
         }
     }
     if resolved.is_none() {
-        if Command::new("py").args(["-3", "--version"]).output().is_ok() {
+        if Command::new("py")
+            .args(["-3", "--version"])
+            .output()
+            .is_ok()
+        {
             resolved = Some("py -3".into());
         }
     }
