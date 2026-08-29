@@ -31,7 +31,7 @@ jobs:
 
       - name: Install Node test dependencies
         run: |
-          npm ci
+          npm ci --ignore-scripts
           npx playwright install chromium
 
       - name: Format
