@@ -19,6 +19,8 @@ members = [
 ]
 resolver = "2"
 
+exclude = ["fixtures/add-one"]
+
 [workspace.package]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/phonton-dev/phonton-cli"

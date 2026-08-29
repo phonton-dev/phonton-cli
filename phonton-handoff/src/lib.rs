@@ -53,6 +53,7 @@ mod tests {
             influence: InfluenceSummary::default(),
             screenshot_path: None,
             rendering_summary: None,
+            cost_receipt: Default::default(),
         };
         let json = export_json(&packet).unwrap();
         assert!(json.contains("\"schema_version\": \"1\""));

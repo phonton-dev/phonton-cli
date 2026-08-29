@@ -10,8 +10,9 @@ use anyhow::Result;
 use phonton_diff::DiffApplier;
 use phonton_store::TaskRecord;
 use phonton_types::{
-    ContextAttribution, CostSummary, DiffHunk, DiffLine, EventRecord, HandoffPacket,
-    OrchestratorEvent, TaskId, TaskStatus, TokenUsage,
+    reference_pricing_for_tier, ContextAttribution, CostReceipt, CostSummary, DiffHunk, DiffLine,
+    EventRecord, HandoffPacket, ModelTier, OrchestratorEvent, RouteOutcome, RouteStep, TaskId,
+    TaskStatus, TokenUsage,
 };
 use serde::Serialize;
 
@@ -43,6 +44,7 @@ pub struct ReviewReport {
     goal: String,
     status: serde_json::Value,
     total_tokens: u64,
+    cost_receipt: CostReceipt,
     handoff: Option<HandoffPacket>,
     checkpoints: Vec<CheckpointItem>,
     review_items: Vec<ReviewItem>,
@@ -444,15 +446,72 @@ pub fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport 
         }
     }
 
+    let handoff = task.outcome_ledger.and_then(|ledger| ledger.handoff);
+    let from_items = cost_receipt_from_items(&review_items);
+    let cost_receipt = match &handoff {
+        Some(packet)
+            if !packet.cost_receipt.route.is_empty()
+                || packet.cost_receipt.frontier_equivalent_usd_micros > 0 =>
+        {
+            packet.cost_receipt.clone()
+        }
+        _ => from_items,
+    };
+
     ReviewReport {
         task_id: task.id.to_string(),
         goal: task.goal_text,
         status: task.status,
         total_tokens: task.total_tokens,
-        handoff: task.outcome_ledger.and_then(|ledger| ledger.handoff),
+        cost_receipt,
+        handoff,
         checkpoints,
         review_items,
     }
+}
+
+fn parse_tier(raw: &str) -> ModelTier {
+    match raw {
+        "local" => ModelTier::Local,
+        "cheap" => ModelTier::Cheap,
+        "standard" => ModelTier::Standard,
+        "frontier" => ModelTier::Frontier,
+        _ => ModelTier::Cheap,
+    }
+}
+
+fn cost_receipt_from_items(items: &[ReviewItem]) -> CostReceipt {
+    let mut usage = TokenUsage::default();
+    let mut actual = 0u64;
+    let mut known = false;
+    let mut route = Vec::new();
+    for item in items {
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(item.token_usage.input_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(item.token_usage.output_tokens);
+        usage.cached_tokens = usage
+            .cached_tokens
+            .saturating_add(item.token_usage.cached_tokens);
+        let tier = parse_tier(&item.tier);
+        if item.cost.pricing_known {
+            actual = actual.saturating_add(item.cost.total_usd_micros);
+            known = true;
+        } else {
+            actual = actual.saturating_add(reference_pricing_for_tier(tier).cost_micros(
+                item.token_usage.input_tokens,
+                item.token_usage.output_tokens,
+            ));
+        }
+        route.push(RouteStep::new(
+            item.model_name.clone(),
+            tier,
+            RouteOutcome::Passed,
+        ));
+    }
+    CostReceipt::from_usage(actual, &usage, known, route)
 }
 
 fn print_text_report(report: &ReviewReport) {
@@ -460,6 +519,35 @@ fn print_text_report(report: &ReviewReport) {
     println!("task:   {}", report.task_id);
     println!("goal:   {}", report.goal);
     println!("tokens: {}", report.total_tokens);
+    if report.cost_receipt.frontier_equivalent_usd_micros > 0 {
+        let pct = report
+            .cost_receipt
+            .saved_percent()
+            .map(|p| format!("{p}%"))
+            .unwrap_or_else(|| "n/a".into());
+        println!(
+            "cost:   ${:.4}  frontier: ${:.4}  saved: {}",
+            report.cost_receipt.actual_usd_micros as f64 / 1_000_000.0,
+            report.cost_receipt.frontier_equivalent_usd_micros as f64 / 1_000_000.0,
+            pct
+        );
+        if !report.cost_receipt.route.is_empty() {
+            let hops: Vec<String> = report
+                .cost_receipt
+                .route
+                .iter()
+                .map(|step| {
+                    let model = if step.model.is_empty() {
+                        step.tier.to_string()
+                    } else {
+                        step.model.clone()
+                    };
+                    format!("{model} ({})", step.outcome)
+                })
+                .collect();
+            println!("route:  {}", hops.join(" -> "));
+        }
+    }
     println!("status: {}", compact_json(&report.status));
     println!("checkpoints: {}", report.checkpoints.len());
     if let Some(handoff) = &report.handoff {

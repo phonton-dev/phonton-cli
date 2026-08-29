@@ -394,6 +394,9 @@ mod tests {
             rollback_points: Vec::new(),
             token_usage: phonton_types::TokenUsage::default(),
             influence: phonton_types::InfluenceSummary::default(),
+            screenshot_path: None,
+            rendering_summary: None,
+            cost_receipt: Default::default(),
         });
         let task = TaskRecord {
             outcome_ledger: Some(ledger),

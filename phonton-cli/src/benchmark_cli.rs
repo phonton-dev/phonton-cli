@@ -425,6 +425,7 @@ mod tests {
             context_manifest: ContextManifest::default(),
             permission_ledger: PermissionLedger::default(),
             verify_report: handoff.verification.clone(),
+            summaries: Default::default(),
             handoff: Some(handoff),
         }
     }
@@ -467,6 +468,7 @@ mod tests {
             influence: InfluenceSummary::default(),
             screenshot_path: None,
             rendering_summary: None,
+            cost_receipt: Default::default(),
         }
     }
 

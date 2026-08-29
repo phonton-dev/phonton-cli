@@ -17,7 +17,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use phonton_types::{EventRecord, GlobalState, TaskId};
+use phonton_types::{CostReceipt, EventRecord, GlobalState, TaskId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, watch, RwLock};
@@ -249,6 +249,7 @@ async fn goal_start(state: AppState, params: Value) -> Result<Value> {
         estimated_naive_tokens: 0,
         checkpoints: Vec::new(),
         resume_checkpoint: None,
+        cost_receipt: CostReceipt::default(),
     });
     let (event_tx, _) = broadcast::channel::<EventRecord>(2048);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));

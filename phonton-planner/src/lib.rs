@@ -111,6 +111,7 @@ impl Goal {
         GoalContract {
             goal: self.description.clone(),
             task_class,
+            intent: None,
             confidence_percent: if self.description.split_whitespace().count() <= 3 {
                 60
             } else {
@@ -121,6 +122,7 @@ impl Goal {
                 "Respect mentioned file/image attachments when planning and editing.".into(),
                 "Do not claim correctness beyond checks that actually ran.".into(),
             ],
+            acceptance_slices: Vec::new(),
             expected_artifacts: self
                 .attachments
                 .iter()
@@ -148,6 +150,7 @@ impl Goal {
                 Vec::new()
             },
             assumptions,
+            token_policy: Default::default(),
         }
     }
 }

@@ -26,12 +26,12 @@ use async_trait::async_trait;
 use petgraph::graph::{DiGraph, NodeIndex};
 use phonton_types::{
     classify_task, effective_tier, BudgetDecision, BudgetLimits, ChangedFileSummary, Checkpoint,
-    CostSummary, DiffHunk, DiffLine, DiffStats, EventRecord, GeneratedArtifact, GlobalState,
-    GoalContract, HandoffPacket, InfluenceSummary, ModelPricing, ModelTier, OrchestratorEvent,
-    OrchestratorMessage, PlanGraph, PlannerOutput, ProviderKind, ResumeCheckpoint, ReviewAction,
-    RollbackPoint, Subtask, SubtaskId, SubtaskResult, SubtaskRole, SubtaskStatus, TaskId,
-    TaskStatus, TokenUsage, VerifyLayer, VerifyReport, VerifyResult, WorkerState,
-    TOKEN_MILESTONE_INTERVAL,
+    CostReceipt, CostSummary, DiffHunk, DiffLine, DiffStats, EventRecord, GeneratedArtifact,
+    GlobalState, GoalContract, HandoffPacket, InfluenceSummary, ModelPricing, ModelTier,
+    OrchestratorEvent, OrchestratorMessage, PlanGraph, PlannerOutput, ProviderKind,
+    ResumeCheckpoint, ReviewAction, RollbackPoint, RouteOutcome, RouteStep, Subtask, SubtaskId,
+    SubtaskResult, SubtaskRole, SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer,
+    VerifyReport, VerifyResult, WorkerState, TOKEN_MILESTONE_INTERVAL,
 };
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -184,6 +184,11 @@ impl BudgetGuard {
     pub fn usd_micros_spent(&self) -> u64 {
         self.usd_micros_spent
     }
+
+    /// True when at least one `(provider, model)` price was registered.
+    pub fn has_pricing(&self) -> bool {
+        !self.pricing.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +243,8 @@ struct SubtaskRuntime {
     /// Model name from the most recent LLM call. Empty until the first
     /// worker result is received.
     model_name: String,
+    /// Cheap-first hops recorded for the cost receipt.
+    route: Vec<RouteStep>,
     /// Most recent verification verdict for this subtask.
     verify_result: Option<VerifyResult>,
     /// True if the worker is actively waiting for an LLM response.
@@ -258,6 +265,7 @@ impl SubtaskRuntime {
             diff_hunks: Vec::new(),
             provider: ProviderKind::Anthropic,
             model_name: String::new(),
+            route: Vec::new(),
             verify_result: None,
             is_thinking: false,
         }
@@ -477,6 +485,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     index_backend: self.index_backend.as_deref(),
                     handoff_packet: Some(&handoff),
                     resume_checkpoint: None,
+                    budget_guard: self.budget_guard.as_deref(),
                 };
                 broadcast(&state_tx, &status, &runtimes, 0, extras);
                 return Ok(status);
@@ -565,6 +574,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 index_backend: self.index_backend.as_deref(),
                 handoff_packet: None,
                 resume_checkpoint: None,
+                budget_guard: self.budget_guard.as_deref(),
             },
         );
 
@@ -596,6 +606,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     index_backend: self.index_backend.as_deref(),
                     handoff_packet: None,
                     resume_checkpoint: None,
+                    budget_guard: self.budget_guard.as_deref(),
                 },
             );
 
@@ -914,6 +925,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 index_backend: self.index_backend.as_deref(),
                 handoff_packet: Some(&handoff),
                 resume_checkpoint,
+                budget_guard: self.budget_guard.as_deref(),
             },
         );
         Ok(terminal)
@@ -1100,6 +1112,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         };
         rt.status = SubtaskStatus::Dispatched;
         rt.is_thinking = false;
+        rt.route.push(RouteStep::new(
+            rt.model_name.clone(),
+            rt.subtask.model_tier,
+            RouteOutcome::Running,
+        ));
         let subtask = rt.subtask.clone();
         let prior_errors = rt.prior_errors.clone();
         let attempt = rt.attempts_at_tier.saturating_add(1);
@@ -1147,12 +1164,18 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             rt.diff_hunks = sr.diff_hunks.clone();
             rt.provider = sr.provider;
             rt.model_name = sr.model_name.clone();
+            if let Some(step) = rt.route.last_mut() {
+                if step.model.is_empty() {
+                    step.model = rt.model_name.clone();
+                }
+            }
 
             // If the worker itself already surfaced a hard failure (no diff
             // to verify), don't re-verify an empty hunk set and mask it.
             if matches!(sr.status, SubtaskStatus::Failed { .. }) {
                 let reason = failure_reason(&sr.status);
                 let attempt = rt.attempts_at_tier.saturating_add(1);
+                finish_route(rt, RouteOutcome::FailedVerify);
                 rt.status = SubtaskStatus::Failed {
                     reason: reason.clone(),
                     attempt,
@@ -1201,6 +1224,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         subtask_id: id,
                         layer,
                     });
+                    finish_route(rt, RouteOutcome::Passed);
                     rt.status = SubtaskStatus::Done {
                         tokens_used: rt.tokens_used,
                         diff_hunk_count: rt.diff_hunks.len(),
@@ -1239,6 +1263,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     });
                     rt.prior_errors = errors;
                     rt.attempts_at_tier = rt.attempts_at_tier.saturating_add(1);
+                    finish_route(rt, RouteOutcome::FailedVerify);
                     if rt.attempts_at_tier >= MAX_RETRIES_PER_TIER {
                         let from_tier = rt.subtask.model_tier;
                         if !escalate(rt) {
@@ -1292,6 +1317,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         reason: reason.clone(),
                     });
                     rt.prior_errors.push(reason.clone());
+                    finish_route(rt, RouteOutcome::Escalated);
                     let from_tier = rt.subtask.model_tier;
                     if !escalate(rt) {
                         let msg = format!("escalation exhausted at max tier: {reason}");
@@ -1593,6 +1619,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             influence: InfluenceSummary::default(),
             screenshot_path,
             rendering_summary,
+            cost_receipt: assemble_cost_receipt(runtimes, self.budget_guard.as_deref()),
         }
     }
 }
@@ -1626,6 +1653,51 @@ fn verify_layer_name(layer: VerifyLayer) -> &'static str {
         VerifyLayer::Test => "test",
         VerifyLayer::BrowserCheck => "browser check",
     }
+}
+
+fn finish_route(rt: &mut SubtaskRuntime, outcome: RouteOutcome) {
+    if let Some(step) = rt.route.last_mut() {
+        if step.model.is_empty() {
+            step.model = rt.model_name.clone();
+        }
+        step.outcome = outcome;
+        step.tier = rt.subtask.model_tier;
+    }
+}
+
+fn assemble_cost_receipt(
+    runtimes: &HashMap<SubtaskId, SubtaskRuntime>,
+    budget_guard: Option<&Mutex<BudgetGuard>>,
+) -> CostReceipt {
+    let mut usage = TokenUsage::default();
+    let mut route = Vec::new();
+    let mut estimated_actual: u64 = 0;
+    for rt in runtimes.values() {
+        usage.input_tokens = usage
+            .input_tokens
+            .saturating_add(rt.token_usage.input_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(rt.token_usage.output_tokens);
+        usage.cached_tokens = usage
+            .cached_tokens
+            .saturating_add(rt.token_usage.cached_tokens);
+        estimated_actual = estimated_actual.saturating_add(
+            phonton_types::reference_pricing_for_tier(rt.subtask.model_tier)
+                .cost_micros(rt.token_usage.input_tokens, rt.token_usage.output_tokens),
+        );
+        route.extend(rt.route.iter().cloned());
+    }
+    let (metered, has_table) = budget_guard
+        .and_then(|g| g.lock().ok())
+        .map(|g| (g.usd_micros_spent(), g.has_pricing()))
+        .unwrap_or((0, false));
+    let (actual, pricing_known) = if has_table && metered > 0 {
+        (metered, true)
+    } else {
+        (estimated_actual, false)
+    };
+    CostReceipt::from_usage(actual, &usage, pricing_known, route)
 }
 
 /// Try to bump `rt`'s tier by one step. Returns `false` if already at the
@@ -1991,6 +2063,7 @@ struct BroadcastExtras<'a> {
     index_backend: Option<&'a str>,
     handoff_packet: Option<&'a HandoffPacket>,
     resume_checkpoint: Option<ResumeCheckpoint>,
+    budget_guard: Option<&'a Mutex<BudgetGuard>>,
 }
 
 fn build_resume_checkpoint(
@@ -2028,6 +2101,7 @@ fn broadcast(
             tokens_used: r.tokens_used,
             status: r.status.clone(),
             is_thinking: r.is_thinking,
+            model_name: r.model_name.clone(),
         })
         .collect();
 
@@ -2045,6 +2119,7 @@ fn broadcast(
         estimated_naive_tokens: extras.estimated_naive_tokens,
         checkpoints: extras.checkpoints.to_vec(),
         resume_checkpoint: extras.resume_checkpoint,
+        cost_receipt: assemble_cost_receipt(runtimes, extras.budget_guard),
     });
 }
 
@@ -2166,6 +2241,7 @@ mod tests {
             estimated_naive_tokens: 0,
             checkpoints: Vec::new(),
             resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
         });
         tx
     }
@@ -2241,6 +2317,7 @@ mod tests {
             estimated_naive_tokens: 0,
             checkpoints: Vec::new(),
             resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
         });
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
@@ -2263,6 +2340,21 @@ mod tests {
             .passed
             .iter()
             .any(|line| line.contains("passed")));
+        assert!(handoff
+            .cost_receipt
+            .route
+            .iter()
+            .any(|step| step.outcome == RouteOutcome::Passed));
+        assert!(
+            handoff.cost_receipt.frontier_equivalent_usd_micros
+                > handoff.cost_receipt.actual_usd_micros
+        );
+        assert!(handoff.cost_receipt.saved_usd_micros > 0);
+        assert!(state
+            .cost_receipt
+            .route
+            .iter()
+            .any(|step| step.outcome == RouteOutcome::Passed));
     }
 
     #[tokio::test]
@@ -2776,8 +2868,10 @@ mod tests {
         let contract = GoalContract {
             goal: "make chess".into(),
             task_class: TaskClass::CoreLogic,
+            intent: None,
             confidence_percent: 60, // under 70% threshold
             acceptance_criteria: vec![],
+            acceptance_slices: Vec::new(),
             expected_artifacts: vec![],
             likely_files: vec![],
             verify_plan: vec![],
@@ -2787,6 +2881,7 @@ mod tests {
                 "What exact behavior or artifact should Phonton produce?".into(),
             ],
             assumptions: vec![],
+            token_policy: Default::default(),
         };
         let plan = PlannerOutput {
             subtasks: vec![a.clone()],

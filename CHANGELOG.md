@@ -4,6 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.21.1 - CostReceipt on the serve line
+
+### Added
+
+- `CostReceipt` and `RouteStep` on `GlobalState` and `HandoffPacket` so Desktop and `phonton review` show actual cost vs a labeled frontier counterfactual.
+- TUI savings line reports spend vs frontier when a receipt is present.
+- `phonton serve` JSON-RPC (`goal.status`, `review.get`) serializes the new receipt fields.
+
+### Changed
+
+- Escalation uses per-tier model ids. A configured cheap model is not reused as Standard/Frontier.
+- Missing provider keys fail closed. Stub diffs are not a verified success.
+- Local-template seeds match only the subtask text after a memory preamble. A failed seed falls through to the configured provider.
+
 ## 0.21.0 - Desktop serve RPC and CORS
 
 ### Added

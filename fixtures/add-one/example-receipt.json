@@ -1,0 +1,42 @@
+{
+  "label": "live",
+  "source": "fixtures/add-one",
+  "note": "Live labeled receipt from phonton-cli 0.21.1 on 2026-08-29. Frontier dollars use FRONTIER_REFERENCE_PRICING (Opus-class $15 input / $75 output per MTok). Not a competitor comparison. The fixture source is restored to the failing add_one so you can rerun.",
+  "cli_version": "0.21.1",
+  "task_id": "010d760f-5b97-4dbb-9af7-4bec3f6b9290",
+  "goal": "Make add_one return n + 1 so the unit tests in src/lib.rs pass.",
+  "headline": "Review ready: 1 file(s), 1 verified subtask(s)",
+  "verification": {
+    "passed": ["Make add_one return n + 1 so the unit tests in src/lib.rs pass. passed patch apply"],
+    "findings": [],
+    "skipped": ["No explicit test layer was recorded."]
+  },
+  "changed_files": [
+    {
+      "path": "src/lib.rs",
+      "added_lines": 1,
+      "removed_lines": 1,
+      "summary": "Return n + 1 instead of n"
+    }
+  ],
+  "cost_receipt": {
+    "actual_usd_micros": 17832,
+    "frontier_equivalent_usd_micros": 89160,
+    "saved_usd_micros": 71328,
+    "pricing_known": false,
+    "route": [
+      {
+        "model": "deepseek-chat",
+        "tier": "Standard",
+        "outcome": "Passed"
+      }
+    ]
+  },
+  "token_usage": {
+    "input_tokens": 5224,
+    "output_tokens": 144,
+    "cached_tokens": 0,
+    "cache_creation_tokens": 0,
+    "estimated": false
+  }
+}

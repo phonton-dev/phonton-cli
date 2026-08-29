@@ -96,18 +96,22 @@ async fn smoke_test_full_pipeline() -> Result<()> {
     let (state_tx, state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
         goal_contract: None,
+        plan_graph: None,
+        index_backend: None,
         handoff_packet: None,
         active_workers: vec![],
         tokens_used: 0,
         tokens_budget: None,
         estimated_naive_tokens: 0,
         checkpoints: Vec::new(),
+        resume_checkpoint: None,
+        cost_receipt: Default::default(),
     });
 
     // 6. Run orchestrator with the plan via timeout
     let final_status = tokio::time::timeout(
         Duration::from_secs(30),
-        orchestrator.run_task(plan, state_tx),
+        orchestrator.run_task(plan, state_tx, None),
     )
     .await??;
 

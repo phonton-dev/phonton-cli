@@ -142,6 +142,9 @@ mod tests {
             rollback_points: Vec::new(),
             token_usage: TokenUsage::estimated(42),
             influence: Default::default(),
+            screenshot_path: None,
+            rendering_summary: None,
+            cost_receipt: Default::default(),
         };
         TaskRecord {
             id: task_id,

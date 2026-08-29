@@ -1,0 +1,11 @@
+[package]
+name = "add-one"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Tiny golden-path fixture: one failing unit test for Phonton to fix."
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

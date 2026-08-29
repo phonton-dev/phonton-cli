@@ -1,4 +1,6 @@
 /target
+/fixtures/**/target/
+/fixtures/**/.fastembed_cache/
 /benchmarks/results/
 /npm/vendor/
 /npm/*.tgz

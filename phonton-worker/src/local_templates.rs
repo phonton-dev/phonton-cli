@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use phonton_types::{
-    DiffHunk, DiffLine, ModelTier, ProviderKind, Subtask, SubtaskId, SubtaskResult, SubtaskStatus,
-    TokenUsage, VerifyLayer, VerifyResult,
+    DiffHunk, DiffLine, ModelTier, ProviderKind, Subtask, SubtaskResult, SubtaskStatus, TokenUsage,
+    VerifyResult,
 };
 
 const LOCAL_MODEL: &str = "local-template";
@@ -43,7 +43,6 @@ pub async fn try_dispatch(
     }
 
     let verdict = phonton_verify::verify_diff(&hunks, project_root).await?;
-    let attempt = 1u8;
     match verdict {
         VerifyResult::Pass { .. } => Ok(Some(SubtaskResult {
             id: subtask.id,
@@ -58,17 +57,8 @@ pub async fn try_dispatch(
             model_name: LOCAL_MODEL.into(),
             token_usage: TokenUsage::default(),
         })),
-        VerifyResult::Fail { layer, errors, .. } => Ok(Some(failed(
-            subtask.id, model_tier, layer, errors, attempt, hunks,
-        ))),
-        VerifyResult::Escalate { reason } => Ok(Some(failed(
-            subtask.id,
-            model_tier,
-            VerifyLayer::Syntax,
-            vec![reason],
-            attempt,
-            hunks,
-        ))),
+        // Failed seed in the wrong repo must not replace the provider loop.
+        VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => Ok(None),
     }
 }
 
@@ -84,7 +74,10 @@ fn local_seeds_disabled() -> bool {
 }
 
 fn match_template(description: &str) -> Option<LocalTemplateMatch> {
-    let lower = description.to_ascii_lowercase();
+    // Planner prepends memory as a preamble separated by a blank line. Match
+    // only the actual subtask so a prior chess/receipt run cannot hijack a
+    // new goal.
+    let lower = description_for_match(description).to_ascii_lowercase();
     // Syntax preflight must win before chess: planner text can mention "rules"
     // without referring to chessRules.ts.
     if is_syntax_preflight(&lower) {
@@ -136,6 +129,14 @@ fn match_template(description: &str) -> Option<LocalTemplateMatch> {
         });
     }
     None
+}
+
+fn description_for_match(description: &str) -> &str {
+    description
+        .rsplit("\n\n")
+        .next()
+        .unwrap_or(description)
+        .trim()
 }
 
 fn is_chess_rules_seed(lower: &str) -> bool {
@@ -199,39 +200,15 @@ fn whole_file_hunk(path: &Path, old_content: Option<&str>, new_content: &str) ->
     }
 }
 
-fn failed(
-    id: SubtaskId,
-    model_tier: ModelTier,
-    layer: VerifyLayer,
-    errors: Vec<String>,
-    attempt: u8,
-    hunks: Vec<DiffHunk>,
-) -> SubtaskResult {
-    SubtaskResult {
-        id,
-        status: SubtaskStatus::Failed {
-            reason: errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "local template verification failed".into()),
-            attempt,
-        },
-        diff_hunks: hunks,
-        model_tier,
-        verify_result: VerifyResult::Fail {
-            layer,
-            errors,
-            attempt,
-        },
-        provider: ProviderKind::Anthropic,
-        model_name: LOCAL_MODEL.into(),
-        token_usage: TokenUsage::default(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_preamble_does_not_match_unrelated_goal() {
+        let desc = "# Prior context\n- compile-safe local chess rules seed\n\nMake add_one return n + 1 so the unit tests in src/lib.rs pass.";
+        assert!(match_template(desc).is_none());
+    }
 
     #[test]
     fn detects_chess_rules_seed_slice() {

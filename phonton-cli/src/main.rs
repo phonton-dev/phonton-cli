@@ -84,12 +84,12 @@ use phonton_providers::{
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
 use phonton_types::{
-    BudgetLimits, ContextManifest, CoverageSummary, DiffHunk, DiffLine, EventRecord, ExtensionId,
+    BudgetLimits, ContextManifest, CostReceipt, CoverageSummary, EventRecord, ExtensionId,
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
     OrchestratorMessage, OutcomeLedger, PausedRunSnapshot, Permission, PermissionLedger,
     PlannerOutput, PromptArtifact, PromptArtifactRole, PromptAttachment, PromptAttachmentKind,
     ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyLayer, VerifyResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyResult,
 };
 use prompt_buffer::{PromptBuffer, SubmittedPrompt};
 use ratatui::backend::{Backend, CrosstermBackend};
@@ -1856,14 +1856,31 @@ pub enum Intent {
 /// uses [`render_savings_line_styled`] for the colored version.
 pub fn render_savings_line(state: Option<&GlobalState>) -> String {
     let Some(s) = state else {
-        return "  ⚡ — tok  |  saved — vs naive  |  Σ baseline: —".into();
+        return "  $—  |  saved — vs frontier  |  tokens: —".into();
     };
+    if s.cost_receipt.frontier_equivalent_usd_micros > 0 {
+        let pct = s
+            .cost_receipt
+            .saved_percent()
+            .map(|p| format!("{p}%"))
+            .unwrap_or_else(|| "—".into());
+        return format!(
+            "  {}  |  saved {} vs frontier  |  {} tok",
+            format_usd_micros(s.cost_receipt.actual_usd_micros),
+            pct,
+            s.tokens_used
+        );
+    }
     let pct = savings_pct(s);
     let pct_txt = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "—".into());
     format!(
-        "  ⚡ {} tok  |  saved {} vs naive  |  Σ baseline: {}",
+        "  {} tok  |  saved {} vs naive  |  Σ baseline: {}",
         s.tokens_used, pct_txt, s.estimated_naive_tokens
     )
+}
+
+fn format_usd_micros(micros: u64) -> String {
+    format!("${:.3}", micros as f64 / 1_000_000.0)
 }
 
 fn savings_pct(s: &GlobalState) -> Option<i64> {
@@ -1885,10 +1902,35 @@ pub fn render_savings_line_styled(
 ) -> Line<'static> {
     let Some(s) = state else {
         return Line::from(Span::styled(
-            "  ⚡ — tok  |  saved — vs naive  |  Σ baseline: —",
+            "  $—  |  saved — vs frontier  |  tokens: —",
             Style::default().fg(MUTED),
         ));
     };
+    if s.cost_receipt.frontier_equivalent_usd_micros > 0 {
+        let pct = s.cost_receipt.saved_percent();
+        let (pct_txt, pct_style) = match pct {
+            Some(p) if p > 50 => (
+                format!("{p}%"),
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Some(p) if p >= 10 => (
+                format!("{p}%"),
+                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            ),
+            Some(p) => (format!("{p}%"), Style::default().fg(MUTED)),
+            None => ("—".into(), Style::default().fg(MUTED)),
+        };
+        return Line::from(vec![
+            Span::styled(
+                format!("  {}", format_usd_micros(s.cost_receipt.actual_usd_micros)),
+                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  saved ", Style::default().fg(MUTED)),
+            Span::styled(pct_txt, pct_style),
+            Span::styled(" vs frontier  ", Style::default().fg(MUTED)),
+            Span::styled(format!("{} tok", s.tokens_used), Style::default().fg(MUTED)),
+        ]);
+    }
     let pct = savings_pct(s);
     let (pct_txt, pct_style) = match pct {
         Some(p) if p > 50 => (
@@ -3872,14 +3914,11 @@ impl SubtaskStatusExt for phonton_types::WorkerState {
 // Stub dispatcher — the CLI drives the orchestrator without a real provider
 // ---------------------------------------------------------------------------
 
-/// Trivial dispatcher: every subtask "succeeds" with a one-line Rust diff.
-/// A real install wires the worker crate in instead; this keeps the CLI
-/// runnable out of the box without an API key on disk.
+/// Fail-closed dispatcher used when no API key is configured.
 ///
-/// Holds an [`Arc<Sandbox>`] even though the stub diff path never executes
-/// commands — the field is present so the real `WorkerDispatcher` that
-/// replaces this struct slots in without changing the CLI construction
-/// site. The sandbox is scoped to the orchestrator's working directory.
+/// Real goals must not report verified success from a stub diff. The CLI
+/// still constructs this type so the orchestrator path stays wired; dispatch
+/// returns an error the user can act on (`phonton doctor --provider`).
 pub struct StubDispatcher {
     #[allow(dead_code)]
     sandbox: Arc<Sandbox>,
@@ -3895,34 +3934,14 @@ impl StubDispatcher {
 impl WorkerDispatcher for StubDispatcher {
     async fn dispatch(
         &self,
-        subtask: Subtask,
+        _subtask: Subtask,
         _prior_errors: Vec<String>,
         _attempt: u8,
         _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
     ) -> Result<SubtaskResult> {
-        let hunks = vec![DiffHunk {
-            file_path: format!("phonton-types/src/stub_{}.rs", subtask.id).into(),
-            old_start: 1,
-            old_count: 0,
-            new_start: 1,
-            new_count: 1,
-            lines: vec![DiffLine::Added("fn stub() -> u32 { 0 }".into())],
-        }];
-        Ok(SubtaskResult {
-            id: subtask.id,
-            status: SubtaskStatus::Done {
-                tokens_used: 120,
-                diff_hunk_count: hunks.len(),
-            },
-            diff_hunks: hunks,
-            model_tier: subtask.model_tier,
-            verify_result: VerifyResult::Pass {
-                layer: VerifyLayer::Syntax,
-            },
-            provider: phonton_types::ProviderKind::Anthropic,
-            model_name: String::new(),
-            token_usage: TokenUsage::estimated(120),
-        })
+        anyhow::bail!(
+            "no provider API key configured. Run `phonton doctor --provider` and save a key before running a goal. Stub output is not a verified success."
+        );
     }
 }
 
@@ -4620,6 +4639,20 @@ fn default_model_for(provider: &str) -> String {
     }
 }
 
+/// Cheap/local use the configured model when set. Standard and frontier use
+/// per-tier ids so escalation is not the same model as cheap.
+fn model_for_dispatch(provider: &str, configured: Option<&str>, tier: ModelTier) -> String {
+    match tier {
+        ModelTier::Local | ModelTier::Cheap => configured
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| phonton_providers::model_for_tier(provider, tier)),
+        ModelTier::Standard | ModelTier::Frontier => {
+            phonton_providers::model_for_tier(provider, tier)
+        }
+    }
+}
+
 /// Print the `phonton --help` text. Plain stdout — runs before the TUI
 /// touches the terminal, so it composes with shell pipes / `less`.
 fn print_help() {
@@ -5182,6 +5215,7 @@ pub(crate) async fn execute_headless_goal(
                 estimated_naive_tokens: 0,
                 checkpoints: Vec::new(),
                 resume_checkpoint: None,
+                cost_receipt: CostReceipt::default(),
             },
             exit_code: 1,
         });
@@ -5301,6 +5335,7 @@ pub(crate) async fn execute_headless_goal(
         estimated_naive_tokens: plan.naive_baseline_tokens,
         checkpoints: Vec::new(),
         resume_checkpoint: None,
+        cost_receipt: CostReceipt::default(),
     };
     let (state_tx, _state_rx) = match hooks.state_tx {
         Some(tx) => {
@@ -5367,9 +5402,7 @@ pub(crate) async fn execute_headless_goal(
             let configured_model = cfg.provider.model.clone();
 
             let factory = move |tier: phonton_types::ModelTier| {
-                let model = configured_model
-                    .clone()
-                    .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
+                let model = model_for_dispatch(&provider_name, configured_model.as_deref(), tier);
                 let provider_cfg = make_api_provider_config(
                     &provider_name,
                     api_key.clone(),
@@ -5510,6 +5543,7 @@ fn print_headless_failure(
         estimated_naive_tokens: 0,
         checkpoints: Vec::new(),
         resume_checkpoint: None,
+        cost_receipt: CostReceipt::default(),
     };
     if let Ok(g) = store.lock() {
         let _ = g.upsert_task(task_id, display_text, &state.task_status, 0);
@@ -5562,6 +5596,7 @@ fn failed_handoff_packet(
         influence: phonton_types::InfluenceSummary::default(),
         screenshot_path: None,
         rendering_summary: None,
+        cost_receipt: CostReceipt::default(),
     }
 }
 
@@ -5585,9 +5620,47 @@ fn print_headless_goal_json(task_id: TaskId, state: &GlobalState) -> Result<()> 
         "index_backend": &state.index_backend,
         "plan_graph": &state.plan_graph,
         "handoff_packet": &state.handoff_packet,
+        "cost_receipt": &state.cost_receipt,
     });
     println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
+}
+
+async fn fail_spawned_goal(
+    tx: &mpsc::Sender<LoopEvent>,
+    store: &Arc<std::sync::Mutex<Store>>,
+    goal_index: usize,
+    task_id: TaskId,
+    display_text: &str,
+    reason: String,
+    index_backend: Option<String>,
+) {
+    let state = GlobalState {
+        task_status: TaskStatus::Failed {
+            reason: reason.clone(),
+            failed_subtask: None,
+        },
+        goal_contract: None,
+        plan_graph: None,
+        index_backend,
+        handoff_packet: Some(failed_handoff_packet(task_id, display_text, &reason, 0)),
+        active_workers: Vec::new(),
+        tokens_used: 0,
+        tokens_budget: None,
+        estimated_naive_tokens: 0,
+        checkpoints: Vec::new(),
+        resume_checkpoint: None,
+        cost_receipt: CostReceipt::default(),
+    };
+    if let Ok(g) = store.lock() {
+        let _ = g.upsert_task(task_id, display_text, &state.task_status, 0);
+        if let Some(ledger) = outcome_ledger_from_state(task_id, &state) {
+            let _ = g.upsert_outcome_ledger(&ledger);
+        }
+    }
+    let _ = tx
+        .send(LoopEvent::StateUpdate(goal_index, Box::new(state)))
+        .await;
 }
 
 fn headless_goal_succeeded(status: &TaskStatus) -> bool {
@@ -6654,16 +6727,26 @@ fn mime_for_path(path: &Path) -> Option<&'static str> {
 
 fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<OutcomeLedger> {
     let handoff = state.handoff_packet.clone()?;
+    let context_manifest = ContextManifest {
+        plan_graph: state.plan_graph.clone(),
+        index_backend: state.index_backend.clone(),
+        ..ContextManifest::default()
+    };
+    let permission_ledger = PermissionLedger::default();
+    let summaries = phonton_types::OutcomeSummaries::from_evidence(
+        state.goal_contract.as_ref(),
+        &context_manifest,
+        &permission_ledger,
+        &handoff.verification,
+        Some(&handoff),
+    );
     Some(OutcomeLedger {
         task_id,
         goal_contract: state.goal_contract.clone(),
-        context_manifest: ContextManifest {
-            plan_graph: state.plan_graph.clone(),
-            index_backend: state.index_backend.clone(),
-            ..ContextManifest::default()
-        },
-        permission_ledger: PermissionLedger::default(),
+        context_manifest,
+        permission_ledger,
         verify_report: handoff.verification.clone(),
+        summaries,
         handoff: Some(handoff),
     })
 }
@@ -6705,7 +6788,19 @@ async fn spawn_goal(
     } else {
         let store_guard = match store.lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => {
+                fail_spawned_goal(
+                    tx,
+                    store,
+                    goal_index,
+                    task_id,
+                    &display_text,
+                    "persistent store lock was poisoned".into(),
+                    Some(cfg.index.backend.clone()),
+                )
+                .await;
+                return;
+            }
         };
         let goal = Goal::new(text.clone())
             .with_attachments(attachments.clone())
@@ -6716,7 +6811,19 @@ async fn spawn_goal(
     };
     let mut plan = match plan_result {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            fail_spawned_goal(
+                tx,
+                store,
+                goal_index,
+                task_id,
+                &display_text,
+                format!("planning failed: {e}"),
+                Some(cfg.index.backend.clone()),
+            )
+            .await;
+            return;
+        }
     };
     contract_preflight::apply_workspace_preflight(&mut plan, working_dir, &text);
 
@@ -6732,6 +6839,7 @@ async fn spawn_goal(
         estimated_naive_tokens: plan.naive_baseline_tokens,
         checkpoints: Vec::new(),
         resume_checkpoint: None,
+        cost_receipt: CostReceipt::default(),
     });
 
     // Broadcast channel for structured telemetry. Capacity is generous so
@@ -6765,19 +6873,12 @@ async fn spawn_goal(
             let provider_name = cfg.provider.name.clone();
             let account_id = cfg.provider.account_id.clone();
             let base_url = cfg.provider.base_url.clone();
-            // CRITICAL: when the user (or auto-detect) picked a specific model,
-            // honour it for *every* tier. The previous behaviour was to call
-            // `model_for_tier(provider, tier)` and silently override the chosen
-            // model with the hard-coded tier default — so a Gemini key that
-            // only has access to `gemma-4-31b-it` would 404 the moment goal
-            // dispatch tried `gemini-2.5-flash`. Test/Ask used the configured
-            // model and worked; goals didn't, and the gap was invisible.
+            // CRITICAL: honour a configured cheap/local model, but escalate on
+            // per-tier ids so Standard/Frontier are not the same model as Cheap.
             let configured_model = cfg.provider.model.clone();
 
             let factory = move |tier: phonton_types::ModelTier| {
-                let model = configured_model
-                    .clone()
-                    .unwrap_or_else(|| phonton_providers::model_for_tier(&provider_name, tier));
+                let model = model_for_dispatch(&provider_name, configured_model.as_deref(), tier);
                 let provider_cfg = make_api_provider_config(
                     &provider_name,
                     api_key.clone(),
@@ -7703,6 +7804,7 @@ fn extract_id(line: &str) -> Option<String> {
             estimated_naive_tokens: 1000,
             checkpoints: Vec::new(),
             resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
         };
         let line = render_savings_line(Some(&s));
         assert!(line.contains("200"));
@@ -7711,9 +7813,36 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn savings_line_shows_frontier_when_receipt_present() {
+        let s = GlobalState {
+            task_status: TaskStatus::Queued,
+            goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 200,
+            tokens_budget: None,
+            estimated_naive_tokens: 1000,
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+            cost_receipt: CostReceipt {
+                actual_usd_micros: 220,
+                frontier_equivalent_usd_micros: 15_000,
+                saved_usd_micros: 14_780,
+                pricing_known: true,
+                route: Vec::new(),
+            },
+        };
+        let line = render_savings_line(Some(&s));
+        assert!(line.contains("frontier"));
+        assert!(line.contains("99%"));
+    }
+
+    #[test]
     fn savings_line_handles_missing_state() {
         let line = render_savings_line(None);
-        assert!(line.contains("baseline"));
+        assert!(line.contains("frontier"));
     }
 
     #[test]
@@ -7851,6 +7980,7 @@ fn extract_id(line: &str) -> Option<String> {
                     influence: phonton_types::InfluenceSummary::default(),
                     screenshot_path: None,
                     rendering_summary: None,
+                    cost_receipt: CostReceipt::default(),
                 }),
                 active_workers: Vec::new(),
                 tokens_used: 240,
@@ -7858,6 +7988,7 @@ fn extract_id(line: &str) -> Option<String> {
                 estimated_naive_tokens: 1000,
                 checkpoints: Vec::new(),
                 resume_checkpoint: None,
+                cost_receipt: CostReceipt::default(),
             },
         );
 
@@ -7894,6 +8025,7 @@ fn extract_id(line: &str) -> Option<String> {
                 estimated_naive_tokens: 500,
                 checkpoints: Vec::new(),
                 resume_checkpoint: None,
+                cost_receipt: CostReceipt::default(),
             },
         );
         terminal.draw(|f| render(f, &app)).unwrap();
@@ -7912,8 +8044,10 @@ fn extract_id(line: &str) -> Option<String> {
         let contract = phonton_types::GoalContract {
             goal: "make chess".into(),
             task_class: phonton_types::TaskClass::CoreLogic,
+            intent: None,
             confidence_percent: 50,
             acceptance_criteria: vec![],
+            acceptance_slices: Vec::new(),
             expected_artifacts: vec![],
             likely_files: vec![],
             verify_plan: vec![],
@@ -7924,6 +8058,7 @@ fn extract_id(line: &str) -> Option<String> {
                 "Enable AI opponent?".to_string(),
             ],
             assumptions: vec![],
+            token_policy: Default::default(),
         };
 
         let state = GlobalState {
@@ -7941,6 +8076,7 @@ fn extract_id(line: &str) -> Option<String> {
             estimated_naive_tokens: 400,
             checkpoints: vec![],
             resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
         };
 
         g.state = Some(state);

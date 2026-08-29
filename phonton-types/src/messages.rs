@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Checkpoint, CodeSlice, ContextAttribution, GoalContract, HandoffPacket, ModelTier, PlanGraph,
-    Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
+    Checkpoint, CodeSlice, ContextAttribution, CostReceipt, GoalContract, HandoffPacket, ModelTier,
+    PlanGraph, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -165,6 +165,9 @@ pub struct GlobalState {
     /// Present when [`TaskStatus::Paused`]; used by `phonton goal --resume`.
     #[serde(default)]
     pub resume_checkpoint: Option<crate::ResumeCheckpoint>,
+    /// Cheap-first spend vs a labeled frontier counterfactual.
+    #[serde(default)]
+    pub cost_receipt: CostReceipt,
 }
 
 /// Live snapshot of a single worker, included in [`GlobalState`].
@@ -183,4 +186,7 @@ pub struct WorkerState {
     /// True if the worker is actively waiting for an LLM response.
     #[serde(default)]
     pub is_thinking: bool,
+    /// Provider model id when known; empty until the first LLM response.
+    #[serde(default)]
+    pub model_name: String,
 }

@@ -9,6 +9,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ModelTier;
+
 // ---------------------------------------------------------------------------
 // Provider identity
 // ---------------------------------------------------------------------------
@@ -289,6 +291,153 @@ impl ModelPricing {
         let i = (input as u128 * self.input_usd_micros_per_mtok as u128) / 1_000_000;
         let o = (output as u128 * self.output_usd_micros_per_mtok as u128) / 1_000_000;
         (i + o) as u64
+    }
+}
+
+/// Published Opus-class list price used only for frontier counterfactuals.
+///
+/// `$15 / MTok` input and `$75 / MTok` output. This is a labeled estimate, not
+/// a live quote from a provider dashboard.
+pub const FRONTIER_REFERENCE_PRICING: ModelPricing = ModelPricing {
+    input_usd_micros_per_mtok: 15_000_000,
+    output_usd_micros_per_mtok: 75_000_000,
+};
+
+/// Published list-price stand-ins used when a model is not in `BudgetGuard`.
+///
+/// Cheap ≈ DeepSeek Flash off-peak. Standard ≈ Sonnet-class. Frontier uses
+/// [`FRONTIER_REFERENCE_PRICING`]. Local is zero.
+pub fn reference_pricing_for_tier(tier: ModelTier) -> ModelPricing {
+    match tier {
+        ModelTier::Local => ModelPricing {
+            input_usd_micros_per_mtok: 0,
+            output_usd_micros_per_mtok: 0,
+        },
+        ModelTier::Cheap => ModelPricing {
+            input_usd_micros_per_mtok: 220_000,
+            output_usd_micros_per_mtok: 660_000,
+        },
+        ModelTier::Standard => ModelPricing {
+            input_usd_micros_per_mtok: 3_000_000,
+            output_usd_micros_per_mtok: 15_000_000,
+        },
+        ModelTier::Frontier => FRONTIER_REFERENCE_PRICING,
+    }
+}
+
+/// Outcome of one model attempt on the cheap-first verify loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RouteOutcome {
+    /// Worker is still running at this tier.
+    Running,
+    /// Diff failed verification at this tier.
+    FailedVerify,
+    /// Diff passed verification at this tier.
+    Passed,
+    /// Orchestrator escalated to a stronger tier after retries.
+    Escalated,
+}
+
+impl fmt::Display for RouteOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            RouteOutcome::Running => "running",
+            RouteOutcome::FailedVerify => "failed-verify",
+            RouteOutcome::Passed => "passed",
+            RouteOutcome::Escalated => "escalated",
+        };
+        f.write_str(s)
+    }
+}
+
+/// One hop in the cheap-first route: which model ran, at which tier, and
+/// whether verification accepted the diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteStep {
+    /// Provider model id when known; empty until the first LLM response.
+    pub model: String,
+    /// Planner/orchestrator tier for this attempt.
+    pub tier: ModelTier,
+    /// What happened after this attempt.
+    pub outcome: RouteOutcome,
+}
+
+impl RouteStep {
+    /// Build a route hop.
+    pub fn new(model: impl Into<String>, tier: ModelTier, outcome: RouteOutcome) -> Self {
+        Self {
+            model: model.into(),
+            tier,
+            outcome,
+        }
+    }
+}
+
+/// Goal-level cost receipt: actual spend vs a frontier-only counterfactual.
+///
+/// This is the product metric: verified success per dollar, not raw tokens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostReceipt {
+    /// Estimated or metered spend for the models actually used.
+    pub actual_usd_micros: u64,
+    /// What the same token mix would have cost at [`FRONTIER_REFERENCE_PRICING`].
+    pub frontier_equivalent_usd_micros: u64,
+    /// `frontier - actual`, saturating at zero.
+    pub saved_usd_micros: u64,
+    /// True when actual spend came from a registered `BudgetGuard` price.
+    pub pricing_known: bool,
+    /// Ordered hops: cheap first, then repair, then escalation if needed.
+    pub route: Vec<RouteStep>,
+}
+
+impl CostReceipt {
+    /// Assemble a receipt from observed usage, actual micros, and the route.
+    pub fn from_usage(
+        actual_usd_micros: u64,
+        usage: &TokenUsage,
+        pricing_known: bool,
+        route: Vec<RouteStep>,
+    ) -> Self {
+        let frontier =
+            FRONTIER_REFERENCE_PRICING.cost_micros(usage.input_tokens, usage.output_tokens);
+        let saved = frontier.saturating_sub(actual_usd_micros);
+        Self {
+            actual_usd_micros,
+            frontier_equivalent_usd_micros: frontier,
+            saved_usd_micros: saved,
+            pricing_known,
+            route,
+        }
+    }
+
+    /// Percent saved vs the frontier counterfactual. `None` when there is
+    /// no frontier baseline (zero tokens).
+    pub fn saved_percent(&self) -> Option<i64> {
+        if self.frontier_equivalent_usd_micros == 0 {
+            return None;
+        }
+        let diff = self.frontier_equivalent_usd_micros as i64 - self.actual_usd_micros as i64;
+        Some(((diff as f64 / self.frontier_equivalent_usd_micros as f64) * 100.0).round() as i64)
+    }
+}
+
+#[cfg(test)]
+mod cost_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn cheap_tokens_save_against_frontier_reference() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            ..TokenUsage::default()
+        };
+        let actual = reference_pricing_for_tier(ModelTier::Cheap).cost_micros(1_000_000, 0);
+        let receipt = CostReceipt::from_usage(actual, &usage, true, Vec::new());
+        assert_eq!(receipt.actual_usd_micros, 220_000);
+        assert_eq!(receipt.frontier_equivalent_usd_micros, 15_000_000);
+        assert_eq!(receipt.saved_usd_micros, 14_780_000);
+        assert_eq!(receipt.saved_percent(), Some(99));
     }
 }
 

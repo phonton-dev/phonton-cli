@@ -22,8 +22,9 @@ pub use extensions::{
 };
 pub use messages::{GlobalState, OrchestratorMessage, WorkerMessage, WorkerState};
 pub use providers::{
-    BudgetDecision, BudgetLimits, CostSummary, LLMResponse, ModelMetricsSnapshot, ModelPricing,
-    ProviderConfig, ProviderError, ProviderKind, TokenUsage,
+    reference_pricing_for_tier, BudgetDecision, BudgetLimits, CostReceipt, CostSummary,
+    LLMResponse, ModelMetricsSnapshot, ModelPricing, ProviderConfig, ProviderError, ProviderKind,
+    RouteOutcome, RouteStep, TokenUsage, FRONTIER_REFERENCE_PRICING,
 };
 
 // ---------------------------------------------------------------------------
@@ -1235,6 +1236,25 @@ pub struct QualityFloor {
     pub criteria: Vec<String>,
 }
 
+/// One independently verifiable slice of a [`GoalContract`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceSlice {
+    /// Stable slice id, e.g. `"scaffold"`.
+    pub id: String,
+    /// What this slice must prove.
+    pub criterion: String,
+    /// Optional artifact this slice should produce.
+    pub artifact_path: Option<PathBuf>,
+}
+
+/// Token-routing policy recorded on a contract for review.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenPolicy {
+    /// Preferred starting tier when known.
+    #[serde(default)]
+    pub preferred_tier: Option<ModelTier>,
+}
+
 /// Visible definition of done for a top-level goal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoalContract {
@@ -1242,10 +1262,16 @@ pub struct GoalContract {
     pub goal: String,
     /// Inferred task class.
     pub task_class: TaskClass,
+    /// Optional restated intent, distinct from the raw goal text.
+    #[serde(default)]
+    pub intent: Option<String>,
     /// Confidence as 0-100 to avoid float drift across serialized records.
     pub confidence_percent: u8,
     /// Concrete acceptance criteria.
     pub acceptance_criteria: Vec<String>,
+    /// Independently verifiable slices of the goal.
+    #[serde(default)]
+    pub acceptance_slices: Vec<AcceptanceSlice>,
     /// Expected files, commands, docs, or generated artifacts.
     pub expected_artifacts: Vec<ExpectedArtifact>,
     /// Paths the planner expects to touch.
@@ -1260,6 +1286,9 @@ pub struct GoalContract {
     pub clarification_questions: Vec<String>,
     /// Assumptions Phonton is making if it proceeds.
     pub assumptions: Vec<String>,
+    /// Token-routing notes for this contract.
+    #[serde(default)]
+    pub token_policy: TokenPolicy,
 }
 
 /// Summary of a context source that influenced a run.
@@ -1431,6 +1460,9 @@ pub struct HandoffPacket {
     /// Summary of visual rendering checks when available.
     #[serde(default)]
     pub rendering_summary: Option<String>,
+    /// Cheap-first spend vs a labeled frontier counterfactual.
+    #[serde(default)]
+    pub cost_receipt: CostReceipt,
 }
 
 /// Durable evidence record for one task run.
@@ -1446,8 +1478,82 @@ pub struct OutcomeLedger {
     pub permission_ledger: PermissionLedger,
     /// Verification report.
     pub verify_report: VerifyReport,
+    /// Compact review summaries derived from the ledger.
+    #[serde(default)]
+    pub summaries: OutcomeSummaries,
     /// Handoff packet when available.
     pub handoff: Option<HandoffPacket>,
+}
+
+/// Compact review-facing summaries derived from an [`OutcomeLedger`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeSummaries {
+    /// One-line result when known.
+    #[serde(default)]
+    pub headline: Option<String>,
+    /// Verification passed lines.
+    #[serde(default)]
+    pub passed: Vec<String>,
+    /// Verification findings.
+    #[serde(default)]
+    pub findings: Vec<String>,
+}
+
+impl OutcomeSummaries {
+    /// Build summaries from the durable evidence record.
+    pub fn from_evidence(
+        contract: Option<&GoalContract>,
+        _context: &ContextManifest,
+        _permissions: &PermissionLedger,
+        verify: &VerifyReport,
+        handoff: Option<&HandoffPacket>,
+    ) -> Self {
+        let headline = handoff
+            .map(|packet| packet.headline.clone())
+            .or_else(|| contract.map(|c| c.goal.clone()));
+        Self {
+            headline,
+            passed: verify.passed.clone(),
+            findings: verify.findings.clone(),
+        }
+    }
+}
+
+/// Terminal classification used by proof and benchmark export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BenchmarkFinalStatus {
+    /// Task failed or was rejected.
+    Failed,
+    /// Verification passed with no findings.
+    VerifiedSuccess,
+    /// Some checks passed, but findings remain.
+    Partial,
+    /// No verification evidence was recorded.
+    Unverified,
+}
+
+/// Proof bundle exported by `phonton proof export`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofBundleExport {
+    /// Task id.
+    pub task_id: TaskId,
+    /// Original goal text.
+    pub goal: String,
+    /// Goal contract when available.
+    pub goal_contract: Option<GoalContract>,
+    /// Context that influenced the run.
+    pub context_manifest: ContextManifest,
+    /// Privileged-action ledger.
+    pub permission_ledger: PermissionLedger,
+    /// Verification report.
+    pub verify_report: VerifyReport,
+    /// Handoff packet.
+    pub handoff_packet: HandoffPacket,
+    /// Compact summaries.
+    pub summaries: OutcomeSummaries,
+    /// Final classification.
+    pub final_status: BenchmarkFinalStatus,
 }
 
 /// Structured memory writes proposed after a task completes.
