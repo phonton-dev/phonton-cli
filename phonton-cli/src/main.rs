@@ -83,6 +83,8 @@ use phonton_providers::{
 };
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
+#[cfg(test)]
+use phonton_types::VerifyResult;
 use phonton_types::{
     BudgetLimits, ContextManifest, CostReceipt, CoverageSummary, EventRecord, ExtensionId,
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
@@ -91,8 +93,6 @@ use phonton_types::{
     ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
     SubtaskStatus, TaskId, TaskStatus, TokenUsage,
 };
-#[cfg(test)]
-use phonton_types::VerifyResult;
 use prompt_buffer::{PromptBuffer, SubmittedPrompt};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
