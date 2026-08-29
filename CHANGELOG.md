@@ -4,6 +4,12 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.21.2 - Pixel marks
+
+### Changed
+
+- README and npm package logos use the pixel CLI mark. The TUI splash is still ANSI Shadow.
+
 ## 0.21.1 - CostReceipt on the serve line
 
 ### Added

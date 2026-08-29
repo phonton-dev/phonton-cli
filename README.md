@@ -2,7 +2,7 @@
   <img src="assets/readme/phonton-cli-logo.png" width="128" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI - v0.21.1</h1>
+<h1 align="center">Phonton CLI - v0.21.2</h1>
 
 <p align="center">
   <strong>A local-first ADE for verified, accountable code changes.</strong><br>
@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI Status" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars&color=ff69b4"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.21.1-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.21.2-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
