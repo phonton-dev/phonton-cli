@@ -1544,7 +1544,7 @@ impl Provider for GeminiProvider {
             if is_json {
                 contents.push(json!({
                     "role": "user",
-                    "parts": [{ "text": format!("SYSTEM: You are a software task decomposer. Respond ONLY with a JSON array.\n\nUSER: Break 'add logging' into subtasks.") }]
+                    "parts": [{ "text": "SYSTEM: You are a software task decomposer. Respond ONLY with a JSON array.\n\nUSER: Break 'add logging' into subtasks.".to_string() }]
                 }));
                 contents.push(json!({
                     "role": "model",
