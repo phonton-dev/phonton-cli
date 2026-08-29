@@ -89,8 +89,10 @@ use phonton_types::{
     OrchestratorMessage, OutcomeLedger, PausedRunSnapshot, Permission, PermissionLedger,
     PlannerOutput, PromptArtifact, PromptArtifactRole, PromptAttachment, PromptAttachmentKind,
     ProviderConfig as ApiProviderConfig, ProviderKind, Subtask, SubtaskId, SubtaskResult,
-    SubtaskStatus, TaskId, TaskStatus, TokenUsage, VerifyResult,
+    SubtaskStatus, TaskId, TaskStatus, TokenUsage,
 };
+#[cfg(test)]
+use phonton_types::VerifyResult;
 use prompt_buffer::{PromptBuffer, SubmittedPrompt};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
