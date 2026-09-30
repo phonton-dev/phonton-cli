@@ -47,10 +47,12 @@ mod memory_cli;
 mod models_cli;
 mod plan_preview;
 mod prompt_buffer;
+mod proof_cli;
 mod review;
 mod serve_cli;
 mod serve_desktop;
 mod store_util;
+mod tokens_cli;
 mod trust;
 
 pub(crate) use store_util::open_persistent_store;
@@ -4668,7 +4670,13 @@ fn model_for_dispatch(provider: &str, configured: Option<&str>, tier: ModelTier)
 /// touches the terminal, so it composes with shell pipes / `less`.
 fn print_help() {
     println!(
-        "phonton — agentic dev environment\n\
+        "phonton — local-first ADE: goal → plan → edit → verify → review → remember\n\
+         \n\
+         QUICK START:\n  \
+         phonton doctor           check provider key, git, and local tools\n  \
+         phonton                  open the TUI and type a goal\n  \
+         phonton models setup     run on local models instead of a cloud key\n  \
+         phonton why-tokens       see where the last goal spent tokens\n\
          \n\
          USAGE:\n  \
          phonton [SUBCOMMAND]\n\
@@ -4686,6 +4694,8 @@ fn print_help() {
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
+         why-tokens        Per-subtask token usage for the latest goal\n  \
+         proof export      Export typed proof evidence for audit\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
          models            Detect hardware, install and calibrate local coding models\n  \
          config path       Print the resolved config file path\n  \
@@ -4931,6 +4941,20 @@ async fn handle_cli_args() -> Result<bool> {
         }
         "memory" => {
             let code = memory_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "why-tokens" | "tokens" => {
+            let code = tokens_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "proof" => {
+            let code = proof_cli::run(&args[1..]).await?;
             if code != 0 {
                 std::process::exit(code);
             }

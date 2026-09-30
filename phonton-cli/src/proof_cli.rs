@@ -193,11 +193,7 @@ mod tests {
 
         let export = build_export(&task).unwrap();
 
-        assert_eq!(export.summaries.verification.passed, 1);
-        assert_eq!(
-            export.summaries.handoff.as_ref().unwrap().headline,
-            "verified"
-        );
-        assert_eq!(export.summaries.token.total_tokens, 42);
+        assert_eq!(export.summaries.passed, vec!["cargo test".to_string()]);
+        assert_eq!(export.summaries.headline.as_deref(), Some("verified"));
     }
 }
