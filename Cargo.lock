@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "phonton-cli"
-version = "0.21.2"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "async-trait",

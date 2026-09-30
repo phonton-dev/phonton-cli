@@ -4,6 +4,32 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.22.0 - Product Hunt beta
+
+### Changed
+
+- [changed] Workers now see the exact current source of the files a subtask
+  edits (bounded: 4 files, 24 KB each, 48 KB total) instead of only symbol
+  signatures, so unified-diff context matches on the first attempt.
+- [changed] Finished subtasks are carried forward in the goal context as a
+  one-line `Done/Changed` note instead of the full prompt and diff. The system
+  prompt is no longer duplicated into that context, and retriever slices the
+  dispatcher already selected are not sent twice.
+- [changed] TUI welcome shows the goal → plan → edit → verify → review →
+  remember loop and generic starter goals; footer hints adapt to terminal
+  width; help overlay no longer clips rows.
+- [changed] `phonton --help` opens with a quick start.
+
+### Fixed
+
+- [fixed] Esc and Ctrl+C at the top level now ask for a second press before
+  quitting, matching the documented quit behavior.
+- [fixed] Ctrl+C no longer opens the clarification questionnaire when the
+  prompt is empty.
+- [fixed] `phonton why-tokens` and `phonton proof export`, advertised on
+  phonton.dev, are wired again. `why-tokens` reports provider usage per
+  verified subtask and the selected code-context estimate.
+
 ## Unreleased - Local harness preview
 
 ### Fixed
