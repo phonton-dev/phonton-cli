@@ -29,6 +29,11 @@
 
 ---
 
+<p align="center">
+  <img src="assets/readme/phonton-demo.gif" alt="Phonton fixing a failing parsePort test in the terminal UI" width="800"><br>
+  <sub>Real recording (sped up): two failing tests in, a verified diff and receipt out.</sub>
+</p>
+
 ## 60-second start
 
 ```bash
@@ -40,15 +45,17 @@ phonton            # opens the TUI; type a goal and press Enter
 No account, no Phonton server. Bring a key from Anthropic, OpenAI, DeepSeek,
 OpenRouter, Gemini, Groq and others, or run on local models (preview, below).
 
-## What a run looks like (illustrative)
+## What a run looks like
+
+From the recorded run above (DeepSeek Flash, small JavaScript repo):
 
 ```text
-goal     Fix parsePort so it rejects ports above 65535
-plan     GoalContract: 3 acceptance criteria, verify with `npm test`
-edit     worker returns a unified diff against the exact current source
-verify   patch applies · syntax · tests pass
-review   receipt: 1 file (+6/-1) · 1 check passed · 5.2k tokens · $0.003
-remember decision stored locally for the next goal
+goal     Make parsePort reject ports outside 1-65535 and trailing garbage
+plan     1 subtask, verify with the repo's own `node --test`
+edit     unified diff against the exact current src/port.js
+verify   patch applies · syntax · tests: 3 pass, 0 fail (was 1 pass, 2 fail)
+review   receipt: 1 file (+6/-2) · 8.8k tokens · est. $0.003 · checkpoint #1
+remember completion stored locally for the next goal
 ```
 
 Nothing lands in your tree until it passes verification, and every run leaves a
