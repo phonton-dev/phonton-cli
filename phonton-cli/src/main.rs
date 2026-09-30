@@ -605,7 +605,13 @@ pub struct App {
     pub clarifying_buffer: String,
     /// Caret position inside clarifying_buffer
     pub clarifying_cursor: usize,
+    /// Set by the first Esc/Ctrl+C at top level; a second press within
+    /// [`QUIT_CONFIRM_WINDOW`] quits. Prevents losing a session to one key.
+    pub quit_armed_at: Option<std::time::Instant>,
 }
+
+/// How long a first Esc/Ctrl+C stays armed waiting for confirmation.
+pub const QUIT_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl App {
     pub fn new(cfg: &crate::config::Config) -> Self {
@@ -642,7 +648,24 @@ impl App {
             clarifying_answers: Vec::new(),
             clarifying_buffer: String::new(),
             clarifying_cursor: 0,
+            quit_armed_at: None,
         }
+    }
+
+    /// True while a first quit press is waiting for confirmation.
+    pub fn quit_armed(&self) -> bool {
+        self.quit_armed_at
+            .is_some_and(|at| at.elapsed() < QUIT_CONFIRM_WINDOW)
+    }
+
+    /// First press arms, second press (within the window) quits.
+    fn request_quit(&mut self) -> Option<Intent> {
+        if self.quit_armed() {
+            self.should_quit = true;
+            return Some(Intent::Quit);
+        }
+        self.quit_armed_at = Some(std::time::Instant::now());
+        None
     }
 
     /// Remove the currently-selected goal, if any. Keeps `selected` valid.
@@ -888,8 +911,7 @@ impl App {
                 self.mode = Mode::Goal;
                 return None;
             }
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit();
         }
 
         // `?` toggles the help overlay anywhere it isn't legitimate text input.
@@ -996,8 +1018,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
-                    self.should_quit = true;
-                    return Some(Intent::Quit);
+                    return self.request_quit();
                 }
                 // Cmd/Ctrl+; toggles the Ask side panel.
                 KeyCode::Char(';') => {
@@ -1035,8 +1056,7 @@ impl App {
 
     fn handle_clarify_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit();
         }
 
         match key.code {
@@ -1140,8 +1160,7 @@ impl App {
 
     fn handle_mcp_approval_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit();
         }
 
         match key.code {
@@ -1403,6 +1422,7 @@ impl App {
     fn handle_goal_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Intercept 'c' or 'C' when prompt is empty to start clarification if questions exist.
         if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
             && self.goal_prompt.is_empty()
         {
             if let Some(g) = self.goals.get(self.selected) {
@@ -2058,6 +2078,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let rows: &[(&str, &str)] = &[
         ("Enter", "submit goal / question"),
         ("/", "open the command palette"),
+        ("@", "attach a file, folder, symbol or MCP server"),
         ("?", "toggle this help"),
         ("Ctrl+V", "paste clipboard as text or artifact"),
         ("Ctrl+;", "toggle the Ask side panel"),
@@ -2070,17 +2091,23 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Home / End", "jump to start/end of the input"),
         ("Ctrl+↑↓", "move the checkpoint cursor"),
         ("r", "rollback to the highlighted checkpoint (input empty)"),
-        ("Ctrl+C", "quit immediately"),
-        ("Esc", "close overlay / cancel / quit"),
+        ("Ctrl+C", "quit (press twice)"),
+        ("Esc", "close overlay / cancel / quit (press twice)"),
     ];
 
     // Fit the modal to the longest description so wrapping never bites.
+    // Row = 2 indent + padded key column + 3 gap + description.
+    let key_col = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8);
     let longest = rows
         .iter()
-        .map(|(k, v)| k.chars().count() + v.chars().count() + 4)
+        .map(|(_, v)| 2 + key_col + 3 + v.chars().count())
         .max()
         .unwrap_or(40);
-    let popup_w = (longest as u16 + 6)
+    let popup_w = (longest as u16 + 4)
         .min(area.width.saturating_sub(2))
         .max(40);
     let popup_h = (rows.len() as u16 + 6).min(area.height.saturating_sub(2));
@@ -2332,7 +2359,7 @@ fn render_splash(frame: &mut Frame, area: Rect, _app: &App) {
         let mut spans = gradient_line("✦ phonton", phase * 0.8, true).spans;
         spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
         spans.push(Span::styled(
-            "agentic dev environment",
+            "local-first ADE · goal → plan → edit → verify → review → remember",
             Style::default().fg(MUTED),
         ));
         let p = Paragraph::new(Line::from(spans))
@@ -2365,86 +2392,86 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let spans: Vec<Span<'static>> = match app.mode {
-        Mode::Goal | Mode::Task => vec![
-            Span::styled("Enter", key),
-            Span::styled(" run  ", txt),
-            sep.clone(),
-            Span::styled("/", key),
-            Span::styled(" commands  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+V", key),
-            Span::styled(" paste  ", txt),
-            sep.clone(),
-            Span::styled("?", key),
-            Span::styled(" help  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+;", key),
-            Span::styled(" ask  ", txt),
-            sep.clone(),
-            Span::styled("Shift+L", key),
-            Span::styled(" log  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+D", key),
-            Span::styled(" del  ", txt),
-            sep,
+    if app.quit_armed() {
+        let hint = Line::from(vec![
             Span::styled("Esc", key),
-            Span::styled(" quit", txt),
+            Span::styled(" or ", txt),
+            Span::styled("Ctrl+C", key),
+            Span::styled(" again to quit", txt),
+            Span::styled("  ·  any other key keeps working", dim),
+        ]);
+        frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), area);
+        return;
+    }
+
+    // Hints in priority order; the last one (quit/close) is always kept and
+    // lower-priority hints drop off the tail when the terminal is narrow.
+    let hints: &[(&str, &str)] = match app.mode {
+        Mode::Goal | Mode::Task => &[
+            ("Enter", "run"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("@", "attach"),
+            ("Ctrl+;", "ask"),
+            ("Shift+L", "log"),
+            ("Ctrl+V", "paste"),
+            ("Ctrl+D", "delete"),
+            ("Esc", "quit"),
         ],
-        Mode::Ask => vec![
-            Span::styled("Enter", key),
-            Span::styled(" send  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+;", key),
-            Span::styled(" close ask  ", txt),
-            sep,
-            Span::styled("Esc", key),
-            Span::styled(" cancel", txt),
+        Mode::Ask => &[
+            ("Enter", "send"),
+            ("Ctrl+;", "close ask"),
+            ("Esc", "cancel"),
         ],
-        Mode::Settings => vec![
-            Span::styled("Enter", key),
-            Span::styled(" save  ", txt),
-            sep.clone(),
-            Span::styled("Tab", key),
-            Span::styled(" next field  ", txt),
-            sep.clone(),
-            Span::styled("←→", key),
-            Span::styled(" cycle provider  ", txt),
-            sep,
-            Span::styled("Esc", key),
-            Span::styled(" cancel", txt),
+        Mode::Settings => &[
+            ("Enter", "save"),
+            ("Tab", "next field"),
+            ("←→", "cycle provider"),
+            ("Esc", "cancel"),
         ],
-        Mode::Memory | Mode::History => vec![
-            Span::styled("/", key),
-            Span::styled(" commands  ", txt),
-            sep.clone(),
-            Span::styled("Esc", key),
-            Span::styled(" back to goals", txt),
+        Mode::Memory | Mode::History => &[("/", "commands"), ("Esc", "back to goals")],
+        Mode::CommandPalette => &[
+            ("type", "filter"),
+            ("↑↓", "select"),
+            ("Enter", "run"),
+            ("Esc", "close"),
         ],
-        Mode::CommandPalette => vec![
-            Span::styled("type", key),
-            Span::styled(" filter  ", txt),
-            sep.clone(),
-            Span::styled("↑↓", key),
-            Span::styled(" select  ", txt),
-            sep.clone(),
-            Span::styled("Enter", key),
-            Span::styled(" run  ", txt),
-            sep,
-            Span::styled("Esc", key),
-            Span::styled(" close", txt),
-        ],
-        Mode::Clarify => vec![
-            Span::styled("Enter", key),
-            Span::styled(" submit answer  ", txt),
-            sep.clone(),
-            Span::styled("Esc", key),
-            Span::styled(" cancel clarification", txt),
-        ],
+        Mode::Clarify => &[("Enter", "submit answer"), ("Esc", "cancel clarification")],
     };
+    let spans = fit_footer_hints(hints, area.width as usize, key, txt, sep);
 
     let p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     frame.render_widget(p, area);
+}
+
+/// Lay out `(key, label)` footer hints, dropping lower-priority hints from the
+/// middle of the list until the row fits `width`. The final hint is kept.
+fn fit_footer_hints(
+    hints: &[(&str, &str)],
+    width: usize,
+    key: Style,
+    txt: Style,
+    sep: Span<'static>,
+) -> Vec<Span<'static>> {
+    let cost = |h: &[(&str, &str)]| -> usize {
+        h.iter()
+            .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+            .sum::<usize>()
+            + h.len().saturating_sub(1) * sep.content.chars().count()
+    };
+    let mut kept: Vec<(&str, &str)> = hints.to_vec();
+    while kept.len() > 2 && cost(&kept) > width {
+        kept.remove(kept.len() - 2);
+    }
+    let mut spans = Vec::new();
+    for (i, (k, l)) in kept.iter().enumerate() {
+        if i > 0 {
+            spans.push(sep.clone());
+        }
+        spans.push(Span::styled((*k).to_string(), key));
+        spans.push(Span::styled(format!(" {l}"), txt));
+    }
+    spans
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
@@ -2607,7 +2634,9 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(short(&g.description, 40), base_style));
+            // Marker + status tag + spinners take ~14 cells; give the rest to text.
+            let text_w = (area.width as usize).saturating_sub(16).max(12);
+            spans.push(Span::styled(short(&g.description, text_w), base_style));
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -2619,10 +2648,21 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
     };
     let goals_focused = matches!(app.mode, Mode::Goal | Mode::Task);
     let goals_border = if goals_focused { ACCENT } else { DIM };
-    let goals_border_type = if goals_focused {
-        ratatui::widgets::BorderType::Thick
+    let goals_border_type = ratatui::widgets::BorderType::Rounded;
+    let items = if items.is_empty() {
+        vec![
+            ListItem::new(Line::raw("")),
+            ListItem::new(Line::from(Span::styled(
+                "  No goals yet.",
+                Style::default().fg(MUTED),
+            ))),
+            ListItem::new(Line::from(Span::styled(
+                "  Type one below ↓",
+                Style::default().fg(DIM),
+            ))),
+        ]
     } else {
-        ratatui::widgets::BorderType::Rounded
+        items
     };
     let list = List::new(items).style(Style::default().bg(BG_PANEL)).block(
         Block::default()
@@ -2645,7 +2685,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
 
     let sys_info = vec![
         Line::from(vec![
-            Span::styled(" V ", Style::default().fg(SUCCESS)),
+            Span::styled(" ● ", Style::default().fg(SUCCESS)),
             Span::styled("version   ", Style::default().fg(MUTED)),
             Span::styled(
                 concat!("v", env!("CARGO_PKG_VERSION")),
@@ -2691,7 +2731,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
     let mut sys_info = sys_info;
     sys_info.push(Line::from(vec![
         Span::styled(
-            " N ",
+            " ◇ ",
             Style::default().fg(if app.nexus_status.active {
                 SUCCESS
             } else {
@@ -2709,7 +2749,7 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ]));
     sys_info.push(Line::from(vec![
-        Span::styled(" DB ", Style::default().fg(ACCENT)),
+        Span::styled(" ▤ ", Style::default().fg(ACCENT)),
         Span::styled("store     ", Style::default().fg(MUTED)),
         Span::styled(
             app.store_path
@@ -2788,71 +2828,68 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
         welcome_spans.push(Span::styled(".", muted));
+        let key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let stages = ["goal", "plan", "edit", "verify", "review", "remember"];
+        let mut loop_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+        for (i, stage) in stages.iter().enumerate() {
+            if i > 0 {
+                loop_spans.push(Span::styled(" → ", Style::default().fg(DIM)));
+            }
+            let t = i as f32 / (stages.len() - 1) as f32;
+            loop_spans.push(Span::styled(
+                (*stage).to_string(),
+                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
+            ));
+        }
+        let bullet = |t: f32, head: &'static str, body: &'static str| {
+            Line::from(vec![
+                Span::styled(
+                    "    ▸ ",
+                    Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{head:<26}"), example),
+                Span::styled(body, muted),
+            ])
+        };
+        let shortcut = |k: &'static str, body: &'static str| {
+            Line::from(vec![
+                Span::styled(format!("    {k:<8}"), key),
+                Span::styled(body, muted),
+            ])
+        };
         let lines = vec![
             Line::raw(""),
             Line::from(welcome_spans),
-            Line::raw(""),
             Line::from(Span::styled(
-                "  Type a goal below and press Enter — it will be planned, executed",
-                muted,
-            )),
-            Line::from(Span::styled(
-                "  by parallel workers, and verified before any diff lands.",
+                "  Local-first coding agent that proves every change before you review it.",
                 muted,
             )),
             Line::raw(""),
-            Line::from(Span::styled("  Try one of:", label)),
-            Line::from(vec![
-                Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(0.0)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Add a Cargo command for running tests in CI", example),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(0.5)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Refactor render_input into smaller helpers", example),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(1.0)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Write integration tests for the orchestrator", example),
-            ]),
+            Line::from(loop_spans),
             Line::raw(""),
-            Line::from(Span::styled("  Shortcuts:", label)),
-            Line::from(vec![
-                Span::styled(
-                    "    /",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("       command palette", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Ctrl+;",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  toggle Ask side panel", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Shift+L",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" open the Flight Log", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Esc",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("     quit", muted),
-            ]),
+            Line::from(Span::styled("  Every goal gets", label)),
+            bullet(0.0, "a visible plan", "acceptance criteria before any edit"),
+            bullet(
+                0.5,
+                "diff-only, verified work",
+                "syntax, build and tests gate review",
+            ),
+            bullet(
+                1.0,
+                "a receipt",
+                "files, checks, tokens and cost you can audit",
+            ),
+            Line::raw(""),
+            Line::from(Span::styled("  Try", label)),
+            bullet(0.0, "Fix the failing test in", "@tests/…"),
+            bullet(0.5, "Add input validation to", "@src/…"),
+            bullet(1.0, "Explain this repo", "Ctrl+; asks without editing"),
+            Line::raw(""),
+            Line::from(Span::styled("  Keys", label)),
+            shortcut("/", "commands · settings · provider"),
+            shortcut("@", "attach a file, folder or symbol"),
+            shortcut("?", "all shortcuts"),
+            shortcut("Esc", "quit (asks first)"),
         ];
         let p = Paragraph::new(lines)
             .block(block)
@@ -3062,7 +3099,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "(waiting for first state snapshot…)",
+            "Planning — reading the workspace and drafting the goal contract…",
             Style::default().fg(MUTED),
         )));
     }
@@ -7958,11 +7995,21 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn esc_from_goal_quits() {
+    fn esc_from_goal_quits_after_confirmation() {
         let mut app = App::default();
-        let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(r, Some(Intent::Quit));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.handle_key(esc), None);
+        assert!(!app.should_quit);
+        assert!(app.quit_armed());
+        assert_eq!(app.handle_key(esc), Some(Intent::Quit));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_needs_confirmation_too() {
+        let mut app = App::default();
+        assert_eq!(app.handle_key(ctrl('c')), None);
+        assert_eq!(app.handle_key(ctrl('c')), Some(Intent::Quit));
     }
 
     #[test]
@@ -8034,6 +8081,24 @@ fn extract_id(line: &str) -> Option<String> {
     fn savings_line_handles_missing_state() {
         let line = render_savings_line(None);
         assert!(line.contains("frontier"));
+    }
+
+    #[test]
+    fn footer_hints_fit_width_and_keep_quit() {
+        let hints = [
+            ("Enter", "run"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("Esc", "quit"),
+        ];
+        let sep = Span::raw("  ·  ");
+        let wide = fit_footer_hints(&hints, 200, Style::default(), Style::default(), sep.clone());
+        let wide_text: String = wide.iter().map(|s| s.content.to_string()).collect();
+        assert!(wide_text.contains("commands") && wide_text.ends_with("Esc quit"));
+        let narrow = fit_footer_hints(&hints, 24, Style::default(), Style::default(), sep);
+        let narrow_text: String = narrow.iter().map(|s| s.content.to_string()).collect();
+        assert!(narrow_text.chars().count() <= 24, "{narrow_text}");
+        assert!(narrow_text.starts_with("Enter run") && narrow_text.ends_with("Esc quit"));
     }
 
     #[test]
@@ -8335,5 +8400,51 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.clarifying_question_idx, 0);
         assert!(app.clarifying_answers.is_empty());
         assert!(app.clarifying_buffer.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tui_screen_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn screen(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn idle_screen_pitches_the_loop_and_footer_fits() {
+        let rows = screen(&App::default(), 120, 36);
+        let all = rows.join(
+            "
+",
+        );
+        assert!(all.contains("goal → plan → edit → verify → review → remember"));
+        assert!(all.contains("No goals yet."));
+        let footer = rows.last().unwrap().trim_end();
+        assert!(footer.contains("Esc quit"), "footer clipped: {footer}");
+    }
+
+    #[test]
+    fn help_overlay_rows_are_not_clipped() {
+        let mut app = App::default();
+        app.help_open = true;
+        let all = screen(&app, 120, 40).join(
+            "
+",
+        );
+        assert!(all.contains("rollback to the highlighted checkpoint (input empty)"));
+    }
+
+    #[test]
+    fn narrow_footer_still_offers_quit() {
+        let rows = screen(&App::default(), 70, 30);
+        assert!(rows.last().unwrap().contains("Esc quit"));
     }
 }
