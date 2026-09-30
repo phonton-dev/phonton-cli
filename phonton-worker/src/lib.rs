@@ -1345,7 +1345,11 @@ fn completion_history_frame(subtask: &Subtask, hunks: &[DiffHunk]) -> String {
     format!(
         "Done: {}\nChanged: {}",
         truncate_chars(summary, 240),
-        if changed.is_empty() { "nothing" } else { &changed }
+        if changed.is_empty() {
+            "nothing"
+        } else {
+            &changed
+        }
     )
 }
 
@@ -2358,7 +2362,10 @@ mod tests {
             assert!(!prompt.contains("You are a Phonton worker"));
         }
         let last = calls.last().unwrap();
-        assert!(!last.contains("USER:"), "prior prompts must not be replayed");
+        assert!(
+            !last.contains("USER:"),
+            "prior prompts must not be replayed"
+        );
     }
 
     #[test]
