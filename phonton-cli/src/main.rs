@@ -608,6 +608,12 @@ pub struct App {
     /// Set by the first Esc/Ctrl+C at top level; a second press within
     /// [`QUIT_CONFIRM_WINDOW`] quits. Prevents losing a session to one key.
     pub quit_armed_at: Option<std::time::Instant>,
+    /// Session answer to "may verification run project code on this
+    /// machine?". `None` until the first goal of the session asks.
+    pub host_checks_approved: Option<bool>,
+    /// Goal held back while the host-check question is on screen, plus
+    /// whether it was submitted in Task mode.
+    pub pending_host_goal: Option<(SubmittedPrompt, bool)>,
 }
 
 /// How long a first Esc/Ctrl+C stays armed waiting for confirmation.
@@ -649,6 +655,8 @@ impl App {
             clarifying_buffer: String::new(),
             clarifying_cursor: 0,
             quit_armed_at: None,
+            host_checks_approved: None,
+            pending_host_goal: None,
         }
     }
 
@@ -666,6 +674,38 @@ impl App {
         }
         self.quit_armed_at = Some(std::time::Instant::now());
         None
+    }
+
+    /// Answer the host-check question for this session, then queue the
+    /// held goal. Esc puts the goal text back in the prompt instead.
+    fn handle_host_checks_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        let approved = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => true,
+            KeyCode::Char('n') | KeyCode::Char('N') => false,
+            KeyCode::Esc => {
+                if let Some((prompt, _)) = self.pending_host_goal.take() {
+                    // ponytail: collapsed paste artifacts are not restored;
+                    // only the visible text comes back.
+                    self.goal_prompt.insert_text(&prompt.display_text);
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        self.host_checks_approved = Some(approved);
+        let (prompt, direct_task) = self.pending_host_goal.take()?;
+        Some(self.queue_goal(prompt, direct_task))
+    }
+
+    fn queue_goal(&mut self, prompt: SubmittedPrompt, direct_task: bool) -> Intent {
+        self.goals
+            .insert(0, GoalEntry::new(prompt.display_text.clone()));
+        self.selected = 0;
+        if direct_task {
+            Intent::QueueTask(prompt)
+        } else {
+            Intent::QueueGoal(prompt)
+        }
     }
 
     /// Remove the currently-selected goal, if any. Keeps `selected` valid.
@@ -876,6 +916,10 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if !self.pending_mcp_approvals.is_empty() {
             return self.handle_mcp_approval_key(key);
+        }
+
+        if self.pending_host_goal.is_some() {
+            return self.handle_host_checks_key(key);
         }
 
         if self.prompt_artifacts_open {
@@ -1507,14 +1551,12 @@ impl App {
                     self.mode = Mode::Settings;
                     return None;
                 }
-                self.goals
-                    .insert(0, GoalEntry::new(prompt.display_text.clone()));
-                self.selected = 0;
-                if self.mode == Mode::Task {
-                    Some(Intent::QueueTask(prompt))
-                } else {
-                    Some(Intent::QueueGoal(prompt))
+                let direct_task = self.mode == Mode::Task;
+                if self.host_checks_approved.is_none() {
+                    self.pending_host_goal = Some((prompt, direct_task));
+                    return None;
                 }
+                Some(self.queue_goal(prompt, direct_task))
             }
             KeyCode::Backspace => {
                 self.goal_prompt.delete_char_before();
@@ -2070,6 +2112,62 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.pending_mcp_approvals.is_empty() {
         render_mcp_approval(frame, area, app);
     }
+    if app.pending_host_goal.is_some() {
+        render_host_checks_prompt(frame, area);
+    }
+}
+
+/// Once-per-session question before the first goal: verification runs the
+/// project's own build and test commands, which is not sandboxed.
+fn render_host_checks_prompt(frame: &mut Frame, area: Rect) {
+    let w = 72.min(area.width.saturating_sub(4));
+    let h = 13.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+    let key = Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(MUTED);
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Verify runs your project's own checks (build, tests)",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            "  on this machine with your user permissions.",
+            Style::default().fg(Color::White),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  No isolation backend is configured. Without approval, Phonton",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  still plans and writes diffs, but cannot mark them verified.",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Y", key),
+            Span::styled(" allow for this session   ", muted),
+            Span::styled("N", key),
+            Span::styled(" run without checks   ", muted),
+            Span::styled("Esc", key),
+            Span::styled(" edit goal", muted),
+        ]),
+    ];
+    let block = Block::default()
+        .title(Span::styled(" Run checks on this machine? ", key))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Centred modal listing every keybinding in one place. Toggled by `?`,
@@ -6092,6 +6190,7 @@ async fn run_app<B: Backend>(
                                 &sandbox,
                                 &cfg,
                                 &working_dir,
+                                app.host_checks_approved.unwrap_or(false),
                             )
                             .await;
                         }
@@ -6874,7 +6973,13 @@ async fn spawn_goal(
     sandbox: &Arc<Sandbox>,
     cfg: &config::Config,
     working_dir: &std::path::PathBuf,
+    host_checks_approved: bool,
 ) {
+    let verification_execution = if host_checks_approved {
+        phonton_types::verification::VerificationExecution::HostApproved
+    } else {
+        phonton_types::verification::VerificationExecution::RequireIsolation
+    };
     let attachments = prepare_prompt_attachments(&prompt, working_dir);
     let display_text = prompt.display_text.clone();
     let prompt_artifacts = prompt.prompt_artifacts.clone();
@@ -7006,7 +7111,8 @@ async fn spawn_goal(
             let mut d =
                 phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
                     .with_task_id(task_id)
-                    .with_memory(memory_store.clone());
+                    .with_memory(memory_store.clone())
+                    .with_verification_execution(verification_execution);
             if let Some(ctx) = semantic_context.clone() {
                 d = d.with_semantic_context(ctx);
             }
@@ -7031,6 +7137,7 @@ async fn spawn_goal(
     let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), cfg);
 
     let mut orch = Orchestrator::new(dispatcher)
+        .with_verification_execution(verification_execution)
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
@@ -7595,7 +7702,10 @@ fn extract_id(line: &str) -> Option<String> {
 
     #[test]
     fn enter_queues_a_goal_and_clears_input() {
-        let mut app = App::default();
+        let mut app = App {
+            host_checks_approved: Some(false),
+            ..App::default()
+        };
         for c in "hello".chars() {
             app.handle_key(key(c));
         }
@@ -7612,6 +7722,7 @@ fn extract_id(line: &str) -> Option<String> {
     fn enter_in_task_mode_emits_direct_task_intent() {
         let mut app = App {
             mode: Mode::Task,
+            host_checks_approved: Some(false),
             ..App::default()
         };
         for c in "write one focused test".chars() {
@@ -7657,7 +7768,10 @@ fn extract_id(line: &str) -> Option<String> {
 
     #[test]
     fn enter_after_multiline_paste_queues_one_goal() {
-        let mut app = App::default();
+        let mut app = App {
+            host_checks_approved: Some(false),
+            ..App::default()
+        };
         assert!(app.handle_paste("do x\ndo y\ndo z".into()).is_none());
 
         let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -8025,6 +8139,38 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(app.quit_armed());
         assert_eq!(app.handle_key(esc), Some(Intent::Quit));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn first_goal_asks_for_host_checks_once() {
+        let mut app = App::default();
+        app.goal_prompt.insert_text("fix the parser");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.handle_key(enter), None);
+        assert!(app.pending_host_goal.is_some());
+        assert!(app.goals.is_empty());
+        let r = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(r, Some(Intent::QueueGoal(_))));
+        assert_eq!(app.host_checks_approved, Some(true));
+        assert_eq!(app.goals.len(), 1);
+
+        app.goal_prompt.insert_text("second goal");
+        assert!(matches!(app.handle_key(enter), Some(Intent::QueueGoal(_))));
+    }
+
+    #[test]
+    fn esc_on_host_checks_prompt_restores_goal_text() {
+        let mut app = App::default();
+        app.goal_prompt.insert_text("fix the parser");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
+        assert!(app.pending_host_goal.is_none());
+        assert_eq!(app.host_checks_approved, None);
+        assert_eq!(app.goal_prompt.text(), "fix the parser");
+        assert!(!app.should_quit);
     }
 
     #[test]
