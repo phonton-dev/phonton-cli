@@ -830,9 +830,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 }
             }
 
-            // Emit token-milestone events for each crossed boundary.
-            while tokens_used / TOKEN_MILESTONE_INTERVAL > last_milestone {
-                last_milestone += 1;
+            // Emit one token-milestone event for the highest boundary crossed.
+            // A single subtask often crosses several at once; one line each
+            // just floods the Flight Log.
+            let reached = tokens_used / TOKEN_MILESTONE_INTERVAL;
+            if reached > last_milestone {
+                last_milestone = reached;
                 self.emit(OrchestratorEvent::TokenMilestone {
                     task_id: self.task_id,
                     tokens_used,

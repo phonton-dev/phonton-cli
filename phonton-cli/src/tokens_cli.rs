@@ -89,7 +89,8 @@ impl TokenReport {
 }
 
 fn render(goal_text: &str, report: &TokenReport) -> String {
-    let mut out = format!("Why tokens: {goal_text}\n\n");
+    let goal: String = goal_text.chars().take(90).collect();
+    let mut out = format!("Why tokens: {goal}\n\n");
     if report.rows.is_empty() {
         out.push_str("No verified subtasks recorded provider usage for this goal.\n");
     }
@@ -100,7 +101,7 @@ fn render(goal_text: &str, report: &TokenReport) -> String {
                 .next()
                 .unwrap_or("")
                 .chars()
-                .take(60)
+                .take(42)
                 .collect();
         out.push_str(&format!(
             "  {:>7} in  {:>6} out  {:>7} cached  {}  [{}]{}\n",
