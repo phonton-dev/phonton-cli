@@ -312,21 +312,25 @@ impl Worker {
         } else {
             Vec::new()
         };
+        // The dispatcher and the worker both query the retriever; drop
+        // repeats so the same symbol is not billed twice.
+        let relevant_slices = dedupe_slices(&context_slices, relevant_slices);
         let origins: Vec<SliceOrigin> = context_slices
             .iter()
             .chain(relevant_slices.iter())
             .map(|s| s.origin)
             .collect();
-
-        // Ensure system prompt is in context (Verbatim, priority 10).
-        // Only push if it's not already the first frame.
-        {
-            let mut ctx = self.context.lock().await;
-            if ctx.frames().is_empty() {
-                ctx.push(ContextFrame::Verbatim(system_prompt.clone()))
-                    .await?;
-            }
-        }
+        // Exact current source for the files this subtask will edit. A
+        // unified diff must reproduce context lines byte-for-byte, so a
+        // worker that only sees signatures guesses and burns retries.
+        // The system prompt travels as the provider's system message only;
+        // it is no longer duplicated into the shared context window.
+        let target_sources = render_target_sources(
+            &subtask,
+            &context_slices,
+            &relevant_slices,
+            self.guard.project_root(),
+        );
 
         let mut last_errors: Vec<String> = prior_errors;
         let mut last_layer = VerifyLayer::Syntax;
@@ -345,6 +349,7 @@ impl Worker {
                     &context_slices,
                     &relevant_slices,
                     &last_errors,
+                    &target_sources,
                     self.mcp.as_deref(),
                     &mcp_results,
                 )
@@ -354,6 +359,7 @@ impl Worker {
                     &context_slices,
                     &relevant_slices,
                     &last_errors,
+                    &target_sources,
                     self.mcp.as_deref(),
                     &mcp_results,
                 )
@@ -374,7 +380,12 @@ impl Worker {
             // that will be superseded by the error-retry prompt.
             let full_prompt = {
                 let ctx = self.context.lock().await;
-                format!("{}\n\n{}", ctx.render(), user_prompt)
+                let history = ctx.render();
+                if history.is_empty() {
+                    user_prompt.clone()
+                } else {
+                    format!("# Earlier in this goal\n{history}\n\n{user_prompt}")
+                }
             };
 
             let response = self
@@ -567,17 +578,15 @@ impl Worker {
                         continue;
                     }
 
-                    // Success! Record this exchange in the shared context manager.
-                    // This is what allows subsequent subtasks to "remember"
-                    // what this subtask did.
+                    // Success! Record a compact outcome in the shared context so
+                    // later subtasks know what changed. The diff is already on
+                    // disk and later prompts carry current source, so replaying
+                    // the full prompt + diff here only grew every later call.
                     {
                         let mut ctx = self.context.lock().await;
                         ctx.push(ContextFrame::Summarizable {
-                            content: format!(
-                                "USER: {}\n\nASSISTANT: {}",
-                                user_prompt, response.content
-                            ),
-                            priority: 5, // SUMMARY_PRIORITY equivalent
+                            content: completion_history_frame(&subtask, &hunks),
+                            priority: COMPLETION_FRAME_PRIORITY,
                         })
                         .await?;
                     }
@@ -1076,6 +1085,7 @@ fn render_user_prompt(
     slices: &[CodeSlice],
     relevant: &[CodeSlice],
     prior_errors: &[String],
+    target_sources: &str,
     mcp: Option<&McpRuntime>,
     mcp_results: &[McpResultContext],
 ) -> String {
@@ -1104,7 +1114,9 @@ fn render_user_prompt(
     }
     out.push_str("# Subtask\n");
     out.push_str(&subtask.description);
-    out.push_str("\n\n# Context slices\n");
+    out.push_str("\n\n");
+    out.push_str(target_sources);
+    out.push_str("# Context slices\n");
     for s in slices {
         out.push_str(&format!(
             "- {} ({}): {}\n",
@@ -1177,6 +1189,7 @@ fn build_surgical_repair_context(
     slices: &[CodeSlice],
     relevant: &[CodeSlice],
     prior_errors: &[String],
+    target_sources: &str,
     _mcp: Option<&McpRuntime>,
     mcp_results: &[McpResultContext],
 ) -> String {
@@ -1244,6 +1257,7 @@ fn build_surgical_repair_context(
         ));
     }
     out.push('\n');
+    out.push_str(target_sources);
 
     // Include the exact errors causing verification failures
     if !prior_errors.is_empty() {
@@ -1276,6 +1290,148 @@ fn build_surgical_repair_context(
     out.push_str("Output the UNIFIED DIFF to fix the above errors. Every removed/context line and hunk count must match the captured source exactly. Never summarize the old side or use a whole-file replacement to bypass stale context; request current source if it is missing. Start with `--- a/` or `--- /dev/null`. NO PROSE.\n");
 
     out
+}
+
+/// Most files whose current source is inlined into one worker prompt.
+const MAX_TARGET_SOURCE_FILES: usize = 4;
+/// Largest single file inlined verbatim; bigger files are named, not sent.
+const MAX_TARGET_SOURCE_FILE_BYTES: usize = 24_000;
+/// Total inlined source budget per prompt.
+const MAX_TARGET_SOURCE_TOTAL_BYTES: usize = 48_000;
+/// Completion notes sit in the compressible band so a long goal can
+/// summarise them instead of carrying every note verbatim.
+const COMPLETION_FRAME_PRIORITY: u8 = 2;
+
+/// Drop slices from `relevant` that already appear in `primary`.
+fn dedupe_slices(primary: &[CodeSlice], relevant: Vec<CodeSlice>) -> Vec<CodeSlice> {
+    relevant
+        .into_iter()
+        .filter(|candidate| {
+            !primary.iter().any(|s| {
+                s.file_path == candidate.file_path && s.symbol_name == candidate.symbol_name
+            })
+        })
+        .collect()
+}
+
+/// One-paragraph record of a finished subtask for later subtasks in the goal.
+fn completion_history_frame(subtask: &Subtask, hunks: &[DiffHunk]) -> String {
+    let mut files: Vec<(String, usize, usize)> = Vec::new();
+    for hunk in hunks {
+        let path = hunk.file_path.to_string_lossy().replace('\\', "/");
+        let (added, removed) = hunk.lines.iter().fold((0, 0), |(a, r), line| match line {
+            DiffLine::Added(_) => (a + 1, r),
+            DiffLine::Removed(_) => (a, r + 1),
+            DiffLine::Context(_) => (a, r),
+        });
+        match files.iter_mut().find(|(p, _, _)| *p == path) {
+            Some(entry) => {
+                entry.1 += added;
+                entry.2 += removed;
+            }
+            None => files.push((path, added, removed)),
+        }
+    }
+    let summary = phonton_types::task_description_without_prior_context(&subtask.description)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let changed = files
+        .iter()
+        .map(|(p, a, r)| format!("{p} (+{a}/-{r})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Done: {}\nChanged: {}",
+        truncate_chars(summary, 240),
+        if changed.is_empty() { "nothing" } else { &changed }
+    )
+}
+
+/// Normalise a slice or mention path to a safe path relative to `root`.
+fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    let rel = if path.is_absolute() {
+        path.strip_prefix(root).ok()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    safe_relative_path(&rel).map(Path::to_path_buf)
+}
+
+/// Render the current contents of the files this subtask most likely edits:
+/// paths named in the description first, then files of retrieved slices.
+/// Files already attached to the subtask are skipped. Returns an empty
+/// string when nothing qualifies.
+fn render_target_sources(
+    subtask: &Subtask,
+    slices: &[CodeSlice],
+    relevant: &[CodeSlice],
+    root: &Path,
+) -> String {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let named = required_touch_files(&subtask.description);
+    let from_slices = slices.iter().chain(relevant).map(|s| s.file_path.clone());
+    for path in named.into_iter().chain(from_slices) {
+        let Some(rel) = relative_to_root(&path, root) else {
+            continue;
+        };
+        let already_attached = subtask
+            .attachments
+            .iter()
+            .any(|a| path_matches_required(&a.path, &rel));
+        if !already_attached && !candidates.iter().any(|c| c == &rel) {
+            candidates.push(rel);
+        }
+    }
+
+    let mut out = String::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut included = 0usize;
+    for rel in candidates {
+        if included >= MAX_TARGET_SOURCE_FILES {
+            break;
+        }
+        let Ok(bytes) = std::fs::read(root.join(&rel)) else {
+            continue;
+        };
+        let display = rel.to_string_lossy().replace('\\', "/");
+        if bytes.len() > MAX_TARGET_SOURCE_FILE_BYTES
+            || total + bytes.len() > MAX_TARGET_SOURCE_TOTAL_BYTES
+        {
+            // ponytail: whole-file or nothing; windowed excerpts around the
+            // retrieved symbols would cover large files if this skips too often.
+            skipped.push(format!("{display} ({} bytes)", bytes.len()));
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        total += text.len();
+        included += 1;
+        let lang = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
+        out.push_str(&format!("## {display}\n```{lang}\n{text}"));
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n");
+    }
+    if out.is_empty() && skipped.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "# Current source\nEdit against these exact lines. Context and removed lines must match byte-for-byte.\n",
+    );
+    section.push_str(&out);
+    if !skipped.is_empty() {
+        section.push_str(&format!(
+            "Too large to inline (edit only lines you can see in slices): {}\n",
+            skipped.join(", ")
+        ));
+    }
+    section.push('\n');
+    section
 }
 
 fn missing_required_touch_files(
@@ -1995,7 +2151,7 @@ mod tests {
             success: true,
             content: "- read_file".into(),
         }];
-        let prompt = render_user_prompt(&subtask, &[], &[], &[], Some(&runtime), &results);
+        let prompt = render_user_prompt(&subtask, &[], &[], &[], "", Some(&runtime), &results);
         assert!(prompt.contains("# MCP servers"));
         assert!(prompt.contains("docs (Docs)"));
         assert!(prompt.contains("# MCP results"));
@@ -2024,7 +2180,7 @@ mod tests {
             status: SubtaskStatus::Queued,
         };
 
-        let prompt = render_user_prompt(&subtask, &[], &[], &[], None, &[]);
+        let prompt = render_user_prompt(&subtask, &[], &[], &[], "", None, &[]);
 
         assert!(prompt.contains("# Prompt artifacts"));
         assert_eq!(prompt.matches("do x").count(), 1);
@@ -2057,6 +2213,7 @@ mod tests {
             &[],
             &[],
             &["broken_code.py hunk at old line 1 does not match worktree context".into()],
+            "",
             None,
             &[],
         );
@@ -2064,6 +2221,144 @@ mod tests {
         assert!(prompt.contains("broken_code.py"));
         assert!(prompt.contains("return value"));
         assert!(prompt.contains("Never summarize the old side"));
+    }
+
+    fn plain_subtask(description: &str) -> Subtask {
+        Subtask {
+            id: SubtaskId::new(),
+            description: description.into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        }
+    }
+
+    fn slice_for(path: &str, symbol: &str) -> CodeSlice {
+        CodeSlice {
+            file_path: PathBuf::from(path),
+            symbol_name: symbol.into(),
+            signature: format!("fn {symbol}()"),
+            docstring: None,
+            callsites: Vec::new(),
+            token_count: 4,
+            origin: SliceOrigin::Semantic,
+        }
+    }
+
+    #[test]
+    fn target_sources_inline_named_and_sliced_files_once() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/math.js"), "export const a = 1;\n").unwrap();
+        std::fs::write(temp.path().join("src/util.js"), "export const b = 2;\n").unwrap();
+        let subtask = plain_subtask("Fix the constant in src/math.js");
+        let slices = vec![slice_for("src/math.js", "a"), slice_for("src/util.js", "b")];
+
+        let rendered = render_target_sources(&subtask, &slices, &[], temp.path());
+        assert!(rendered.starts_with("# Current source"));
+        assert_eq!(rendered.matches("## src/math.js").count(), 1);
+        assert!(rendered.contains("export const a = 1;"));
+        assert!(rendered.contains("## src/util.js"));
+
+        let prompt = render_user_prompt(&subtask, &slices, &[], &[], &rendered, None, &[]);
+        assert!(prompt.contains("export const b = 2;"));
+    }
+
+    #[test]
+    fn target_sources_skip_oversized_and_escaping_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let big = "x".repeat(MAX_TARGET_SOURCE_FILE_BYTES + 1);
+        std::fs::write(temp.path().join("big.rs"), &big).unwrap();
+        let subtask = plain_subtask("Edit big.rs and ../outside.rs");
+        let rendered = render_target_sources(&subtask, &[], &[], temp.path());
+        assert!(rendered.contains("Too large to inline"));
+        assert!(!rendered.contains(&big));
+        assert!(!rendered.contains("outside.rs"));
+    }
+
+    #[test]
+    fn dedupe_drops_slices_already_selected() {
+        let primary = vec![slice_for("src/a.rs", "one")];
+        let kept = dedupe_slices(
+            &primary,
+            vec![slice_for("src/a.rs", "one"), slice_for("src/a.rs", "two")],
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].symbol_name, "two");
+    }
+
+    #[test]
+    fn completion_frame_is_compact_and_counts_lines() {
+        let subtask = plain_subtask("Fix add in src/math.js\nlong trailing detail");
+        let hunks = parse_unified_diff(
+            "--- a/src/math.js\n+++ b/src/math.js\n@@ -1,3 +1,3 @@\n export function add(a, b) {\n-  return a - b;\n+  return a + b;\n }\n",
+        )
+        .unwrap();
+        let frame = completion_history_frame(&subtask, &hunks);
+        assert_eq!(
+            frame,
+            "Done: Fix add in src/math.js\nChanged: src/math.js (+1/-1)"
+        );
+        assert!(!frame.contains("return a"));
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_replay_system_prompt_or_prior_prompts() {
+        #[derive(Clone, Default)]
+        struct Recording(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl Provider for Recording {
+            async fn call(
+                &self,
+                _system: &str,
+                user: &str,
+                _slice_origins: &[SliceOrigin],
+            ) -> Result<phonton_types::LLMResponse> {
+                self.0.lock().unwrap().push(user.to_string());
+                Ok(phonton_types::LLMResponse {
+                    content: "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1,1 @@\n+hi\n".into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    cache_creation_tokens: 0,
+                    provider: phonton_types::ProviderKind::OpenAiCompatible,
+                    model_name: "fixture".into(),
+                })
+            }
+            fn kind(&self) -> phonton_types::ProviderKind {
+                phonton_types::ProviderKind::OpenAiCompatible
+            }
+            fn model(&self) -> String {
+                "fixture".into()
+            }
+            fn clone_box(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Recording::default();
+        let calls = Arc::clone(&provider.0);
+        let worker = Worker::new(
+            Box::new(provider),
+            ExecutionGuard::new(temp.path().to_path_buf()),
+        );
+        for description in ["write notes first", "write notes second"] {
+            let _ = worker
+                .execute(plain_subtask(description), Vec::new())
+                .await
+                .unwrap();
+        }
+        let calls = calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        for prompt in calls.iter() {
+            assert!(!prompt.contains("You are a Phonton worker"));
+        }
+        let last = calls.last().unwrap();
+        assert!(!last.contains("USER:"), "prior prompts must not be replayed");
     }
 
     #[test]
