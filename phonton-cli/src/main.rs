@@ -2121,7 +2121,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// project's own build and test commands, which is not sandboxed.
 fn render_host_checks_prompt(frame: &mut Frame, area: Rect) {
     let w = 72.min(area.width.saturating_sub(4));
-    let h = 13.min(area.height.saturating_sub(2));
+    let h = 11.min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -3130,7 +3130,11 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         for w in &state.active_workers {
             let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
             spans.push(Span::raw(" "));
-            spans.push(Span::raw(short(&w.subtask_description, 50)));
+            // Worker descriptions can carry a "Prior context from memory"
+            // preamble for the model; show the user the task itself.
+            let task =
+                phonton_types::task_description_without_prior_context(&w.subtask_description);
+            spans.push(Span::raw(short(task.lines().next().unwrap_or(""), 50)));
             if w.is_thinking {
                 let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
                 let frame_ch = SPINNER[frame_idx];
