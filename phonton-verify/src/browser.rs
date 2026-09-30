@@ -1,384 +1,84 @@
-use anyhow::{anyhow, Result};
+//! Supervised static rendering checks; functional assertions remain explicit.
+use anyhow::Result;
+use phonton_types::verification::VerificationExecution;
 use phonton_types::{VerifyLayer, VerifyResult};
-use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use std::{path::Path, time::Duration};
 
-/// Layer 5: Non-interactive Playwright-based browser verification routines
-/// for generated web/Vite/HTML outputs.
-///
-/// Detects if there is an `index.html` or a web project. If present, spawns a
-/// background zero-dependency Node static server, launches headless Chromium
-/// via Playwright to run DOM click/interaction tests, takes a screenshot,
-/// and returns appropriate `VerifyResult` verdicts.
+/// Detect a web surface, requiring isolation before any browser execution.
 pub async fn verify_browser_check(working_dir: &Path) -> Result<Option<VerifyResult>> {
-    // 1. Detect if this is a web/HTML project
-    let has_html = working_dir.join("index.html").is_file();
-    let package_json = working_dir.join("package.json");
-    if !has_html && !package_json_looks_browser_runnable(&package_json) {
-        return Ok(None); // Skip if no web indicators are present
-    }
+    verify_browser_check_with_execution(working_dir, VerificationExecution::RequireIsolation).await
+}
 
-    // 2. Generate temporary Node.js scripts in the working directory
-    let server_script = working_dir.join("phonton-server.js");
-    let playwright_script = working_dir.join("phonton-playwright.js");
-    let screenshot_name = "phonton-screenshot.png";
-    let _screenshot_path = working_dir.join(screenshot_name);
-
-    let server_content = r#"
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-
-const port = process.argv[2] || 0; // 0 lets OS assign a free port
-const docRoot = process.argv[3] || '.';
-
-const mimeTypes = {
-  '.html': 'text/html',
-  '.js': 'text/javascript',
-  '.css': 'text/css',
-  '.json': 'application/json',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-};
-
-const server = http.createServer((req, res) => {
-  let filePath = path.join(docRoot, req.url === '/' ? 'index.html' : req.url.split('?')[0]);
-  const extname = String(path.extname(filePath)).toLowerCase();
-  const contentType = mimeTypes[extname] || 'application/octet-stream';
-
-  fs.readFile(filePath, (error, content) => {
-    if (error) {
-      if (error.code === 'ENOENT') {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('404 Not Found');
-      } else {
-        res.writeHead(500);
-        res.end(`Server Error: ${error.code}`);
-      }
-    } else {
-      res.writeHead(200, { 'Content-Type': contentType });
-      res.end(content, 'utf-8');
-    }
-  });
-});
-
-server.listen(port, '127.0.0.1', () => {
-  console.log(`SERVER_RUNNING:${server.address().port}`);
-});
-"#;
-
-    let playwright_content = r#"
-const { chromium } = require('playwright');
-
-(async () => {
-  const url = process.env.PHONTON_URL || 'http://127.0.0.1:8080';
-  const screenshotPath = process.env.PHONTON_SCREENSHOT || 'phonton-screenshot.png';
-
-  const errors = [];
-  const logMessages = [];
-
-  let browser;
-  try {
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-
-    page.on('pageerror', (err) => {
-      errors.push(`Page Error: ${err.message}`);
-    });
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') {
-        errors.push(`Console Error: ${msg.text()}`);
-      } else {
-        logMessages.push(`[${msg.type()}] ${msg.text()}`);
-      }
-    });
-
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
-
-    // Check basic rendering
-    const title = await page.title();
-    const content = await page.content();
-    if (!content || content.trim().length === 0) {
-      errors.push('Page is completely empty');
-    }
-
-    // Interaction checks - e.g., Counter Click test
-    const buttons = await page.$$('button');
-    let counterClicked = false;
-    for (const btn of buttons) {
-      const txt = await btn.textContent();
-      if (txt.toLowerCase().includes('click') || txt.toLowerCase().includes('count') || txt.toLowerCase().includes('+')) {
-        await btn.click();
-        counterClicked = true;
-        await page.waitForTimeout(200);
-        break;
-      }
-    }
-
-    // Chess board click test:
-    const board = await page.$('.board, #board, [class*="board"], [id*="board"]');
-    let chessInteraction = false;
-    if (board) {
-      const squares = await page.$$('.square, [class*="square"], [id*="square"], svg g g');
-      if (squares.length >= 2) {
-        await squares[0].click();
-        await page.waitForTimeout(200);
-        await squares[1].click();
-        await page.waitForTimeout(200);
-        chessInteraction = true;
-      }
-    }
-
-    // Check for obvious crash text
-    const bodyText = await page.innerText('body');
-    if (bodyText.toLowerCase().includes('error') && !bodyText.toLowerCase().includes('no error') && !chessInteraction) {
-      errors.push(`Possible error text visible: "${bodyText.substring(0, 100)}..."`);
-    }
-
-    // Take screenshot
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-
-    const summary = [
-      `Title: "${title}"`,
-      counterClicked ? 'Executed counter button click simulation successfully.' : 'No counter button clicked.',
-      chessInteraction ? 'Detected chess board/squares and simulated pieces movement successfully.' : 'No active chess interaction simulated.',
-      `Unhandled Errors/Exceptions: ${errors.length}`,
-      `Total console log trace rows: ${logMessages.length}`
-    ].join(' | ');
-
-    console.log('PHONTON_JSON:' + JSON.stringify({
-      success: errors.length === 0,
-      errors: errors,
-      summary: summary
-    }));
-
-  } catch (err) {
-    console.log('PHONTON_JSON:' + JSON.stringify({
-      success: false,
-      errors: [String(err.message || err)],
-      summary: 'Playwright execution encountered an exception'
-    }));
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
-  }
-})();
-"#;
-
-    std::fs::write(&server_script, server_content)?;
-    std::fs::write(&playwright_script, playwright_content)?;
-
-    // Create the scope guard to guarantee cleanup of files and child process on any exit path.
-    let mut guard = BrowserCheckGuard {
-        server_script: &server_script,
-        playwright_script: &playwright_script,
-        server_child: None,
-    };
-
-    // 3. Start the background Node static file server
-    let mut server_child = match Command::new("node")
-        .arg("phonton-server.js")
-        .arg("0") // Listen on a free port
-        .current_dir(working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+/// Run a static render smoke through the shared executor with explicit authority.
+/// This proves neither application functionality nor filesystem/network isolation.
+pub async fn verify_browser_check_with_execution(
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<Option<VerifyResult>> {
+    if !working_dir.join("index.html").is_file()
+        && !package_json_looks_browser_runnable(&working_dir.join("package.json"))
     {
-        Ok(child) => child,
-        Err(e) => {
-            return Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::BrowserCheck,
-                errors: vec![format!("failed to spawn node background server: {e}")],
-                attempt: 1,
-            }));
-        }
+        return Ok(None);
+    }
+    if policy == VerificationExecution::RequireIsolation {
+        return Ok(Some(VerifyResult::Unavailable { reason: "Browser verification unavailable: no isolation backend is configured and host execution was not approved.".into() }));
+    }
+    if !working_dir.join("index.html").is_file() {
+        return Ok(Some(VerifyResult::Unavailable { reason: "Browser verification unavailable: this project needs an explicit build/start/test command; static rendering cannot verify it.".into() }));
+    }
+    let evidence = tempfile::tempdir()?;
+    let script = evidence.path().join("render-check.cjs");
+    std::fs::write(&script, include_str!("browser_check.cjs"))?;
+    let mut module_roots = Vec::new();
+    for root in working_dir.ancestors().take(16) {
+        module_roots.push(root.to_path_buf());
+    }
+    if let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        module_roots.push(root.to_path_buf());
+    }
+    let output = match crate::executor::run(
+        working_dir,
+        "node",
+        vec![
+            script.to_string_lossy().into(),
+            serde_json::to_string(&module_roots)?,
+        ],
+        Duration::from_secs(45),
+        policy,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(unavailable) => return Ok(Some(unavailable)),
     };
-
-    // Discover the port the server bound to from its stdout
-    let stdout = server_child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to read node server stdout"))?;
-
-    // Arm the guard with the child process to prevent background zombie process leaks
-    guard.server_child = Some(server_child);
-
-    let mut reader = BufReader::new(stdout).lines();
-
-    let port_discovery = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(rest) = line.strip_prefix("SERVER_RUNNING:") {
-                return Ok(rest.trim().parse::<u16>()?);
-            }
-        }
-        Err(anyhow!("node server closed stdout before printing port"))
-    })
-    .await;
-
-    let port = match port_discovery {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            return Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::BrowserCheck,
-                errors: vec![format!("node server failed to start: {e}")],
-                attempt: 1,
-            }));
-        }
-        Err(_) => {
-            return Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::BrowserCheck,
-                errors: vec!["node server port discovery timed out after 5s".into()],
-                attempt: 1,
-            }));
-        }
-    };
-
-    let url = format!("http://127.0.0.1:{port}");
-
-    // Construct robust NODE_PATH to resolve 'playwright' module
-    let mut node_paths = Vec::new();
-    node_paths.push(working_dir.join("node_modules"));
-
-    let mut current = working_dir;
-    while let Some(parent) = current.parent() {
-        node_paths.push(parent.join("node_modules"));
-        current = parent;
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut cur = cwd.as_path();
-        node_paths.push(cur.join("node_modules"));
-        while let Some(parent) = cur.parent() {
-            node_paths.push(parent.join("node_modules"));
-            cur = parent;
-        }
-    }
-
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        if let Some(parent) = Path::new(manifest_dir).parent() {
-            node_paths.push(parent.join("node_modules"));
-        }
-    }
-
-    let mut path_strings = Vec::new();
-    for p in node_paths {
-        if p.exists() {
-            if let Some(s) = p.to_str() {
-                path_strings.push(s.to_string());
-            }
-        }
-    }
-
-    if let Ok(val) = std::env::var("NODE_PATH") {
-        path_strings.push(val);
-    }
-
-    let separator = if cfg!(windows) { ";" } else { ":" };
-    let joined_paths = path_strings.join(separator);
-
-    // 5. Run the Playwright verification script using `npx playwright test`
-    // 5. Run the Playwright verification script using `node`
-    let mut cmd = Command::new("node");
-    cmd.arg("phonton-playwright.js")
-        .env("PHONTON_URL", &url)
-        .env("PHONTON_SCREENSHOT", screenshot_name)
-        .current_dir(working_dir);
-
-    if !joined_paths.is_empty() {
-        cmd.env("NODE_PATH", joined_paths);
-    }
-
-    let playwright_cmd = cmd.output();
-
-    let playwright_output = tokio::time::timeout(Duration::from_secs(45), playwright_cmd).await;
-
-    // Shutdown background server explicitly (otherwise the guard will kill it on drop)
-    if let Some(mut child) = guard.server_child.take() {
-        let _ = child.kill().await;
-    }
-
-    let output = match playwright_output {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            return Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::BrowserCheck,
-                errors: vec![format!("could not invoke playwright check: {e}")],
-                attempt: 1,
-            }));
-        }
-        Err(_) => {
-            return Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::BrowserCheck,
-                errors: vec!["playwright check timed out after 45s".into()],
-                attempt: 1,
-            }));
-        }
-    };
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let json_line = stdout_str
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result = stdout
         .lines()
-        .find(|line| line.starts_with("PHONTON_JSON:"))
-        .map(|line| &line["PHONTON_JSON:".len()..]);
-
-    let parsed: serde_json::Value = match json_line {
-        Some(json_str) => match serde_json::from_str(json_str) {
-            Ok(val) => val,
-            Err(e) => {
-                let stderr_str = String::from_utf8_lossy(&output.stderr);
-                return Ok(Some(VerifyResult::Fail {
-                    layer: VerifyLayer::BrowserCheck,
-                    errors: vec![
-                        format!("failed to parse playwright JSON output: {e}"),
-                        format!("Playwright stdout: {stdout_str}"),
-                        format!("Playwright stderr: {stderr_str}"),
-                    ],
-                    attempt: 1,
-                }));
-            }
-        },
-        None => {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            return Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::BrowserCheck,
-                errors: vec![
-                    "playwright test did not emit PHONTON_JSON prefix".to_string(),
-                    format!("Playwright stdout: {stdout_str}"),
-                    format!("Playwright stderr: {stderr_str}"),
-                ],
-                attempt: 1,
-            }));
-        }
+        .filter_map(|line| line.strip_prefix("PHONTON_JSON:"))
+        .next_back()
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+    let Some(result) = result else {
+        return Ok(Some(VerifyResult::Unavailable {
+            reason: format!(
+                "Browser verification unavailable: missing result; {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }));
     };
-
-    let success = parsed
-        .get("success")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-    let _summary = parsed
-        .get("summary")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let errors = parsed
-        .get("errors")
-        .and_then(|e| e.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|v| v.as_str().unwrap_or("").to_string())
-                .collect::<Vec<String>>()
+    let errors: Vec<String> = result["errors"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
         })
         .unwrap_or_default();
-
-    if success {
-        // Save the screenshot_path and rendering_summary in outcome ledger context if passed
+    if result["unavailable"] == true || !output.status.success() {
+        Ok(Some(VerifyResult::Unavailable {
+            reason: format!("Browser verification unavailable: {}", errors.join("; ")),
+        }))
+    } else if result["success"] == true && errors.is_empty() {
         Ok(Some(VerifyResult::Pass {
             layer: VerifyLayer::BrowserCheck,
         }))
@@ -433,20 +133,4 @@ fn package_json_looks_browser_runnable(path: &Path) -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-struct BrowserCheckGuard<'a> {
-    server_script: &'a Path,
-    playwright_script: &'a Path,
-    server_child: Option<tokio::process::Child>,
-}
-
-impl<'a> Drop for BrowserCheckGuard<'a> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.server_script);
-        let _ = std::fs::remove_file(self.playwright_script);
-        if let Some(mut child) = self.server_child.take() {
-            let _ = child.start_kill();
-        }
-    }
 }

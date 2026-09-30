@@ -196,7 +196,13 @@ pub fn trust_grant(params: Value) -> Result<Value> {
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("trust.grant requires params.path"))?;
-    let workspace = PathBuf::from(path);
+    let workspace = PathBuf::from(path).canonicalize()?;
+    let active_workspace = std::env::current_dir()?.canonicalize()?;
+    if workspace != active_workspace {
+        return Err(anyhow!(
+            "Trust can only be granted for the active Desktop project"
+        ));
+    }
     trust::record_trust(&workspace)?;
     Ok(json!({ "ok": true, "trusted": trust::is_trusted(&workspace) }))
 }

@@ -28,7 +28,8 @@ async fn run_watch(workspace: &Path) -> Result<i32> {
         "phonton index: watching {} (Ctrl+C to stop)",
         workspace.display()
     );
-    let embedder = Embedder::new().context("load embedding model for semantic index")?;
+    let embedder = Embedder::new_for_workspace(workspace)
+        .context("load embedding model for semantic index")?;
     let index = index_workspace_using_embedder(workspace, &embedder)
         .await
         .context("build initial semantic index")?;

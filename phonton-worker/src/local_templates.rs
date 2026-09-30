@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use phonton_types::verification::VerificationExecution;
 use phonton_types::{
     DiffHunk, DiffLine, ModelTier, ProviderKind, Subtask, SubtaskResult, SubtaskStatus, TokenUsage,
     VerifyResult,
@@ -27,6 +28,7 @@ pub async fn try_dispatch(
     subtask: &Subtask,
     project_root: &Path,
     model_tier: ModelTier,
+    verification_execution: VerificationExecution,
 ) -> Result<Option<SubtaskResult>> {
     if local_seeds_disabled() {
         return Ok(None);
@@ -42,7 +44,13 @@ pub async fn try_dispatch(
         hunks.push(whole_file_hunk(&path, old.as_deref(), file.contents));
     }
 
-    let verdict = phonton_verify::verify_diff(&hunks, project_root).await?;
+    let verdict = phonton_verify::verify_diff_with_execution(
+        &hunks,
+        project_root,
+        None,
+        verification_execution,
+    )
+    .await?;
     match verdict {
         VerifyResult::Pass { .. } => Ok(Some(SubtaskResult {
             id: subtask.id,
@@ -58,7 +66,10 @@ pub async fn try_dispatch(
             token_usage: TokenUsage::default(),
         })),
         // Failed seed in the wrong repo must not replace the provider loop.
-        VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => Ok(None),
+        VerifyResult::Fail { .. }
+        | VerifyResult::Escalate { .. }
+        | VerifyResult::Unavailable { .. }
+        | VerifyResult::NotRun { .. } => Ok(None),
     }
 }
 
@@ -74,9 +85,8 @@ fn local_seeds_disabled() -> bool {
 }
 
 fn match_template(description: &str) -> Option<LocalTemplateMatch> {
-    // Planner prepends memory as a preamble separated by a blank line. Match
-    // only the actual subtask so a prior chess/receipt run cannot hijack a
-    // new goal.
+    // Match the whole task after removing a recognized context preamble. A
+    // genuine multi-paragraph goal may put an exclusion in its first paragraph.
     let lower = description_for_match(description).to_ascii_lowercase();
     // Syntax preflight must win before chess: planner text can mention "rules"
     // without referring to chessRules.ts.
@@ -132,11 +142,12 @@ fn match_template(description: &str) -> Option<LocalTemplateMatch> {
 }
 
 fn description_for_match(description: &str) -> &str {
-    description
-        .rsplit("\n\n")
-        .next()
-        .unwrap_or(description)
-        .trim()
+    if description.contains(phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR)
+        || description.trim_start().starts_with("# Prior context")
+    {
+        return phonton_types::task_description_without_prior_context(description);
+    }
+    description.trim()
 }
 
 fn is_chess_rules_seed(lower: &str) -> bool {
@@ -214,6 +225,12 @@ mod tests {
     fn detects_chess_rules_seed_slice() {
         let desc = "Existing Vite React chess app acceptance slice 1/4: create a compile-safe local chess rules seed";
         assert!(is_chess_rules_seed(&desc.to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn full_multiline_task_keeps_earlier_template_exclusion() {
+        let desc = "Repair broken_code.py syntax errors.\n\nA previous compile-safe local chess rules seed did not address this.";
+        assert!(match_template(desc).is_none());
     }
 
     #[test]

@@ -597,7 +597,11 @@ pub async fn decompose_with_memory(
     let preamble = render_memory_preamble(&rejected, &decisions, &constraints, &conventions);
     if !preamble.is_empty() {
         if let Some(first) = plan.subtasks.first_mut() {
-            first.description = format!("{preamble}\n\n{}", first.description);
+            first.description = format!(
+                "{preamble}{}{}",
+                phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR,
+                first.description
+            );
         }
     }
     plan.plan_graph = PlanGraph::from_subtasks(
@@ -635,7 +639,11 @@ pub async fn decompose_with_memory_store(
     }
 
     if let Some(first) = plan.subtasks.first_mut() {
-        first.description = format!("{preamble}\n{}", first.description);
+        first.description = format!(
+            "{preamble}{}{}",
+            phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR,
+            first.description
+        );
     }
     plan.plan_graph = PlanGraph::from_subtasks(
         &plan.subtasks,
@@ -1159,17 +1167,20 @@ Validate maxRetries as an integer from 0 through 10.";
         store
             .append_memory(&MemoryRecord::Decision {
                 title: "use mpsc for parse_callsites".into(),
-                body: "channels avoided lock contention".into(),
+                body: "channels avoided lock contention\n\nKeep the worker prompt small".into(),
                 task_id: None,
             })
             .unwrap();
-        let plan =
-            decompose_with_memory(&Goal::new("add a function parse_callsites"), &store, None)
-                .await
-                .unwrap();
+        let goal = Goal::new("add a function parse_callsites");
+        let expected = decompose(&goal).subtasks[0].description.clone();
+        let plan = decompose_with_memory(&goal, &store, None).await.unwrap();
         let first = &plan.subtasks[0];
         assert!(first.description.contains("Prior context from memory"));
         assert!(first.description.contains("parse_callsites"));
+        assert_eq!(
+            phonton_types::task_description_without_prior_context(&first.description),
+            expected
+        );
     }
 
     #[tokio::test]

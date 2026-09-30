@@ -11,7 +11,7 @@ See `phonton doctor --provider` for a live completion probe.
 cd your-repo
 phonton demo trust-loop    # local proof without spending tokens
 phonton                     # TUI: submit a goal
-phonton goal "fix the failing test" --yes   # headless
+phonton goal "fix the failing test" --yes --allow-host-checks   # headless, after reviewing repo checks
 phonton review latest       # receipt + diffs
 ```
 
@@ -32,6 +32,9 @@ When a goal pauses on budget, resume with:
 ```bash
 phonton goal --resume <task-id>
 ```
+
+Resume from the original repository. Pass `--allow-host-checks` again if you
+approve host verification for the resumed run.
 
 ## Incremental index
 

@@ -1,4 +1,4 @@
-//! `~/.phonton/config.toml` loader.
+//! `~/.phonton/config.toml` loader with an optional per-process path override.
 //!
 //! Provides the [`Config`] struct and [`load`] function. On first run the
 //! file is absent; [`load`] returns a default config rather than an error.
@@ -192,18 +192,36 @@ impl BudgetConfig {
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Return the path to `~/.phonton/config.toml`.
+/// Return the config path, honoring an explicit per-process override.
 pub fn config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("config.toml"))
+    config_path_for(std::env::var_os("PHONTON_CONFIG_PATH"), dirs::home_dir())
 }
 
-/// Load configuration from `~/.phonton/config.toml`.
+fn config_path_for(
+    override_path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match override_path.filter(|path| !path.is_empty()) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            path.is_absolute().then_some(path)
+        }
+        None => home.map(|h| h.join(".phonton").join("config.toml")),
+    }
+}
+
+/// Load configuration from the resolved config path.
 ///
 /// Returns `Config::default()` when the file is absent. Returns an error
 /// only when the file exists but cannot be parsed.
 pub fn load() -> Result<Config> {
     let path = match config_path() {
         Some(p) => p,
+        None if std::env::var_os("PHONTON_CONFIG_PATH").is_some_and(|path| !path.is_empty()) => {
+            return Err(anyhow::anyhow!(
+                "PHONTON_CONFIG_PATH must be an absolute path"
+            ));
+        }
         None => return Ok(Config::default()),
     };
 
@@ -220,10 +238,15 @@ pub fn load() -> Result<Config> {
     Ok(cfg)
 }
 
-/// Save configuration to `~/.phonton/config.toml`.
+/// Save configuration to the resolved config path.
 pub fn save(cfg: &Config) -> Result<()> {
     let path = match config_path() {
         Some(p) => p,
+        None if std::env::var_os("PHONTON_CONFIG_PATH").is_some_and(|path| !path.is_empty()) => {
+            return Err(anyhow::anyhow!(
+                "PHONTON_CONFIG_PATH must be an absolute path"
+            ));
+        }
         None => return Err(anyhow::anyhow!("could not determine config path")),
     };
 
@@ -388,6 +411,29 @@ mode = "ask"
     fn empty_file_is_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.provider.name, "anthropic");
+    }
+
+    #[test]
+    fn config_path_override_is_isolated_from_normal_home() {
+        let home = PathBuf::from("normal-home");
+        let isolated = if cfg!(windows) {
+            PathBuf::from(r"C:\isolated\config.toml")
+        } else {
+            PathBuf::from("/isolated/config.toml")
+        };
+        assert_eq!(
+            config_path_for(Some(isolated.clone().into_os_string()), Some(home.clone())),
+            Some(isolated)
+        );
+        assert_eq!(
+            config_path_for(Some(std::ffi::OsString::new()), Some(home.clone())),
+            Some(home.join(".phonton").join("config.toml"))
+        );
+        assert_eq!(
+            config_path_for(Some("relative-config.toml".into()), Some(home)),
+            None
+        );
+        assert_eq!(config_path_for(None, None), None);
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! In particular, `SubtaskReviewReady` is emitted only after verification
 //! passes, so this command never presents an unverified worker diff as ready.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -11,8 +13,8 @@ use phonton_diff::DiffApplier;
 use phonton_store::TaskRecord;
 use phonton_types::{
     reference_pricing_for_tier, ContextAttribution, CostReceipt, CostSummary, DiffHunk, DiffLine,
-    EventRecord, HandoffPacket, ModelTier, OrchestratorEvent, RouteOutcome, RouteStep, TaskId,
-    TaskStatus, TokenUsage,
+    EventRecord, HandoffPacket, ModelTier, OrchestratorEvent, RollbackPoint, RouteOutcome,
+    RouteStep, TaskId, TaskStatus, TokenUsage,
 };
 use serde::Serialize;
 
@@ -92,7 +94,7 @@ pub fn parse_request(args: &[String]) -> Result<ReviewRequest> {
             "--json" => options.json = true,
             "-h" | "--help" => {
                 return Err(anyhow::anyhow!(
-                    "usage: phonton review [--json] [latest|<task-id>]\n       phonton review approve [--json] [latest|<task-id>]\n       phonton review reject [--json] [latest|<task-id>]\n       phonton review rollback [--json] [latest|<task-id>] <seq>"
+                    "usage: phonton review [--json] [latest|<task-id>]\n       phonton review approve [--json] [latest|<task-id>]\n       phonton review reject [--json] [latest|<task-id>]\n       phonton review rollback [--json] [latest|<task-id>] <seq>  (disabled: unsafe legacy reset)"
                 ));
             }
             other if other.starts_with('-') => {
@@ -189,6 +191,27 @@ pub async fn run(args: &[String]) -> Result<i32> {
     match request.action {
         ReviewAction::Show => {}
         ReviewAction::Approve => {
+            let refusal = approval_refusal(&task, &report)
+                .map(str::to_owned)
+                .or_else(|| {
+                    std::env::current_dir()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|cwd| reviewed_checkpoint_identity(&task, &report, &cwd))
+                        .err()
+                        .map(|error| error.to_string())
+                });
+            if let Some(reason) = refusal {
+                print_action_report(
+                    &ActionReport {
+                        task_id: task.id.to_string(),
+                        action: "approve-refused".into(),
+                        status: task.status.clone(),
+                        detail: reason,
+                    },
+                    request.options.json,
+                )?;
+                return Ok(1);
+            }
             return finish_task(
                 &store,
                 task,
@@ -223,6 +246,109 @@ pub async fn run(args: &[String]) -> Result<i32> {
     }
 
     Ok(if report.review_items.is_empty() { 1 } else { 0 })
+}
+
+fn approval_refusal(task: &TaskRecord, report: &ReviewReport) -> Option<&'static str> {
+    if !matches!(
+        serde_json::from_value::<TaskStatus>(task.status.clone()),
+        Ok(TaskStatus::Reviewing { .. })
+    ) {
+        return Some("Only a task in Reviewing can be approved.");
+    }
+    if report.review_items.is_empty()
+        || report
+            .review_items
+            .iter()
+            .any(|item| item.diff_hunks.is_empty())
+    {
+        return Some("No verified change payload is ready to approve.");
+    }
+    None
+}
+
+fn reviewed_checkpoint_identity(
+    task: &TaskRecord,
+    report: &ReviewReport,
+    cwd: &Path,
+) -> Result<()> {
+    let checkpoint = report
+        .checkpoints
+        .iter()
+        .max_by_key(|checkpoint| checkpoint.seq)
+        .ok_or_else(|| anyhow::anyhow!("No Git checkpoint proves the reviewed files"))?;
+    if report.review_items.iter().any(|item| {
+        !report
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.subtask_id == item.subtask_id)
+    }) {
+        return Err(anyhow::anyhow!(
+            "A reviewed change has no matching checkpoint"
+        ));
+    }
+    let diff = DiffApplier::open(cwd)?;
+    let repo = diff.repo();
+    let ref_name = format!("refs/phonton/checkpoints/{}/{}", task.id, checkpoint.seq);
+    let current_oid = repo
+        .find_reference(&ref_name)?
+        .target()
+        .ok_or_else(|| anyhow::anyhow!("Reviewed checkpoint has no commit"))?;
+    if current_oid.to_string() != checkpoint.commit_oid {
+        return Err(anyhow::anyhow!(
+            "Reviewed checkpoint changed since the task finished"
+        ));
+    }
+    let tree = repo.find_commit(current_oid)?.tree()?;
+    let mut index = repo.index()?;
+    index.read(true)?;
+    let root = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("Reviewed repository has no worktree"))?;
+    let mut paths = BTreeSet::new();
+    for item in &report.review_items {
+        for hunk in &item.diff_hunks {
+            paths.insert(diff.repository_relative_path(&hunk.file_path)?);
+        }
+    }
+    for path in paths {
+        let saved = tree.get_path(&path)?;
+        let staged = index.get_path(&path, 0).ok_or_else(|| {
+            anyhow::anyhow!("Reviewed file {} is no longer staged", path.display())
+        })?;
+        if saved.kind() != Some(git2::ObjectType::Blob)
+            || saved.id() != staged.id
+            || saved.filemode() as u32 != staged.mode
+        {
+            return Err(anyhow::anyhow!(
+                "Reviewed file {} differs from its checkpoint in the Git index",
+                path.display()
+            ));
+        }
+        if !std::fs::symlink_metadata(root.join(&path))?
+            .file_type()
+            .is_file()
+        {
+            return Err(anyhow::anyhow!(
+                "Reviewed file {} is no longer a regular file",
+                path.display()
+            ));
+        }
+        let status = repo.status_file(&path)?;
+        if status.intersects(
+            git2::Status::WT_NEW
+                | git2::Status::WT_MODIFIED
+                | git2::Status::WT_DELETED
+                | git2::Status::WT_TYPECHANGE
+                | git2::Status::WT_RENAMED
+                | git2::Status::CONFLICTED,
+        ) {
+            return Err(anyhow::anyhow!(
+                "Reviewed file {} changed in the worktree since verification",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub async fn fetch_report(task_ref: Option<&str>) -> Result<Option<ReviewReport>> {
@@ -261,8 +387,8 @@ async fn finish_task(
         task.id,
         action,
         match action {
-            "approve" => "Task marked Done.",
-            "reject" => "Task marked Rejected.",
+            "approve" => "Task marked Done. Hosted edits were already staged before review.",
+            "reject" => "Task marked Rejected. Hosted edits remain staged for manual review.",
             _ => "Task updated.",
         },
     )?;
@@ -272,8 +398,10 @@ async fn finish_task(
         action: action.into(),
         status: status_json,
         detail: match action {
-            "approve" => "Task marked Done.".into(),
-            "reject" => "Task marked Rejected.".into(),
+            "approve" => "Task marked Done. Hosted edits were already staged before review.".into(),
+            "reject" => {
+                "Task marked Rejected. Hosted edits remain staged for manual review.".into()
+            }
             _ => "Task updated.".into(),
         },
     };
@@ -429,7 +557,10 @@ pub fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport 
                     .unwrap_or_default();
                 review_items.push(ReviewItem {
                     subtask_id: subtask_id.to_string(),
-                    description,
+                    description: phonton_types::task_description_without_prior_context(
+                        &description,
+                    )
+                    .to_string(),
                     tier: tier.to_string(),
                     tokens_used,
                     token_usage,
@@ -446,7 +577,10 @@ pub fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport 
         }
     }
 
-    let handoff = task.outcome_ledger.and_then(|ledger| ledger.handoff);
+    let mut handoff = task.outcome_ledger.and_then(|ledger| ledger.handoff);
+    if let Some(packet) = &mut handoff {
+        sanitize_rollback_labels(&mut packet.rollback_points, &checkpoints, &review_items);
+    }
     let from_items = cost_receipt_from_items(&review_items);
     let cost_receipt = match &handoff {
         Some(packet)
@@ -470,6 +604,30 @@ pub fn build_report(task: TaskRecord, events: Vec<EventRecord>) -> ReviewReport 
     }
 }
 
+fn sanitize_rollback_labels(
+    points: &mut [RollbackPoint],
+    checkpoints: &[CheckpointItem],
+    review_items: &[ReviewItem],
+) {
+    for point in points {
+        if !point.label.trim_start().starts_with("# Prior context") {
+            continue;
+        }
+        let task = checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.seq == point.seq)
+            .and_then(|checkpoint| {
+                review_items
+                    .iter()
+                    .find(|item| item.subtask_id == checkpoint.subtask_id)
+            })
+            .map(|item| item.description.as_str());
+        point.label = task
+            .map(|task| task.chars().take(120).collect())
+            .unwrap_or_else(|| format!("Verified checkpoint #{}", point.seq));
+    }
+}
+
 fn parse_tier(raw: &str) -> ModelTier {
     match raw {
         "local" => ModelTier::Local,
@@ -483,7 +641,7 @@ fn parse_tier(raw: &str) -> ModelTier {
 fn cost_receipt_from_items(items: &[ReviewItem]) -> CostReceipt {
     let mut usage = TokenUsage::default();
     let mut actual = 0u64;
-    let mut known = false;
+    let mut known = !items.is_empty();
     let mut route = Vec::new();
     for item in items {
         usage.input_tokens = usage
@@ -498,8 +656,8 @@ fn cost_receipt_from_items(items: &[ReviewItem]) -> CostReceipt {
         let tier = parse_tier(&item.tier);
         if item.cost.pricing_known {
             actual = actual.saturating_add(item.cost.total_usd_micros);
-            known = true;
         } else {
+            known = false;
             actual = actual.saturating_add(reference_pricing_for_tier(tier).cost_micros(
                 item.token_usage.input_tokens,
                 item.token_usage.output_tokens,
@@ -526,7 +684,7 @@ fn print_text_report(report: &ReviewReport) {
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "n/a".into());
         println!(
-            "cost:   ${:.4}  frontier: ${:.4}  saved: {}",
+            "cost est.: ${:.4}  frontier est.: ${:.4}  saved est.: {}",
             report.cost_receipt.actual_usd_micros as f64 / 1_000_000.0,
             report.cost_receipt.frontier_equivalent_usd_micros as f64 / 1_000_000.0,
             pct
@@ -585,7 +743,7 @@ fn print_text_report(report: &ReviewReport) {
             item.context_token_count
         );
         let price = if item.cost.pricing_known {
-            format!("{} micros", item.cost.total_usd_micros)
+            format!("{} micros estimated", item.cost.total_usd_micros)
         } else {
             "unknown pricing".into()
         };
@@ -713,6 +871,179 @@ mod tests {
     }
 
     #[test]
+    fn approval_requires_reviewing_and_a_verified_change_payload() {
+        let id = TaskId::new();
+        let make_task = |status: TaskStatus| TaskRecord {
+            id,
+            goal_text: "edit code".into(),
+            status: serde_json::to_value(status).unwrap(),
+            created_at: 1,
+            total_tokens: 1,
+            outcome_ledger: None,
+        };
+        let mut report = ReviewReport {
+            task_id: id.to_string(),
+            goal: "edit code".into(),
+            status: serde_json::Value::Null,
+            total_tokens: 1,
+            cost_receipt: CostReceipt::default(),
+            handoff: None,
+            checkpoints: vec![],
+            review_items: vec![],
+        };
+        let reviewing = || TaskStatus::Reviewing {
+            tokens_used: 1,
+            estimated_savings_tokens: 0,
+        };
+        assert!(approval_refusal(&make_task(reviewing()), &report).is_some());
+        report.review_items.push(ReviewItem {
+            subtask_id: SubtaskId::new().to_string(),
+            description: "edit code".into(),
+            tier: "standard".into(),
+            tokens_used: 1,
+            token_usage: TokenUsage::default(),
+            cost: CostSummary::default(),
+            provider: "test".into(),
+            model_name: "test".into(),
+            verify: "Pass".into(),
+            context: vec![],
+            context_token_count: 0,
+            diff_hunks: vec![],
+        });
+        assert!(approval_refusal(&make_task(reviewing()), &report).is_some());
+        report.review_items[0].diff_hunks.push(DiffHunk {
+            file_path: "code.txt".into(),
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Added("fixed".into())],
+        });
+        assert_eq!(approval_refusal(&make_task(reviewing()), &report), None);
+        assert!(approval_refusal(&make_task(TaskStatus::Queued), &report).is_some());
+        assert!(approval_refusal(
+            &make_task(TaskStatus::Running {
+                active_subtasks: vec![],
+                completed: 0,
+                total: 1,
+            }),
+            &report,
+        )
+        .is_some());
+        assert!(approval_refusal(
+            &make_task(TaskStatus::Failed {
+                reason: "check failed".into(),
+                failed_subtask: None,
+            }),
+            &report,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn approval_checks_the_reviewed_repository_index_and_worktree() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(root.path()).unwrap();
+        let scope = root.path().join("project");
+        std::fs::create_dir(&scope).unwrap();
+        let path = Path::new("code.txt");
+        std::fs::write(scope.join(path), "before\n").unwrap();
+        std::fs::write(root.path().join(path), "outer\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("project/code.txt")).unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("phonton-test", "test@phonton").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .unwrap();
+        drop(tree);
+
+        let task_id = TaskId::new();
+        let subtask_id = SubtaskId::new();
+        let hunk = DiffHunk {
+            file_path: path.into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("before".into()),
+                DiffLine::Added("verified".into()),
+            ],
+        };
+        let mut applier = DiffApplier::open(&scope).unwrap();
+        applier
+            .apply_verified_hunks(std::slice::from_ref(&hunk))
+            .unwrap();
+        let checkpoint = applier
+            .commit_checkpoint(task_id, subtask_id, 1, "verified", &[path.into()])
+            .unwrap();
+        let task = TaskRecord {
+            id: task_id,
+            goal_text: "fix code".into(),
+            status: serde_json::to_value(TaskStatus::Reviewing {
+                tokens_used: 1,
+                estimated_savings_tokens: 0,
+            })
+            .unwrap(),
+            created_at: 1,
+            total_tokens: 1,
+            outcome_ledger: None,
+        };
+        let report = ReviewReport {
+            task_id: task_id.to_string(),
+            goal: "fix code".into(),
+            status: task.status.clone(),
+            total_tokens: 1,
+            cost_receipt: CostReceipt::default(),
+            handoff: None,
+            checkpoints: vec![CheckpointItem {
+                seq: 1,
+                subtask_id: subtask_id.to_string(),
+                commit_oid: checkpoint.commit_oid,
+            }],
+            review_items: vec![ReviewItem {
+                subtask_id: subtask_id.to_string(),
+                description: "fix code".into(),
+                tier: "cheap".into(),
+                tokens_used: 1,
+                token_usage: TokenUsage::default(),
+                cost: CostSummary::default(),
+                provider: "test".into(),
+                model_name: "test".into(),
+                verify: "Pass".into(),
+                context: vec![],
+                context_token_count: 0,
+                diff_hunks: vec![hunk],
+            }],
+        };
+        reviewed_checkpoint_identity(&task, &report, &scope).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(path)).unwrap(),
+            "outer\n"
+        );
+        let mut missing = report.clone();
+        missing.checkpoints.clear();
+        assert!(reviewed_checkpoint_identity(&task, &missing, &scope).is_err());
+
+        std::fs::write(root.path().join("unrelated.txt"), "user work\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.add_path(Path::new("unrelated.txt")).unwrap();
+        index.write().unwrap();
+        reviewed_checkpoint_identity(&task, &report, &scope).unwrap();
+
+        std::fs::write(scope.join(path), "changed after review\n").unwrap();
+        assert!(reviewed_checkpoint_identity(&task, &report, &scope).is_err());
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        index.add_path(Path::new("project/code.txt")).unwrap();
+        index.write().unwrap();
+        assert!(reviewed_checkpoint_identity(&task, &report, &scope).is_err());
+    }
+
+    #[test]
     fn parse_request_accepts_rollback_latest_short_form() {
         let request = parse_request(&["rollback".into(), "3".into()]).unwrap();
         assert_eq!(request.action, ReviewAction::Rollback { seq: 3 });
@@ -769,7 +1100,10 @@ mod tests {
                 timestamp_ms: 3,
                 event: OrchestratorEvent::SubtaskReviewReady {
                     subtask_id,
-                    description: "Implement function `foo`".into(),
+                    description: format!(
+                        "# Prior context from memory\n- unrelated task{}Implement function `foo`",
+                        phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR
+                    ),
                     tier: ModelTier::Standard,
                     tokens_used: 120,
                     token_usage: TokenUsage {
@@ -803,10 +1137,50 @@ mod tests {
         let report = build_report(task, events);
         assert_eq!(report.review_items.len(), 1);
         assert_eq!(report.review_items[0].subtask_id, subtask_id.to_string());
+        assert_eq!(
+            report.review_items[0].description,
+            "Implement function `foo`"
+        );
         assert_eq!(report.review_items[0].diff_hunks.len(), 1);
         assert_eq!(report.review_items[0].context_token_count, 11);
         assert_eq!(report.review_items[0].context[0].symbol_name, "foo");
         assert_eq!(report.review_items[0].token_usage.input_tokens, 80);
         assert_eq!(report.review_items[0].cost.total_usd_micros, 120);
+
+        let mut mixed = report.review_items.clone();
+        let mut unpriced = mixed[0].clone();
+        unpriced.cost.pricing_known = false;
+        mixed.push(unpriced);
+        assert!(!cost_receipt_from_items(&mixed).pricing_known);
+    }
+
+    #[test]
+    fn old_memory_checkpoint_label_uses_reviewed_task_description() {
+        let subtask_id = SubtaskId::new().to_string();
+        let mut points = vec![RollbackPoint {
+            seq: 1,
+            label: "# Prior context from memory\n- unrelated task".into(),
+        }];
+        let checkpoints = vec![CheckpointItem {
+            seq: 1,
+            subtask_id: subtask_id.clone(),
+            commit_oid: "abc123".into(),
+        }];
+        let review_items = vec![ReviewItem {
+            subtask_id,
+            description: "Implement function `foo`".into(),
+            tier: "cheap".into(),
+            tokens_used: 1,
+            token_usage: TokenUsage::default(),
+            cost: CostSummary::default(),
+            provider: "test".into(),
+            model_name: "test".into(),
+            verify: "Pass".into(),
+            context: vec![],
+            context_token_count: 0,
+            diff_hunks: vec![],
+        }];
+        sanitize_rollback_labels(&mut points, &checkpoints, &review_items);
+        assert_eq!(points[0].label, "Implement function `foo`");
     }
 }

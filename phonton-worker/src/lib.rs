@@ -6,8 +6,8 @@
 //! 1. Build a prompt from the subtask + retrieved code slices.
 //! 2. Call the assigned [`Provider`].
 //! 3. Parse a unified-diff response into [`DiffHunk`]s.
-//! 4. Hand them to [`phonton_verify::verify_diff`] **before doing anything
-//!    with the result**.
+//! 4. Hand them to `phonton-verify` with caller-owned execution authority
+//!    **before doing anything with the result**.
 //! 5. On `VerifyResult::Fail`, retry up to [`MAX_ATTEMPTS`] with the
 //!    verifier errors threaded back into the prompt as additional context.
 //!    On the final failure, escalate the [`ModelTier`] one notch and
@@ -17,7 +17,7 @@
 //!
 //! * **No unverified diff ever leaves this crate.** [`SubtaskResult`] always
 //!   carries a [`VerifyResult`] that came from `phonton-verify`. The only
-//!   path to `VerifyResult::Pass` is through `verify_diff` returning Pass.
+//!   path to `VerifyResult::Pass` is through `phonton-verify` returning Pass.
 //! * **No blocked tool call ever runs.** [`ExecutionGuard`] enforces the
 //!   permission tiers from `01-architecture/failure-modes.md` Risk 4
 //!   before any [`ToolCall`] is dispatched. `Block` is terminal — there is
@@ -33,6 +33,7 @@ use phonton_mcp::{McpCallResult, McpRuntime, McpTool};
 use phonton_providers::Provider;
 use phonton_sandbox::Sandbox;
 use phonton_store::Store;
+use phonton_types::verification::VerificationExecution;
 use phonton_types::{
     CodeSlice, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord, ModelTier, Permission,
     SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer,
@@ -50,6 +51,8 @@ pub use phonton_sandbox::{ExecutionGuard, GuardDecision, ToolCall};
 /// Production [`WorkerDispatcher`] bridge from orchestrator to worker.
 pub mod dispatcher;
 
+/// Bounded, profile-bound local candidate execution shared by CLI and Desktop.
+pub mod local_run;
 mod local_templates;
 
 /// Maximum verification attempts before escalating model tier.
@@ -93,6 +96,7 @@ pub struct Worker {
     context: Arc<tokio::sync::Mutex<ContextManager>>,
     /// Optional MCP runtime used for attributed tool calls.
     mcp: Option<Arc<McpRuntime>>,
+    verification_execution: VerificationExecution,
 }
 
 /// Bundle of the embedder + prebuilt index used to surface relevant
@@ -133,7 +137,15 @@ impl Worker {
             msg_tx: None,
             context: Arc::new(tokio::sync::Mutex::new(context)),
             mcp: None,
+            verification_execution: VerificationExecution::RequireIsolation,
         }
+    }
+
+    /// Set caller-owned authority for executable verification of this worker.
+    /// Without an explicit choice, project checks require isolation.
+    pub fn with_verification_execution(mut self, policy: VerificationExecution) -> Self {
+        self.verification_execution = policy;
+        self
     }
 
     /// Attach a message sender to the worker so it can emit intermediate
@@ -214,8 +226,14 @@ impl Worker {
     /// Approval decisions are handled by the orchestrator layer, so this
     /// low-level executor only enforces terminal blocks.
     pub async fn execute_tool(&self, call: ToolCall) -> Result<String> {
-        if let GuardDecision::Block { .. } = self.guard.evaluate(&call) {
-            return Ok("[blocked by sandbox policy]".into());
+        match self.guard.evaluate(&call) {
+            GuardDecision::Allow => {}
+            GuardDecision::Approve { reason } => {
+                return Err(anyhow!("Approval required: {reason}"))
+            }
+            GuardDecision::Block { reason } => {
+                return Err(anyhow!("Blocked by sandbox policy: {reason}"))
+            }
         }
 
         match call {
@@ -255,20 +273,20 @@ impl Worker {
     ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
         if prior_errors.is_empty() {
-            if let Some(result) =
-                local_templates::try_dispatch(&subtask, self.guard.project_root(), model_tier)
-                    .await?
+            if let Some(result) = local_templates::try_dispatch(
+                &subtask,
+                self.guard.project_root(),
+                model_tier,
+                self.verification_execution,
+            )
+            .await?
             {
                 if matches!(result.verify_result, VerifyResult::Pass { .. }) {
                     if let Err(e) = self.persist_decisions(&subtask) {
                         warn!(error = %e, "failed to persist subtask decisions");
                     }
                     if let Some(memory) = &self.memory {
-                        let rec = MemoryRecord::Decision {
-                            title: subtask.description.clone(),
-                            body: format!("completed via local template: {}", subtask.description),
-                            task_id: self.task_id,
-                        };
+                        let rec = completion_memory_record(&subtask, true, self.task_id);
                         if let Err(e) = memory.record(rec).await {
                             warn!(error = %e, "failed to record completion memory");
                         }
@@ -283,7 +301,10 @@ impl Worker {
             match &self.semantic {
                 Some(ctx) => ctx
                     .retriever
-                    .query(&subtask.description, 5)
+                    .query(
+                        phonton_types::task_description_without_prior_context(&subtask.description),
+                        5,
+                    )
                     .await
                     .unwrap_or_default(),
                 None => Vec::new(),
@@ -500,7 +521,13 @@ impl Worker {
             };
             debug!(attempt, hunks = hunks.len(), "worker received diff");
 
-            let verdict = phonton_verify::verify_diff(&hunks, self.guard.project_root()).await?;
+            let verdict = phonton_verify::verify_diff_with_execution(
+                &hunks,
+                self.guard.project_root(),
+                None,
+                self.verification_execution,
+            )
+            .await?;
             match verdict {
                 VerifyResult::Pass { layer } => {
                     let missing_required_files =
@@ -559,11 +586,7 @@ impl Worker {
                         warn!(error = %e, "failed to persist subtask decisions");
                     }
                     if let Some(memory) = &self.memory {
-                        let rec = MemoryRecord::Decision {
-                            title: subtask.description.clone(),
-                            body: format!("completed: {}", subtask.description),
-                            task_id: self.task_id,
-                        };
+                        let rec = completion_memory_record(&subtask, false, self.task_id);
                         if let Err(e) = memory.record(rec).await {
                             warn!(error = %e, "failed to record completion memory");
                         }
@@ -622,6 +645,17 @@ impl Worker {
                         subtask.id,
                         model_tier,
                         VerifyResult::Escalate { reason },
+                        token_usage,
+                        attempt,
+                        last_provider,
+                        last_model_name,
+                    ));
+                }
+                unavailable @ (VerifyResult::Unavailable { .. } | VerifyResult::NotRun { .. }) => {
+                    return Ok(failed_result(
+                        subtask.id,
+                        model_tier,
+                        unavailable,
                         token_usage,
                         attempt,
                         last_provider,
@@ -881,6 +915,7 @@ impl Worker {
 /// `module`, `type`. A `function` addition is not, by itself, an
 /// architectural decision — workers add functions routinely.
 pub fn detect_decisions(subtask: &Subtask, task_id: Option<TaskId>) -> Vec<MemoryRecord> {
+    let task = phonton_types::task_description_without_prior_context(&subtask.description);
     let re = match Regex::new(
         r"(?ix)
         \b(?:add|create|implement|introduce|define|build)\b
@@ -895,7 +930,7 @@ pub fn detect_decisions(subtask: &Subtask, task_id: Option<TaskId>) -> Vec<Memor
     };
 
     let mut seen: Vec<(String, String)> = Vec::new();
-    for caps in re.captures_iter(&subtask.description) {
+    for caps in re.captures_iter(task) {
         let kind = caps["kind"].to_ascii_lowercase();
         let name = caps["name"].to_string();
         if seen.iter().any(|(k, n)| k == &kind && n == &name) {
@@ -907,10 +942,28 @@ pub fn detect_decisions(subtask: &Subtask, task_id: Option<TaskId>) -> Vec<Memor
     seen.into_iter()
         .map(|(kind, name)| MemoryRecord::Decision {
             title: format!("introduced {kind} {name}"),
-            body: subtask.description.clone(),
+            body: task.to_string(),
             task_id,
         })
         .collect()
+}
+
+fn completion_memory_record(
+    subtask: &Subtask,
+    via_local_template: bool,
+    task_id: Option<TaskId>,
+) -> MemoryRecord {
+    let task = phonton_types::task_description_without_prior_context(&subtask.description);
+    let route = if via_local_template {
+        "completed via local template"
+    } else {
+        "completed"
+    };
+    MemoryRecord::Decision {
+        title: task.to_string(),
+        body: format!("{route}: {task}"),
+        task_id,
+    }
 }
 
 /// Shape a `Failed` [`SubtaskResult`] with no diffs and the supplied verdict.
@@ -924,7 +977,9 @@ fn failed_result(
     model_name: String,
 ) -> SubtaskResult {
     let reason = match &verify_result {
-        VerifyResult::Escalate { reason } => reason.clone(),
+        VerifyResult::Escalate { reason }
+        | VerifyResult::Unavailable { reason }
+        | VerifyResult::NotRun { reason } => reason.clone(),
         VerifyResult::Fail { errors, .. } => errors.join("; "),
         VerifyResult::Pass { .. } => "unexpected Pass in failed_result".into(),
     };
@@ -1218,7 +1273,7 @@ fn build_surgical_repair_context(
     }
 
     out.push_str("\n# CRITICAL\n");
-    out.push_str("Output the UNIFIED DIFF to fix the above errors. If the verifier reported stale hunk context for a small target file, replace that whole file with one unified-diff hunk. Start with `--- a/` or `--- /dev/null`. NO PROSE.\n");
+    out.push_str("Output the UNIFIED DIFF to fix the above errors. Every removed/context line and hunk count must match the captured source exactly. Never summarize the old side or use a whole-file replacement to bypass stale context; request current source if it is missing. Start with `--- a/` or `--- /dev/null`. NO PROSE.\n");
 
     out
 }
@@ -1235,12 +1290,35 @@ fn missing_required_touch_files(
     required
         .into_iter()
         .filter(|required_path| {
-            required_path_is_enforceable(required_path, project_root)
+            !is_verification_definition_path(required_path)
+                && required_path_is_enforceable(required_path, project_root)
                 && !hunks
                     .iter()
                     .any(|hunk| path_matches_required(&hunk.file_path, required_path))
         })
         .collect()
+}
+
+fn is_verification_definition_path(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let file = normalized.rsplit('/').next().unwrap_or_default();
+    normalized
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "__tests__" | "spec" | "specs"))
+        || file.starts_with("test_")
+        || file.starts_with("test-")
+        || file.starts_with("test.")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file.contains("_test.")
+        || file.contains("-test.")
+        || matches!(
+            file,
+            "package.json" | "package-lock.json" | "cargo.toml" | "cargo.lock"
+        )
 }
 
 fn required_path_is_enforceable(required_path: &Path, project_root: &Path) -> bool {
@@ -1555,15 +1633,30 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
     // a diff header and start from there.
     let markers = ["--- ", "+++ ", "@@ "];
     let mut start_idx = 0;
-    let lines_vec: Vec<&str> = body.lines().collect();
+    let raw_lines: Vec<&str> = body.split_terminator('\n').collect();
+    // A model may send CRLF as the diff transport. Strip that separator CR,
+    // while retaining literal CR at the end of source lines in LF-framed
+    // diffs (including an unterminated final source line).
+    let transport_crlf = raw_lines.iter().any(|line| {
+        (line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@ "))
+            && line.ends_with('\r')
+    });
+    let lines_vec: Vec<&str> = raw_lines
+        .iter()
+        .map(|line| {
+            if transport_crlf {
+                line.strip_suffix('\r').unwrap_or(line)
+            } else {
+                line
+            }
+        })
+        .collect();
     for (i, line) in lines_vec.iter().enumerate() {
         if markers.iter().any(|m| line.starts_with(m)) {
             start_idx = i;
             break;
         }
     }
-    let body_trimmed = lines_vec[start_idx..].join("\n");
-
     let mut hunks: Vec<DiffHunk> = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut header: Option<(u32, u32, u32, u32)> = None;
@@ -1590,7 +1683,7 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
         }
     }
 
-    for raw in body_trimmed.lines() {
+    for raw in &lines_vec[start_idx..] {
         if let Some(rest) = raw.strip_prefix("+++ b/") {
             flush(&mut hunks, &current_path, &header, &mut lines);
             current_path = Some(PathBuf::from(rest.trim()));
@@ -1656,8 +1749,8 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
 fn unfence_diff(text: &str) -> String {
     let mut in_fence = false;
     let mut captured = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
+    for line in text.split_terminator('\n') {
+        let trimmed = line.trim_start().trim_end_matches('\r');
         if !in_fence {
             if trimmed.starts_with("```") {
                 in_fence = true;
@@ -1725,8 +1818,9 @@ mod tests {
 
     #[test]
     fn allow_read_inside_root() {
-        let d = guard().evaluate(&ToolCall::Read {
-            path: PathBuf::from("/work/proj/src/lib.rs"),
+        let root = std::env::current_dir().unwrap();
+        let d = ExecutionGuard::new(root.clone()).evaluate(&ToolCall::Read {
+            path: root.join("src/lib.rs"),
         });
         assert_eq!(d, GuardDecision::Allow);
     }
@@ -1821,6 +1915,19 @@ mod tests {
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].file_path, PathBuf::from("src/lib.rs"));
         assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn diff_parser_separates_transport_crlf_from_literal_source_cr() {
+        let transported = "--- a/code.txt\r\n+++ b/code.txt\r\n@@ -1,1 +1,1 @@\r\n-old\r\n+new\r\n";
+        let hunks = parse_unified_diff(transported).unwrap();
+        assert_eq!(hunks[0].lines[0], DiffLine::Removed("old".into()));
+        assert_eq!(hunks[0].lines[1], DiffLine::Added("new".into()));
+
+        let literal = "--- a/code.txt\n+++ b/code.txt\n@@ -1,1 +1,1 @@\n-old\r\n\\ No newline at end of file\n+new\r\n\\ No newline at end of file\n";
+        let hunks = parse_unified_diff(literal).unwrap();
+        assert_eq!(hunks[0].lines[0], DiffLine::Removed("old\r".into()));
+        assert_eq!(hunks[0].lines[1], DiffLine::Added("new\r".into()));
     }
 
     #[test]
@@ -1956,7 +2063,7 @@ mod tests {
 
         assert!(prompt.contains("broken_code.py"));
         assert!(prompt.contains("return value"));
-        assert!(prompt.contains("replace that whole file"));
+        assert!(prompt.contains("Never summarize the old side"));
     }
 
     #[test]
@@ -2033,6 +2140,46 @@ mod tests {
     }
 
     #[test]
+    fn required_touch_files_do_not_demand_edits_to_referenced_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::create_dir_all(temp.path().join("test")).unwrap();
+        std::fs::write(temp.path().join("src/math.js"), "old\n").unwrap();
+        std::fs::write(temp.path().join("test/math.test.js"), "test\n").unwrap();
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description:
+                "In src/math.js, fix add so the existing test/math.test.js passes. Change only src/math.js; do not modify tests."
+                    .into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/math.js"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("old".into()),
+                DiffLine::Added("new".into()),
+            ],
+        }];
+        assert!(missing_required_touch_files(&subtask, &hunks, temp.path()).is_empty());
+    }
+
+    #[test]
+    fn required_touch_excludes_other_node_test_names() {
+        for path in ["foo_test.js", "foo-test.js", "test-foo.js", "test.js"] {
+            assert!(is_verification_definition_path(Path::new(path)));
+        }
+        assert!(!is_verification_definition_path(Path::new("src/math.js")));
+    }
+
+    #[test]
     fn detects_trait_decision() {
         let st = Subtask {
             id: SubtaskId::new(),
@@ -2066,6 +2213,35 @@ mod tests {
             status: SubtaskStatus::Queued,
         };
         assert!(detect_decisions(&st, None).is_empty());
+    }
+
+    #[test]
+    fn prior_memory_stays_out_of_new_decisions_and_completion_records() {
+        let task = "Implement function `add_one`\n\nKeep tests unchanged.";
+        let st = Subtask {
+            id: SubtaskId::new(),
+            description: format!(
+                "# Prior context from memory\n- Add struct Unrelated in another project{}{}",
+                phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR,
+                task
+            ),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        assert!(detect_decisions(&st, None).is_empty());
+        for template in [false, true] {
+            match completion_memory_record(&st, template, None) {
+                MemoryRecord::Decision { title, body, .. } => {
+                    assert_eq!(title, task);
+                    assert!(!body.contains("Prior context"));
+                    assert!(!body.contains("Unrelated"));
+                }
+                other => panic!("unexpected record: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

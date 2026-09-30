@@ -1,22 +1,37 @@
-//! Atomic diff application and rollback via git2.
+//! Exact diff application and checkpoint history via git2.
 //!
 //! Provides the [`DiffApplier`] which stages verified changes into the
-//! git index without committing, and a [`RollbackGuard`] wrapper for
-//! rolling back a goal's worth of changes on failure.
+//! git index without committing. Legacy checkpoint rollback is disabled;
+//! local Apply uses its own path-scoped journal for recovery.
 
 use anyhow::{anyhow, Context, Result};
-use git2::{ObjectType, Repository, Signature, StashFlags};
-use phonton_types::{Checkpoint, DiffHunk, DiffLine, SubtaskId, TaskId};
-use std::collections::BTreeMap;
+use git2::{ObjectType, Repository, Signature};
+use phonton_types::{Checkpoint, DiffHunk, SubtaskId, TaskId};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_DIRECT_REPLACE_LINES: usize = 400;
-const MAX_DIRECT_REPLACE_BYTES: u64 = 64 * 1024;
-
 pub struct DiffApplier {
     repo: Repository,
-    stash_oid: Option<git2::Oid>,
+    working_dir: PathBuf,
+    repo_prefix: PathBuf,
+}
+
+/// Apply exact hunks to a directory without a Git index. Validation completes
+/// before any file write; I/O failures propagate to the caller. This is not a
+/// multi-file transaction and must not be used as an automatic rollback path.
+pub fn apply_worktree_hunks(root: &Path, hunks: &[DiffHunk]) -> Result<()> {
+    let allowed: Vec<_> = hunks.iter().map(|h| h.file_path.clone()).collect();
+    let contents = phonton_local::edit::materialize_hunks_with_new_files(root, &allowed, hunks)?;
+    for (path, content) in contents {
+        let full = root.join(&path);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(full, content)
+            .with_context(|| format!("writing exact candidate {}", path.display()))?;
+    }
+    Ok(())
 }
 
 impl DiffApplier {
@@ -24,128 +39,73 @@ impl DiffApplier {
     /// is not inside a git repository.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let p = path.as_ref();
-        let repo = Repository::discover(p).map_err(|e| {
+        let working_dir = std::fs::canonicalize(p)
+            .with_context(|| format!("opening working directory {}", p.display()))?;
+        if !working_dir.is_dir() {
+            return Err(anyhow!("'{}' is not a working directory", p.display()));
+        }
+        let repo = Repository::discover(&working_dir).map_err(|e| {
             anyhow!(
                 "'{}' is not inside a git repository (git2: {})",
                 p.display(),
                 e.message()
             )
         })?;
+        let repo_root = std::fs::canonicalize(
+            repo.workdir()
+                .ok_or_else(|| anyhow!("repository has no worktree (bare repo)"))?,
+        )?;
+        let repo_prefix = working_dir
+            .strip_prefix(&repo_root)
+            .with_context(|| {
+                format!(
+                    "working directory {} is outside repository {}",
+                    working_dir.display(),
+                    repo_root.display()
+                )
+            })?
+            .to_path_buf();
         Ok(Self {
             repo,
-            stash_oid: None,
+            working_dir,
+            repo_prefix,
         })
     }
 
-    /// Apply a set of verified hunks to the worktree and stage them.
-    /// New files (no existing file, or `old_count == 0`) are written
-    /// directly; modifications go through a `git2::Diff` so offsets are
-    /// handled by libgit2's patch applier.
+    /// Resolve a path relative to the selected working directory into a
+    /// repository-root path for Git index and checkpoint operations.
+    pub fn repository_relative_path(&self, path: &Path) -> Result<PathBuf> {
+        let safe =
+            phonton_local::edit::safe_relative_path(&path.to_string_lossy().replace('\\', "/"))?;
+        Ok(self.repo_prefix.join(safe))
+    }
+
+    /// Revalidate every hunk against the exact current worktree, then apply
+    /// and stage only those paths. Missing files can be created; insertions
+    /// into existing files never silently replace the file. Validation uses
+    /// the same strict materializer as verification and local candidates.
     pub fn apply_verified_hunks(&mut self, hunks: &[DiffHunk]) -> Result<()> {
-        let workdir = self
-            .repo
-            .workdir()
-            .ok_or_else(|| anyhow!("repository has no worktree (bare repo)"))?
-            .to_path_buf();
-
-        let mut grouped: BTreeMap<PathBuf, Vec<&DiffHunk>> = BTreeMap::new();
-        for h in hunks {
-            grouped.entry(h.file_path.clone()).or_default().push(h);
-        }
-
-        let mut new_files: Vec<PathBuf> = Vec::new();
-        let mut direct_written: Vec<PathBuf> = Vec::new();
-        let mut modified: BTreeMap<PathBuf, Vec<&DiffHunk>> = BTreeMap::new();
-
-        for (path, hs) in grouped {
-            let full = workdir.join(&path);
-            let treat_as_new =
-                !full.exists() || hs.iter().all(|h| h.old_count == 0 && h.old_start == 0);
-            if treat_as_new {
-                let content = reconstruct_new_side(&hs);
-                if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                std::fs::write(&full, content)
-                    .with_context(|| format!("writing new file {}", path.display()))?;
-                new_files.push(path);
-            } else if is_small_full_file_replacement(&hs, &full) {
-                let content = reconstruct_new_side(&hs);
-                std::fs::write(&full, content)
-                    .with_context(|| format!("writing replacement file {}", path.display()))?;
-                direct_written.push(path);
-            } else {
-                modified.insert(path, hs);
-            }
-        }
-
-        if !modified.is_empty() {
-            let diff_text = build_unified_diff(&modified);
-            let apply_result = git2::Diff::from_buffer(diff_text.as_bytes())
-                .context("constructing git2::Diff from unified patch text")
-                .and_then(|diff| {
-                    self.repo
-                        .apply(&diff, git2::ApplyLocation::WorkDir, None)
-                        .context("git apply failed in worktree")
-                });
-            if apply_result.is_err() {
-                apply_modified_hunks_direct(&workdir, &modified)
-                    .with_context(|| apply_result.unwrap_err())?;
-            }
-        }
-
+        let allowed: Vec<_> = hunks.iter().map(|h| h.file_path.clone()).collect();
+        let contents = phonton_local::edit::materialize_hunks_with_new_files(
+            &self.working_dir,
+            &allowed,
+            hunks,
+        )?;
+        // Obtain the index before writes, so an unavailable index cannot leave
+        // partially applied work. All hunks have already passed validation.
         let mut index = self.repo.index()?;
-        for path in new_files
-            .iter()
-            .chain(direct_written.iter())
-            .chain(modified.keys())
-        {
+        for (path, content) in &contents {
+            let full = self.working_dir.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&full, content)
+                .with_context(|| format!("writing exact candidate {}", path.display()))?;
             index
-                .add_path(path)
+                .add_path(&self.repository_relative_path(path)?)
                 .with_context(|| format!("staging {}", path.display()))?;
         }
         index.write()?;
-        Ok(())
-    }
-
-    /// Stash all current worktree + index state (including untracked
-    /// files) under `message` so it can be restored by [`rollback`].
-    /// No-op if the worktree is clean.
-    fn save_restore_point(&mut self, message: &str) -> Result<()> {
-        let sig = self
-            .repo
-            .signature()
-            .or_else(|_| Signature::now("phonton", "phonton@localhost"))?;
-        match self.repo.stash_save(
-            &sig,
-            message,
-            Some(StashFlags::INCLUDE_UNTRACKED | StashFlags::KEEP_INDEX),
-        ) {
-            Ok(oid) => {
-                self.stash_oid = Some(oid);
-                Ok(())
-            }
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                self.stash_oid = None;
-                Ok(())
-            }
-            Err(e) => Err(anyhow!("stash_save failed: {}", e)),
-        }
-    }
-
-    /// Roll back worktree + index to the pre-apply state.
-    pub fn rollback(&mut self) -> Result<()> {
-        let mut co = git2::build::CheckoutBuilder::new();
-        co.force().remove_untracked(true);
-        self.repo
-            .checkout_head(Some(&mut co))
-            .context("checkout_head during rollback")?;
-
-        if self.stash_oid.take().is_some() {
-            self.repo
-                .stash_pop(0, None)
-                .context("stash_pop during rollback")?;
-        }
         Ok(())
     }
 
@@ -160,49 +120,76 @@ impl DiffApplier {
     /// The commit is written on a side ref under
     /// `refs/phonton/checkpoints/<task_id>/<seq>` so HEAD's
     /// user-visible history isn't polluted, but the worktree state at
-    /// the moment of the checkpoint is fully reproducible: the commit
-    /// is a real `git2::Commit` object whose tree captures everything
-    /// currently in the index.
+    /// the moment of the checkpoint is reproducible: the commit is a real
+    /// `git2::Commit` object whose tree starts at the preceding checkpoint
+    /// (or HEAD for the first step) and adds only `verified_paths`. The
+    /// verified paths were staged by [`Self::apply_verified_hunks`]. Unrelated
+    /// staged and worktree changes are excluded from the side-ref tree.
     ///
-    /// The checkpoint's parent is the current HEAD, so a `git log`
-    /// rooted at the checkpoint shows the user's pre-Phonton history
-    /// followed by Phonton's chain of subtask commits.
+    /// Each checkpoint's parent is the previous checkpoint, or current HEAD
+    /// for the first step, so its tree includes prior verified subtasks.
     pub fn commit_checkpoint(
         &mut self,
         task_id: TaskId,
         subtask_id: SubtaskId,
         seq: u32,
         message: &str,
+        verified_paths: &[std::path::PathBuf],
     ) -> Result<Checkpoint> {
-        // Stage everything in the worktree so the checkpoint snapshots
-        // the *whole* current state, not just the last apply.
-        let mut index = self.repo.index()?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
-        index.write()?;
-        let tree_oid = index.write_tree()?;
-        let tree = self.repo.find_tree(tree_oid)?;
+        if seq == 0 || verified_paths.is_empty() {
+            return Err(anyhow!(
+                "checkpoint requires a positive step and verified paths"
+            ));
+        }
+        let mut live_index = self.repo.index()?;
+        live_index.read(true)?;
 
         let sig = self
             .repo
             .signature()
             .or_else(|_| Signature::now("phonton", "phonton@localhost"))?;
 
-        // Parent = current HEAD if it exists; otherwise the checkpoint
-        // is a root commit (fresh repo case).
-        let parents: Vec<git2::Commit> = match self.repo.head() {
-            Ok(head_ref) => {
-                if let Ok(obj) = head_ref.peel(ObjectType::Commit) {
-                    if let Ok(c) = obj.into_commit() {
-                        vec![c]
+        // The first checkpoint roots at HEAD; later steps use the preceding
+        // side-ref so unrelated pre-staged index entries never enter the tree.
+        let parents: Vec<git2::Commit> = if seq > 1 {
+            let previous = format!("refs/phonton/checkpoints/{task_id}/{}", seq - 1);
+            vec![self
+                .repo
+                .find_reference(&previous)
+                .with_context(|| format!("previous checkpoint {previous} missing"))?
+                .peel_to_commit()?]
+        } else {
+            match self.repo.head() {
+                Ok(head_ref) => {
+                    if let Ok(obj) = head_ref.peel(ObjectType::Commit) {
+                        if let Ok(c) = obj.into_commit() {
+                            vec![c]
+                        } else {
+                            Vec::new()
+                        }
                     } else {
                         Vec::new()
                     }
-                } else {
-                    Vec::new()
                 }
+                Err(_) => Vec::new(),
             }
-            Err(_) => Vec::new(),
         };
+        let mut checkpoint_index = git2::Index::new()?;
+        if let Some(parent) = parents.first() {
+            checkpoint_index.read_tree(&parent.tree()?)?;
+        }
+        let mut paths = BTreeSet::new();
+        for path in verified_paths {
+            paths.insert(self.repository_relative_path(path)?);
+        }
+        for path in paths {
+            let entry = live_index.get_path(&path, 0).ok_or_else(|| {
+                anyhow!("verified checkpoint path {} is not staged", path.display())
+            })?;
+            checkpoint_index.add(&entry)?;
+        }
+        let tree_oid = checkpoint_index.write_tree_to(&self.repo)?;
+        let tree = self.repo.find_tree(tree_oid)?;
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
 
         let full_msg = format!(
@@ -249,8 +236,7 @@ impl DiffApplier {
             let commit = self.repo.find_commit(oid)?;
             let summary = commit.summary().unwrap_or("").to_string();
             // Subtask id is recorded only in the commit message; we
-            // surface a placeholder here since rollback only needs seq
-            // + commit oid. Callers that retain the full Checkpoint at
+            // surface a placeholder here. Callers that retain the full Checkpoint at
             // creation time should prefer that copy.
             out.push(Checkpoint {
                 task_id,
@@ -265,76 +251,13 @@ impl DiffApplier {
         Ok(out)
     }
 
-    /// Hard-reset the worktree + index to the commit named by
-    /// `commit_oid`. Used by the orchestrator to perform a "Rollback to
-    /// step N" request: the user gives up everything since the named
-    /// checkpoint, in exchange for a clean replay starting from there.
-    ///
-    /// The rollback is destructive — uncommitted worktree changes are
-    /// discarded. Call this only after the orchestrator has aborted
-    /// every in-flight worker.
-    pub fn rollback_to_checkpoint(&mut self, commit_oid: &str) -> Result<()> {
-        let oid = git2::Oid::from_str(commit_oid)
-            .with_context(|| format!("parsing checkpoint oid {commit_oid}"))?;
-        let obj = self
-            .repo
-            .find_object(oid, Some(ObjectType::Commit))
-            .context("checkpoint commit not found")?;
-        let mut co = git2::build::CheckoutBuilder::new();
-        co.force().remove_untracked(true);
-        self.repo
-            .reset(&obj, git2::ResetType::Hard, Some(&mut co))
-            .context("hard reset to checkpoint")?;
-        Ok(())
-    }
-
-    /// Save a restore point, apply `hunks`, and return a guard that
-    /// will roll back on drop unless [`RollbackGuard::commit`] is called.
-    pub async fn apply_transaction(
-        &mut self,
-        hunks: Vec<DiffHunk>,
-        task_id: &str,
-    ) -> Result<RollbackGuard<'_>> {
-        self.save_restore_point(&format!("phonton:{}", task_id))?;
-        if let Err(e) = self.apply_verified_hunks(&hunks) {
-            let _ = self.rollback();
-            return Err(e);
-        }
-        Ok(RollbackGuard {
-            applier: Some(self),
-            committed: false,
-        })
-    }
-}
-
-/// RAII guard returned by [`DiffApplier::apply_transaction`]. Drops back
-/// to the pre-apply state unless [`commit`](Self::commit) is called.
-pub struct RollbackGuard<'a> {
-    applier: Option<&'a mut DiffApplier>,
-    committed: bool,
-}
-
-impl<'a> RollbackGuard<'a> {
-    /// Keep the applied changes and discard the saved restore point.
-    pub fn commit(mut self) -> Result<()> {
-        self.committed = true;
-        if let Some(app) = self.applier.as_mut() {
-            if app.stash_oid.take().is_some() {
-                app.repo.stash_drop(0).context("stash_drop during commit")?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<'a> Drop for RollbackGuard<'a> {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if let Some(app) = self.applier.as_mut() {
-            let _ = app.rollback();
-        }
+    /// Refuse legacy checkpoint rollback until it can restore only owned
+    /// paths. The former hard reset moved HEAD and deleted unrelated work.
+    /// Local Apply journals use a separate scoped rollback implementation.
+    pub fn rollback_to_checkpoint(&mut self, _commit_oid: &str) -> Result<()> {
+        Err(anyhow!(
+            "Legacy checkpoint rollback is disabled: it could discard unrelated work. Use a local Apply journal for scoped rollback."
+        ))
     }
 }
 
@@ -345,204 +268,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn build_unified_diff(by_file: &BTreeMap<PathBuf, Vec<&DiffHunk>>) -> String {
-    let mut out = String::new();
-    for (path, hunks) in by_file {
-        let p = path.to_string_lossy().replace('\\', "/");
-        out.push_str(&format!("diff --git a/{0} b/{0}\n", p));
-        out.push_str("index 0000000..0000000 100644\n");
-        out.push_str(&format!("--- a/{}\n", p));
-        out.push_str(&format!("+++ b/{}\n", p));
-        for h in hunks {
-            let old_count = h
-                .lines
-                .iter()
-                .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Removed(_)))
-                .count();
-            let new_count = h
-                .lines
-                .iter()
-                .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Added(_)))
-                .count();
-            out.push_str(&format!(
-                "@@ -{},{} +{},{} @@\n",
-                h.old_start, old_count, h.new_start, new_count
-            ));
-            for line in &h.lines {
-                match line {
-                    DiffLine::Context(s) => {
-                        out.push(' ');
-                        out.push_str(s);
-                        out.push('\n');
-                    }
-                    DiffLine::Added(s) => {
-                        out.push('+');
-                        out.push_str(s);
-                        out.push('\n');
-                    }
-                    DiffLine::Removed(s) => {
-                        out.push('-');
-                        out.push_str(s);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn reconstruct_new_side(hunks: &[&DiffHunk]) -> String {
-    let mut out = String::new();
-    for h in hunks {
-        for line in &h.lines {
-            match line {
-                DiffLine::Context(s) | DiffLine::Added(s) => {
-                    out.push_str(s);
-                    out.push('\n');
-                }
-                DiffLine::Removed(_) => {}
-            }
-        }
-    }
-    out
-}
-
-fn is_small_full_file_replacement(hunks: &[&DiffHunk], full_path: &Path) -> bool {
-    if hunks.len() != 1 {
-        return false;
-    }
-    let hunk = hunks[0];
-    if hunk.old_start > 1 || hunk.new_start > 1 {
-        return false;
-    }
-    if hunk
-        .lines
-        .iter()
-        .any(|line| matches!(line, DiffLine::Context(_)))
-    {
-        return false;
-    }
-    let added = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line, DiffLine::Added(_)))
-        .count();
-    let removed = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line, DiffLine::Removed(_)))
-        .count();
-    if added == 0 || removed == 0 || added > MAX_DIRECT_REPLACE_LINES {
-        return false;
-    }
-    let Ok(metadata) = std::fs::metadata(full_path) else {
-        return false;
-    };
-    if metadata.len() > MAX_DIRECT_REPLACE_BYTES {
-        return false;
-    }
-    let Ok(current) = std::fs::read_to_string(full_path) else {
-        return false;
-    };
-    current.lines().count() <= MAX_DIRECT_REPLACE_LINES
-}
-
-fn apply_modified_hunks_direct(
-    workdir: &Path,
-    modified: &BTreeMap<PathBuf, Vec<&DiffHunk>>,
-) -> Result<()> {
-    for (path, hunks) in modified {
-        let full_path = workdir.join(path);
-        let original = std::fs::read_to_string(&full_path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let trailing_newline = original.ends_with('\n');
-        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
-        let mut sorted = hunks.clone();
-        sorted.sort_by_key(|hunk| std::cmp::Reverse(hunk.old_start));
-
-        for hunk in sorted {
-            let start = hunk.old_start.saturating_sub(1) as usize;
-            let old_len = hunk_old_side_len(hunk);
-            if start + old_len > lines.len() {
-                anyhow::bail!(
-                    "{} hunk at old line {} spans past end of file",
-                    path.display(),
-                    hunk.old_start
-                );
-            }
-            let old_slice = &lines[start..start + old_len];
-            if !hunk_old_side_matches(old_slice, hunk) {
-                anyhow::bail!(
-                    "{} hunk at old line {} does not match worktree context",
-                    path.display(),
-                    hunk.old_start
-                );
-            }
-
-            let mut replacement = Vec::new();
-            let mut old_idx = 0usize;
-            for line in &hunk.lines {
-                match line {
-                    DiffLine::Context(_) => {
-                        replacement.push(old_slice[old_idx].clone());
-                        old_idx += 1;
-                    }
-                    DiffLine::Removed(_) => {
-                        old_idx += 1;
-                    }
-                    DiffLine::Added(s) => replacement.push(s.clone()),
-                }
-            }
-            lines.splice(start..start + old_len, replacement);
-        }
-
-        let mut out = lines.join("\n");
-        if trailing_newline {
-            out.push('\n');
-        }
-        std::fs::write(&full_path, out).with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn hunk_old_side_len(hunk: &DiffHunk) -> usize {
-    hunk.lines
-        .iter()
-        .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Removed(_)))
-        .count()
-}
-
-fn hunk_old_side_matches(actual: &[String], hunk: &DiffHunk) -> bool {
-    let mut idx = 0usize;
-    for line in &hunk.lines {
-        let expected = match line {
-            DiffLine::Context(s) | DiffLine::Removed(s) => s,
-            DiffLine::Added(_) => continue,
-        };
-        let Some(actual_line) = actual.get(idx) else {
-            return false;
-        };
-        if !old_line_matches(actual_line, expected) {
-            return false;
-        }
-        idx += 1;
-    }
-    true
-}
-
-fn old_line_matches(actual: &str, expected: &str) -> bool {
-    if actual == expected {
-        return true;
-    }
-    let actual_trimmed = actual.trim_start();
-    let expected_trimmed = expected.trim_start();
-    actual_trimmed
-        .strip_prefix("export ")
-        .map(|rest| rest == expected_trimmed)
-        .unwrap_or(false)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -550,7 +275,8 @@ fn old_line_matches(actual: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phonton_types::{SubtaskId, TaskId};
+    use phonton_types::{DiffLine, SubtaskId, TaskId};
+    use std::path::PathBuf;
 
     fn init_repo_with_seed(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
@@ -571,26 +297,114 @@ mod tests {
     }
 
     #[test]
+    fn nested_working_directory_applies_and_checkpoints_only_nested_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_seed(tmp.path());
+        let nested = tmp.path().join("project");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(tmp.path().join("code.txt"), "outer\n").unwrap();
+        std::fs::write(nested.join("code.txt"), "before\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("code.txt")).unwrap();
+        index.add_path(Path::new("project/code.txt")).unwrap();
+        index.write().unwrap();
+        let hunk = DiffHunk {
+            file_path: "code.txt".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("before".into()),
+                DiffLine::Added("verified".into()),
+            ],
+        };
+        let mut applier = DiffApplier::open(&nested).unwrap();
+        applier.apply_verified_hunks(&[hunk]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(nested.join("code.txt")).unwrap(),
+            "verified\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("code.txt")).unwrap(),
+            "outer\n"
+        );
+        let checkpoint = applier
+            .commit_checkpoint(
+                TaskId::new(),
+                SubtaskId::new(),
+                1,
+                "verified",
+                &["code.txt".into()],
+            )
+            .unwrap();
+        let tree = repo
+            .find_commit(git2::Oid::from_str(&checkpoint.commit_oid).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(tree.get_path(Path::new("project/code.txt")).is_ok());
+        assert!(tree.get_path(Path::new("code.txt")).is_err());
+    }
+
+    #[test]
     fn checkpoint_round_trip_lists_and_rolls_back() {
         let tmp = tempfile::tempdir().unwrap();
-        let _repo = init_repo_with_seed(tmp.path());
+        let repo = init_repo_with_seed(tmp.path());
         let mut applier = DiffApplier::open(tmp.path()).unwrap();
         let task = TaskId::new();
 
-        // Take checkpoint #1 with one file.
-        std::fs::write(tmp.path().join("a.txt"), "alpha\n").unwrap();
+        // Take checkpoint #1 after a verified edit stages one file.
+        applier
+            .apply_verified_hunks(&[DiffHunk {
+                file_path: "a.txt".into(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine::Added("alpha".into())],
+            }])
+            .unwrap();
         let cp1 = applier
-            .commit_checkpoint(task, SubtaskId::new(), 1, "after subtask 1")
+            .commit_checkpoint(
+                task,
+                SubtaskId::new(),
+                1,
+                "after subtask 1",
+                &["a.txt".into()],
+            )
             .unwrap();
         assert_eq!(cp1.seq, 1);
 
-        // Take checkpoint #2 after a second change.
-        std::fs::write(tmp.path().join("a.txt"), "alpha+beta\n").unwrap();
+        // Take checkpoint #2 after a second verified edit.
+        applier
+            .apply_verified_hunks(&[DiffHunk {
+                file_path: "a.txt".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    DiffLine::Removed("alpha".into()),
+                    DiffLine::Added("alpha+beta".into()),
+                ],
+            }])
+            .unwrap();
         let cp2 = applier
-            .commit_checkpoint(task, SubtaskId::new(), 2, "after subtask 2")
+            .commit_checkpoint(
+                task,
+                SubtaskId::new(),
+                2,
+                "after subtask 2",
+                &["a.txt".into()],
+            )
             .unwrap();
         assert_eq!(cp2.seq, 2);
         assert_ne!(cp1.commit_oid, cp2.commit_oid);
+        let second = repo
+            .find_commit(git2::Oid::from_str(&cp2.commit_oid).unwrap())
+            .unwrap();
+        assert_eq!(second.parent_id(0).unwrap().to_string(), cp1.commit_oid);
 
         // List should return both, ordered by seq.
         let listed = applier.list_checkpoints(task).unwrap();
@@ -598,10 +412,98 @@ mod tests {
         assert_eq!(listed[0].seq, 1);
         assert_eq!(listed[1].seq, 2);
 
-        // Rollback to #1: a.txt should revert to "alpha".
-        applier.rollback_to_checkpoint(&cp1.commit_oid).unwrap();
-        let after = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
-        assert_eq!(after.replace("\r\n", "\n"), "alpha\n");
+        // Legacy checkpoint rollback must leave all user and Phonton bytes
+        // intact until it has a path-scoped recovery protocol.
+        std::fs::write(tmp.path().join("a.txt"), "user's later edit\n").unwrap();
+        std::fs::write(tmp.path().join("untracked.txt"), "private notes\n").unwrap();
+        std::fs::write(tmp.path().join("staged.txt"), "staged work\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+        let index_before = std::fs::read(repo.path().join("index")).unwrap();
+        let head_before = repo.head().unwrap().target().unwrap();
+        assert!(applier
+            .rollback_to_checkpoint(&cp1.commit_oid)
+            .unwrap_err()
+            .to_string()
+            .contains("disabled"));
+        assert_eq!(repo.head().unwrap().target().unwrap(), head_before);
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "user's later edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("untracked.txt")).unwrap(),
+            "private notes\n"
+        );
+    }
+
+    #[test]
+    fn checkpoint_does_not_stage_or_capture_unrelated_worktree_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_seed(tmp.path());
+        std::fs::write(tmp.path().join("seed.txt"), "user's unstaged edit\n").unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "user's untracked file\n").unwrap();
+        std::fs::write(tmp.path().join("staged.txt"), "user's staged file\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+        let staged_oid = index.get_path(Path::new("staged.txt"), 0).unwrap().id;
+        let baseline_seed = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("seed.txt"), 0)
+            .unwrap()
+            .id;
+
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        applier
+            .apply_verified_hunks(&[DiffHunk {
+                file_path: "result.txt".into(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine::Added("verified".into())],
+            }])
+            .unwrap();
+        let checkpoint = applier
+            .commit_checkpoint(
+                TaskId::new(),
+                SubtaskId::new(),
+                1,
+                "verified result",
+                &["result.txt".into()],
+            )
+            .unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        assert_eq!(
+            index.get_path(Path::new("seed.txt"), 0).unwrap().id,
+            baseline_seed
+        );
+        assert!(index.get_path(Path::new("notes.txt"), 0).is_none());
+        assert!(index.get_path(Path::new("result.txt"), 0).is_some());
+        assert_eq!(
+            index.get_path(Path::new("staged.txt"), 0).unwrap().id,
+            staged_oid
+        );
+        let tree = repo
+            .find_commit(git2::Oid::from_str(&checkpoint.commit_oid).unwrap())
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(tree.get_path(Path::new("notes.txt")).is_err());
+        assert!(tree.get_path(Path::new("staged.txt")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "user's unstaged edit\n"
+        );
     }
 
     #[test]
@@ -615,7 +517,87 @@ mod tests {
     }
 
     #[test]
-    fn apply_verified_hunks_writes_small_full_file_replacement_directly() {
+    fn invalid_second_file_leaves_worktree_and_index_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_seed(tmp.path());
+        std::fs::write(tmp.path().join("unrelated.txt"), "private work\n").unwrap();
+        let index_before = std::fs::read(repo.path().join("index")).unwrap();
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let hunks = vec![
+            DiffHunk {
+                file_path: "a-new.txt".into(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine::Added("new".into())],
+            },
+            DiffHunk {
+                file_path: "seed.txt".into(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    DiffLine::Removed("imagined".into()),
+                    DiffLine::Added("changed".into()),
+                ],
+            },
+        ];
+        assert!(applier.apply_verified_hunks(&hunks).is_err());
+        assert!(!tmp.path().join("a-new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "seed\n"
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("index")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("unrelated.txt")).unwrap(),
+            "private work\n"
+        );
+    }
+
+    #[test]
+    fn insertion_preserves_existing_file_and_unrelated_index_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_seed(tmp.path());
+        std::fs::write(tmp.path().join("staged.txt"), "staged work\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+        let staged_oid = index.get_path(Path::new("staged.txt"), 0).unwrap().id;
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        applier
+            .apply_verified_hunks(&[DiffHunk {
+                file_path: "seed.txt".into(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![DiffLine::Added("inserted".into())],
+            }])
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "inserted\nseed\n"
+        );
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        assert_eq!(
+            index.get_path(Path::new("staged.txt"), 0).unwrap().id,
+            staged_oid
+        );
+        let applied_blob = repo
+            .find_blob(index.get_path(Path::new("seed.txt"), 0).unwrap().id)
+            .unwrap();
+        assert_eq!(applied_blob.content(), b"inserted\nseed\n");
+    }
+
+    #[test]
+    fn apply_verified_hunks_rejects_invented_old_side_without_writes() {
         let tmp = tempfile::tempdir().unwrap();
         let _repo = init_repo_with_seed(tmp.path());
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -625,9 +607,9 @@ mod tests {
         let hunks = vec![DiffHunk {
             file_path: PathBuf::from("src/App.tsx"),
             old_start: 1,
-            old_count: 99,
+            old_count: 1,
             new_start: 1,
-            new_count: 2,
+            new_count: 3,
             lines: vec![
                 DiffLine::Removed("different old line".into()),
                 DiffLine::Added("export function App() {".into()),
@@ -636,13 +618,10 @@ mod tests {
             ],
         }];
 
-        applier.apply_verified_hunks(&hunks).unwrap();
+        assert!(applier.apply_verified_hunks(&hunks).is_err());
 
         let written = std::fs::read_to_string(tmp.path().join("src/App.tsx")).unwrap();
-        assert_eq!(
-            written.replace("\r\n", "\n"),
-            "export function App() {\n  return <main>Chess</main>;\n}\n"
-        );
+        assert_eq!(written.replace("\r\n", "\n"), "stale old line\n");
     }
 
     #[test]
@@ -660,9 +639,9 @@ mod tests {
         let hunks = vec![DiffHunk {
             file_path: PathBuf::from("src/config.js"),
             old_start: 1,
-            old_count: 99,
+            old_count: 4,
             new_start: 1,
-            new_count: 99,
+            new_count: 7,
             lines: vec![
                 DiffLine::Context(
                     "export function loadConfig(raw = {}, env = process.env) {".into(),
@@ -691,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_verified_hunks_preserves_export_context_when_model_omits_it() {
+    fn apply_verified_hunks_rejects_context_when_model_omits_export() {
         let tmp = tempfile::tempdir().unwrap();
         let _repo = init_repo_with_seed(tmp.path());
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -707,7 +686,7 @@ mod tests {
             old_start: 1,
             old_count: 4,
             new_start: 1,
-            new_count: 7,
+            new_count: 5,
             lines: vec![
                 DiffLine::Context("function loadConfig(raw = {}, env = process.env) {".into()),
                 DiffLine::Removed(
@@ -722,12 +701,12 @@ mod tests {
             ],
         }];
 
-        applier.apply_verified_hunks(&hunks).unwrap();
+        assert!(applier.apply_verified_hunks(&hunks).is_err());
 
         let written = std::fs::read_to_string(tmp.path().join("src/config.js")).unwrap();
         assert_eq!(
             written.replace("\r\n", "\n"),
-            "export function loadConfig(raw = {}, env = process.env) {\n  const maxRetriesRaw = raw.maxRetries ?? env.MAX_RETRIES ?? 2;\n  const maxRetries = Number(maxRetriesRaw);\n  return maxRetries;\n}\n"
+            "export function loadConfig(raw = {}, env = process.env) {\n  const maxRetries = Number(raw.maxRetries || env.MAX_RETRIES || 2);\n  return maxRetries;\n}\n"
         );
     }
 }

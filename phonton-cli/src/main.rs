@@ -41,8 +41,10 @@ mod contract_preflight;
 mod doctor;
 mod extensions_cli;
 mod index_cli;
+mod local_goal_cli;
 mod mcp_cli;
 mod memory_cli;
+mod models_cli;
 mod plan_preview;
 mod prompt_buffer;
 mod review;
@@ -1524,23 +1526,6 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('r') if self.goal_prompt.is_empty() => {
-                // Rollback shortcut — only when the goal bar is empty so the
-                // user can still type words starting with 'r' normally.
-                let goal_index = self.selected;
-                if let Some(g) = self.goals.get(goal_index) {
-                    if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref()) {
-                        if let Some(cp) = state.checkpoints.get(cursor) {
-                            return Some(Intent::Rollback {
-                                goal_index,
-                                to_seq: cp.seq,
-                            });
-                        }
-                    }
-                }
-                self.goal_prompt.insert_char('r');
-                None
-            }
             KeyCode::Char(c) => {
                 self.goal_prompt.insert_char(c);
                 None
@@ -1818,9 +1803,6 @@ pub enum Intent {
     QueueTask(SubmittedPrompt),
     /// User submitted an ask-mode question. Isolated from goal context.
     Ask(String),
-    /// User triggered a rollback to a specific checkpoint seq for the
-    /// currently selected goal.
-    Rollback { goal_index: usize, to_seq: u32 },
     /// User approved or denied a pending MCP approval prompt.
     ResolveMcpApproval { approval_id: u64, approved: bool },
     /// Save settings.
@@ -1858,7 +1840,7 @@ pub enum Intent {
 /// uses [`render_savings_line_styled`] for the colored version.
 pub fn render_savings_line(state: Option<&GlobalState>) -> String {
     let Some(s) = state else {
-        return "  $—  |  saved — vs frontier  |  tokens: —".into();
+        return "  est. $—  |  est. saved — vs frontier  |  tokens: —".into();
     };
     if s.cost_receipt.frontier_equivalent_usd_micros > 0 {
         let pct = s
@@ -1867,7 +1849,7 @@ pub fn render_savings_line(state: Option<&GlobalState>) -> String {
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "—".into());
         return format!(
-            "  {}  |  saved {} vs frontier  |  {} tok",
+            "  est. {}  |  est. saved {} vs frontier  |  {} tok",
             format_usd_micros(s.cost_receipt.actual_usd_micros),
             pct,
             s.tokens_used
@@ -1904,7 +1886,7 @@ pub fn render_savings_line_styled(
 ) -> Line<'static> {
     let Some(s) = state else {
         return Line::from(Span::styled(
-            "  $—  |  saved — vs frontier  |  tokens: —",
+            "  est. $—  |  est. saved — vs frontier  |  tokens: —",
             Style::default().fg(MUTED),
         ));
     };
@@ -1924,10 +1906,13 @@ pub fn render_savings_line_styled(
         };
         return Line::from(vec![
             Span::styled(
-                format!("  {}", format_usd_micros(s.cost_receipt.actual_usd_micros)),
+                format!(
+                    "  est. {}",
+                    format_usd_micros(s.cost_receipt.actual_usd_micros)
+                ),
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  saved ", Style::default().fg(MUTED)),
+            Span::styled("  est. saved ", Style::default().fg(MUTED)),
             Span::styled(pct_txt, pct_style),
             Span::styled(" vs frontier  ", Style::default().fg(MUTED)),
             Span::styled(format!("{} tok", s.tokens_used), Style::default().fg(MUTED)),
@@ -3043,16 +3028,13 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ]));
         }
 
-        // Checkpoint picker — one line per landed subtask, newest last.
-        // Marked with a "↶ N" tag for "Rollback to step N" — the actual
-        // rollback is dispatched through the orchestrator's control
-        // channel (see `OrchestratorMessage::RollbackRequest`); this
-        // panel only surfaces the picker.
+        // Checkpoint history is inspectable; legacy reset-based rollback is
+        // disabled until it can leave unrelated user work intact.
         if !state.checkpoints.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 format!(
-                    "Checkpoints ({} — Ctrl+↑↓ select, 'r' rollback):",
+                    "Checkpoints ({} — history only; legacy rollback disabled):",
                     state.checkpoints.len()
                 ),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -3069,7 +3051,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 let marker = if is_selected {
                     format!("  ▶ #{:>2}  ", cp.seq)
                 } else {
-                    format!("  ↶ #{:>2}  ", cp.seq)
+                    format!("    #{:>2}  ", cp.seq)
                 };
                 lines.push(Line::from(vec![
                     Span::styled(marker, marker_style),
@@ -3978,16 +3960,6 @@ enum LoopEvent {
     Tick,
 }
 
-/// Per-goal control channel sender, stored so the event loop can dispatch
-/// rollback requests to the right orchestrator instance.
-struct GoalControl {
-    /// Sender end of the orchestrator's control channel.
-    control_tx: mpsc::Sender<OrchestratorMessage>,
-}
-
-/// Shared registry mapping goal index → control handle.
-type ControlRegistry = Arc<std::sync::Mutex<HashMap<usize, GoalControl>>>;
-
 /// Approval bridge from the MCP runtime into the TUI event loop.
 #[derive(Clone)]
 struct TuiMcpApprover {
@@ -4078,7 +4050,7 @@ async fn build_semantic_context_with_warnings(
     let index_cfg = cfg.clone();
     let build = async move {
         let retriever: Arc<dyn phonton_index::CodeRetriever> = if index_cfg.backend == "qdrant" {
-            let embedder = phonton_index::Embedder::new()?;
+            let embedder = phonton_index::Embedder::new_for_workspace(&root)?;
             let url = index_cfg
                 .qdrant_url
                 .clone()
@@ -4092,7 +4064,7 @@ async fn build_semantic_context_with_warnings(
                 embedder,
             ))
         } else {
-            let embedder = phonton_index::Embedder::new()?;
+            let embedder = phonton_index::Embedder::new_for_workspace(&root)?;
             let index = match phonton_index::discover_nexus_config(&root) {
                 Ok(Some(cfg)) => {
                     phonton_index::index_workspace_with_nexus_using_embedder(&root, &cfg, &embedder)
@@ -4633,7 +4605,7 @@ fn default_model_for(provider: &str) -> String {
         "agentrouter" => "claude-sonnet-4-5".into(),
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "ollama" => "llama3.2:3b".into(),
-        "deepseek" => "deepseek-chat".into(),
+        "deepseek" => "deepseek-flash".into(),
         "xai" | "grok" => "grok-2-mini".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
@@ -4678,6 +4650,7 @@ fn print_help() {
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
+         models            Detect hardware, install and calibrate local coding models\n  \
          config path       Print the resolved config file path\n  \
          config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
          config show       Dump the resolved config as TOML\n  \
@@ -4689,15 +4662,24 @@ fn print_help() {
          -V, --version     Same as `version`\n\
          \n\
          CONFIG:\n  \
-         Settings live in ~/.phonton/config.toml. Override the provider key with\n  \
-         ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
+         Settings live in ~/.phonton/config.toml; PHONTON_CONFIG_PATH selects\n  \
+         another config file for this process. Provider keys may use\n  \
+         ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, etc.\n\
          \n\
          DOCTOR:\n  \
          phonton doctor [--json] [--provider]\n\
          \n\
          GOAL:\n  \
+         phonton goal --local [--plan] <goal> [--repo <path>] [--files a,b]\n  \
+         phonton goal --local <goal> [--check <JSON-array>] [--yes] [--allow-host-checks]\n  \
+         phonton goal --local --reviewed-plan <path> --sha256 <hash> --yes [--allow-host-checks]\n  \
+         phonton goal --local --request <path> [--allow-host-checks]\n  \
+         phonton goal --local apply RUN_ID --yes\n  \
+         phonton goal --local rollback RUN_ID --yes\n  \
+         phonton goal --local list\n  \
+         phonton goal --local show RUN_ID\n  \
          phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  \
-         phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n\
+         phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n\
          \n\
          BENCHMARK:\n  \
          phonton benchmark export --latest --format json\n\
@@ -4709,7 +4691,7 @@ fn print_help() {
          phonton review [--json] [latest|<task-id>]\n  \
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
-         phonton review rollback [--json] [latest|<task-id>] <seq>\n\
+         phonton review rollback [--json] [latest|<task-id>] <seq>  (disabled: unsafe legacy reset)\n\
          \n\
          MCP:\n  \
          phonton mcp list [--json]\n  \
@@ -4776,8 +4758,8 @@ async fn handle_cli_args() -> Result<bool> {
                     if !path.exists() {
                         // Seed with current resolved config so the editor opens
                         // a non-empty buffer with the keys the user can tweak.
-                        let cfg = config::load().unwrap_or_default();
-                        let _ = config::save(&cfg);
+                        let cfg = config::load()?;
+                        config::save(&cfg)?;
                     }
                     let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
                         if cfg!(windows) {
@@ -4800,7 +4782,7 @@ async fn handle_cli_args() -> Result<bool> {
                     }
                 }
                 "show" => {
-                    let cfg = config::load().unwrap_or_default();
+                    let cfg = config::load()?;
                     match toml::to_string_pretty(&cfg) {
                         Ok(s) => println!("{}", s),
                         Err(e) => {
@@ -4814,6 +4796,13 @@ async fn handle_cli_args() -> Result<bool> {
                     print_help();
                     std::process::exit(2);
                 }
+            }
+            Ok(true)
+        }
+        "models" => {
+            let code = models_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
             }
             Ok(true)
         }
@@ -4863,7 +4852,13 @@ async fn handle_cli_args() -> Result<bool> {
             Ok(true)
         }
         "goal" => {
-            let code = run_headless_goal(&args[1..]).await?;
+            let code = if args.get(1).is_some_and(|arg| arg == "--local") {
+                // The local run future holds candidate-search state. Keep it
+                // off the main thread's stack, including for plan previews.
+                Box::pin(local_goal_cli::run(&args[2..])).await?
+            } else {
+                run_headless_goal(&args[1..]).await?
+            };
             if code != 0 {
                 std::process::exit(code);
             }
@@ -4917,7 +4912,7 @@ async fn handle_cli_args() -> Result<bool> {
                 eprintln!("phonton: `ask` requires a question.\n  e.g. phonton ask \"how do I add a feature flag?\"");
                 std::process::exit(2);
             }
-            let cfg = config::load().unwrap_or_default();
+            let cfg = config::load()?;
             let provider = load_ask_provider(&cfg).ok_or_else(|| {
                 anyhow::anyhow!(
                     "no provider configured — set an API key (e.g. ANTHROPIC_API_KEY) \
@@ -4966,6 +4961,7 @@ pub(crate) struct HeadlessGoalOptions {
     display_text: String,
     json: bool,
     yes: bool,
+    host_checks_approved: bool,
     direct_task: bool,
     timeout_seconds: u64,
     resume_task_id: Option<TaskId>,
@@ -4973,16 +4969,14 @@ pub(crate) struct HeadlessGoalOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HeadlessGoalResult {
-    #[allow(dead_code)]
     pub task_id: TaskId,
-    #[allow(dead_code)]
     pub final_state: GlobalState,
     pub exit_code: i32,
 }
 
 fn print_goal_help() {
     println!(
-        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id>\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop."
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nHost checks execute repository code and require explicit --allow-host-checks on each invocation."
     );
 }
 
@@ -5024,22 +5018,35 @@ fn apply_budget_pricing(guard: BudgetGuard, cfg: &config::Config) -> BudgetGuard
             },
         );
     }
-    if provider == "deepseek"
-        || (provider == "openai-compatible"
-            && cfg
-                .provider
-                .base_url
-                .as_deref()
-                .is_some_and(|url| url.contains("deepseek")))
-    {
-        return guard.with_price(
-            kind,
-            &model,
-            ModelPricing {
-                input_usd_micros_per_mtok: 270_000,
-                output_usd_micros_per_mtok: 1_100_000,
-            },
-        );
+    let official_deepseek_endpoint = match cfg.provider.base_url.as_deref() {
+        None => provider == "deepseek",
+        Some(url) => matches!(
+            url.trim_end_matches('/'),
+            "https://api.deepseek.com" | "https://api.deepseek.com/v1"
+        ),
+    };
+    if matches!(provider, "deepseek" | "openai-compatible") && official_deepseek_endpoint {
+        // Published peak cache-miss prices are conservative for the
+        // discounted off-peak and cache-hit periods. Register every tier the
+        // dispatcher can select, not only the configured cheap model.
+        let flash = ModelPricing {
+            input_usd_micros_per_mtok: 300_000,
+            output_usd_micros_per_mtok: 1_200_000,
+        };
+        let pro = ModelPricing {
+            input_usd_micros_per_mtok: 1_320_000,
+            output_usd_micros_per_mtok: 3_960_000,
+        };
+        let mut guard = guard;
+        for id in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            guard = guard.with_price(kind, id, flash);
+        }
+        guard = guard.with_price(kind, "deepseek-v4-pro", pro);
+        return guard;
     }
     guard
 }
@@ -5047,6 +5054,7 @@ fn apply_budget_pricing(guard: BudgetGuard, cfg: &config::Config) -> BudgetGuard
 fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
     let mut json = false;
     let mut yes = false;
+    let mut host_checks_approved = false;
     let mut direct_task = false;
     let mut timeout_seconds = 900;
     let mut prompt_file: Option<PathBuf> = None;
@@ -5068,6 +5076,7 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
             }
             "--json" => json = true,
             "--yes" | "-y" => yes = true,
+            "--allow-host-checks" => host_checks_approved = true,
             "--task" => direct_task = true,
             "--stdin" => read_stdin = true,
             "--prompt-file" => {
@@ -5095,6 +5104,9 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
                 i += 1;
                 args.get(i)
                     .ok_or_else(|| anyhow::anyhow!("--permission-mode requires a value"))?;
+                return Err(anyhow::anyhow!(
+                    "--permission-mode is unsupported for headless goals; use --allow-host-checks to explicitly approve repository checks"
+                ));
             }
             "--" => {
                 positionals.extend(args[i + 1..].iter().cloned());
@@ -5155,6 +5167,7 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
         display_text,
         json,
         yes,
+        host_checks_approved,
         direct_task,
         timeout_seconds,
         resume_task_id,
@@ -5168,6 +5181,20 @@ fn summarize_goal_display(text: &str) -> String {
         .map(str::trim)
         .unwrap_or("goal");
     short(first_line, 96)
+}
+
+fn ensure_resume_workspace(saved_working_dir: &str, current_working_dir: &Path) -> Result<()> {
+    let saved = std::fs::canonicalize(saved_working_dir)
+        .map_err(|e| anyhow::anyhow!("cannot resolve the paused goal workspace: {e}"))?;
+    let current = std::fs::canonicalize(current_working_dir)
+        .map_err(|e| anyhow::anyhow!("cannot resolve the current workspace: {e}"))?;
+    if saved != current {
+        return Err(anyhow::anyhow!(
+            "paused goal belongs to {}; resume it from that workspace",
+            saved.display()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_headless_goal(args: &[String]) -> Result<i32> {
@@ -5190,6 +5217,10 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
     };
 
     let result = execute_headless_goal(opts, HeadlessGoalHooks::default()).await?;
+    debug_assert_eq!(
+        result.exit_code == 0,
+        headless_goal_succeeded(&result.final_state.task_status)
+    );
     Ok(result.exit_code)
 }
 
@@ -5197,9 +5228,16 @@ pub(crate) async fn execute_headless_goal(
     opts: HeadlessGoalOptions,
     hooks: HeadlessGoalHooks,
 ) -> Result<HeadlessGoalResult> {
-    let cfg = config::load().unwrap_or_default();
+    let cfg = config::load()?;
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if !opts.yes && !hooks.skip_trust_prompt && !trust::prompt_if_needed(&working_dir)? {
+    let workspace_trusted = if opts.yes {
+        true
+    } else if hooks.skip_trust_prompt {
+        trust::is_trusted(&working_dir)
+    } else {
+        trust::prompt_if_needed(&working_dir)?
+    };
+    if !workspace_trusted {
         return Ok(HeadlessGoalResult {
             task_id: hooks.fixed_task_id.unwrap_or_default(),
             final_state: GlobalState {
@@ -5235,7 +5273,10 @@ pub(crate) async fn execute_headless_goal(
             .ok()
             .and_then(|g| g.load_paused_run(resume_id).ok().flatten());
         match paused {
-            Some(snapshot) => Some(snapshot),
+            Some(snapshot) => {
+                ensure_resume_workspace(&snapshot.working_dir, &working_dir)?;
+                Some(snapshot)
+            }
             None => {
                 return print_headless_failure(
                     opts.json,
@@ -5353,20 +5394,36 @@ pub(crate) async fn execute_headless_goal(
     };
     let mut event_rx_store = event_tx.subscribe();
     let store_for_events = Arc::clone(&store);
+    let (event_writer_stop, mut event_writer_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let event_writer = tokio::spawn(async move {
+        let persist = |rec: EventRecord| {
+            let store = Arc::clone(&store_for_events);
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(g) = store.lock() {
+                        let _ = g.append_event(&rec);
+                    }
+                })
+                .await;
+            }
+        };
         loop {
-            match event_rx_store.recv().await {
-                Ok(rec) => {
-                    let store = Arc::clone(&store_for_events);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(g) = store.lock() {
-                            let _ = g.append_event(&rec);
+            tokio::select! {
+                event = event_rx_store.recv() => match event {
+                    Ok(rec) => persist(rec).await,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut event_writer_stop_rx => {
+                    loop {
+                        match event_rx_store.try_recv() {
+                            Ok(rec) => persist(rec).await,
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => break,
                         }
-                    })
-                    .await;
+                    }
+                    break;
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -5396,6 +5453,11 @@ pub(crate) async fn execute_headless_goal(
         ))
     };
 
+    let verification_execution = if opts.host_checks_approved {
+        phonton_types::verification::VerificationExecution::HostApproved
+    } else {
+        phonton_types::verification::VerificationExecution::RequireIsolation
+    };
     let dispatcher: Arc<dyn WorkerDispatcher> =
         if let Some(api_key) = provider_key_for_run(&cfg.provider) {
             let provider_name = cfg.provider.name.clone();
@@ -5420,7 +5482,8 @@ pub(crate) async fn execute_headless_goal(
             let mut dispatcher =
                 phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
                     .with_task_id(task_id)
-                    .with_memory(memory_store.clone());
+                    .with_memory(memory_store.clone())
+                    .with_verification_execution(verification_execution);
             if let Some(ctx) = semantic_context.clone() {
                 dispatcher = dispatcher.with_semantic_context(ctx);
             }
@@ -5443,6 +5506,7 @@ pub(crate) async fn execute_headless_goal(
     let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), &cfg);
 
     let mut orchestrator = Orchestrator::new(dispatcher)
+        .with_verification_execution(verification_execution)
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
@@ -5494,6 +5558,7 @@ pub(crate) async fn execute_headless_goal(
     }
 
     drop(event_tx);
+    let _ = event_writer_stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), event_writer).await;
 
     if opts.json {
@@ -5691,7 +5756,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     // Load configuration first so the rest of startup can use it.
-    let mut cfg = config::load().unwrap_or_default();
+    let mut cfg = config::load()?;
 
     // Start background auto-update check
     let pending_update = Arc::new(std::sync::Mutex::new(None));
@@ -5802,7 +5867,6 @@ async fn main() -> Result<()> {
     }
 
     let sandbox = Arc::new(Sandbox::new(working_dir.clone(), "phonton-cli".to_string()));
-    let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -5822,7 +5886,6 @@ async fn main() -> Result<()> {
         store,
         ask_provider,
         sandbox,
-        controls,
         cfg,
         working_dir,
     )
@@ -5902,7 +5965,6 @@ async fn run_app<B: Backend>(
     store: Arc<std::sync::Mutex<Store>>,
     ask_provider: Option<Arc<dyn Provider>>,
     sandbox: Arc<Sandbox>,
-    controls: ControlRegistry,
     mut cfg: config::Config,
     working_dir: std::path::PathBuf,
 ) -> Result<()> {
@@ -5969,20 +6031,10 @@ async fn run_app<B: Backend>(
                                 &tx,
                                 &store,
                                 &sandbox,
-                                &controls,
                                 &cfg,
                                 &working_dir,
                             )
                             .await;
-                        }
-                        Intent::Rollback { goal_index, to_seq } => {
-                            if let Ok(reg) = controls.lock() {
-                                if let Some(gc) = reg.get(&goal_index) {
-                                    let _ = gc
-                                        .control_tx
-                                        .try_send(OrchestratorMessage::RollbackRequest { to_seq });
-                                }
-                            }
                         }
                         Intent::ResolveMcpApproval {
                             approval_id,
@@ -6761,7 +6813,6 @@ async fn spawn_goal(
     tx: &mpsc::Sender<LoopEvent>,
     store: &Arc<std::sync::Mutex<Store>>,
     sandbox: &Arc<Sandbox>,
-    controls: &ControlRegistry,
     cfg: &config::Config,
     working_dir: &std::path::PathBuf,
 ) {
@@ -6914,17 +6965,6 @@ async fn spawn_goal(
         .ok()
         .map(|d| Arc::new(std::sync::Mutex::new(d)));
 
-    // Control channel for rollback requests from the UI.
-    let (ctrl_tx, ctrl_rx) = mpsc::channel::<OrchestratorMessage>(8);
-    if let Ok(mut reg) = controls.lock() {
-        reg.insert(
-            goal_index,
-            GoalControl {
-                control_tx: ctrl_tx,
-            },
-        );
-    }
-
     let limits = BudgetLimits {
         max_tokens: cfg.budget.max_tokens,
         max_usd_micros: cfg.budget.max_usd_micros(),
@@ -6937,8 +6977,7 @@ async fn spawn_goal(
         .with_working_dir(working_dir.clone())
         .with_index_backend(cfg.index.backend.clone())
         .with_memory(memory_store)
-        .with_event_sink(task_id, display_text.clone(), event_tx)
-        .with_control_channel(ctrl_rx);
+        .with_event_sink(task_id, display_text.clone(), event_tx);
     if let Some(da) = diff_applier {
         orch = orch.with_diff_applier(da);
     }
@@ -7043,7 +7082,11 @@ fn apply_extension_context_to_plan(plan: &mut PlannerOutput, extension_set: &Ext
     }
 
     for subtask in &mut plan.subtasks {
-        subtask.description = format!("{preamble}\n\n{}", subtask.description);
+        subtask.description = format!(
+            "{preamble}{}{}",
+            phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR,
+            subtask.description
+        );
     }
 }
 
@@ -7191,6 +7234,102 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn deepseek_cli_default_uses_current_flash_id() {
+        assert_eq!(default_model_for("deepseek"), "deepseek-flash");
+    }
+
+    #[test]
+    fn deepseek_budget_prices_flash_and_frontier_escalation() {
+        let mut cfg = config::Config::default();
+        cfg.provider.name = "deepseek".into();
+        let mut guard = apply_budget_pricing(
+            BudgetGuard::new(BudgetLimits {
+                max_tokens: None,
+                max_usd_micros: Some(1_000_000),
+            }),
+            &cfg,
+        );
+        assert_eq!(
+            guard
+                .estimate(
+                    ProviderKind::OpenAiCompatible,
+                    "deepseek-flash",
+                    TokenUsage {
+                        input_tokens: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                )
+                .total_usd_micros,
+            300_000
+        );
+        assert_eq!(
+            guard
+                .estimate(
+                    ProviderKind::OpenAiCompatible,
+                    "deepseek-v4-pro",
+                    TokenUsage {
+                        output_tokens: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                )
+                .total_usd_micros,
+            3_960_000
+        );
+        assert_eq!(
+            guard
+                .estimate(
+                    ProviderKind::OpenAiCompatible,
+                    "deepseek-v4-flash",
+                    TokenUsage {
+                        input_tokens: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                )
+                .total_usd_micros,
+            300_000
+        );
+        assert!(matches!(
+            guard.charge(
+                ProviderKind::OpenAiCompatible,
+                "deepseek-flash",
+                1_000_000,
+                0
+            ),
+            phonton_types::BudgetDecision::Ok
+        ));
+        assert!(matches!(
+            guard.charge(ProviderKind::OpenAiCompatible, "deepseek-v4-pro", 1_000_000, 0),
+            phonton_types::BudgetDecision::Pause { limit, .. } if limit == "usd"
+        ));
+    }
+
+    #[test]
+    fn deepseek_prices_do_not_apply_to_custom_or_lookalike_endpoints() {
+        let mut cfg = config::Config::default();
+        cfg.provider.name = "deepseek".into();
+        cfg.provider.base_url = Some("https://proxy.example/v1".into());
+        let guard = apply_budget_pricing(BudgetGuard::new(BudgetLimits::default()), &cfg);
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            ..TokenUsage::default()
+        };
+        assert!(
+            !guard
+                .estimate(ProviderKind::OpenAiCompatible, "deepseek-flash", usage)
+                .pricing_known
+        );
+
+        cfg.provider.name = "openai-compatible".into();
+        cfg.provider.base_url = Some("https://notdeepseek.example/v1".into());
+        let guard = apply_budget_pricing(BudgetGuard::new(BudgetLimits::default()), &cfg);
+        assert!(
+            !guard
+                .estimate(ProviderKind::OpenAiCompatible, "deepseek-flash", usage)
+                .pricing_known
+        );
+    }
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -7551,8 +7690,6 @@ fn extract_id(line: &str) -> Option<String> {
             "--prompt-file".to_string(),
             prompt_path.display().to_string(),
             "--yes".to_string(),
-            "--permission-mode".to_string(),
-            "full-access".to_string(),
             "--timeout-seconds".to_string(),
             "900".to_string(),
             "--json".to_string(),
@@ -7563,9 +7700,58 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(opts.goal_text, "Fix the fixture bug\n\nUse tests.");
         assert_eq!(opts.display_text, "Fix the fixture bug");
         assert!(opts.yes);
+        assert!(!opts.host_checks_approved);
         assert!(opts.json);
         assert!(!opts.direct_task);
         assert_eq!(opts.timeout_seconds, 900);
+        Ok(())
+    }
+
+    #[test]
+    fn headless_goal_host_checks_require_separate_explicit_flag() -> Result<()> {
+        let default = parse_headless_goal_options(&["fix bug".into(), "--yes".into()])?;
+        assert!(!default.host_checks_approved);
+
+        let approved =
+            parse_headless_goal_options(&["fix bug".into(), "--allow-host-checks".into()])?;
+        assert!(approved.host_checks_approved);
+        assert!(!approved.yes);
+
+        let resumed =
+            parse_headless_goal_options(&["--resume".into(), uuid::Uuid::new_v4().to_string()])?;
+        assert!(!resumed.host_checks_approved);
+
+        let err = parse_headless_goal_options(&[
+            "fix bug".into(),
+            "--permission-mode".into(),
+            "full-access".into(),
+        ])
+        .expect_err("legacy mode must not silently approve host checks");
+        assert!(err.to_string().contains("--allow-host-checks"));
+        Ok(())
+    }
+
+    #[test]
+    fn headless_resume_requires_original_workspace_with_or_without_host_approval() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let original = root.path().join("original");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&original)?;
+        std::fs::create_dir_all(&other)?;
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        for approve_host in [false, true] {
+            let mut args = vec!["--resume".to_string(), task_id.clone()];
+            if approve_host {
+                args.push("--allow-host-checks".into());
+            }
+            let opts = parse_headless_goal_options(&args)?;
+            assert_eq!(opts.host_checks_approved, approve_host);
+            ensure_resume_workspace(&original.display().to_string(), &original)?;
+            let error = ensure_resume_workspace(&original.display().to_string(), &other)
+                .expect_err("a paused plan must not run in another repository");
+            assert!(error.to_string().contains("resume it from that workspace"));
+        }
         Ok(())
     }
 
@@ -7635,7 +7821,7 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[tokio::test]
-    async fn worker_mcp_e2e_uses_tui_approval_and_verified_diff() -> Result<()> {
+    async fn worker_mcp_approval_does_not_grant_verification_execution() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let server_exe = compile_fake_mcp_server(temp.path())?;
 
@@ -7711,20 +7897,23 @@ fn extract_id(line: &str) -> Option<String> {
         let approvals = tokio::time::timeout(Duration::from_secs(5), approval_driver).await??;
 
         assert!(
-            matches!(result.status, SubtaskStatus::Done { .. }),
-            "worker should finish after MCP result, got {:?}",
+            matches!(result.status, SubtaskStatus::Failed { .. }),
+            "MCP approval must not certify a diff without execution authority, got {:?}",
             result.status
         );
         assert!(
-            matches!(result.verify_result, VerifyResult::Pass { .. }),
-            "final diff must be verified, got {:?}",
+            matches!(
+                result.verify_result,
+                phonton_types::VerifyResult::Unavailable { .. }
+            ),
+            "MCP approval is separate from project verification, got {:?}",
             result.verify_result
         );
-        assert_eq!(result.diff_hunks.len(), 1);
-        assert_eq!(
-            result.diff_hunks[0].file_path,
-            PathBuf::from("src/mcp_fixture.rs")
+        assert!(
+            result.diff_hunks.is_empty(),
+            "unverified output must not reach apply"
         );
+        assert!(!temp.path().join("src/mcp_fixture.rs").exists());
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
         assert!(
             approvals.len() >= 2,

@@ -8,10 +8,14 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod code_context;
 pub mod events;
 pub mod extensions;
+pub mod local;
+pub mod local_run;
 pub mod messages;
 pub mod providers;
+pub mod verification;
 
 pub use events::{EventRecord, OrchestratorEvent, TOKEN_MILESTONE_INTERVAL};
 pub use extensions::{
@@ -773,9 +777,9 @@ pub enum VerifyLayer {
     DecisionCheck,
     /// `cargo check --package <crate>` on the affected crate only.
     CrateCheck,
-    /// `cargo check --workspace` — only when public types/APIs change.
+    /// `cargo check --workspace` for a Cargo candidate.
     WorkspaceCheck,
-    /// `cargo test` — never automatic; user-triggered.
+    /// `cargo test` with a completed passing test under approved execution.
     Test,
     /// Headless browser verification using Playwright.
     BrowserCheck,
@@ -785,8 +789,8 @@ pub enum VerifyLayer {
 ///
 /// `Pass` lets the orchestrator advance the subtask to `Done`. `Fail` is
 /// retryable: the orchestrator may re-dispatch with a stronger model tier
-/// while `attempt` is below the policy ceiling. `Escalate` is terminal for
-/// the verification loop and surfaces to the user as a hard stop.
+/// while `attempt` is below the policy ceiling. `Escalate` can request a stronger
+/// model. `Unavailable` and `NotRun` stop without retrying or changing models.
 ///
 /// Both `Pass` and `Fail` carry the [`VerifyLayer`] that produced them so
 /// the UI can attribute the verdict ("syntax error" vs "type error") with
@@ -807,7 +811,17 @@ pub enum VerifyResult {
         /// 1-indexed retry attempt that produced this failure.
         attempt: u8,
     },
-    /// Verification cannot proceed and human attention is required.
+    /// Required verification could not execute. A stronger model cannot fix it.
+    Unavailable {
+        /// Missing authority, dependency, containment or trustworthy check setup.
+        reason: String,
+    },
+    /// No executable checks were selected or available for this candidate.
+    NotRun {
+        /// Why verification did not run; this is never passing evidence.
+        reason: String,
+    },
+    /// The current model cannot complete verification; a stronger tier may retry.
     Escalate {
         /// Why the loop is bailing out (e.g. retry budget exhausted).
         reason: String,
@@ -1158,16 +1172,39 @@ fn is_test_or_verification_task(description: &str) -> bool {
         || d.contains("unit-test")
 }
 
-fn task_description_without_prior_context(description: &str) -> &str {
+/// Separator between retrieved memory and the current task in worker prompts.
+pub const PRIOR_CONTEXT_TASK_SEPARATOR: &str = "\n\n--- Phonton current task ---\n";
+
+/// Return only the task text when a worker description includes prior memory.
+/// Older saved plans used a blank-line boundary rather than an explicit separator.
+pub fn task_description_without_prior_context(description: &str) -> &str {
     let trimmed = description.trim_start();
-    if !trimmed.starts_with("# Prior context") {
-        return description;
+    if let Some((_, task)) = trimmed.rsplit_once(PRIOR_CONTEXT_TASK_SEPARATOR) {
+        if !task.trim().is_empty() {
+            return task.trim();
+        }
     }
-    trimmed
-        .rsplit_once("\n\n")
-        .map(|(_, tail)| tail.trim())
-        .filter(|tail| !tail.is_empty())
-        .unwrap_or(description)
+    // The structured legacy preamble ended in a newline, then inserted two
+    // more newlines before the task. Its section boundaries use only two.
+    if trimmed.starts_with("# Prior context from memory\n") {
+        return trimmed
+            .split_once("\n\n\n")
+            .map(|(_, task)| task.trim())
+            .filter(|task| !task.is_empty())
+            .unwrap_or(description);
+    }
+    // The older MemoryStore preamble had no section headings and inserted one
+    // extra newline after its final record. Split at the first boundary so a
+    // multi-paragraph task remains intact. Ambiguous malformed records retain
+    // their full text instead of silently dropping task paragraphs.
+    if trimmed.starts_with("# Prior context\n") {
+        return trimmed
+            .split_once("\n\n")
+            .map(|(_, task)| task.trim())
+            .filter(|task| !task.is_empty())
+            .unwrap_or(description);
+    }
+    description
 }
 
 /// Pre-execution coverage signal: how many new symbols the plan creates,
@@ -1561,4 +1598,38 @@ pub struct ProofBundleExport {
 pub struct MemoryUpdate {
     /// Records that should be written if accepted.
     pub records: Vec<MemoryRecord>,
+}
+
+#[cfg(test)]
+mod prior_context_tests {
+    use super::*;
+
+    #[test]
+    fn current_task_separator_preserves_multiline_task_text() {
+        let task = "Implement function `add_one`.\n\nKeep the existing tests unchanged.";
+        let description = format!(
+            "# Prior context from memory\n- unrelated memory with paragraphs\n\nold detail{PRIOR_CONTEXT_TASK_SEPARATOR}{task}"
+        );
+        assert_eq!(task_description_without_prior_context(&description), task);
+        let with_extension = format!(
+            "# Phonton steering\n- unrelated extension context{PRIOR_CONTEXT_TASK_SEPARATOR}{description}"
+        );
+        assert_eq!(
+            task_description_without_prior_context(&with_extension),
+            task
+        );
+        assert_eq!(task_description_without_prior_context(task), task);
+        assert_eq!(
+            task_description_without_prior_context(
+                "# Prior context from memory\n\n## Honour these prior decisions\n- old record\n\n\nImplement function `add_one`\n\nKeep tests unchanged."
+            ),
+            "Implement function `add_one`\n\nKeep tests unchanged."
+        );
+        assert_eq!(
+            task_description_without_prior_context(
+                "# Prior context\n- old record\n\nImplement function `add_one`\n\nKeep tests unchanged."
+            ),
+            "Implement function `add_one`\n\nKeep tests unchanged."
+        );
+    }
 }

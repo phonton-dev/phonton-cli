@@ -373,25 +373,26 @@ impl RouteStep {
     }
 }
 
-/// Goal-level cost receipt: actual spend vs a frontier-only counterfactual.
+/// Goal-level cost receipt: estimated model spend vs a frontier counterfactual.
 ///
 /// This is the product metric: verified success per dollar, not raw tokens.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostReceipt {
-    /// Estimated or metered spend for the models actually used.
+    /// Estimated model spend for the models used. The serialized field name
+    /// predates the estimate label and is retained for stored receipts.
     pub actual_usd_micros: u64,
     /// What the same token mix would have cost at [`FRONTIER_REFERENCE_PRICING`].
     pub frontier_equivalent_usd_micros: u64,
-    /// `frontier - actual`, saturating at zero.
+    /// `frontier - estimated spend`, saturating at zero.
     pub saved_usd_micros: u64,
-    /// True when actual spend came from a registered `BudgetGuard` price.
+    /// True when every charged call had a registered `BudgetGuard` rate.
     pub pricing_known: bool,
     /// Ordered hops: cheap first, then repair, then escalation if needed.
     pub route: Vec<RouteStep>,
 }
 
 impl CostReceipt {
-    /// Assemble a receipt from observed usage, actual micros, and the route.
+    /// Assemble a receipt from observed usage, estimated micros, and the route.
     pub fn from_usage(
         actual_usd_micros: u64,
         usage: &TokenUsage,

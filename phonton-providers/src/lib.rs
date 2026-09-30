@@ -61,9 +61,9 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
         },
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "deepseek" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
-            ModelTier::Standard => "deepseek-chat".into(),
-            ModelTier::Frontier => "deepseek-reasoner".into(),
+            ModelTier::Local | ModelTier::Cheap => "deepseek-flash".into(),
+            ModelTier::Standard => "deepseek-flash".into(),
+            ModelTier::Frontier => "deepseek-v4-pro".into(),
         },
         "xai" | "grok" => match tier {
             ModelTier::Local | ModelTier::Cheap => "grok-2-mini".into(),
@@ -499,7 +499,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "llama-3.1-8b-instant",
             "llama",
         ],
-        "deepseek" => &["deepseek-chat", "deepseek-coder", "deepseek"],
+        "deepseek" => &["deepseek-flash", "deepseek-v4-pro", "deepseek"],
         "xai" | "grok" => &["grok-2", "grok-beta", "grok"],
         "together" => &[
             "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -1906,6 +1906,30 @@ mod tests {
                 assert_ne!(model_for_tier(provider, tier), "unknown", "{provider:?}");
             }
         }
+    }
+
+    #[test]
+    fn deepseek_current_models_are_the_defaults() {
+        let available = vec!["deepseek-v4-pro".into(), "deepseek-flash".into()];
+        assert_eq!(
+            pick_default_from_list("deepseek", &available).as_deref(),
+            Some("deepseek-flash")
+        );
+        assert_eq!(
+            model_for_tier("deepseek", ModelTier::Cheap),
+            "deepseek-flash"
+        );
+        assert_eq!(
+            model_for_tier("deepseek", ModelTier::Standard),
+            "deepseek-flash"
+        );
+        assert_eq!(
+            model_for_tier("deepseek", ModelTier::Frontier),
+            "deepseek-v4-pro"
+        );
+        let registry = registry::find_provider("deepseek").unwrap();
+        assert_eq!(registry.default_cheap, "deepseek-flash");
+        assert_eq!(registry.default_frontier, "deepseek-v4-pro");
     }
 
     /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`

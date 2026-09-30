@@ -71,16 +71,17 @@ pub const BUDGET_PAUSE_PREFIX: &str = "BUDGET_PAUSE: ";
 /// [`TaskStatus::Paused`] so the UI can present it as a pause rather
 /// than a terminal error.
 ///
-/// Pricing is keyed by `(ProviderKind, model_name)`; unknown models are
-/// treated as free for USD accounting (tokens still count). A future
-/// iteration will pull pricing from a shipped table; today callers wire
-/// in whatever they know.
+/// Pricing is keyed by `(ProviderKind, model_name)`. Unknown prices are
+/// tracked, and a dollar cap pauses after such a call rather than treating
+/// it as free. Callers must register prices for every dispatchable model.
 #[derive(Debug, Clone, Default)]
 pub struct BudgetGuard {
     limits: BudgetLimits,
     pricing: HashMap<(ProviderKind, String), ModelPricing>,
     tokens_used: u64,
     usd_micros_spent: u64,
+    priced_calls: u64,
+    unpriced_calls: u64,
 }
 
 impl BudgetGuard {
@@ -92,6 +93,8 @@ impl BudgetGuard {
             pricing: HashMap::new(),
             tokens_used: 0,
             usd_micros_spent: 0,
+            priced_calls: 0,
+            unpriced_calls: 0,
         }
     }
 
@@ -124,9 +127,12 @@ impl BudgetGuard {
             .tokens_used
             .saturating_add(input_tokens.saturating_add(output_tokens));
         if let Some(p) = self.pricing.get(&(provider, model.to_string())) {
+            self.priced_calls = self.priced_calls.saturating_add(1);
             self.usd_micros_spent = self
                 .usd_micros_spent
                 .saturating_add(p.cost_micros(input_tokens, output_tokens));
+        } else {
+            self.unpriced_calls = self.unpriced_calls.saturating_add(1);
         }
         self.decision()
     }
@@ -145,7 +151,7 @@ impl BudgetGuard {
             * p.output_usd_micros_per_mtok as u128)
             / 1_000_000) as u64;
         CostSummary {
-            pricing_known: true,
+            pricing_known: self.unpriced_calls == 0,
             input_usd_micros,
             output_usd_micros,
             total_usd_micros: input_usd_micros.saturating_add(output_usd_micros),
@@ -164,6 +170,13 @@ impl BudgetGuard {
             }
         }
         if let Some(ceiling) = self.limits.max_usd_micros {
+            if self.unpriced_calls > 0 {
+                return BudgetDecision::Pause {
+                    limit: "usd-pricing".into(),
+                    observed: self.usd_micros_spent,
+                    ceiling,
+                };
+            }
             if self.usd_micros_spent >= ceiling {
                 return BudgetDecision::Pause {
                     limit: "usd".into(),
@@ -188,6 +201,12 @@ impl BudgetGuard {
     /// True when at least one `(provider, model)` price was registered.
     pub fn has_pricing(&self) -> bool {
         !self.pricing.is_empty()
+    }
+
+    /// True when every charged call had a registered model price. A
+    /// registered zero-dollar local model counts as priced.
+    pub fn pricing_complete(&self) -> bool {
+        self.priced_calls > 0 && self.unpriced_calls == 0
     }
 }
 
@@ -310,6 +329,7 @@ pub struct Orchestrator<D: WorkerDispatcher + ?Sized> {
     diff_applier: Option<Arc<Mutex<phonton_diff::DiffApplier>>>,
     control_rx: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<OrchestratorMessage>>>>,
     working_dir: std::path::PathBuf,
+    verification_execution: phonton_types::verification::VerificationExecution,
     index_backend: Option<String>,
     task_id: TaskId,
     goal_text: String,
@@ -328,6 +348,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             diff_applier: None,
             control_rx: Arc::new(Mutex::new(None)),
             working_dir: std::path::PathBuf::from("."),
+            verification_execution:
+                phonton_types::verification::VerificationExecution::RequireIsolation,
             index_backend: None,
             task_id: TaskId::new(),
             goal_text: String::new(),
@@ -356,6 +378,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
     /// `"."`. Typically set to the repo root or a scratch worktree path.
     pub fn with_working_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.working_dir = path.into();
+        self
+    }
+
+    /// Set caller-owned verification authority. Host approval permits project
+    /// commands without containment; never derive this from a model or `--yes`.
+    pub fn with_verification_execution(
+        mut self,
+        policy: phonton_types::verification::VerificationExecution,
+    ) -> Self {
+        self.verification_execution = policy;
         self
     }
 
@@ -418,11 +450,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
     }
 
     /// Provide a control-message channel the orchestrator polls between
-    /// scheduler iterations. Today this is the rollback path: the UI
-    /// sends `OrchestratorMessage::RollbackRequest { to_seq }` and the
-    /// orchestrator aborts in-flight workers, asks `phonton-diff` to
-    /// reset to the named checkpoint, requeues every subtask after it,
-    /// and resumes the scheduler.
+    /// scheduler iterations. Legacy checkpoint rollback requests are refused
+    /// without interrupting workers until path-scoped recovery exists.
     pub fn with_control_channel(
         self,
         rx: tokio::sync::mpsc::Receiver<OrchestratorMessage>,
@@ -656,18 +685,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     }
                 } => {
                     if let Some(OrchestratorMessage::RollbackRequest { to_seq }) = msg {
-                        joinset.abort_all();
-                        let requeued = self.handle_rollback(
-                            to_seq,
-                            &mut runtimes,
-                            &mut checkpoints,
-                            &mut checkpointed,
-                            &mut next_seq,
-                        );
-                        self.emit(OrchestratorEvent::RollbackPerformed {
+                        self.emit(OrchestratorEvent::ReviewDecision {
                             task_id: self.task_id,
-                            to_seq,
-                            requeued_subtasks: requeued,
+                            decision: "rollback-refused".into(),
+                            detail: format!("Checkpoint #{to_seq} rollback is disabled because the legacy reset could discard unrelated work."),
                         });
                         continue;
                     }
@@ -728,7 +749,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     .map(|r| {
                         (
                             r.subtask.id,
-                            r.subtask.description.clone(),
+                            phonton_types::task_description_without_prior_context(
+                                &r.subtask.description,
+                            )
+                            .to_string(),
                             r.diff_hunks.clone(),
                         )
                     })
@@ -736,6 +760,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 for (sid, desc, hunks) in newly_done {
                     let seq = next_seq;
                     next_seq = next_seq.saturating_add(1);
+                    let verified_paths: Vec<_> =
+                        hunks.iter().map(|h| h.file_path.clone()).collect();
 
                     if let Some(diff) = &self.diff_applier {
                         // Git-backed path: apply hunks → stage → checkpoint commit.
@@ -749,17 +775,32 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                                     checkpointed.insert(sid);
                                     break;
                                 }
-                                match d.commit_checkpoint(self.task_id, sid, seq, &desc) {
+                                match d.commit_checkpoint(
+                                    self.task_id,
+                                    sid,
+                                    seq,
+                                    &desc,
+                                    &verified_paths,
+                                ) {
                                     Ok(c) => Some(c),
                                     Err(e) => {
                                         warn!(error = %e, subtask = %sid, "checkpoint commit failed");
-                                        None
+                                        let reason = format!("checkpoint commit failed after verified diff was applied: {e}");
+                                        fail_subtask(&mut runtimes, sid, reason.clone());
+                                        failure = Some((sid, reason));
+                                        checkpointed.insert(sid);
+                                        break;
                                     }
                                 }
                             }
                             Err(e) => {
                                 warn!(error = %e, "diff applier mutex poisoned");
-                                None
+                                let reason =
+                                    "checkpoint applier unavailable after verification".to_string();
+                                fail_subtask(&mut runtimes, sid, reason.clone());
+                                failure = Some((sid, reason));
+                                checkpointed.insert(sid);
+                                break;
                             }
                         };
                         checkpointed.insert(sid);
@@ -775,7 +816,15 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     } else {
                         // No git repo — write files directly to disk so the
                         // user sees output even without a git repository.
-                        apply_hunks_direct(&hunks, &self.working_dir);
+                        if let Err(error) =
+                            phonton_diff::apply_worktree_hunks(&self.working_dir, &hunks)
+                        {
+                            let reason = format!("apply verified diff failed: {error}");
+                            fail_subtask(&mut runtimes, sid, reason.clone());
+                            failure = Some((sid, reason));
+                            checkpointed.insert(sid);
+                            break;
+                        }
                         checkpointed.insert(sid);
                     }
                 }
@@ -931,104 +980,6 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         Ok(terminal)
     }
 
-    /// Apply an inbound `RollbackRequest`.
-    ///
-    /// Hard-resets the worktree to the checkpoint with seq = `to_seq`
-    /// (via `phonton-diff`), then walks the runtime map and re-marks
-    /// every subtask whose checkpoint seq is *greater than* `to_seq`
-    /// as `Queued`, dropping its diff hunks and prior errors so the
-    /// scheduler will re-dispatch fresh. Subtasks at or below the
-    /// target seq are left in `Done`.
-    ///
-    /// Crucially, subtasks that *depend on* any rolled-back subtask are
-    /// also requeued, even if they were never checkpointed themselves.
-    /// This transitive invalidation ensures the scheduler re-evaluates
-    /// the full DAG tail after a rollback.
-    ///
-    /// Returns the count of subtasks that were requeued so the
-    /// `RollbackPerformed` event can carry an accurate number.
-    fn handle_rollback(
-        &self,
-        to_seq: u32,
-        runtimes: &mut HashMap<SubtaskId, SubtaskRuntime>,
-        checkpoints: &mut Vec<Checkpoint>,
-        checkpointed: &mut HashSet<SubtaskId>,
-        next_seq: &mut u32,
-    ) -> usize {
-        // Find the target checkpoint commit.
-        let target = checkpoints.iter().find(|c| c.seq == to_seq).cloned();
-        let target_oid = match target {
-            Some(c) => c.commit_oid,
-            None => {
-                warn!(to_seq, "rollback target seq not found; ignoring");
-                return 0;
-            }
-        };
-        if let Some(diff) = &self.diff_applier {
-            if let Ok(mut d) = diff.lock() {
-                if let Err(e) = d.rollback_to_checkpoint(&target_oid) {
-                    warn!(error = %e, "rollback_to_checkpoint failed");
-                    return 0;
-                }
-            }
-        }
-
-        // Seed set: every checkpoint with seq > to_seq.
-        let mut invalidated: HashSet<SubtaskId> = checkpoints
-            .iter()
-            .filter(|c| c.seq > to_seq)
-            .map(|c| c.subtask_id)
-            .collect();
-
-        // Trim the checkpoint list and bookkeeping in lockstep.
-        checkpoints.retain(|c| c.seq <= to_seq);
-        for id in &invalidated {
-            checkpointed.remove(id);
-        }
-        *next_seq = to_seq.saturating_add(1);
-
-        // Expand the invalidated set to include every subtask that
-        // transitively depends on one of the rolled-back subtasks.
-        // Fixed-point loop: keep growing until no new subtask is added.
-        loop {
-            let mut grew = false;
-            for rt in runtimes.values() {
-                if invalidated.contains(&rt.subtask.id) {
-                    continue;
-                }
-                // If any of this subtask's deps is invalidated, it must
-                // also be invalidated — regardless of its current status.
-                let depends_on_invalid = rt
-                    .subtask
-                    .dependencies
-                    .iter()
-                    .any(|dep| invalidated.contains(dep));
-                if depends_on_invalid {
-                    invalidated.insert(rt.subtask.id);
-                    grew = true;
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
-
-        let mut requeued = 0usize;
-        for rt in runtimes.values_mut() {
-            if invalidated.contains(&rt.subtask.id) {
-                rt.status = SubtaskStatus::Queued;
-                rt.attempts_at_tier = 0;
-                rt.escalations = 0;
-                rt.prior_errors.clear();
-                rt.tokens_used = 0;
-                rt.diff_hunks.clear();
-                rt.verify_result = None;
-                requeued += 1;
-            }
-        }
-        requeued
-    }
-
     /// Publish an event on the attached sink, if any. Never fails — a
     /// closed receiver or missing sink is a no-op so telemetry can never
     /// break the orchestrator's control flow.
@@ -1173,6 +1124,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             // If the worker itself already surfaced a hard failure (no diff
             // to verify), don't re-verify an empty hunk set and mask it.
             if matches!(sr.status, SubtaskStatus::Failed { .. }) {
+                rt.verify_result = Some(sr.verify_result.clone());
                 let reason = failure_reason(&sr.status);
                 let attempt = rt.attempts_at_tier.saturating_add(1);
                 finish_route(rt, RouteOutcome::FailedVerify);
@@ -1195,10 +1147,11 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // the orchestrator marks it Done. No bypass flags. When a memory
         // store is attached, Layer 1.5 (Decision Check) runs between
         // Syntax and CrateCheck — see `with_memory`.
-        let verdict = phonton_verify::verify_diff_with_memory(
+        let verdict = phonton_verify::verify_diff_with_execution(
             &diff_hunks,
             &self.working_dir,
             self.memory.as_ref(),
+            self.verification_execution,
         )
         .await?;
         self.apply_verdict(runtimes, id, verdict, joinset, worker_msg_tx)
@@ -1235,7 +1188,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                     });
                     events.push(OrchestratorEvent::SubtaskReviewReady {
                         subtask_id: id,
-                        description: rt.subtask.description.clone(),
+                        description: phonton_types::task_description_without_prior_context(
+                            &rt.subtask.description,
+                        )
+                        .to_string(),
                         tier: rt.subtask.model_tier,
                         tokens_used: rt.tokens_used,
                         token_usage: rt.token_usage,
@@ -1311,6 +1267,21 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         });
                         (true, false)
                     }
+                }
+                VerifyResult::Unavailable { ref reason } | VerifyResult::NotRun { ref reason } => {
+                    let reason = reason.clone();
+                    rt.verify_result = Some(verdict);
+                    finish_route(rt, RouteOutcome::FailedVerify);
+                    rt.status = SubtaskStatus::Failed {
+                        reason: reason.clone(),
+                        attempt: rt.attempts_at_tier,
+                    };
+                    events.push(OrchestratorEvent::SubtaskFailed {
+                        subtask_id: id,
+                        reason,
+                        attempt: rt.attempts_at_tier,
+                    });
+                    (false, false)
                 }
                 VerifyResult::Escalate { reason } => {
                     rt.verify_result = Some(VerifyResult::Escalate {
@@ -1415,6 +1386,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 Some(VerifyResult::Escalate { reason }) => {
                     findings.push(format!("{clean_desc} escalated: {reason}"));
                 }
+                Some(VerifyResult::Unavailable { reason }) => {
+                    findings.push(format!("{clean_desc} verification unavailable: {reason}"));
+                }
+                Some(VerifyResult::NotRun { reason }) => {
+                    findings.push(format!("{clean_desc} verification not run: {reason}"));
+                }
                 None if rt.is_failed() => {
                     findings.push(format!(
                         "{clean_desc} failed: {}",
@@ -1498,7 +1475,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             known_gaps.push("No changed files were recorded for this run.".into());
         }
         if run_commands.is_empty() {
-            known_gaps.push("No run command was inferred yet.".into());
+            known_gaps.push(
+                "No application launch command was inferred; verification checks are reported separately."
+                    .into(),
+            );
         }
         if !reached_test_layer {
             known_gaps.push("No explicit test layer was recorded by this run.".into());
@@ -1688,11 +1668,11 @@ fn assemble_cost_receipt(
         );
         route.extend(rt.route.iter().cloned());
     }
-    let (metered, has_table) = budget_guard
+    let (metered, complete) = budget_guard
         .and_then(|g| g.lock().ok())
-        .map(|g| (g.usd_micros_spent(), g.has_pricing()))
+        .map(|g| (g.usd_micros_spent(), g.pricing_complete()))
         .unwrap_or((0, false));
-    let (actual, pricing_known) = if has_table && metered > 0 {
+    let (actual, pricing_known) = if complete {
         (metered, true)
     } else {
         (estimated_actual, false)
@@ -1751,76 +1731,6 @@ fn failure_reason(status: &SubtaskStatus) -> String {
     match status {
         SubtaskStatus::Failed { reason, .. } => reason.clone(),
         _ => "unknown failure".into(),
-    }
-}
-
-/// Fallback diff application for projects without a git repository.
-/// Writes new files and applies simple line-based patches directly to disk.
-/// Silently skips hunks whose parent directory can't be created.
-fn apply_hunks_direct(hunks: &[phonton_types::DiffHunk], working_dir: &std::path::Path) {
-    use phonton_types::DiffLine;
-    use std::collections::BTreeMap;
-
-    let mut by_file: BTreeMap<&std::path::Path, Vec<&phonton_types::DiffHunk>> = BTreeMap::new();
-    for h in hunks {
-        by_file.entry(&h.file_path).or_default().push(h);
-    }
-
-    for (rel_path, file_hunks) in by_file {
-        let full = working_dir.join(rel_path);
-        // Create parent dirs if needed.
-        if let Some(parent) = full.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let is_new = file_hunks
-            .iter()
-            .all(|h| h.old_count == 0 && h.old_start == 0)
-            || !full.exists();
-
-        if is_new {
-            // New file — reconstruct from Added lines.
-            let content: String = file_hunks
-                .iter()
-                .flat_map(|h| h.lines.iter())
-                .filter_map(|l| {
-                    if let DiffLine::Added(s) = l {
-                        Some(s.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = std::fs::write(&full, content);
-        } else {
-            // Existing file — apply line patches naively.
-            let Ok(original) = std::fs::read_to_string(&full) else {
-                continue;
-            };
-            let mut out_lines: Vec<String> = original.lines().map(String::from).collect();
-            // Apply hunks in reverse order so line offsets don't shift.
-            let mut sorted = file_hunks.clone();
-            sorted.sort_by_key(|h| std::cmp::Reverse(h.new_start));
-            for hunk in sorted {
-                let start = hunk.new_start.saturating_sub(1) as usize;
-                let remove = hunk.old_count as usize;
-                let added: Vec<String> = hunk
-                    .lines
-                    .iter()
-                    .filter_map(|l| {
-                        if let DiffLine::Added(s) = l {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let end = (start + remove).min(out_lines.len());
-                out_lines.splice(start..end, added);
-            }
-            let _ = std::fs::write(&full, out_lines.join("\n"));
-        }
     }
 }
 
@@ -2185,7 +2095,7 @@ mod tests {
                 .push((subtask.id, attempt, subtask.model_tier));
             let hunks = vec![DiffHunk {
                 file_path: PathBuf::from("phonton-types/src/stub.rs"),
-                old_start: 1,
+                old_start: 0,
                 old_count: 0,
                 new_start: 1,
                 new_count: 1,
@@ -2269,6 +2179,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_and_not_run_stop_without_dispatch_or_escalation() {
+        for verdict in [
+            VerifyResult::Unavailable {
+                reason: "containment missing".into(),
+            },
+            VerifyResult::NotRun {
+                reason: "checks missing".into(),
+            },
+        ] {
+            let task = subtask("edit source", vec![]);
+            let id = task.id;
+            let dispatcher = Arc::new(TrivialDispatcher::new());
+            let orch = Orchestrator::new(Arc::clone(&dispatcher));
+            let mut runtimes = HashMap::from([(id, SubtaskRuntime::new(task, NodeIndex::new(0)))]);
+            let mut joins = JoinSet::new();
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            orch.apply_verdict(&mut runtimes, id, verdict.clone(), &mut joins, tx)
+                .unwrap();
+            let runtime = &runtimes[&id];
+            assert!(runtime.is_failed());
+            assert_eq!(runtime.verify_result.as_ref(), Some(&verdict));
+            assert_eq!(runtime.subtask.model_tier, ModelTier::Cheap);
+            assert_eq!(runtime.escalations, 0);
+            assert!(joins.is_empty());
+            assert!(dispatcher.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn default_orchestrator_does_not_accept_worker_claimed_pass() {
+        let task = subtask("create source", vec![]);
+        let dispatcher = Arc::new(TrivialDispatcher::new());
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let state = empty_state();
+        let status = orch
+            .run_task(
+                PlannerOutput {
+                    subtasks: vec![task],
+                    estimated_total_tokens: 0,
+                    naive_baseline_tokens: 0,
+                    coverage_summary: CoverageSummary::default(),
+                    goal_contract: None,
+                    plan_graph: Default::default(),
+                },
+                state.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(status, TaskStatus::Failed { .. }));
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+        assert!(!tmp.path().join("target").exists());
+        let snapshot = state.borrow();
+        let packet = snapshot.handoff_packet.as_ref().unwrap();
+        assert!(format!("{packet:?}").contains("verification unavailable"));
+    }
+
+    #[tokio::test]
     async fn runs_linear_chain_in_order() {
         let a = subtask("first", vec![]);
         let b = subtask("second", vec![a.id]);
@@ -2283,9 +2252,13 @@ mod tests {
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let status = orch.run_task(plan, empty_state(), None).await.unwrap();
-        assert!(matches!(status, TaskStatus::Reviewing { .. }));
+        assert!(matches!(status, TaskStatus::Reviewing { .. }), "{status:?}");
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         // Linear: first dispatch must be a, then b, then c.
@@ -2321,7 +2294,11 @@ mod tests {
         });
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
 
         let status = orch.run_task(plan, state_tx, None).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
@@ -2371,7 +2348,11 @@ mod tests {
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         assert!(matches!(status, TaskStatus::Reviewing { .. }));
         assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
@@ -2395,7 +2376,7 @@ mod tests {
                 self.calls.lock().unwrap().push(subtask.model_tier);
                 let hunks = vec![DiffHunk {
                     file_path: PathBuf::from("phonton-types/src/stub.rs"),
-                    old_start: 1,
+                    old_start: 0,
                     old_count: 0,
                     new_start: 1,
                     new_count: 1,
@@ -2435,7 +2416,11 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         assert!(matches!(status, TaskStatus::Failed { .. }));
         let calls = dispatcher.calls.lock().unwrap();
@@ -2459,7 +2444,7 @@ mod tests {
             ) -> Result<SubtaskResult> {
                 let hunks = vec![DiffHunk {
                     file_path: PathBuf::from("phonton-types/src/stub.rs"),
-                    old_start: 1,
+                    old_start: 0,
                     old_count: 0,
                     new_start: 1,
                     new_count: 1,
@@ -2500,6 +2485,9 @@ mod tests {
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::new(BrokenDispatcher))
             .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            )
             .with_event_sink(task_id, "busted", events_tx);
 
         let _ = orch.run_task(plan, empty_state(), None).await.unwrap();
@@ -2552,7 +2540,7 @@ mod tests {
                 self.calls.lock().unwrap().push(subtask.id);
                 let hunks = vec![DiffHunk {
                     file_path: PathBuf::from("phonton-types/src/stub.rs"),
-                    old_start: 1,
+                    old_start: 0,
                     old_count: 0,
                     new_start: 1,
                     new_count: 1,
@@ -2597,7 +2585,11 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let status = timeout(
             Duration::from_secs(600),
             orch.run_task(plan, empty_state(), None),
@@ -2760,6 +2752,9 @@ mod tests {
         let tmp = temp_workspace();
         let orch = Orchestrator::new(Arc::clone(&dispatcher))
             .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            )
             .with_budget_guard(guard);
         let status = orch.run_task(plan, empty_state(), None).await.unwrap();
         match status {
@@ -2793,7 +2788,11 @@ mod tests {
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let _ = orch.run_task(plan, empty_state(), None).await.unwrap();
         let calls = dispatcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -2821,6 +2820,47 @@ mod tests {
         // Add 50k output at $15/Mtok = $0.75 → $1.05 total → trips.
         let d = g.charge(ProviderKind::Anthropic, "claude-sonnet-4-6", 0, 50_000);
         assert!(matches!(d, BudgetDecision::Pause { .. }));
+    }
+
+    #[test]
+    fn unpriced_call_does_not_look_free_under_usd_cap() {
+        let mut guard = BudgetGuard::new(BudgetLimits {
+            max_tokens: None,
+            max_usd_micros: Some(1_000_000),
+        })
+        .with_price(
+            ProviderKind::OpenAiCompatible,
+            "known",
+            ModelPricing {
+                input_usd_micros_per_mtok: 300_000,
+                output_usd_micros_per_mtok: 1_200_000,
+            },
+        );
+        assert!(matches!(
+            guard.charge(ProviderKind::OpenAiCompatible, "known", 1_000_000, 0),
+            BudgetDecision::Ok
+        ));
+        assert!(guard.pricing_complete());
+        assert!(matches!(
+            guard.charge(ProviderKind::OpenAiCompatible, "unknown", 1, 0),
+            BudgetDecision::Pause { limit, .. } if limit == "usd-pricing"
+        ));
+        assert!(!guard.pricing_complete());
+    }
+
+    #[test]
+    fn registered_zero_cost_model_is_priced() {
+        let mut guard = BudgetGuard::new(BudgetLimits::default()).with_price(
+            ProviderKind::Ollama,
+            "local",
+            ModelPricing {
+                input_usd_micros_per_mtok: 0,
+                output_usd_micros_per_mtok: 0,
+            },
+        );
+        guard.charge(ProviderKind::Ollama, "local", 12, 4);
+        assert!(guard.pricing_complete());
+        assert_eq!(guard.usd_micros_spent(), 0);
     }
 
     #[tokio::test]
@@ -2855,7 +2895,11 @@ mod tests {
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let r = orch.run_task(plan, empty_state(), None).await;
         assert!(r.is_err());
     }
@@ -2893,7 +2937,11 @@ mod tests {
         };
         let dispatcher = Arc::new(TrivialDispatcher::new());
         let tmp = temp_workspace();
-        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let orch = Orchestrator::new(Arc::clone(&dispatcher))
+            .with_working_dir(tmp.path())
+            .with_verification_execution(
+                phonton_types::verification::VerificationExecution::HostApproved,
+            );
         let status = orch.run_task(plan, empty_state(), None).await.unwrap();
 
         assert!(

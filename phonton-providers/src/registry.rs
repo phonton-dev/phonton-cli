@@ -36,9 +36,9 @@ pub const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         id: "deepseek",
         display_name: "DeepSeek",
         env_keys: &["DEEPSEEK_API_KEY"],
-        default_cheap: "deepseek-chat",
-        default_standard: "deepseek-chat",
-        default_frontier: "deepseek-reasoner",
+        default_cheap: "deepseek-flash",
+        default_standard: "deepseek-flash",
+        default_frontier: "deepseek-v4-pro",
         openai_compatible: true,
     },
 ];

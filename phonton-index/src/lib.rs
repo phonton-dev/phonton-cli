@@ -21,7 +21,7 @@ const RUST_KINDS: &[&str] = &[
 const PYTHON_KINDS: &[&str] = &["function_definition", "class_definition"];
 const TS_KINDS: &[&str] = &[
     "function_declaration",
-    "class_description",
+    "class_declaration",
     "interface_declaration",
     "method_definition",
 ];
@@ -45,7 +45,7 @@ pub fn extract_symbols(source: &str, file_path: &Path) -> Vec<CodeSlice> {
             tree_sitter_python::language(),
             PYTHON_KINDS,
         ),
-        "ts" | "js" | "tsx" | "jsx" => extract_semantic(
+        "ts" | "js" | "mts" | "cts" | "mjs" | "cjs" | "tsx" | "jsx" => extract_semantic(
             source,
             file_path,
             tree_sitter_typescript::language_typescript(),
@@ -53,6 +53,56 @@ pub fn extract_symbols(source: &str, file_path: &Path) -> Vec<CodeSlice> {
         ),
         _ => extract_fallback(source, file_path),
     }
+}
+
+/// Extract exact inclusive line spans without embeddings, downloads or network.
+/// The traversal is bounded; unsupported languages return no parsed spans so
+/// callers can explicitly use lexical source windows instead.
+pub fn extract_symbol_spans(
+    source: &str,
+    file_path: &Path,
+) -> Vec<phonton_types::code_context::SymbolSpan> {
+    let extension = file_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let (language, kinds) = match extension {
+        "rs" => (tree_sitter_rust::language(), RUST_KINDS),
+        "py" => (tree_sitter_python::language(), PYTHON_KINDS),
+        "ts" | "js" | "mts" | "cts" | "mjs" | "cjs" => {
+            (tree_sitter_typescript::language_typescript(), TS_KINDS)
+        }
+        "tsx" | "jsx" => (tree_sitter_typescript::language_tsx(), TS_KINDS),
+        _ => return Vec::new(),
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut stack = vec![tree.root_node()];
+    let mut spans = Vec::new();
+    let mut visited = 0;
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > 200_000 || spans.len() >= 4096 {
+            break;
+        }
+        if kinds.contains(&node.kind()) || node.kind() == "variable_declarator" {
+            if let Some(name) = extract_name(node, source.as_bytes()) {
+                spans.push(phonton_types::code_context::SymbolSpan {
+                    name,
+                    start_line: node.start_position().row + 1,
+                    end_line: node.end_position().row + usize::from(node.end_position().column > 0),
+                });
+            }
+        }
+        for index in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    spans
 }
 
 fn extract_semantic(
@@ -93,8 +143,7 @@ fn extract_fallback(source: &str, file_path: &Path) -> Vec<CodeSlice> {
         let start = full_match.start();
 
         // Grab a few lines of context.
-        let end = (start + 200).min(source.len());
-        let signature = source[start..end].to_string();
+        let signature = bounded_utf8(&source[start..], 200).to_string();
 
         symbols.push(CodeSlice {
             file_path: file_path.to_path_buf(),
@@ -156,7 +205,15 @@ fn extract_signature(node: tree_sitter::Node, source: &[u8]) -> String {
     if text.len() <= 400 {
         return text.to_string();
     }
-    text[..400].to_string()
+    bounded_utf8(text, 400).to_string()
+}
+
+fn bounded_utf8(text: &str, maximum: usize) -> &str {
+    let mut end = maximum.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -184,11 +241,23 @@ pub struct Embedder {
 
 #[cfg(feature = "semantic")]
 impl Embedder {
-    /// Load `all-MiniLM-L6-v2`. On first call this downloads and caches
-    /// the ONNX weights under the platform's fastembed cache dir.
+    /// Load `all-MiniLM-L6-v2` outside the current working directory.
     pub fn new() -> Result<Self> {
+        let cwd = std::env::current_dir().context("locating embedding workspace")?;
+        Self::new_for_workspace(&cwd)
+    }
+
+    /// Load `all-MiniLM-L6-v2` with its cache outside the indexed workspace.
+    pub fn new_for_workspace(workspace: &Path) -> Result<Self> {
+        let cache_dir = embedding_cache_dir(
+            workspace,
+            dirs::cache_dir(),
+            std::env::var_os("FASTEMBED_CACHE_DIR"),
+            std::env::var_os("HF_HOME"),
+        )?;
         let model = fastembed::TextEmbedding::try_new(
             fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+                .with_cache_dir(cache_dir)
                 .with_show_download_progress(false),
         )
         .context("loading all-MiniLM-L6-v2")?;
@@ -202,6 +271,62 @@ impl Embedder {
             .embed(docs, None)
             .map_err(|e| anyhow::anyhow!("fastembed: {e}"))
     }
+}
+
+#[cfg(feature = "semantic")]
+fn embedding_cache_dir(
+    workspace: &Path,
+    user_cache: Option<PathBuf>,
+    fastembed_override: Option<std::ffi::OsString>,
+    hf_home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let configured = match fastembed_override {
+        Some(path) => PathBuf::from(path),
+        None => user_cache
+            .ok_or_else(|| anyhow::anyhow!("cannot locate a user model cache directory"))?
+            .join("Phonton")
+            .join("fastembed"),
+    };
+    let cache = safe_embedding_cache_path(&configured, workspace)?;
+    // fastembed 4.x gives HF_HOME precedence over InitOptions.cache_dir.
+    if let Some(path) = hf_home {
+        safe_embedding_cache_path(&PathBuf::from(path), workspace)?;
+    }
+    Ok(cache)
+}
+
+#[cfg(feature = "semantic")]
+fn safe_embedding_cache_path(path: &Path, workspace: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        anyhow::bail!("embedding cache location must be an absolute path without parent traversal");
+    }
+    let project = std::fs::canonicalize(workspace).context("resolving embedding workspace")?;
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("embedding cache location has no existing ancestor"))?;
+        missing.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("embedding cache location has no parent"))?;
+    }
+    let mut resolved =
+        std::fs::canonicalize(ancestor).context("resolving embedding cache location")?;
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    if resolved.starts_with(&project) {
+        anyhow::bail!("embedding cache location is inside the working repository");
+    }
+    Ok(resolved)
 }
 
 /// HNSW index over [`CodeSlice`]s, keyed by insertion order.
@@ -430,7 +555,7 @@ pub async fn index_workspace_with_nexus(
     root: &Path,
     config: &NexusConfig,
 ) -> Result<SemanticIndex> {
-    let embedder = Embedder::new()?;
+    let embedder = Embedder::new_for_workspace(root)?;
     index_workspace_with_nexus_using_embedder(root, config, &embedder).await
 }
 
@@ -500,7 +625,7 @@ pub async fn index_workspace_with_nexus_using_embedder(
 /// embed their signatures in batches of 32, and return an HNSW index.
 #[cfg(feature = "semantic")]
 pub async fn index_workspace(root: &Path) -> Result<SemanticIndex> {
-    let embedder = Embedder::new()?;
+    let embedder = Embedder::new_for_workspace(root)?;
     index_workspace_using_embedder(root, &embedder).await
 }
 
@@ -747,7 +872,7 @@ pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
     watcher
         .watch(root, RecursiveMode::Recursive)
         .expect("failed to watch");
-    let embedder = Embedder::new().expect("failed to load embedder");
+    let embedder = Embedder::new_for_workspace(root).expect("failed to load embedder");
 
     loop {
         let mut events = Vec::new();
@@ -809,6 +934,105 @@ pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn embedding_cache_stays_outside_workspace_and_refuses_unsafe_overrides() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().join("repo");
+        let user_cache = temp.path().join("user-cache");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::create_dir_all(&user_cache)?;
+        let resolved_user_cache = std::fs::canonicalize(&user_cache)?;
+
+        let chosen = embedding_cache_dir(&workspace, Some(user_cache.clone()), None, None)?;
+        assert_eq!(
+            chosen,
+            resolved_user_cache.join("Phonton").join("fastembed")
+        );
+        assert!(!workspace.join(".fastembed_cache").exists());
+        assert!(embedding_cache_dir(
+            &workspace,
+            Some(user_cache.clone()),
+            Some(".fastembed_cache".into()),
+            None
+        )
+        .is_err());
+        assert!(embedding_cache_dir(
+            &workspace,
+            Some(user_cache.clone()),
+            Some(workspace.join(".fastembed_cache").into_os_string()),
+            None
+        )
+        .is_err());
+        assert!(embedding_cache_dir(
+            &workspace,
+            Some(user_cache.clone()),
+            None,
+            Some("relative-hf-cache".into())
+        )
+        .is_err());
+        assert!(embedding_cache_dir(
+            &workspace,
+            Some(user_cache.clone()),
+            None,
+            Some(workspace.join("hf-cache").into_os_string())
+        )
+        .is_err());
+        assert_eq!(
+            embedding_cache_dir(
+                &workspace,
+                Some(user_cache.clone()),
+                Some(user_cache.clone().into_os_string()),
+                None
+            )?,
+            resolved_user_cache
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_extraction_never_splits_utf8() {
+        let source = format!("pub fn sample() {{\n    // {}\n}}\n", "é".repeat(250));
+        assert!(!source.is_char_boundary(400));
+        let slices = extract_symbols(&source, Path::new("sample.rs"));
+        assert_eq!(slices.len(), 1);
+        assert!(slices[0].signature.len() <= 400);
+        let fallback = format!("function sample()  {}\n", "é".repeat(150));
+        assert!(!fallback.is_char_boundary(200));
+        let slices = extract_symbols(&fallback, Path::new("sample.txt"));
+        assert_eq!(slices.len(), 1);
+        assert!(slices[0].signature.len() <= 200);
+    }
+
+    #[test]
+    fn parsed_spans_identify_complete_functions_and_tsx_methods() {
+        let spans = extract_symbol_spans(
+            "// header\nexport function sum(a, b) {\n  return a + b;\n}\n",
+            Path::new("sum.js"),
+        );
+        assert!(spans
+            .iter()
+            .any(|s| s.name == "sum" && s.start_line == 2 && s.end_line == 4));
+        let spans = extract_symbol_spans(
+            "export function View() {\n  return <main>hello</main>;\n}\n",
+            Path::new("View.tsx"),
+        );
+        assert!(spans.iter().any(|s| s.name == "View" && s.end_line == 3));
+    }
+    #[test]
+    fn module_extensions_keep_complete_function_spans() {
+        let source = "export function sumInclusive(start, end) {\n  return start + end;\n}\n";
+        for extension in ["mjs", "cjs", "mts", "cts"] {
+            let path = PathBuf::from(format!("sum.{extension}"));
+            assert!(extract_symbol_spans(source, &path)
+                .iter()
+                .any(|s| s.name == "sumInclusive" && s.start_line == 1 && s.end_line == 3));
+            assert!(extract_symbols(source, &path)
+                .iter()
+                .any(|s| s.symbol_name == "sumInclusive"));
+        }
+    }
     #[cfg(feature = "semantic")]
     use phonton_types::{CodeSlice, SliceOrigin};
 

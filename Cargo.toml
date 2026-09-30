@@ -16,6 +16,7 @@ members = [
     "phonton-mcp",
     "phonton-cli",
     "phonton-handoff",
+    "phonton-local",
 ]
 resolver = "2"
 
@@ -35,3 +36,8 @@ anyhow    = "1"
 thiserror = "1"
 tracing   = "0.1"
 uuid      = { version = "1", features = ["v4", "serde"] }
+
+# The unsigned local Desktop preview embeds a debug CLI. Keep multi-gigabyte
+# runtime-integrity hashing practical in that build without optimizing all crates.
+[profile.dev.package.sha2]
+opt-level = 3
