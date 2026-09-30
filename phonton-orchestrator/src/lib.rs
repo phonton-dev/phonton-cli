@@ -2171,7 +2171,8 @@ mod tests {
         .expect("crate manifest");
         fs::write(
             tmp.path().join("phonton-types/src/lib.rs"),
-            "pub mod stub;\n",
+            // The Test layer requires at least one completed passing test.
+            "pub mod stub;\n\n#[test]\nfn fixture_passes() {}\n",
         )
         .expect("lib");
         fs::write(tmp.path().join("phonton-types/src/stub.rs"), "").expect("stub");

@@ -87,8 +87,6 @@ use phonton_providers::{
 };
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
-#[cfg(test)]
-use phonton_types::VerifyResult;
 use phonton_types::{
     BudgetLimits, ContextManifest, CostReceipt, CoverageSummary, EventRecord, ExtensionId,
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
@@ -8445,10 +8443,7 @@ mod tui_screen_tests {
     #[test]
     fn idle_screen_pitches_the_loop_and_footer_fits() {
         let rows = screen(&App::default(), 120, 36);
-        let all = rows.join(
-            "
-",
-        );
+        let all = rows.join("\n");
         assert!(all.contains("goal → plan → edit → verify → review → remember"));
         assert!(all.contains("No goals yet."));
         let footer = rows.last().unwrap().trim_end();
@@ -8457,12 +8452,11 @@ mod tui_screen_tests {
 
     #[test]
     fn help_overlay_rows_are_not_clipped() {
-        let mut app = App::default();
-        app.help_open = true;
-        let all = screen(&app, 120, 40).join(
-            "
-",
-        );
+        let app = App {
+            help_open: true,
+            ..Default::default()
+        };
+        let all = screen(&app, 120, 40).join("\n");
         assert!(all.contains("rollback to the highlighted checkpoint (input empty)"));
     }
 
