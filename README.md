@@ -5,7 +5,7 @@
 <h1 align="center">Phonton</h1>
 
 <p align="center">
-  <strong>The local-first coding agent that proves its work.</strong><br>
+  <strong>The local-first ADE that proves its work.</strong><br>
   Give it a goal. It shows a plan, writes diffs, runs your checks, and hands you
   a receipt: what changed, what passed, and what it cost.
 </p>

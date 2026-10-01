@@ -2959,7 +2959,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             Line::raw(""),
             Line::from(welcome_spans),
             Line::from(Span::styled(
-                "  Local-first coding agent that proves every change before you review it.",
+                "  Local-first ADE: every change is planned, diffed and verified before review.",
                 muted,
             )),
             Line::raw(""),
@@ -4755,6 +4755,14 @@ fn default_model_for(provider: &str) -> String {
 /// Cheap/local use the configured model when set. Standard and frontier use
 /// per-tier ids so escalation is not the same model as cheap.
 fn model_for_dispatch(provider: &str, configured: Option<&str>, tier: ModelTier) -> String {
+    // Keyless providers (Ollama, custom/OpenAI-compatible endpoints) serve
+    // whatever the user installed; there is no tier ladder to escalate to,
+    // so every tier uses the configured model.
+    if !provider_requires_key(provider) {
+        if let Some(model) = configured.filter(|s| !s.trim().is_empty()) {
+            return model.to_string();
+        }
+    }
     match tier {
         ModelTier::Local | ModelTier::Cheap => configured
             .map(str::to_string)
@@ -8143,6 +8151,25 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(app.quit_armed());
         assert_eq!(app.handle_key(esc), Some(Intent::Quit));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn local_providers_use_the_configured_model_on_every_tier() {
+        for tier in [ModelTier::Cheap, ModelTier::Standard, ModelTier::Frontier] {
+            assert_eq!(
+                model_for_dispatch("ollama", Some("qwen2.5-coder:7b"), tier),
+                "qwen2.5-coder:7b"
+            );
+        }
+        // Keyed providers still escalate along their tier ladder.
+        assert_ne!(
+            model_for_dispatch(
+                "anthropic",
+                Some("claude-haiku-4-5-20251001"),
+                ModelTier::Frontier
+            ),
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     #[test]
