@@ -26,6 +26,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   quitting, matching the documented quit behavior.
 - [fixed] Ctrl+C no longer opens the clarification questionnaire when the
   prompt is empty.
+- [fixed] TUI goals now ask once per session before running project checks on
+  the host; previously every verified TUI run failed as "verification
+  unavailable".
+- [fixed] Ollama and custom endpoints use the configured model on every tier;
+  Standard/Frontier subtasks no longer fall back to a hardcoded `llama3.2:3b`.
+- [fixed] Local edits keep regex escapes like `` that small models write
+  with a single JSON backslash, instead of decoding them to a backspace byte.
+- [fixed] Local-run Apply works on Windows: the saved-review hash no longer
+  depends on the OS path separator.
 - [fixed] `phonton why-tokens` and `phonton proof export`, advertised on
   phonton.dev, are wired again. `why-tokens` reports provider usage per
   verified subtask and the selected code-context estimate.
