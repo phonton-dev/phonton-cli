@@ -22,13 +22,44 @@ struct CreateEdit {
     text: String,
 }
 
+/// Small models often write a regex `\b` (word boundary) or `\f` inside a JSON
+/// string with one backslash, which JSON decodes as a backspace or form-feed
+/// control character. Source code essentially never contains those raw
+/// characters, so keep them as a literal backslash + letter instead. Already
+/// escaped pairs (`\\b`) are left untouched.
+pub(crate) fn preserve_code_escapes(response: &str) -> std::borrow::Cow<'_, str> {
+    if !response.contains("\\b") && !response.contains("\\f") {
+        return std::borrow::Cow::Borrowed(response);
+    }
+    let mut out = String::with_capacity(response.len() + 8);
+    let mut chars = response.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(next @ ('b' | 'f')) => {
+                out.push_str("\\\\");
+                out.push(next);
+            }
+            Some(next) => {
+                out.push('\\');
+                out.push(next);
+            }
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Parse and normalize the exact creation transport without touching a file.
 /// Calibration uses this same contract before any repository goal relies on it.
 pub(crate) fn parse_creation_text(target: &Path, response: &str) -> Result<String> {
     if response.len() > 1024 * 1024 {
         return Err(LocalError::Invalid("Creation output exceeds 1 MiB".into()));
     }
-    let edit: CreateEdit = serde_json::from_str(response)?;
+    let edit: CreateEdit = serde_json::from_str(&preserve_code_escapes(response))?;
     let path = safe_relative_path(&edit.path)?;
     if path != target {
         return Err(LocalError::Invalid(
@@ -105,7 +136,7 @@ pub fn search_replace_hunks(
     if response.len() > 1024 * 1024 {
         return Err(LocalError::Invalid("Edit output exceeds 1 MiB".into()));
     }
-    let edit: Edit = serde_json::from_str(response)?;
+    let edit: Edit = serde_json::from_str(&preserve_code_escapes(response))?;
     let relative = safe_relative_path(&edit.path)?;
     if !allowed.iter().any(|path| path == &relative) {
         return Err(LocalError::Invalid(format!(
@@ -514,6 +545,28 @@ fn materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn under_escaped_regex_boundaries_stay_regex_boundaries() {
+        // Verbatim qwen2.5-coder:3b output: `\b` meant a regex word boundary,
+        // but strict JSON decodes it as a backspace (0x08).
+        let dir = tempfile::tempdir().unwrap();
+        let path = PathBuf::from("port.js");
+        std::fs::write(
+            dir.path().join(&path),
+            "  const port = Number.parseInt(input, 10);\n",
+        )
+        .unwrap();
+        let raw = r#"{"path":"port.js","search":"  const port = Number.parseInt(input, 10);","text":"  if (!/^\b[0-9]{1,5}\b$/.test(input)) throw 1;\n  const port = Number.parseInt(input, 10);"}"#;
+        let scope = [path.clone()];
+        let hunks = search_replace_hunks(dir.path(), &scope, raw).unwrap();
+        let out = materialize_hunks(dir.path(), &scope, &hunks).unwrap();
+        assert!(out[&path].contains(r"/^\b[0-9]{1,5}\b$/"));
+        assert!(!out[&path].contains('\u{8}'));
+        // A properly escaped backslash pair and real newlines are unchanged.
+        assert_eq!(preserve_code_escapes(r#"a\\b\nc"#), r#"a\\b\nc"#);
+    }
+
     #[test]
     fn canonical_creation_is_distinct_from_an_empty_existing_file() {
         let root = tempfile::tempdir().unwrap();

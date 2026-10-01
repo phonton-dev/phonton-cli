@@ -1633,7 +1633,7 @@ fn parse_progress(bytes: &[u8]) -> Result<DownloadProgress> {
 
 fn edit_probe_passed(protocol: EditProtocol, output: &str) -> bool {
     match protocol {
-        EditProtocol::SearchReplace => serde_json::from_str::<crate::edit::Edit>(output.trim()).ok().is_some_and(|edit|
+        EditProtocol::SearchReplace => serde_json::from_str::<crate::edit::Edit>(&crate::edit::preserve_code_escapes(output.trim())).ok().is_some_and(|edit|
             edit.path == "add.py" && edit.search.trim_end() == "def add(a, b): return a - b"
                 && edit.replace.trim_end() == "def add(a, b): return a + b"),
         EditProtocol::UnifiedDiff => output.trim().replace("\r\n", "\n") == "--- a/add.py\n+++ b/add.py\n@@ -1 +1 @@\n-def add(a, b): return a - b\n+def add(a, b): return a + b"
