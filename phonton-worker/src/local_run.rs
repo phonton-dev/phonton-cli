@@ -3827,7 +3827,9 @@ fn captured_hash(root: &Path, files: &[PathBuf]) -> Result<String> {
                 "Candidate identity changed outside supported bounds",
             ));
         }
-        let name = path.to_string_lossy();
+        // Hash a separator-independent name: the capture lists repository
+        // paths with `/`, while a saved snapshot re-read on Windows yields `\`.
+        let name = path.to_string_lossy().replace('\\', "/");
         hash.update((name.len() as u64).to_le_bytes());
         hash.update(name.as_bytes());
         hash.update(metadata.len().to_le_bytes());
@@ -11099,5 +11101,20 @@ mod tests {
         assert_eq!(result[0].status, CheckStatus::Unavailable);
         assert!(result[0].detail.contains("capture limit"));
         assert!(result[0].stdout.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod path_separator_hash_tests {
+    use super::*;
+
+    #[test]
+    fn captured_hash_ignores_path_separator_style() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/port.js"), "export {};\n").unwrap();
+        let forward = captured_hash(dir.path(), &[PathBuf::from("src/port.js")]).unwrap();
+        let native: PathBuf = ["src", "port.js"].iter().collect();
+        assert_eq!(forward, captured_hash(dir.path(), &[native]).unwrap());
     }
 }
