@@ -34,6 +34,7 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod art;
 mod ask_context;
 mod benchmark_cli;
 mod config;
@@ -42,12 +43,14 @@ mod doctor;
 mod extensions_cli;
 mod index_cli;
 mod local_goal_cli;
+mod local_tui;
 mod mcp_cli;
 mod memory_cli;
 mod models_cli;
 mod plan_preview;
 mod prompt_buffer;
 mod proof_cli;
+mod record;
 mod review;
 mod serve_cli;
 mod serve_desktop;
@@ -105,240 +108,71 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 // ---------------------------------------------------------------------------
-// Visual identity
+// Visual identity: Ink & Photon (see art.rs)
 // ---------------------------------------------------------------------------
 
-// Curated palette - cool slate base with cyan/violet/magenta accents.
-const ACCENT: Color = Color::Rgb(99, 179, 237); // cyan-300
-const ACCENT_HI: Color = Color::Rgb(160, 215, 250); // cyan-200 highlight
-const SUCCESS: Color = Color::Rgb(72, 199, 142);
-const WARN: Color = Color::Rgb(246, 173, 85);
-const DANGER: Color = Color::Rgb(252, 129, 74);
-const MUTED: Color = Color::Rgb(113, 128, 150);
-const DIM: Color = Color::Rgb(74, 85, 104);
-const BG_PANEL: Color = Color::Rgb(26, 32, 44);
-const BG_DEEP: Color = Color::Rgb(18, 22, 33);
-const VIOLET: Color = Color::Rgb(159, 122, 234);
-#[allow(dead_code)]
-const PINK: Color = Color::Rgb(237, 100, 166);
-
-// Gradient endpoints used by the logo / accents.
-const GRAD_A: (u8, u8, u8) = (99, 179, 237); // cyan
-const GRAD_B: (u8, u8, u8) = (159, 122, 234); // violet
-const GRAD_C: (u8, u8, u8) = (237, 100, 166); // pink
-const GRAD_D: (u8, u8, u8) = (69, 144, 255); // electric blue
-const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
-const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
+// Ink and paper, flat signal colours; the logo spectrum lives in art.rs.
+const ACCENT: Color = art::PHOTON;
+const ACCENT_HI: Color = art::PAPER;
+const PAPER: Color = art::PAPER;
+const SUCCESS: Color = art::VERIFIED;
+const WARN: Color = art::RUNNING;
+const DANGER: Color = art::FAILED;
+const MUTED: Color = art::MUTED;
+const DIM: Color = art::DIM;
+const RULE: Color = art::RULE;
+const BG_PANEL: Color = art::PANEL;
+const BG_DEEP: Color = art::INK;
+/// Side-channel accent (ask mode, flight log): quiet paper, not a new hue.
+const QUIET: Color = Color::Rgb(201, 198, 190);
 
 const UI_TICK_MS: u64 = 80;
-#[allow(dead_code)]
-const LOGO_SHIMMER_SPEED: f32 = 0.018;
-const LOGO_ROW_PHASE: f32 = 0.085;
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-const LOGO: &[&str] = &[
-    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
-    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
-    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
-    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
-    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
-    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
-    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
-];
-
 const LOGO_WIDTH_THRESHOLD: u16 = 72;
 static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 
-// ---------------------------------------------------------------------------
-// Visual helpers — gradient + pill primitives
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    let v = a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0);
-    v.round().clamp(0.0, 255.0) as u8
-}
-
-/// Linearly interpolate between two RGB colors.
-fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
-    Color::Rgb(
-        lerp_u8(a.0, b.0, t),
-        lerp_u8(a.1, b.1, t),
-        lerp_u8(a.2, b.2, t),
-    )
-}
-
-/// Three-stop gradient (a → b → c) sampled at t ∈ [0, 1].
-fn grad3(t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        grad(GRAD_A, GRAD_B, t * 2.0)
-    } else {
-        grad(GRAD_B, GRAD_C, (t - 0.5) * 2.0)
-    }
-}
-
-/// Four-stop animated logo palette. Starts in violet/pink like the splash
-/// mock, then travels through electric blue and cyan before looping.
-fn logo_grad(t: f32) -> Color {
-    let t = t - t.floor();
-    if t < 0.33 {
-        grad(GRAD_B, GRAD_C, t / 0.33)
-    } else if t < 0.66 {
-        grad(GRAD_C, GRAD_D, (t - 0.33) / 0.33)
-    } else {
-        grad(GRAD_D, GRAD_A, (t - 0.66) / 0.34)
-    }
-}
-
-/// Build a horizontally-gradient-colored line from `text`. `phase` shifts the
-/// gradient to produce a subtle shimmer when called per frame.
-fn gradient_line(text: &str, phase: f32, bold: bool) -> Line<'static> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len().max(1) as f32;
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let modifier = if bold {
-        Modifier::BOLD
-    } else {
-        Modifier::empty()
-    };
-    for (i, ch) in chars.into_iter().enumerate() {
-        if ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
-        }
-        let mut t = (i as f32) / n + phase;
-        t = t - t.floor();
-        let color = grad3(t);
-        spans.push(Span::styled(
-            ch.to_string(),
-            Style::default().fg(color).add_modifier(modifier),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len().max(1) as f32;
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
-    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
-
-    for (i, ch) in chars.into_iter().enumerate() {
-        if ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
-        }
-
-        let x = i as f32 / n;
-        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
-        let base_color = base_rgb(base);
-        let dist = |w: f32| -> f32 {
-            let raw = (x - w).abs();
-            raw.min(1.0 - raw)
-        };
-        let d_a = dist(wave_a);
-        let d_b = dist(wave_b);
-
-        let style = match ch {
-            '░' | '▒' | '▓' => {
-                let body = match ch {
-                    '▓' => 0.55,
-                    '▒' => 0.32,
-                    _ => 0.16,
-                };
-                let glow = if d_a < 0.14 {
-                    (1.0 - d_a / 0.14) * 0.45
-                } else {
-                    0.0
-                };
-                Style::default().fg(grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9)))
-            }
-            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
-                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
-                let lift = if d_a < 0.07 {
-                    (1.0 - d_a / 0.07) * 0.35
-                } else {
-                    0.0
-                };
-                Style::default()
-                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
-                    .add_modifier(Modifier::BOLD)
-            }
-            _ => {
-                let glint_a = if d_a < 0.08 {
-                    (1.0 - d_a / 0.08) * 0.65
-                } else {
-                    0.0
-                };
-                let glint_b = if d_b < 0.05 {
-                    (1.0 - d_b / 0.05) * 0.45
-                } else {
-                    0.0
-                };
-                let breathing = ((phase * std::f32::consts::TAU
-                    + x * std::f32::consts::TAU * 1.4
-                    + row_idx as f32 * 0.65)
-                    .sin()
-                    + 1.0)
-                    * 0.08;
-                Style::default()
-                    .fg(grad(
-                        base_color,
-                        LOGO_GLOW,
-                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
-                    ))
-                    .add_modifier(Modifier::BOLD)
-            }
-        };
-        spans.push(Span::styled(ch.to_string(), style));
-    }
-
-    Line::from(spans)
-}
-
-fn base_rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => GRAD_B,
-    }
-}
-
-/// Render text as a "pill" — small inline badge with a colored bg.
-fn pill(text: &str, bg: Color, fg: Color) -> Span<'static> {
+/// `[ text ]` tag in a flat signal colour.
+fn tag(text: &str, color: Color) -> Span<'static> {
     Span::styled(
-        format!(" {} ", text),
-        Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
+        format!("[{text}]"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
 }
 
-/// Build a unicode progress bar of `width` cells, filled `filled_frac` of the
-/// way through with the cyan→violet gradient.
-fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
-    let frac = filled_frac.clamp(0.0, 1.0);
-    let total_eighths = (frac * (width as f32) * 8.0).round() as usize;
-    let full = total_eighths / 8;
-    let rem = total_eighths % 8;
-    let partials = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-    let mut spans = Vec::with_capacity(width);
-    for i in 0..width {
-        let t = if width <= 1 {
-            0.0
-        } else {
-            i as f32 / (width as f32 - 1.0)
-        };
-        let color = grad3(t);
-        if i < full {
-            spans.push(Span::styled("█".to_string(), Style::default().fg(color)));
-        } else if i == full && rem > 0 {
-            let ch = partials[rem - 1];
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-        } else {
-            spans.push(Span::styled("·".to_string(), Style::default().fg(DIM)));
-        }
+/// What a handoff can honestly claim.
+fn handoff_verdict(h: &HandoffPacket) -> art::Verdict {
+    if !h.verification.findings.is_empty() {
+        art::Verdict::Review
+    } else if h.verification.passed.is_empty() {
+        art::Verdict::Unverified
+    } else if !h.verification.skipped.is_empty() {
+        art::Verdict::Partial
+    } else {
+        art::Verdict::Verified
     }
-    spans
+}
+
+/// True when the provider runs on this machine (Ollama, or a compatible
+/// server on a loopback address).
+fn provider_is_local(provider: &str, base_url: &str) -> bool {
+    match provider {
+        "ollama" => true,
+        "custom" | "openai-compatible" => {
+            let host = base_url
+                .split("://")
+                .nth(1)
+                .unwrap_or(base_url)
+                .split(['/', ':'])
+                .next()
+                .unwrap_or("");
+            matches!(host, "localhost" | "127.0.0.1" | "[" | "::1") || host.ends_with(".localhost")
+        }
+        _ => false,
+    }
+}
+
+/// Flat block bar, `width` cells, filled `filled_frac` of the way.
+fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
+    art::gauge(filled_frac, width, ACCENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +318,34 @@ pub struct GoalEntry {
     /// Index into `state.checkpoints` the user is hovering over in the
     /// checkpoint picker. `None` when the picker has no focus.
     pub checkpoint_cursor: Option<usize>,
+    /// When the goal was queued; drives the elapsed clock.
+    pub started_at: std::time::Instant,
+    /// When the goal reached a terminal or review state.
+    pub finished_at: Option<std::time::Instant>,
+    /// UI tick at which the receipt first appeared (count-up animation).
+    pub receipt_tick: Option<usize>,
+    /// True once this goal has been added to the run record.
+    pub recorded: bool,
+    /// Latest local-harness receipt when this goal ran on the local model.
+    pub local: Option<Box<phonton_types::local_run::LocalRunReceipt>>,
+    /// Result of applying the local candidate: `Ok(summary)` or `Err(why)`.
+    pub applied: Option<Result<String, String>>,
+}
+
+/// What this machine brings to a run, shown in the side panel. Filled in
+/// the background at startup; absent fields mean "not observed".
+#[derive(Debug, Clone, Default)]
+pub struct Machine {
+    /// Calibrated and selected local model, if any.
+    pub local_model: Option<String>,
+    /// Edit protocol the calibration chose for it.
+    pub protocol: Option<String>,
+    /// Calibrated context window.
+    pub context_tokens: Option<u32>,
+    /// First GPU: name, free bytes, total bytes.
+    pub gpu: Option<(String, u64, u64)>,
+    /// Host RAM: free bytes, total bytes.
+    pub ram: Option<(u64, u64)>,
 }
 
 /// Render-safe view of one MCP approval request.
@@ -517,6 +379,16 @@ impl PendingMcpApproval {
 }
 
 impl GoalEntry {
+    /// A local candidate is reviewed and not yet applied.
+    fn can_apply(&self) -> bool {
+        self.applied.is_none()
+            && matches!(self.status, TaskStatus::Reviewing { .. })
+            && self
+                .local
+                .as_ref()
+                .is_some_and(|r| r.selected_candidate.is_some() && r.state == "review_ready")
+    }
+
     fn new(description: String) -> Self {
         Self {
             description,
@@ -525,6 +397,12 @@ impl GoalEntry {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             checkpoint_cursor: None,
+            started_at: std::time::Instant::now(),
+            finished_at: None,
+            receipt_tick: None,
+            recorded: false,
+            local: None,
+            applied: None,
         }
     }
 }
@@ -614,6 +492,15 @@ pub struct App {
     /// Goal held back while the host-check question is on screen, plus
     /// whether it was submitted in Task mode.
     pub pending_host_goal: Option<(SubmittedPrompt, bool)>,
+    /// Verified-run record; only finished receipts move it.
+    pub record: record::Record,
+    /// Local model and hardware observed at startup.
+    pub machine: Machine,
+    /// False when `PHONTON_REDUCED_MOTION` is set: art renders still.
+    pub motion: bool,
+    /// Finished runs not yet written to the record file (the event loop
+    /// saves them; tests never touch the user's record).
+    pub unsaved_runs: Vec<(record::Outcome, u64, bool)>,
 }
 
 /// How long a first Esc/Ctrl+C stays armed waiting for confirmation.
@@ -657,7 +544,16 @@ impl App {
             quit_armed_at: None,
             host_checks_approved: None,
             pending_host_goal: None,
+            record: record::Record::default(),
+            machine: Machine::default(),
+            motion: std::env::var_os("PHONTON_REDUCED_MOTION").is_none(),
+            unsaved_runs: Vec::new(),
         }
+    }
+
+    /// Animation tick for art helpers; `None` when motion is reduced.
+    fn tick(&self) -> Option<usize> {
+        self.motion.then_some(self.spinner_frame)
     }
 
     /// True while a first quit press is waiting for confirmation.
@@ -865,7 +761,31 @@ impl App {
                 }
             }
         }
+        let tick = self.spinner_frame;
+        let local = provider_is_local(&self.settings.provider, &self.settings.base_url);
         if let Some(g) = self.goals.get_mut(index) {
+            let settled = matches!(
+                state.task_status,
+                TaskStatus::Reviewing { .. } | TaskStatus::Done { .. } | TaskStatus::Failed { .. }
+            );
+            if settled && g.finished_at.is_none() {
+                g.finished_at = Some(std::time::Instant::now());
+            }
+            if state.handoff_packet.is_some() && g.receipt_tick.is_none() {
+                g.receipt_tick = Some(tick);
+            }
+            if settled && !g.recorded {
+                g.recorded = true;
+                let outcome = match (&state.task_status, &state.handoff_packet) {
+                    (TaskStatus::Failed { .. }, _) => record::Outcome::Failed,
+                    (_, Some(h)) if handoff_verdict(h) == art::Verdict::Verified => {
+                        record::Outcome::Verified
+                    }
+                    _ => record::Outcome::Unverified,
+                };
+                self.record.add(outcome, state.tokens_used, local);
+                self.unsaved_runs.push((outcome, state.tokens_used, local));
+            }
             g.status = state.task_status.clone();
             g.state = Some(state);
         }
@@ -924,6 +844,13 @@ impl App {
 
         if self.prompt_artifacts_open {
             return self.handle_prompt_artifacts_key(key);
+        }
+
+        // Ctrl+Y applies a reviewed local candidate on the selected goal.
+        if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(g) = self.current_goal().filter(|g| g.can_apply()) {
+                return Some(Intent::ApplyLocal(g.task_id));
+            }
         }
 
         // Global shortcuts first, regardless of mode.
@@ -1889,6 +1816,8 @@ pub enum Intent {
     AcceptTrust,
     /// User declined trust. Caller should exit cleanly.
     DeclineTrust,
+    /// Apply the selected goal's reviewed local candidate.
+    ApplyLocal(TaskId),
     /// Quit the TUI.
     Quit,
 }
@@ -2039,9 +1968,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     // Once a goal is queued, collapse the giant ASCII logo down to a slim
     // one-line header so the work area gets the screen real estate.
-    let want_full_logo = app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD;
+    let want_full_logo =
+        app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD && area.height >= 24;
     let splash_h: u16 = if want_full_logo {
-        LOGO.len() as u16 + 1
+        art::LOGO_ROWS + 1
     } else {
         1
     };
@@ -2135,11 +2065,11 @@ fn render_host_checks_prompt(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         Line::from(Span::styled(
             "  Verify runs your project's own checks (build, tests)",
-            Style::default().fg(Color::White),
+            Style::default().fg(PAPER),
         )),
         Line::from(Span::styled(
             "  on this machine with your user permissions.",
-            Style::default().fg(Color::White),
+            Style::default().fg(PAPER),
         )),
         Line::raw(""),
         Line::from(Span::styled(
@@ -2246,7 +2176,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled((*v).to_string(), Style::default().fg(Color::White)),
+            Span::styled((*v).to_string(), Style::default().fg(PAPER)),
         ]));
     }
     lines.push(Line::raw(""));
@@ -2304,7 +2234,7 @@ fn render_prompt_artifacts_drawer(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(ACCENT_HI)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).bg(BG_DEEP)
+            Style::default().fg(PAPER).bg(BG_DEEP)
         };
         lines.push(Line::from(Span::styled(
             format!("{} {}", idx + 1, artifact.label),
@@ -2402,9 +2332,7 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  tool    ", Style::default().fg(MUTED)),
             Span::styled(
                 prompt.tool_name.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -2420,7 +2348,7 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
     for line in wrap_text(&prompt.reason, reason_width).into_iter().take(4) {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(line, Style::default().fg(Color::White)),
+            Span::styled(line, Style::default().fg(PAPER)),
         ]));
     }
     lines.push(Line::raw(""));
@@ -2437,29 +2365,43 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_splash(frame: &mut Frame, area: Rect, _app: &App) {
-    // We set phase to 0.0 to render a gorgeous, static gradient without animation shimmer
-    let phase = 0.0;
-    if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
-        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 1);
+fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height > art::LOGO_ROWS && area.width >= LOGO_WIDTH_THRESHOLD {
+        let mut lines: Vec<Line> = Vec::with_capacity(art::LOGO_ROWS as usize + 1);
         lines.push(Line::raw(""));
-        lines.extend(
-            LOGO.iter()
-                .enumerate()
-                .map(|(row_idx, row)| logo_line(row, phase, row_idx)),
-        );
+        lines.extend(art::logo(app.tick()));
         let p = Paragraph::new(lines)
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
         frame.render_widget(p, area);
     } else {
-        // Compact one-line header - gradient "phonton" + dim subtitle.
-        let mut spans = gradient_line("✦ phonton", phase * 0.8, true).spans;
-        spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            "local-first ADE · goal → plan → edit → verify → review → remember",
-            Style::default().fg(MUTED),
-        ));
+        // Compact one-line header: wordmark, version, where the model runs.
+        let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+        let spans = vec![
+            Span::styled(
+                "φ ",
+                Style::default()
+                    .fg(art::spectrum(0.35))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "phonton",
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                concat!(" ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(DIM),
+            ),
+            Span::styled("  ·  ", Style::default().fg(RULE)),
+            Span::styled(
+                if local { "local" } else { "cloud" },
+                Style::default().fg(if local { SUCCESS } else { WARN }),
+            ),
+            Span::styled(
+                format!(" · {}", display_model(app)),
+                Style::default().fg(MUTED),
+            ),
+        ];
         let p = Paragraph::new(Line::from(spans))
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
@@ -2467,14 +2409,28 @@ fn render_splash(frame: &mut Frame, area: Rect, _app: &App) {
     }
 }
 
+/// Model label for headers: the configured model, else the calibrated local
+/// model, else the provider default.
+fn display_model(app: &App) -> String {
+    if !app.settings.model.trim().is_empty() {
+        app.settings.model.clone()
+    } else if let Some(m) = app
+        .machine
+        .local_model
+        .as_ref()
+        .filter(|_| provider_is_local(&app.settings.provider, &app.settings.base_url))
+    {
+        m.clone()
+    } else {
+        default_model_for(&app.settings.provider)
+    }
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let key = Style::default()
-        .bg(DIM)
-        .fg(ACCENT_HI)
-        .add_modifier(Modifier::BOLD);
+    let key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let txt = Style::default().fg(MUTED);
     let dim = Style::default().fg(DIM);
-    let sep = Span::styled("  ·  ", dim);
+    let sep = Span::styled("   ", dim);
 
     if let Some(goal) = app.goals.get(app.selected) {
         if matches!(goal.status, TaskStatus::Paused { .. }) {
@@ -2504,7 +2460,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     // Hints in priority order; the last one (quit/close) is always kept and
     // lower-priority hints drop off the tail when the terminal is narrow.
+    let can_apply = app.current_goal().is_some_and(GoalEntry::can_apply);
     let hints: &[(&str, &str)] = match app.mode {
+        Mode::Goal | Mode::Task if can_apply => &[
+            ("Ctrl+Y", "apply"),
+            ("Enter", "run"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("Shift+L", "log"),
+            ("Esc", "quit"),
+        ],
         Mode::Goal | Mode::Task => &[
             ("Enter", "run"),
             ("/", "commands"),
@@ -2605,7 +2570,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled("◆ ", Style::default().fg(VIOLET)),
+            Span::styled("◆ ", Style::default().fg(QUIET)),
             Span::styled(
                 "Command Palette",
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
@@ -2694,33 +2659,27 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, g)| {
             let selected = i == app.selected;
             let (marker, base_style) = if selected {
-                (
-                    "▍ ",
-                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-                )
+                ("▍", Style::default().fg(PAPER).add_modifier(Modifier::BOLD))
             } else {
-                ("  ", Style::default().fg(MUTED))
+                (" ", Style::default().fg(MUTED))
             };
-            let mut spans = vec![Span::styled(marker, base_style)];
+            let mut spans = vec![
+                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::raw(" "),
+            ];
             spans.extend(status_tag_spans(&g.status, app.spinner_frame));
-            // Parallel-worker indicator: one spinner glyph per concurrently
-            // active subtask, capped at 5 so the sidebar stays readable.
-            // Each glyph is drawn at a different phase of the spinner so
-            // the row visibly *moves* — making it obvious that multiple
-            // workers are in flight at once, not just one.
+            // One photon per concurrently active worker, capped at 5.
             let active_count = g
                 .state
                 .as_ref()
                 .map(|s| s.active_workers.len())
                 .unwrap_or(0);
-            if active_count > 0 {
+            if active_count > 1 {
                 spans.push(Span::raw(" "));
                 let visible = active_count.min(5);
                 for i in 0..visible {
-                    let frame_idx = (app.spinner_frame.wrapping_add(i * 2) / 4) % SPINNER.len();
-                    let ch = SPINNER[frame_idx];
                     spans.push(Span::styled(
-                        ch.to_string(),
+                        art::spinner(app.spinner_frame.wrapping_add(i * 3)).to_string(),
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ));
                 }
@@ -2732,262 +2691,264 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
             spans.push(Span::raw(" "));
-            // Marker + status tag + spinners take ~14 cells; give the rest to text.
-            let text_w = (area.width as usize).saturating_sub(16).max(12);
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let text_w = (area.width as usize).saturating_sub(used + 3).max(12);
             spans.push(Span::styled(short(&g.description, text_w), base_style));
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let goal_count = app.goals.len();
-    let title_text = if goal_count == 0 {
-        " Goals ".to_string()
-    } else {
-        format!(" Goals ({}) ", goal_count)
-    };
     let goals_focused = matches!(app.mode, Mode::Goal | Mode::Task);
-    let goals_border = if goals_focused { ACCENT } else { DIM };
-    let goals_border_type = ratatui::widgets::BorderType::Rounded;
-    let items = if items.is_empty() {
-        vec![
-            ListItem::new(Line::raw("")),
-            ListItem::new(Line::from(Span::styled(
-                "  No goals yet.",
-                Style::default().fg(MUTED),
-            ))),
-            ListItem::new(Line::from(Span::styled(
-                "  Type one below ↓",
-                Style::default().fg(DIM),
-            ))),
-        ]
-    } else {
-        items
-    };
-    let list = List::new(items).style(Style::default().bg(BG_PANEL)).block(
-        Block::default()
-            .title(Span::styled(
-                title_text,
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(goals_border_type)
-            .border_style(Style::default().fg(goals_border))
-            .style(Style::default().bg(BG_PANEL)),
-    );
+    let block = Block::default()
+        .title(Span::styled(
+            if app.goals.is_empty() {
+                " runs ".to_string()
+            } else {
+                format!(" runs · {} ", app.goals.len())
+            },
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if goals_focused { DIM } else { RULE }))
+        .style(Style::default().bg(BG_PANEL));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(8)])
+        .constraints([Constraint::Min(1), Constraint::Length(9)])
         .split(area);
 
-    frame.render_widget(list, chunks[0]);
+    if app.goals.is_empty() {
+        // Empty board: the φ, drawn from the logo's own pixels.
+        let inner = block.inner(chunks[0]);
+        frame.render_widget(block, chunks[0]);
+        let mut lines: Vec<Line> = Vec::new();
+        let hint = [
+            Line::from(Span::styled("No goals yet.", Style::default().fg(MUTED))),
+            Line::from(Span::styled("Type one below ↓", Style::default().fg(DIM))),
+        ];
+        let phi_h = art::PHI_HEIGHT;
+        if inner.width >= art::PHI_WIDTH && inner.height > phi_h {
+            // Centre the φ and as much of the hint as fits under it.
+            let room = (inner.height - phi_h - 1).min(2) as usize;
+            let pad = inner.height.saturating_sub(phi_h + 1 + room as u16) / 2;
+            lines.extend((0..pad).map(|_| Line::raw("")));
+            lines.extend(art::phi(app.tick()));
+            lines.push(Line::raw(""));
+            lines.extend(hint.into_iter().take(room));
+        } else {
+            lines.push(Line::raw(""));
+            lines.extend(hint);
+        }
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    } else {
+        frame.render_widget(List::new(items).block(block), chunks[0]);
+    }
 
-    let sys_info = vec![
-        Line::from(vec![
-            Span::styled(" ● ", Style::default().fg(SUCCESS)),
-            Span::styled("version   ", Style::default().fg(MUTED)),
-            Span::styled(
-                concat!("v", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(ACCENT_HI),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" ◆ ", Style::default().fg(ACCENT)),
-            Span::styled("provider  ", Style::default().fg(MUTED)),
-            Span::styled(
-                &app.settings.provider,
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" ⌬ ", Style::default().fg(VIOLET)),
-            Span::styled("model     ", Style::default().fg(MUTED)),
-            Span::styled(
-                if app.settings.model.is_empty() {
-                    "(default)"
-                } else {
-                    &app.settings.model
-                },
-                Style::default().fg(ACCENT_HI),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " ▣ ",
-                Style::default().fg(if app.flight_log_open { SUCCESS } else { DIM }),
-            ),
-            Span::styled("log       ", Style::default().fg(MUTED)),
-            Span::styled(
-                if app.flight_log_open {
-                    "Open"
-                } else {
-                    "Closed"
-                },
-                Style::default().fg(if app.flight_log_open { SUCCESS } else { MUTED }),
-            ),
-        ]),
-    ];
-    let mut sys_info = sys_info;
-    sys_info.push(Line::from(vec![
+    render_machine(frame, chunks[1], app);
+}
+
+/// Side panel: what this machine brings to a run, and the run record.
+fn render_machine(frame: &mut Frame, area: Rect, app: &App) {
+    let label = |s: &str| Span::styled(format!(" {s:<7}"), Style::default().fg(MUTED));
+    let value = |s: String| Span::styled(s, Style::default().fg(PAPER));
+    let gib = |b: u64| b as f64 / 1_073_741_824.0;
+    let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+    let width = area.width.saturating_sub(11) as usize;
+
+    let mut lines = vec![Line::from(vec![
+        label("where"),
         Span::styled(
-            " ◇ ",
-            Style::default().fg(if app.nexus_status.active {
-                SUCCESS
-            } else {
-                DIM
-            }),
+            if local { "this machine" } else { "cloud" },
+            Style::default()
+                .fg(if local { SUCCESS } else { WARN })
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("nexus     ", Style::default().fg(MUTED)),
         Span::styled(
-            nexus_label(&app.nexus_status),
-            Style::default().fg(if app.nexus_status.active {
-                SUCCESS
-            } else {
-                MUTED
-            }),
+            format!(" · {}", app.settings.provider),
+            Style::default().fg(DIM),
+        ),
+    ])];
+    lines.push(Line::from(vec![
+        label("model"),
+        value(short(&display_model(app), width)),
+    ]));
+    if local {
+        let calibrated = match (&app.machine.local_model, app.machine.context_tokens) {
+            (Some(_), Some(ctx)) => format!(
+                "{} · {} ctx",
+                app.machine.protocol.as_deref().unwrap_or("calibrated"),
+                art::thousands(ctx as u64)
+            ),
+            _ => "not calibrated · phonton models".to_string(),
+        };
+        lines.push(Line::from(vec![
+            label("edits"),
+            Span::styled(short(&calibrated, width), Style::default().fg(MUTED)),
+        ]));
+    }
+    match &app.machine.gpu {
+        Some((name, free, total)) if *total > 0 => {
+            let mut spans = vec![label("vram")];
+            let bar = 8.min(width.saturating_sub(12));
+            spans.extend(art::gauge(1.0 - *free as f32 / *total as f32, bar, MUTED));
+            spans.push(value(format!(
+                " {:.1}/{:.1}G",
+                gib(total.saturating_sub(*free)),
+                gib(*total)
+            )));
+            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                label(""),
+                Span::styled(short(name, width), Style::default().fg(DIM)),
+            ]));
+        }
+        _ => {
+            if let Some((free, total)) = app.machine.ram {
+                lines.push(Line::from(vec![
+                    label("ram"),
+                    value(format!("{:.1} GiB free of {:.1}", gib(free), gib(total))),
+                ]));
+            }
+        }
+    }
+    let r = &app.record;
+    lines.push(Line::from(vec![
+        label("record"),
+        Span::styled(
+            format!("{} verified", art::thousands(r.verified_runs)),
+            Style::default().fg(if r.verified_runs > 0 { SUCCESS } else { MUTED }),
+        ),
+        Span::styled(
+            format!(" · streak {}", r.streak),
+            Style::default().fg(if r.streak > 0 { PAPER } else { DIM }),
         ),
     ]));
-    sys_info.push(Line::from(vec![
-        Span::styled(" ▤ ", Style::default().fg(ACCENT)),
-        Span::styled("store     ", Style::default().fg(MUTED)),
+    lines.push(Line::from(vec![
+        label(""),
         Span::styled(
-            app.store_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("(memory)"),
-            Style::default().fg(ACCENT_HI),
+            format!("{} tokens kept local", art::thousands(r.local_tokens)),
+            Style::default().fg(DIM),
         ),
     ]));
 
-    let sys_p = Paragraph::new(sys_info)
+    let p = Paragraph::new(lines)
         .style(Style::default().bg(BG_PANEL))
         .block(
             Block::default()
                 .title(Span::styled(
-                    " System ",
-                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                    concat!(" machine · v", env!("CARGO_PKG_VERSION"), " "),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::default().fg(DIM))
+                .border_style(Style::default().fg(RULE))
                 .style(Style::default().bg(BG_PANEL)),
         );
-    frame.render_widget(sys_p, chunks[1]);
+    frame.render_widget(p, area);
 }
 
 fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
-    let has_active = if let Some(g) = app.current_goal() {
-        g.state
-            .as_ref()
-            .map(|s| !s.active_workers.is_empty())
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    let border_color = if has_active { ACCENT_HI } else { DIM };
-
-    // Pulsing effect for the "Active" indicator
-    let pulse_colors = [SUCCESS, ACCENT_HI, SUCCESS, MUTED];
-    let pulse_idx = (app.spinner_frame / 8) % pulse_colors.len();
+    let has_active = app
+        .current_goal()
+        .and_then(|g| g.state.as_ref())
+        .is_some_and(|s| !s.active_workers.is_empty());
     let pulse_color = if has_active {
-        pulse_colors[pulse_idx]
+        art::spectrum(((app.spinner_frame / 3) % 20) as f32 / 19.0)
     } else {
         MUTED
     };
-
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled("◉ ", Style::default().fg(pulse_color)),
+            Span::raw(" "),
             Span::styled(
-                "Active",
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                if has_active {
+                    art::spinner(app.spinner_frame).to_string()
+                } else {
+                    "○".to_string()
+                },
+                Style::default().fg(pulse_color),
             ),
-            Span::styled(" ", Style::default()),
+            Span::styled(
+                if app.current_goal().is_some() {
+                    " run "
+                } else {
+                    " welcome "
+                },
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+            ),
         ]))
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
+        .border_style(Style::default().fg(if has_active { DIM } else { RULE }))
         .style(Style::default().bg(BG_PANEL));
 
     let Some(g) = app.current_goal() else {
-        let label = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let head = Style::default().fg(PAPER).add_modifier(Modifier::BOLD);
         let muted = Style::default().fg(MUTED);
-        let example = Style::default().fg(Color::White);
-        let mut welcome_spans: Vec<Span<'static>> = vec![Span::styled("  Welcome to ", muted)];
-        let title_chars: Vec<char> = "phonton".chars().collect();
-        let n = title_chars.len() as f32;
-        for (i, ch) in title_chars.into_iter().enumerate() {
-            let t = (i as f32) / (n - 1.0).max(1.0);
-            welcome_spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
-            ));
-        }
-        welcome_spans.push(Span::styled(".", muted));
+        let dim = Style::default().fg(DIM);
         let key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-        let stages = ["goal", "plan", "edit", "verify", "review", "remember"];
-        let mut loop_spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-        for (i, stage) in stages.iter().enumerate() {
-            if i > 0 {
-                loop_spans.push(Span::styled(" → ", Style::default().fg(DIM)));
-            }
-            let t = i as f32 / (stages.len() - 1) as f32;
-            loop_spans.push(Span::styled(
-                (*stage).to_string(),
-                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
-            ));
-        }
-        let bullet = |t: f32, head: &'static str, body: &'static str| {
+        let item = |k: &'static str, body: &'static str| {
             Line::from(vec![
+                Span::styled("  › ", Style::default().fg(ACCENT)),
+                Span::styled(format!("{k:<24}"), Style::default().fg(PAPER)),
+                Span::styled(body, muted),
+            ])
+        };
+        let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+        let local_line = match (&app.machine.local_model, local) {
+            (Some(model), true) => Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(SUCCESS)),
                 Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
+                    model.clone(),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("{head:<26}"), example),
-                Span::styled(body, muted),
-            ])
+                Span::styled(" runs on this machine", muted),
+                Span::styled(
+                    app.machine
+                        .context_tokens
+                        .map(|c| format!(" · {} ctx calibrated", art::thousands(c as u64)))
+                        .unwrap_or_default(),
+                    dim,
+                ),
+            ]),
+            (None, true) => Line::from(vec![
+                Span::styled("  ○ ", Style::default().fg(WARN)),
+                Span::styled("No calibrated local model yet. ", muted),
+                Span::styled("phonton models", key),
+                Span::styled(" picks one for your GPU.", muted),
+            ]),
+            (_, false) => Line::from(vec![
+                Span::styled("  ○ ", Style::default().fg(WARN)),
+                Span::styled(
+                    format!("Cloud provider ({}). ", app.settings.provider),
+                    muted,
+                ),
+                Span::styled("phonton models", key),
+                Span::styled(" sets up a model on this machine.", muted),
+            ]),
         };
-        let shortcut = |k: &'static str, body: &'static str| {
-            Line::from(vec![
-                Span::styled(format!("    {k:<8}"), key),
-                Span::styled(body, muted),
-            ])
-        };
+        let inner_w = area.width.saturating_sub(2);
         let lines = vec![
             Line::raw(""),
-            Line::from(welcome_spans),
-            Line::from(Span::styled(
-                "  Local-first ADE: every change is planned, diffed and verified before review.",
-                muted,
-            )),
+            Line::from(vec![
+                Span::styled("  phonton", head),
+                Span::styled(" — the local-first ADE that proves its work.", muted),
+            ]),
             Line::raw(""),
-            Line::from(loop_spans),
+            {
+                let mut track = vec![Span::raw("  ")];
+                track.extend(art::loop_track(art::Track::Idle, app.tick(), inner_w).spans);
+                Line::from(track)
+            },
             Line::raw(""),
-            Line::from(Span::styled("  Every goal gets", label)),
-            bullet(0.0, "a visible plan", "acceptance criteria before any edit"),
-            bullet(
-                0.5,
-                "diff-only, verified work",
-                "syntax, build and tests gate review",
-            ),
-            bullet(
-                1.0,
-                "a receipt",
-                "files, checks, tokens and cost you can audit",
-            ),
+            local_line,
             Line::raw(""),
-            Line::from(Span::styled("  Try", label)),
-            bullet(0.0, "Fix the failing test in", "@tests/…"),
-            bullet(0.5, "Add input validation to", "@src/…"),
-            bullet(1.0, "Explain this repo", "Ctrl+; asks without editing"),
+            Line::from(Span::styled("  Every run gets", head)),
+            item("a plan first", "files, checks and budget before any edit"),
+            item("verified diffs", "your build and tests gate review"),
+            item("a receipt", "tokens, time, cost, what left the machine"),
             Line::raw(""),
-            Line::from(Span::styled("  Keys", label)),
-            shortcut("/", "commands · settings · provider"),
-            shortcut("@", "attach a file, folder or symbol"),
-            shortcut("?", "all shortcuts"),
-            shortcut("Esc", "quit (asks first)"),
+            Line::from(Span::styled("  Try", head)),
+            item("Fix the failing test in", "@tests/…"),
+            item("Add input validation to", "@src/…"),
+            item("Explain this repo", "Ctrl+; asks without editing"),
         ];
         let p = Paragraph::new(lines)
             .block(block)
@@ -3052,18 +3013,13 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                     Span::styled(
                         questions[q_idx].clone(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
                     Span::styled("  Your Answer: ", Style::default().fg(ACCENT_HI)),
-                    Span::styled(
-                        app.clarifying_buffer.clone(),
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled(app.clarifying_buffer.clone(), Style::default().fg(PAPER)),
                     Span::styled("█", Style::default().fg(pulse_color)),
                 ]));
             }
@@ -3081,7 +3037,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                         .map(|c| c.confidence_percent)
                         .unwrap_or(0)
                 ),
-                Style::default().fg(Color::White),
+                Style::default().fg(PAPER),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
@@ -3094,7 +3050,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                         format!("    {}. ", idx + 1),
                         Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(q.clone(), Style::default().fg(Color::White)),
+                    Span::styled(q.clone(), Style::default().fg(PAPER)),
                 ]));
             }
             lines.push(Line::raw(""));
@@ -3109,57 +3065,90 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let inner_w = area.width.saturating_sub(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
+        Span::styled("goal  ", Style::default().fg(MUTED)),
         Span::styled(
-            "goal: ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            g.description.clone(),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(g.description.clone()),
     ]));
+    let mut track = art::loop_track(goal_track(g), app.tick(), inner_w).spans;
+    track.push(Span::styled(
+        format!("   {}", fmt_elapsed(g)),
+        Style::default().fg(DIM),
+    ));
+    lines.push(Line::from(track));
     lines.push(Line::raw(""));
 
     if let Some(state) = &g.state {
-        // Receipt-first: when a handoff exists, show the merge gate summary
-        // before in-flight worker noise.
-        if let Some(handoff) = &state.handoff_packet {
-            append_handoff_lines(&mut lines, handoff);
-            lines.push(Line::raw(""));
-        }
-
         for w in &state.active_workers {
-            let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
-            spans.push(Span::raw(" "));
             // Worker descriptions can carry a "Prior context from memory"
             // preamble for the model; show the user the task itself.
             let task =
                 phonton_types::task_description_without_prior_context(&w.subtask_description);
-            spans.push(Span::raw(short(task.lines().next().unwrap_or(""), 50)));
+            let mut spans = vec![
+                Span::styled(
+                    format!("  {} ", art::spinner(app.spinner_frame)),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    short(task.lines().next().unwrap_or(""), 52),
+                    Style::default().fg(PAPER),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} · {} tok",
+                        if w.model_name.is_empty() {
+                            w.model_tier.to_string()
+                        } else {
+                            w.model_name.clone()
+                        },
+                        art::thousands(w.tokens_used)
+                    ),
+                    Style::default().fg(DIM),
+                ),
+            ];
             if w.is_thinking {
-                let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
-                let frame_ch = SPINNER[frame_idx];
                 spans.push(Span::styled(
-                    format!("  {} thinking…", frame_ch),
-                    Style::default()
-                        .fg(Color::Rgb(180, 100, 255))
-                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                    "  thinking…",
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                 ));
             }
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("({})", w.model_tier),
-                Style::default().fg(MUTED),
-            ));
             lines.push(Line::from(spans));
         }
         if !state.active_workers.is_empty() {
             lines.push(Line::raw(""));
         }
-        lines.push(render_savings_line_styled(
-            Some(state),
-            app.best_savings_pct,
-            app.new_best_ticks,
-        ));
+        // Receipt-first: once a handoff exists it leads the pane.
+        if let Some(handoff) = &state.handoff_packet {
+            let width = (inner_w as usize).saturating_sub(1).clamp(40, 66);
+            lines.extend(receipt_lines(app, g, state, handoff, width));
+            append_local_review(&mut lines, g);
+            append_handoff_lines(&mut lines, handoff);
+            lines.push(Line::raw(""));
+        } else if let TaskStatus::Failed { reason, .. } = &g.status {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "✗ ",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(reason.clone(), Style::default().fg(PAPER)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "  Streak reset. The flight log (Shift+L) has every event.",
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::raw(""));
+        }
+        if state.estimated_naive_tokens > 0 {
+            lines.push(render_savings_line_styled(
+                Some(state),
+                app.best_savings_pct,
+                app.new_best_ticks,
+            ));
+        }
         if let Some(label) = execution_mode_label(g) {
             lines.push(Line::from(vec![
                 Span::styled("execution: ", Style::default().fg(MUTED)),
@@ -3176,7 +3165,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                     "Checkpoints ({} — history only; legacy rollback disabled):",
                     state.checkpoints.len()
                 ),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
             )));
             let cursor = g.checkpoint_cursor;
             for (i, cp) in state.checkpoints.iter().enumerate() {
@@ -3200,14 +3189,313 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     } else {
-        lines.push(Line::from(Span::styled(
-            "Planning — reading the workspace and drafting the goal contract…",
-            Style::default().fg(MUTED),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", art::spinner(app.spinner_frame)),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                "Planning — reading the workspace and drafting the goal contract…",
+                Style::default().fg(MUTED),
+            ),
+        ]));
     }
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block);
     frame.render_widget(p, area);
+}
+
+/// The reviewed local candidate's diff and how to apply it.
+fn append_local_review(lines: &mut Vec<Line<'static>>, g: &GoalEntry) {
+    let Some(receipt) = &g.local else { return };
+    let selected = receipt
+        .selected_candidate
+        .and_then(|n| receipt.candidates.iter().find(|c| c.number == n));
+    // Show the most informative attempt: the selected one, else the last
+    // with a diff; explain failure from the last attempt whose checks failed.
+    let Some(candidate) = selected
+        .or_else(|| receipt.candidates.iter().rev().find(|c| !c.diff.is_empty()))
+        .or(receipt.candidates.last())
+    else {
+        return;
+    };
+    let failed_attempt = selected.or_else(|| {
+        receipt.candidates.iter().rev().find(|c| {
+            c.checks
+                .iter()
+                .any(|k| k.status == phonton_types::local::CheckStatus::Failed)
+        })
+    });
+    lines.push(Line::raw(""));
+    match &g.applied {
+        None if selected.is_none() => lines.push(Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                match &g.status {
+                    TaskStatus::Failed { reason, .. } => {
+                        format!("{reason}. Your files are unchanged. ")
+                    }
+                    _ => "Nothing to apply. Your files are unchanged. ".to_string(),
+                },
+                Style::default().fg(PAPER),
+            ),
+            Span::styled(
+                format!("Evidence: phonton goal --local show {}", receipt.id),
+                Style::default().fg(DIM),
+            ),
+        ])),
+        None if receipt.state != "review_ready" => lines.push(Line::from(vec![
+            Span::styled("○ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Not appliable: only a candidate whose checks passed can land. ",
+                Style::default().fg(PAPER),
+            ),
+            Span::styled(
+                format!("Evidence: phonton goal --local show {}", receipt.id),
+                Style::default().fg(DIM),
+            ),
+        ])),
+        None => lines.push(Line::from(vec![
+            Span::styled(
+                "Ctrl+Y",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " apply to the working tree · originals kept for rollback",
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        Some(Ok(done)) => lines.push(Line::from(vec![
+            Span::styled(
+                "✓ ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(done.clone(), Style::default().fg(PAPER)),
+        ])),
+        Some(Err(why)) => lines.push(Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("Not applied: {why}"), Style::default().fg(PAPER)),
+        ])),
+    }
+    lines.push(Line::raw(""));
+    let failures = failed_attempt
+        .map(|c| local_tui::check_failures(c, 8))
+        .unwrap_or_default();
+    if let (false, Some(attempt)) = (failures.is_empty(), failed_attempt) {
+        lines.push(Line::from(Span::styled(
+            format!("Why candidate {} failed", attempt.number),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+        )));
+        for line in failures {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(if line.starts_with("not ok") {
+                    DANGER
+                } else {
+                    MUTED
+                }),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled(
+        if selected.is_some() {
+            format!("Diff · candidate {}", candidate.number)
+        } else {
+            format!("Diff · candidate {} · not applied", candidate.number)
+        },
+        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+    )));
+    let diff: Vec<&str> = candidate.diff.lines().collect();
+    for line in diff.iter().take(40) {
+        let color = if line.starts_with("+++") || line.starts_with("---") {
+            DIM
+        } else if line.starts_with('+') {
+            SUCCESS
+        } else if line.starts_with('-') {
+            DANGER
+        } else if line.starts_with("@@") {
+            ACCENT
+        } else {
+            MUTED
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(color),
+        )));
+    }
+    if diff.len() > 40 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  … {} more lines · phonton goal --local show {}",
+                diff.len() - 40,
+                receipt.id
+            ),
+            Style::default().fg(DIM),
+        )));
+    }
+}
+
+/// Where a goal sits on the ADE loop.
+fn goal_track(g: &GoalEntry) -> art::Track {
+    let verifying = g.flight_log.iter().rev().take(6).any(|r| {
+        matches!(
+            r.event,
+            OrchestratorEvent::VerifyPass { .. }
+                | OrchestratorEvent::VerifyFail { .. }
+                | OrchestratorEvent::RepairPlanned { .. }
+                | OrchestratorEvent::VerifyEscalated { .. }
+        )
+    });
+    match (&g.local, &g.status) {
+        (Some(local), TaskStatus::Running { .. }) => {
+            return art::Track::Active(local_tui::stage(local));
+        }
+        (Some(local), TaskStatus::Reviewing { .. }) if local.state != "review_ready" => {
+            return art::Track::Failed(3);
+        }
+        _ => {}
+    }
+    match &g.status {
+        TaskStatus::Queued => art::Track::Active(0),
+        TaskStatus::Planning => art::Track::Active(1),
+        TaskStatus::Running { .. } | TaskStatus::Paused { .. } => {
+            art::Track::Active(if verifying { 3 } else { 2 })
+        }
+        TaskStatus::Reviewing { .. } => art::Track::Active(4),
+        TaskStatus::Done { .. } => art::Track::Complete,
+        TaskStatus::Failed { .. } => art::Track::Failed(if verifying { 3 } else { 2 }),
+        TaskStatus::Rejected => art::Track::Failed(4),
+    }
+}
+
+/// `12.4 s` or `3m 05s` since the goal was queued (frozen once settled).
+fn fmt_elapsed(g: &GoalEntry) -> String {
+    let d = g
+        .finished_at
+        .unwrap_or_else(std::time::Instant::now)
+        .saturating_duration_since(g.started_at);
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1} s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
+/// The receipt card: counts up, then stamps what the evidence supports.
+fn receipt_lines(
+    app: &App,
+    g: &GoalEntry,
+    state: &GlobalState,
+    h: &HandoffPacket,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let since = g
+        .receipt_tick
+        .filter(|_| app.motion)
+        .map(|t| app.spinner_frame.wrapping_sub(t));
+    let verdict = if matches!(g.status, TaskStatus::Failed { .. }) {
+        art::Verdict::Failed
+    } else {
+        handoff_verdict(h)
+    };
+    let inner = width.saturating_sub(4);
+    let n = |v: u64| art::thousands(art::count_up(v, since));
+    let num = |s: String| Span::styled(s, Style::default().fg(PAPER).add_modifier(Modifier::BOLD));
+    let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+    let usage = &h.token_usage;
+    let (tin, tout) = if usage.input_tokens + usage.output_tokens > 0 {
+        (usage.input_tokens, usage.output_tokens)
+    } else {
+        (state.tokens_used, 0)
+    };
+    let mut body = vec![
+        Line::from(Span::styled(
+            short(&h.headline, inner),
+            Style::default().fg(PAPER),
+        )),
+        Line::raw(""),
+        art::leader(
+            "files",
+            vec![
+                num(h.diff_stats.files_changed.to_string()),
+                Span::styled(
+                    format!("  +{}", h.diff_stats.added_lines),
+                    Style::default().fg(SUCCESS),
+                ),
+                Span::styled(
+                    format!(" −{}", h.diff_stats.removed_lines),
+                    Style::default().fg(DANGER),
+                ),
+            ],
+            inner,
+        ),
+        art::leader(
+            "checks",
+            vec![
+                num(format!("{} passed", h.verification.passed.len())),
+                Span::styled(
+                    if h.verification.findings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} findings", h.verification.findings.len())
+                    },
+                    Style::default().fg(WARN),
+                ),
+            ],
+            inner,
+        ),
+        art::leader("tokens in", vec![num(n(tin))], inner),
+        art::leader("tokens out", vec![num(n(tout))], inner),
+        art::leader("time", vec![num(fmt_elapsed(g))], inner),
+    ];
+    let cost = if local {
+        "$0.00 · ran on this machine".to_string()
+    } else if h.cost_receipt.pricing_known {
+        format!(
+            "${:.4} · sent to {}",
+            h.cost_receipt.actual_usd_micros as f64 / 1e6,
+            app.settings.provider
+        )
+    } else {
+        format!("unpriced · sent to {}", app.settings.provider)
+    };
+    body.push(art::leader("cost", vec![num(cost)], inner));
+    if g.recorded {
+        let streak = app.record.streak;
+        body.push(art::leader(
+            "streak",
+            vec![Span::styled(
+                if verdict == art::Verdict::Verified {
+                    format!("{streak} verified in a row")
+                } else {
+                    "reset · needs passing tests".to_string()
+                },
+                Style::default().fg(if verdict == art::Verdict::Verified {
+                    SUCCESS
+                } else {
+                    DIM
+                }),
+            )],
+            inner,
+        ));
+    }
+    art::boxed(
+        "receipt",
+        Some(art::stamp(verdict, since)),
+        body,
+        width,
+        RULE,
+    )
 }
 
 fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
@@ -3231,47 +3519,18 @@ fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
 }
 
 fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket) {
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Result",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(handoff.headline.clone(), Style::default().fg(Color::White)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  files ", Style::default().fg(MUTED)),
-        Span::styled(
-            handoff.diff_stats.files_changed.to_string(),
-            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  +", Style::default().fg(MUTED)),
-        Span::styled(
-            handoff.diff_stats.added_lines.to_string(),
-            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  -", Style::default().fg(MUTED)),
-        Span::styled(
-            handoff.diff_stats.removed_lines.to_string(),
-            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
     if !handoff.changed_files.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Changed files",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         )));
         for file in handoff.changed_files.iter().take(6) {
             lines.push(Line::from(vec![
                 Span::styled("  - ", Style::default().fg(ACCENT_HI)),
                 Span::styled(
                     short(&file.path.display().to_string(), 44),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("  +", Style::default().fg(MUTED)),
                 Span::styled(file.added_lines.to_string(), Style::default().fg(SUCCESS)),
@@ -3293,7 +3552,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Verification",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         )));
         for passed in handoff.verification.passed.iter().take(4) {
             lines.push(Line::from(vec![
@@ -3318,7 +3577,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Run",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
     )));
     if handoff.run_commands.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -3332,7 +3591,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
                     "  $ ",
                     Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(command.command.join(" "), Style::default().fg(Color::White)),
+                Span::styled(command.command.join(" "), Style::default().fg(PAPER)),
             ]));
         }
     }
@@ -3369,7 +3628,7 @@ fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
             " Flight Log ",
-            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
             scroll_hint,
@@ -3377,7 +3636,7 @@ fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
         )))
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(VIOLET));
+        .border_style(Style::default().fg(QUIET));
 
     let Some(g) = app.current_goal() else {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -3607,16 +3866,6 @@ fn memory_record_summary(record: &MemoryRecord) -> (&'static str, String) {
     }
 }
 
-fn nexus_label(status: &NexusStatus) -> String {
-    if !status.message.is_empty() {
-        short(&status.message, 22)
-    } else if status.active {
-        format!("{} repos", status.repo_count)
-    } else {
-        "single repo".into()
-    }
-}
-
 fn permissions_label(permissions: &[Permission]) -> String {
     if permissions.is_empty() {
         return "none".into();
@@ -3674,12 +3923,12 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::TaskCompleted { .. } => (SUCCESS, "task-done"),
         E::TaskFailed { .. } => (DANGER, "task-failed"),
         E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
-        E::ContextSelected { .. } => (VIOLET, "context"),
+        E::ContextSelected { .. } => (QUIET, "context"),
         E::ExtensionLoaded { .. } => (ACCENT, "ext-loaded"),
         E::ExtensionSkipped { .. } => (WARN, "ext-skipped"),
         E::ExtensionConflict { .. } => (WARN, "ext-conflict"),
-        E::SteeringApplied { .. } => (VIOLET, "steering"),
-        E::SkillApplied { .. } => (VIOLET, "skill"),
+        E::SteeringApplied { .. } => (QUIET, "steering"),
+        E::SkillApplied { .. } => (QUIET, "skill"),
         E::McpServerAvailable { .. } => (ACCENT, "mcp-server"),
         E::McpToolRequested { .. } => (WARN, "mcp-request"),
         E::McpToolApproved { .. } => (SUCCESS, "mcp-approve"),
@@ -3694,7 +3943,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::RepairPlanned { .. } => (WARN, "repair"),
         E::VerifyEscalated { .. } => (WARN, "escalate"),
         E::TokenMilestone { .. } => (MUTED, "tokens"),
-        E::Thinking { .. } => (VIOLET, "thinking"),
+        E::Thinking { .. } => (QUIET, "thinking"),
         E::CheckpointCreated { .. } => (SUCCESS, "checkpoint"),
         E::RollbackPerformed { .. } => (WARN, "rollback"),
         E::ReviewDecision { .. } => (ACCENT, "review"),
@@ -3717,17 +3966,16 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(Span::styled(
             "Ask mode (Ctrl+; to close, Esc to cancel)",
-            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
     ];
     if app.ask_pending {
-        let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
-        let frame_ch = SPINNER[frame_idx];
+        let frame_ch = art::spinner(app.spinner_frame);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{frame_ch} "),
-                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
             ),
             Span::styled("thinking…", Style::default().fg(MUTED)),
         ]));
@@ -3749,11 +3997,11 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .title(Span::styled(
                 " Ask ",
-                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(VIOLET)),
+            .border_style(Style::default().fg(QUIET)),
     );
     frame.render_widget(p, area);
 }
@@ -3815,7 +4063,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             .fg(BG_PANEL)
             .add_modifier(Modifier::BOLD),
         Mode::Ask => Style::default()
-            .bg(VIOLET)
+            .bg(QUIET)
             .fg(BG_PANEL)
             .add_modifier(Modifier::BOLD),
         Mode::Settings => Style::default()
@@ -3837,7 +4085,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let border_color = match app.mode {
-        Mode::Ask => VIOLET,
+        Mode::Ask => QUIET,
         Mode::Task | Mode::Clarify => WARN,
         Mode::Memory | Mode::History => SUCCESS,
         _ => ACCENT,
@@ -3880,7 +4128,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                 label,
                 Style::default()
                     .fg(BG_DEEP)
-                    .bg(VIOLET)
+                    .bg(QUIET)
                     .add_modifier(Modifier::BOLD),
             ));
             chip_spans.push(Span::raw(" "));
@@ -3918,10 +4166,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(DANGER),
             ));
         } else {
-            prompt_spans.push(Span::styled(visible, Style::default().fg(Color::White)));
+            prompt_spans.push(Span::styled(visible, Style::default().fg(PAPER)));
         }
     } else {
-        prompt_spans.push(Span::styled(visible, Style::default().fg(Color::White)));
+        prompt_spans.push(Span::styled(visible, Style::default().fg(PAPER)));
     }
 
     let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
@@ -3951,47 +4199,28 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 /// the running-state animation; callers increment it once per tick.
 fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> {
     match s {
-        TaskStatus::Queued => vec![pill("queued", Color::Rgb(60, 60, 60), ACCENT_HI)],
-        TaskStatus::Planning => vec![pill("plan", ACCENT, BG_DEEP)],
+        TaskStatus::Queued => vec![tag("queued", DIM)],
+        TaskStatus::Planning => vec![tag(
+            &format!("{} plan", art::spinner(spinner_frame)),
+            ACCENT,
+        )],
         TaskStatus::Running {
             completed, total, ..
-        } => {
-            let frame_idx = (spinner_frame / 4) % SPINNER.len();
-            let ch = SPINNER[frame_idx];
-            vec![
-                Span::styled(
-                    format!("{ch} "),
-                    Style::default()
-                        .fg(Color::Rgb(255, 170, 0))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                pill(
-                    &format!("run {completed}/{total}"),
-                    Color::Rgb(255, 150, 0),
-                    BG_DEEP,
-                ),
-            ]
-        }
-        TaskStatus::Reviewing { .. } => vec![pill("review", Color::Rgb(180, 100, 255), BG_DEEP)],
-        TaskStatus::Done { .. } => vec![pill("done", Color::Rgb(0, 200, 100), BG_DEEP)],
-        TaskStatus::Failed { .. } => vec![pill("fail", Color::Rgb(255, 50, 50), Color::White)],
+        } => vec![tag(
+            &format!("{} run {completed}/{total}", art::spinner(spinner_frame)),
+            WARN,
+        )],
+        TaskStatus::Reviewing { .. } => vec![tag("review", ACCENT)],
+        TaskStatus::Done { .. } => vec![tag("✓ done", SUCCESS)],
+        TaskStatus::Failed { .. } => vec![tag("✗ fail", DANGER)],
         TaskStatus::Paused {
             limit,
             observed,
             ceiling,
-        } => {
-            vec![pill(
-                &format!("paused — {limit} {observed}/{ceiling}"),
-                Color::Rgb(255, 200, 0),
-                BG_DEEP,
-            )]
-        }
+        } => vec![tag(&format!("paused — {limit} {observed}/{ceiling}"), WARN)],
         TaskStatus::Rejected => vec![Span::styled(
-            " rej ",
-            Style::default()
-                .bg(Color::Rgb(100, 0, 0))
-                .fg(Color::Rgb(200, 200, 200))
-                .add_modifier(Modifier::CROSSED_OUT),
+            "[rej]",
+            Style::default().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
         )],
     }
 }
@@ -4003,33 +4232,6 @@ fn short(s: &str, n: usize) -> String {
         out
     } else {
         s.to_string()
-    }
-}
-
-/// Helper for rendering a `SubtaskStatus` using the same taxonomy as a
-/// `TaskStatus` — lets the centre pane reuse [`status_tag`] on workers.
-trait SubtaskStatusExt {
-    fn status_as_task(&self) -> TaskStatus;
-}
-impl SubtaskStatusExt for phonton_types::WorkerState {
-    fn status_as_task(&self) -> TaskStatus {
-        match &self.status {
-            SubtaskStatus::Queued => TaskStatus::Queued,
-            SubtaskStatus::Ready => TaskStatus::Queued,
-            SubtaskStatus::Dispatched | SubtaskStatus::Running { .. } => TaskStatus::Running {
-                active_subtasks: vec![self.subtask_id],
-                completed: 0,
-                total: 1,
-            },
-            SubtaskStatus::Done { .. } => TaskStatus::Done {
-                tokens_used: self.tokens_used,
-                wall_time_ms: 0,
-            },
-            SubtaskStatus::Failed { reason, .. } => TaskStatus::Failed {
-                reason: reason.clone(),
-                failed_subtask: Some(self.subtask_id),
-            },
-        }
     }
 }
 
@@ -4078,7 +4280,8 @@ enum LoopEvent {
     Key(KeyEvent),
     Paste(String),
     ClipboardPaste(Result<String, String>),
-    StateUpdate(usize, Box<GlobalState>),
+    /// Snapshot for the goal with this task id (indices shift as goals queue).
+    StateUpdate(TaskId, Box<GlobalState>),
     AskAnswer(String),
     McpApprovalRequested {
         prompt: PendingMcpApproval,
@@ -4095,7 +4298,13 @@ enum LoopEvent {
     /// Background model-list fetch completed for the picker overlay.
     /// Carries the full list on success or an error string.
     ModelsLoaded(Result<Vec<String>, String>),
-    FlightEvent(usize, EventRecord),
+    FlightEvent(TaskId, EventRecord),
+    /// Local model and hardware observed by the startup probe.
+    Machine(Box<Machine>),
+    /// Latest local-harness receipt for a goal running on the local model.
+    Local(TaskId, Box<phonton_types::local_run::LocalRunReceipt>),
+    /// Outcome of applying a local candidate to the working tree.
+    LocalApplied(TaskId, Result<String, String>),
     Tick,
 }
 
@@ -4425,7 +4634,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled("⚙ ", Style::default().fg(VIOLET)),
+            Span::styled("⚙ ", Style::default().fg(QUIET)),
             Span::styled(
                 "Settings",
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
@@ -4617,7 +4826,7 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
 
     // Title: loading spinner or count
     let title = if picker.loading {
-        let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
+        let spinner = art::spinner(app.spinner_frame);
         format!(" {spinner} Fetching models… ")
     } else {
         let n = picker.filtered.len();
@@ -4633,7 +4842,7 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(title.as_str())
-        .border_style(Style::default().fg(VIOLET))
+        .border_style(Style::default().fg(QUIET))
         .style(Style::default().bg(BG_DEEP));
 
     frame.render_widget(block, picker_area);
@@ -4687,7 +4896,7 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
             } else if is_current {
                 Style::default().fg(SUCCESS)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(PAPER)
             };
             ListItem::new(label).style(style)
         })
@@ -4803,6 +5012,7 @@ fn print_help() {
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
          why-tokens        Per-subtask token usage for the latest goal\n  \
+         record            Verified runs, streak, and tokens kept local\n  \
          proof export      Export typed proof evidence for audit\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
          models            Detect hardware, install and calibrate local coding models\n  \
@@ -5059,6 +5269,10 @@ async fn handle_cli_args() -> Result<bool> {
             if code != 0 {
                 std::process::exit(code);
             }
+            Ok(true)
+        }
+        "record" => {
+            record::run(&args[1..])?;
             Ok(true)
         }
         "proof" => {
@@ -5865,7 +6079,6 @@ fn print_headless_goal_json(task_id: TaskId, state: &GlobalState) -> Result<()> 
 async fn fail_spawned_goal(
     tx: &mpsc::Sender<LoopEvent>,
     store: &Arc<std::sync::Mutex<Store>>,
-    goal_index: usize,
     task_id: TaskId,
     display_text: &str,
     reason: String,
@@ -5895,7 +6108,7 @@ async fn fail_spawned_goal(
         }
     }
     let _ = tx
-        .send(LoopEvent::StateUpdate(goal_index, Box::new(state)))
+        .send(LoopEvent::StateUpdate(task_id, Box::new(state)))
         .await;
 }
 
@@ -6126,6 +6339,29 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
     });
 }
 
+/// Selected local model (from calibration state) and hardware headroom.
+async fn probe_machine() -> Machine {
+    let mut machine = Machine::default();
+    if let Ok(Some(selection)) = local_goal_cli::current_model_selection().await {
+        machine.local_model = Some(selection.model);
+        machine.context_tokens = Some(selection.context_tokens);
+        machine.protocol = selection.protocol.map(|p| {
+            match p {
+                phonton_types::local::EditProtocol::SearchReplace => "search/replace",
+                phonton_types::local::EditProtocol::UnifiedDiff => "unified diff",
+            }
+            .to_string()
+        });
+    }
+    let hw = phonton_local::hardware::detect().await;
+    machine.gpu = hw
+        .gpus
+        .first()
+        .map(|g| (g.name.clone(), g.available_bytes, g.total_bytes));
+    machine.ram = hw.ram_available_bytes.zip(hw.ram_total_bytes);
+    machine
+}
+
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -6143,6 +6379,15 @@ async fn run_app<B: Backend>(
     // until the user restarted the CLI.
     let mut ask_provider = ask_provider;
     let mut approval_replies: HashMap<u64, oneshot::Sender<McpApprovalDecision>> = HashMap::new();
+    app.record = record::load();
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(LoopEvent::Machine(Box::new(probe_machine().await)))
+                .await;
+        });
+    }
     loop {
         terminal.draw(|f| render(f, app))?;
         let Some(evt) = rx.recv().await else { break };
@@ -6192,19 +6437,56 @@ async fn run_app<B: Backend>(
                             } else {
                                 Some(app.settings.base_url.clone())
                             };
-                            spawn_goal(
-                                0,
-                                task_id,
-                                prompt,
-                                direct_task,
-                                &tx,
-                                &store,
-                                &sandbox,
-                                &cfg,
-                                &working_dir,
-                                app.host_checks_approved.unwrap_or(false),
-                            )
-                            .await;
+                            if provider_is_local(&app.settings.provider, &app.settings.base_url)
+                                && app.machine.local_model.is_some()
+                            {
+                                // Calibrated local model: run through the
+                                // search/replace harness it was measured on.
+                                spawn_local_goal(
+                                    task_id,
+                                    prompt.description.clone(),
+                                    tx.clone(),
+                                    working_dir.clone(),
+                                    app.host_checks_approved.unwrap_or(false),
+                                );
+                            } else {
+                                spawn_goal(
+                                    0,
+                                    task_id,
+                                    prompt,
+                                    direct_task,
+                                    &tx,
+                                    &store,
+                                    &sandbox,
+                                    &cfg,
+                                    &working_dir,
+                                    app.host_checks_approved.unwrap_or(false),
+                                )
+                                .await;
+                            }
+                        }
+                        Intent::ApplyLocal(id) => {
+                            let receipt = app
+                                .goals
+                                .iter()
+                                .find(|g| g.task_id == id)
+                                .and_then(|g| g.local.clone());
+                            if let Some(receipt) = receipt {
+                                let tx = tx.clone();
+                                let repo = working_dir.clone();
+                                tokio::spawn(async move {
+                                    let result = local_goal_cli::apply_selected(&receipt, &repo)
+                                        .await
+                                        .map(|applied| {
+                                            format!(
+                                                "Applied candidate {} · original files kept for rollback",
+                                                applied.candidate_number
+                                            )
+                                        })
+                                        .map_err(|e| e.to_string());
+                                    let _ = tx.send(LoopEvent::LocalApplied(id, result)).await;
+                                });
+                            }
                         }
                         Intent::ResolveMcpApproval {
                             approval_id,
@@ -6566,8 +6848,45 @@ async fn run_app<B: Backend>(
                         .set_notice(format!("Clipboard unavailable: {msg}"));
                 }
             },
-            LoopEvent::StateUpdate(idx, state) => app.apply_state(idx, *state),
-            LoopEvent::FlightEvent(idx, ev) => app.apply_event(idx, ev),
+            LoopEvent::StateUpdate(id, state) => {
+                if let Some(idx) = app.goals.iter().position(|g| g.task_id == id) {
+                    app.apply_state(idx, *state);
+                }
+                for (outcome, tokens, local) in std::mem::take(&mut app.unsaved_runs) {
+                    app.record = record::add_run(outcome, tokens, local);
+                }
+            }
+            LoopEvent::Machine(machine) => app.machine = *machine,
+            LoopEvent::Local(id, receipt) => {
+                if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    g.local = Some(receipt);
+                }
+            }
+            LoopEvent::LocalApplied(id, result) => {
+                if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    if result.is_ok() {
+                        let tokens_used = g.state.as_ref().map(|s| s.tokens_used).unwrap_or(0);
+                        let wall_time_ms = g
+                            .finished_at
+                            .unwrap_or_else(std::time::Instant::now)
+                            .saturating_duration_since(g.started_at)
+                            .as_millis() as u64;
+                        g.status = TaskStatus::Done {
+                            tokens_used,
+                            wall_time_ms,
+                        };
+                        if let Some(state) = g.state.as_mut() {
+                            state.task_status = g.status.clone();
+                        }
+                    }
+                    g.applied = Some(result);
+                }
+            }
+            LoopEvent::FlightEvent(id, ev) => {
+                if let Some(idx) = app.goals.iter().position(|g| g.task_id == id) {
+                    app.apply_event(idx, ev);
+                }
+            }
             LoopEvent::AskAnswer(a) => {
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
@@ -6975,6 +7294,69 @@ fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<Out
     })
 }
 
+/// Run a goal on the calibrated local model through the local harness. The
+/// working tree changes only when the user applies the reviewed candidate.
+fn spawn_local_goal(
+    task_id: TaskId,
+    goal: String,
+    tx: mpsc::Sender<LoopEvent>,
+    repository: std::path::PathBuf,
+    host_approved: bool,
+) {
+    tokio::spawn(async move {
+        let worker = SubtaskId::new();
+        let planning = GlobalState {
+            task_status: TaskStatus::Planning,
+            goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
+        };
+        let _ = tx
+            .send(LoopEvent::StateUpdate(task_id, Box::new(planning.clone())))
+            .await;
+        let progress = |receipt: &phonton_types::local_run::LocalRunReceipt| {
+            let state = local_tui::global_state(receipt, task_id, worker);
+            let _ = tx.try_send(LoopEvent::StateUpdate(task_id, Box::new(state)));
+            let _ = tx.try_send(LoopEvent::Local(task_id, Box::new(receipt.clone())));
+        };
+        let result =
+            local_goal_cli::run_goal(goal, repository, host_approved, |_| {}, progress).await;
+        match result {
+            Ok(receipt) => {
+                let state = local_tui::global_state(&receipt, task_id, worker);
+                let _ = tx.send(LoopEvent::Local(task_id, Box::new(receipt))).await;
+                let _ = tx
+                    .send(LoopEvent::StateUpdate(task_id, Box::new(state)))
+                    .await;
+            }
+            Err(error) => {
+                let mut reason = error.to_string();
+                if reason.contains("11434") || reason.to_lowercase().contains("connect") {
+                    reason.push_str(
+                        " · Is the local runtime running? `phonton models setup` starts it.",
+                    );
+                }
+                let mut failed = planning;
+                failed.task_status = TaskStatus::Failed {
+                    reason,
+                    failed_subtask: None,
+                };
+                let _ = tx
+                    .send(LoopEvent::StateUpdate(task_id, Box::new(failed)))
+                    .await;
+            }
+        }
+    });
+}
+
 async fn spawn_goal(
     goal_index: usize,
     task_id: TaskId,
@@ -7021,7 +7403,6 @@ async fn spawn_goal(
                 fail_spawned_goal(
                     tx,
                     store,
-                    goal_index,
                     task_id,
                     &display_text,
                     "persistent store lock was poisoned".into(),
@@ -7044,7 +7425,6 @@ async fn spawn_goal(
             fail_spawned_goal(
                 tx,
                 store,
-                goal_index,
                 task_id,
                 &display_text,
                 format!("planning failed: {e}"),
@@ -7198,7 +7578,7 @@ async fn spawn_goal(
                 }
             }
             if tx_updates
-                .send(LoopEvent::StateUpdate(goal_index, Box::new(s)))
+                .send(LoopEvent::StateUpdate(task_id, Box::new(s)))
                 .await
                 .is_err()
             {
@@ -7214,7 +7594,7 @@ async fn spawn_goal(
             match event_rx_ui.recv().await {
                 Ok(rec) => {
                     if tx_events
-                        .send(LoopEvent::FlightEvent(goal_index, rec))
+                        .send(LoopEvent::FlightEvent(task_id, rec))
                         .await
                         .is_err()
                     {
@@ -8310,16 +8690,17 @@ fn extract_id(line: &str) -> Option<String> {
 
     #[test]
     fn splash_logo_is_compact_and_shadowed() {
-        let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
+        let max_width = art::LOGO
+            .iter()
+            .map(|row| char_count(row))
+            .max()
+            .unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
         assert!(
-            LOGO[0].contains("██████╗"),
+            art::LOGO[0].contains("██████╗"),
             "logo should use the standard ANSI Shadow wordmark"
         );
-        assert!(
-            LOGO.last().unwrap_or(&"").contains("░▒▓"),
-            "logo should keep the soft glow strip"
-        );
+        assert_eq!(art::logo(None).len(), art::LOGO_ROWS as usize);
     }
 
     #[test]
@@ -8450,10 +8831,15 @@ fn extract_id(line: &str) -> Option<String> {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("Result"));
+        assert!(dump.contains("receipt"));
         assert!(dump.contains("Changed files"));
         assert!(dump.contains("chess.py"));
         assert!(dump.contains("Known gaps"));
+        // Syntax passed but no test ran: the receipt must not claim VERIFIED,
+        // and the run does not extend the streak.
+        assert!(!dump.contains("✓ VERIFIED"));
+        assert_eq!(app.record.streak, 0);
+        assert_eq!(app.unsaved_runs.len(), 1);
     }
 
     #[test]
@@ -8621,8 +9007,10 @@ mod tui_screen_tests {
     fn idle_screen_pitches_the_loop_and_footer_fits() {
         let rows = screen(&App::default(), 120, 36);
         let all = rows.join("\n");
-        assert!(all.contains("goal → plan → edit → verify → review → remember"));
+        assert!(all.contains("· goal"), "{all}");
+        assert!(all.contains("· remember"), "{all}");
         assert!(all.contains("No goals yet."));
+        assert!(all.contains("machine"), "{all}");
         let footer = rows.last().unwrap().trim_end();
         assert!(footer.contains("Esc quit"), "footer clipped: {footer}");
     }

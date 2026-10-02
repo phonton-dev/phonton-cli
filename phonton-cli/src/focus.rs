@@ -143,7 +143,7 @@ fn code_focus_line_style(line: &str) -> Style {
     if line.starts_with(' ') {
         return Style::default().fg(MUTED);
     }
-    Style::default().fg(Color::White)
+    Style::default().fg(crate::art::PAPER)
 }
 
 pub(crate) fn code_focus_text(goal: &GoalEntry, selected_file: usize) -> String {
@@ -250,7 +250,7 @@ pub(crate) fn append_problems_focus_lines(
         } else if line.starts_with("@@") || line.starts_with("file:") {
             Style::default().fg(ACCENT_HI)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::art::PAPER)
         };
         lines.push(Line::from(Span::styled(line.to_string(), style)));
     }
@@ -820,7 +820,7 @@ pub(crate) fn append_command_run_lines(
                 format!("  {label} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(short(&run.command, 72), Style::default().fg(Color::White)),
+            Span::styled(short(&run.command, 72), Style::default().fg(crate::art::PAPER)),
             Span::styled(duration, Style::default().fg(MUTED)),
         ]));
         if !run.stdout_preview.is_empty() && run.stdout_preview != "running..." {

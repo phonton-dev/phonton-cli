@@ -518,7 +518,7 @@ async fn current_model_selection_at(path: &Path) -> Result<Option<ReviewedModelS
     .map_err(|_| anyhow!("Local runtime did not confirm the selected model within 15 seconds; retry or inspect Local models"))?
 }
 
-async fn current_model_selection() -> Result<Option<ReviewedModelSelection>> {
+pub(crate) async fn current_model_selection() -> Result<Option<ReviewedModelSelection>> {
     current_model_selection_at(&crate::models_cli::state_path()?).await
 }
 
@@ -1516,6 +1516,92 @@ pub async fn run(args: &[String]) -> Result<i32> {
             Err(error)
         }
     }
+}
+
+/// One local goal for the TUI: preview the plan, admit it against the
+/// selected calibrated model, run it, and save the receipt. Mirrors `run`
+/// without terminal prompts; `on_plan` sees the reviewed scope first and
+/// `progress` sees every intermediate receipt.
+pub(crate) async fn run_goal(
+    goal: String,
+    repository: PathBuf,
+    host_approved: bool,
+    on_plan: impl FnOnce(&LocalPlan),
+    progress: impl FnMut(&LocalRunReceipt),
+) -> Result<LocalRunReceipt> {
+    let request = LocalRunRequest {
+        goal,
+        repository,
+        files: vec![],
+        new_file: None,
+        editable_existing: vec![],
+        checks: vec![],
+        preparation: None,
+        approve_host_execution: false,
+        allow_unverified_runtime: false,
+        budget: Default::default(),
+        expected_source_hashes: Default::default(),
+        expected_baseline_sha256: None,
+    };
+    let mut plan = phonton_worker::local_run::plan::preview(request).await?;
+    let selection = plan_model_selection(&mut plan).await?;
+    adjust_reviewed_plan_budget(&mut plan, selection.as_ref(), false);
+    on_plan(&plan);
+    let selection = selection.ok_or_else(|| {
+        anyhow!("No calibrated local model is selected. Run `phonton models` to pick one")
+    })?;
+    plan.request.approve_host_execution = host_approved;
+    let request = plan.request;
+    let (_lease, profile, runtime_guard, directory) = prepare(&request, None, &selection).await?;
+    let attempt = begin_attempt(
+        &directory,
+        &request,
+        &profile,
+        &crate::models_cli::state_path()?,
+    )?;
+    let started = std::time::Instant::now();
+    match phonton_worker::local_run::run(request, profile, runtime_guard, &directory, progress)
+        .await
+    {
+        Ok(receipt) => {
+            write_end_receipt(&directory, &receipt)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            record_end(
+                &directory,
+                &attempt,
+                &error.to_string(),
+                false,
+                started.elapsed().as_millis() as u64,
+            );
+            Err(error.into())
+        }
+    }
+}
+
+/// Apply a reviewed local candidate to `repository` through the same RPC
+/// the CLI and desktop use (hash-checked against the saved review).
+pub(crate) async fn apply_selected(
+    receipt: &LocalRunReceipt,
+    repository: &Path,
+) -> Result<LocalApplyReceipt> {
+    let number = receipt
+        .selected_candidate
+        .ok_or_else(|| anyhow!("No selected candidate to apply"))?;
+    let hash = receipt
+        .candidates
+        .iter()
+        .find(|c| c.number == number)
+        .and_then(|c| c.content_sha256.clone())
+        .ok_or_else(|| anyhow!("Selected candidate has no saved hash"))?;
+    Ok(serde_json::from_value(
+        rpc(
+            "local.run.apply",
+            json!({"id": receipt.id, "candidate_number": number, "expected_candidate_sha256": hash, "expected_repository": repository}),
+        )
+        .await?,
+    )?)
 }
 
 struct GoalOptions {
