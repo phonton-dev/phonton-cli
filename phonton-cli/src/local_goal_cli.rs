@@ -975,6 +975,15 @@ pub async fn rpc(method: &str, params: Value) -> Result<Value> {
                         run_started.elapsed().as_millis() as u64,
                     )
                 });
+                match &result {
+                    Ok(receipt) => {
+                        crate::record::add_local_receipt(receipt);
+                    }
+                    Err(_) if !cancelled => {
+                        crate::record::add_run(crate::record::Outcome::Failed, 0, true);
+                    }
+                    Err(_) => {}
+                }
                 if let Ok(mut state) = shared.lock() {
                     state.running = false;
                     state.cancel = None;
@@ -1494,6 +1503,15 @@ pub async fn run(args: &[String]) -> Result<i32> {
         write_end_receipt(&directory, &receipt)?;
         Ok(receipt)
     });
+    match &result {
+        Ok(receipt) => {
+            crate::record::add_local_receipt(receipt);
+        }
+        Err(_) if !cancelled => {
+            crate::record::add_run(crate::record::Outcome::Failed, 0, true);
+        }
+        Err(_) => {}
+    }
     match result {
         Ok(receipt) => {
             println!("{}", serde_json::to_string_pretty(&receipt)?);

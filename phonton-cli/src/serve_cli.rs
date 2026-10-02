@@ -191,6 +191,7 @@ async fn dispatch_rpc(state: AppState, method: &str, params: Value) -> Result<Va
             "local_run_schema": 2,
             "local_creation_schema": 1,
         })),
+        "record.read" => Ok(serde_json::to_value(crate::record::load())?),
         "plan.preview" => {
             let goal = params
                 .get("goal")

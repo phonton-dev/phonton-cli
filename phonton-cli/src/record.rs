@@ -79,6 +79,21 @@ pub fn add_run(outcome: Outcome, tokens: u64, local: bool) -> Record {
     record
 }
 
+/// Count a finished local-harness run (desktop or `phonton goal --local`).
+pub fn add_local_receipt(receipt: &phonton_types::local_run::LocalRunReceipt) -> Record {
+    let tokens = receipt
+        .candidates
+        .iter()
+        .map(|c| c.input_tokens.unwrap_or(0) + c.output_tokens.unwrap_or(0))
+        .sum();
+    let outcome = match receipt.state.as_str() {
+        "review_ready" => Outcome::Verified,
+        "review_unverified" => Outcome::Unverified,
+        _ => Outcome::Failed,
+    };
+    add_run(outcome, tokens, true)
+}
+
 /// `phonton record [--json]`.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let r = load();
