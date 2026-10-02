@@ -431,6 +431,15 @@ pub(super) fn next(candidates: &[CandidateEvidence]) -> SearchDecision {
         );
     }
     let parent = last.decision.as_ref().and_then(|d| d.parent_candidate);
+    if parent.is_some() && rejection == "Edit makes no change" {
+        // A repair that reproduces its parent will reproduce it again; small
+        // models need a different approach, not the same prompt twice.
+        return choice(
+            SearchAction::Restart,
+            None,
+            "The repair reproduced its parent unchanged; try a different approach from the original source",
+        );
+    }
     choice(if parent.is_some() { SearchAction::Repair } else { SearchAction::Restart }, parent,
         "Rejected edit did not produce a checkable change; revise it without altering the source scope")
 }
@@ -491,15 +500,85 @@ pub(super) fn failed_checks_feedback(checks: &[CheckEvidence]) -> String {
             } else {
                 (stream_budget / 2, stream_budget - stream_budget / 2)
             };
+            // TAP keeps the failing assertion far from both ends of the
+            // output; a digest of it beats a head/tail slice.
+            let stdout = tap_failure_digest(&check.stdout).unwrap_or_else(|| check.stdout.clone());
             format!(
                 "{}{}:{}",
                 prefix,
-                feedback_output_excerpt(&check.stdout, stdout_budget),
+                feedback_output_excerpt(&stdout, stdout_budget),
                 feedback_output_excerpt(&check.stderr, stderr_budget)
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// For TAP output with failures: each `not ok` line with its error fields
+/// and the failing test's opening source lines, then the pass/fail counts.
+/// Passing cases, timings and stacks are dropped. `None` for other output.
+fn tap_failure_digest(stdout: &str) -> Option<String> {
+    if !stdout
+        .lines()
+        .any(|l| l.trim_start().starts_with("not ok "))
+    {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut lines = stdout.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("# pass ") || trimmed.starts_with("# fail ") {
+            out.push(trimmed.to_string());
+        }
+        if !trimmed.starts_with("not ok ") {
+            continue;
+        }
+        out.push(trimmed.to_string());
+        let mut location = None;
+        while let Some(next) = lines.peek() {
+            let t = next.trim();
+            if t.starts_with("ok ") || t.starts_with("not ok ") || t.starts_with("# ") {
+                break;
+            }
+            let next = lines.next().unwrap_or_default().trim();
+            for key in ["error:", "expected:", "actual:", "operator:"] {
+                if next.starts_with(key) {
+                    out.push(format!("  {}", super::truncate(next, 120)));
+                }
+            }
+            if next.contains("Missing expected exception") {
+                out.push("  meaning: the asserted call returned normally; it must throw".into());
+            }
+            if let Some(raw) = next.strip_prefix("location:") {
+                location = Some(raw.trim().trim_matches('\'').replace("\\\\", "\\"));
+            }
+        }
+        if let Some(source) = location.as_deref().and_then(failing_test_source) {
+            out.push(source);
+        }
+    }
+    Some(out.join("\n"))
+}
+
+/// `file.js:14` and the three source lines from that location.
+fn failing_test_source(location: &str) -> Option<String> {
+    let mut parts = location.rsplitn(3, ':');
+    let _column = parts.next()?;
+    let line: usize = parts.next()?.parse().ok()?;
+    let path = std::path::Path::new(parts.next()?);
+    if std::fs::metadata(path).ok()?.len() > 256 * 1024 {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let body: Vec<String> = text
+        .lines()
+        .skip(line.saturating_sub(1))
+        .take(3)
+        .map(|l| format!("  | {}", super::truncate(l.trim_end(), 100)))
+        .collect();
+    let name = path.file_name()?.to_string_lossy();
+    Some(format!("  {name}:{line}\n{}", body.join("\n")))
 }
 
 // This is a search heuristic only. Bounded output excerpts remain in the
@@ -992,6 +1071,16 @@ mod tests {
         }
     }
     #[test]
+    fn noop_repair_restarts_instead_of_repeating() {
+        let mut noop = failed(2, Some(1), "");
+        noop.checks.clear();
+        noop.content_sha256 = None;
+        noop.rejection = Some("Edit makes no change".into());
+        let decision = next(&[failed(1, None, "not ok 3 - rejects trailing garbage"), noop]);
+        assert_eq!(decision.action, SearchAction::Restart);
+        assert_eq!(decision.parent_candidate, None);
+    }
+    #[test]
     fn repair_uses_parent_and_unchanged_evidence_restarts() {
         assert_eq!(next(&[]).action, SearchAction::Initial);
         let first = failed(1, None, "test A failed");
@@ -1281,6 +1370,35 @@ mod tests {
                 assert!(excerpt.contains(&format!("WARN stream_{number} end")));
             }
         }
+    }
+    #[test]
+    fn tap_digest_keeps_the_failing_assertion_and_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_file = dir.path().join("port.test.js");
+        std::fs::write(
+            &test_file,
+            "import test from 'node:test';\n\ntest('rejects trailing garbage', () => {\n  assert.throws(() => parsePort('80abc'));\n});\n",
+        )
+        .unwrap();
+        let location = format!("{}:3:1", test_file.display()).replace('\\', "\\\\");
+        let tap = format!(
+            "TAP version 13\nok 1 - parses\n  ---\n  duration_ms: 1.6\n  ...\nnot ok 2 - rejects trailing garbage\n  ---\n  duration_ms: 0.9\n  location: '{location}'\n  error: 'Missing expected exception.'\n  operator: 'throws'\n  stack: |-\n    at x\n  ...\n1..2\n# pass 1\n# fail 1\n# duration_ms 161.8\n"
+        );
+        let digest = tap_failure_digest(&tap).unwrap();
+        assert!(
+            digest.contains("not ok 2 - rejects trailing garbage"),
+            "{digest}"
+        );
+        assert!(
+            digest.contains("error: 'Missing expected exception.'"),
+            "{digest}"
+        );
+        assert!(digest.contains("must throw"), "{digest}");
+        assert!(digest.contains("parsePort('80abc')"), "{digest}");
+        assert!(digest.contains("# fail 1"), "{digest}");
+        assert!(!digest.contains("duration_ms"), "{digest}");
+        assert!(!digest.contains("ok 1 - parses"), "{digest}");
+        assert!(tap_failure_digest("all good\n").is_none());
     }
     #[test]
     fn baseline_failure_tail_reaches_first_generation() {

@@ -882,6 +882,9 @@ fn suggested_checks(
                             args: vec!["test".into()],
                         };
                         let Some(runner) = super::node_test_invocation(&check, root) else {
+                            if let Some(tap) = super::node_spec_test_script_as_tap(root) {
+                                return Ok((vec![tap], Some("The root test script runs Node's test runner with its default reporter; the plan runs the same files directly with --test-reporter=tap so completed cases are counted.")));
+                            }
                             return Ok((vec![], Some("The inferred root npm test was withheld: its script has no supported test runner with an explicit TAP reporter, so a successful exit would not prove a completed test. Choose a check that reports named completed cases.")));
                         };
                         return Ok((vec![runner], Some("The root npm script was used to propose a direct Node TAP check. The plan runs Node directly so npm script-shell and node_modules/.bin cannot change the verifier executable; review whether the project needs npm-specific setup.")));
@@ -1309,10 +1312,16 @@ mod tests {
             r#"{"scripts":{"test":"node --test src/test.js"}}"#,
         )
         .unwrap();
+        // A default-reporter `node --test` script runs the same files with
+        // an explicit TAP reporter, so completed cases can be counted.
         let spec_plan = preview(request_for(root.path(), &["src/app.js"]))
             .await
             .unwrap();
-        assert!(spec_plan.request.checks.is_empty());
+        assert_eq!(spec_plan.request.checks.len(), 1);
+        assert_eq!(
+            spec_plan.request.checks[0].args,
+            ["--test", "--test-reporter=tap", "src/test.js"]
+        );
         std::fs::write(
             root.path().join("package.json"),
             r#"{"scripts":{"test":"node --test --test-reporter=tap src/test.js"}}"#,

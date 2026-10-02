@@ -5256,6 +5256,35 @@ fn node_script_invocation_inner(
     None
 }
 
+/// A root `"test": "node --test [files]"` script uses Node's default spec
+/// reporter, which forwards child output and cannot prove completed cases.
+/// The same runner with `--test-reporter=tap` can; propose that instead.
+/// Only plain file arguments qualify, and npm pre/post hooks disqualify.
+pub(super) fn node_spec_test_script_as_tap(directory: &Path) -> Option<LocalCheck> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("package.json")).ok()?).ok()?;
+    let scripts = manifest["scripts"].as_object()?;
+    if scripts.contains_key("pretest") || scripts.contains_key("posttest") {
+        return None;
+    }
+    let words = simple_script_words(single_literal_script_command(
+        scripts.get("test")?.as_str()?,
+    )?)?;
+    let (program, args) = words.split_first()?;
+    if !(program.eq_ignore_ascii_case("node") || program.eq_ignore_ascii_case("node.exe"))
+        || args.first().map(String::as_str) != Some("--test")
+        || args[1..].iter().any(|a| a.starts_with('-'))
+    {
+        return None;
+    }
+    let mut tap = vec!["--test".to_string(), "--test-reporter=tap".to_string()];
+    tap.extend(args[1..].iter().cloned());
+    supported_node_tap_invocation(&tap).then(|| LocalCheck {
+        program: "node".into(),
+        args: tap,
+    })
+}
+
 fn single_literal_script_command(script: &str) -> Option<&str> {
     // Single quotes and backslash escapes differ between npm's Windows and
     // POSIX shells. A shell chain can skip a later runner or forge its output.
@@ -5894,6 +5923,35 @@ fn move_file_write_through(source: &Path, target: &Path, replace_existing: bool)
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod spec_script_tests {
+    use super::*;
+
+    fn script(test: &str, extra: &str) -> Option<LocalCheck> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(r#"{{"scripts":{{"test":"{test}"{extra}}}}}"#),
+        )
+        .unwrap();
+        node_spec_test_script_as_tap(dir.path())
+    }
+
+    #[test]
+    fn plain_node_test_scripts_become_tap_checks() {
+        let check = script("node --test", "").unwrap();
+        assert_eq!(check.args, ["--test", "--test-reporter=tap"]);
+        let check = script("node --test test/a.test.js", "").unwrap();
+        assert_eq!(
+            check.args,
+            ["--test", "--test-reporter=tap", "test/a.test.js"]
+        );
+        assert!(script("node --test --watch", "").is_none());
+        assert!(script("jest", "").is_none());
+        assert!(script("node --test", r#","pretest":"node gen.js""#).is_none());
+    }
 }
 
 #[cfg(test)]
