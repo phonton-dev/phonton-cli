@@ -11,12 +11,16 @@ pub const RUNTIME_VERSION: &str = "0.34.2";
 pub const ARCHIVE_BYTES: u64 = 1_460_928_014;
 /// Minimum free space for a fresh managed runtime install, including extraction reserve.
 pub const MIN_INSTALL_FREE_BYTES: u64 = ARCHIVE_BYTES * 4;
+#[cfg(all(windows, target_arch = "x86_64"))]
 const ARCHIVE_SHA256: &str = "8f3fd071a2a2f9497b562f43502c77c2b701a99d1ee5dfda28da8c786373063b";
 // Independently extracted ollama.exe from the archive with the pinned SHA-256.
+#[cfg(all(windows, target_arch = "x86_64"))]
 const EXECUTABLE_SHA256: &str = "ad41dcf55c5de96d4a0bff7c559a17285c3aa064a6f12d23db3ebf59ad8e4125";
 // Path-and-content digest of the 82 files independently extracted from the
 // pinned ZIP. This covers the executable, CPU/CUDA/Vulkan DLLs and load tree.
+#[cfg(all(windows, target_arch = "x86_64"))]
 const TREE_SHA256: &str = "3367e5c4874bcdced42c85cfac1aa0f8aa68e7b538e7c7d6ea17495323c74397";
+#[cfg(all(windows, target_arch = "x86_64"))]
 const ARCHIVE_URL: &str =
     "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-windows-amd64.zip";
 

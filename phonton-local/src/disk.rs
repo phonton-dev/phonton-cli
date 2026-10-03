@@ -138,6 +138,7 @@ pub fn available_directory_bytes(directory: &Path) -> Result<u64> {
 /// A unique SHA-256 manifest descriptor. The digest is normalized to lowercase.
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestBlob {
+    #[cfg(all(windows, target_arch = "x86_64"))]
     pub(crate) sha256: String,
     pub(crate) size_bytes: u64,
 }

@@ -563,6 +563,7 @@ fn set_managed_storage_guarded(
     set_managed_storage_at(path, requested, isolated_state)
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn previous_managed_runtime(root: &Path, installed: bool) -> bool {
     if installed {
         return true;

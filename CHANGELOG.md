@@ -22,6 +22,8 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Gate Windows-only sandbox diagnostics and managed-runtime metadata
+  on their supported platform so strict Linux linting avoids unused declarations.
 - [fixed] Every calibrated local TUI goal requires review of its exact frozen
   scope, model and commands before execution. Only an explicit Y approves;
   repeated keys, Enter, paste and a dropped approval channel cannot approve.

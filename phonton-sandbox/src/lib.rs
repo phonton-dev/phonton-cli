@@ -327,6 +327,7 @@ fn blocked_path(path: &Path) -> Option<String> {
 /// deadline. This executor does not currently establish required containment.
 pub struct Sandbox {
     guard: ExecutionGuard,
+    #[cfg(target_os = "windows")]
     task_id: String,
     host_execution_approved: bool,
 }
@@ -335,8 +336,11 @@ impl Sandbox {
     /// Create a new sandbox bound to `project_root`. Typically the
     /// orchestrator's working directory.
     pub fn new(project_root: PathBuf, task_id: String) -> Self {
+        #[cfg(not(target_os = "windows"))]
+        let _ = task_id;
         Self {
             guard: ExecutionGuard::new(project_root),
+            #[cfg(target_os = "windows")]
             task_id,
             host_execution_approved: false,
         }

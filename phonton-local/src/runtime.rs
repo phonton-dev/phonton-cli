@@ -199,6 +199,7 @@ fn manifest_descriptors(manifest: &Value) -> Result<Vec<crate::disk::ManifestBlo
                     LocalError::Invalid("Registry manifest size overflowed".into())
                 })?;
                 blobs.push(crate::disk::ManifestBlob {
+                    #[cfg(all(windows, target_arch = "x86_64"))]
                     sha256: hash,
                     size_bytes: bytes,
                 });
