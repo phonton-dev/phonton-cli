@@ -37,6 +37,11 @@ pub type Result<T> = std::result::Result<T, LocalError>;
 
 /// Estimate a conservative 4K-context cold-load working set. The model's
 /// context ceiling is unknown here, so this is not an automatic recommendation.
+/// Host RAM a GPU-resident model needs free: the runtime process only. Matches
+/// the calibration reserve, so a calibrated model is admitted under the same
+/// conditions it was measured in.
+pub const GPU_HOST_RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
+
 pub fn estimate_fit(weights_bytes: u64, hardware: &HardwareSnapshot) -> ModelFit {
     estimate_fit_for_context(weights_bytes, hardware, 4096)
 }
@@ -52,7 +57,19 @@ pub fn estimate_fit_for_context(
     let required = weights_bytes
         .saturating_add(weights_bytes / 4)
         .saturating_add(GIB.saturating_mul(u64::from(context).div_ceil(4096).max(1)));
-    let host_headroom = hardware.ram_available_bytes.map(|n| n >= 2 * GIB);
+    let gpu_fit = hardware
+        .gpus
+        .iter()
+        .any(|gpu| gpu.available_bytes >= required);
+    // A model that fits in VRAM needs host memory only for the runtime
+    // process, so it uses the same reserve calibration measures under.
+    // CPU/offload keeps the 2 GiB host reserve.
+    let host_floor = if gpu_fit {
+        GPU_HOST_RESERVE_BYTES
+    } else {
+        2 * GIB
+    };
+    let host_headroom = hardware.ram_available_bytes.map(|n| n >= host_floor);
     let (status, explanation) = if weights_bytes == 0 || host_headroom.is_none() {
         (
             FitStatus::Unknown,
@@ -61,13 +78,13 @@ pub fn estimate_fit_for_context(
     } else if host_headroom == Some(false) {
         (
             FitStatus::InsufficientMemory,
-            "Less than 2 GiB host RAM is available. Close other workloads before loading a model.",
+            if gpu_fit {
+                "Less than 1.5 GiB host RAM is available for the runtime. Close other workloads before loading a model."
+            } else {
+                "Less than 2 GiB host RAM is available. Close other workloads before loading a model."
+            },
         )
-    } else if hardware
-        .gpus
-        .iter()
-        .any(|gpu| gpu.available_bytes >= required)
-    {
+    } else if gpu_fit {
         (FitStatus::LikelyFitsGpu, "Weights plus 25% and a context-scaled reserve fit one observed GPU. KV cache is estimated; calibrate before use.")
     } else if hardware
         .ram_available_bytes
@@ -122,6 +139,29 @@ mod tests {
         assert_eq!(
             recommend_context(500_000_000, &HardwareSnapshot::default(), Some(32768)),
             None
+        );
+    }
+
+    #[test]
+    fn gpu_resident_models_need_only_the_runtime_reserve() {
+        let gpu = |free: u64| GpuSnapshot {
+            name: "GPU".into(),
+            total_bytes: 6 << 30,
+            available_bytes: free,
+        };
+        let h = HardwareSnapshot {
+            ram_available_bytes: Some(1800 << 20),
+            gpus: vec![gpu(5 << 30)],
+            ..Default::default()
+        };
+        assert_eq!(estimate_fit(1 << 30, &h).status, FitStatus::LikelyFitsGpu);
+        let no_gpu = HardwareSnapshot {
+            gpus: vec![gpu(1 << 30)],
+            ..h
+        };
+        assert_eq!(
+            estimate_fit(1 << 30, &no_gpu).status,
+            FitStatus::InsufficientMemory
         );
     }
 

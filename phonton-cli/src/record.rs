@@ -81,6 +81,10 @@ pub fn add_run(outcome: Outcome, tokens: u64, local: bool) -> Record {
 
 /// Count a finished local-harness run (desktop or `phonton goal --local`).
 pub fn add_local_receipt(receipt: &phonton_types::local_run::LocalRunReceipt) -> Record {
+    if receipt.candidates.is_empty() {
+        // Stopped before any candidate (admission, baseline): nothing ran.
+        return load();
+    }
     let tokens = receipt
         .candidates
         .iter()

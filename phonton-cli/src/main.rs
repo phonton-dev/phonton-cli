@@ -774,7 +774,15 @@ impl App {
             if state.handoff_packet.is_some() && g.receipt_tick.is_none() {
                 g.receipt_tick = Some(tick);
             }
-            if settled && !g.recorded {
+            // Only runs that produced evidence move the record; a goal refused
+            // before any model call (no RAM, no runtime) is not a lost run.
+            let ran = state.handoff_packet.as_ref().is_some_and(|h| {
+                !h.verification.passed.is_empty()
+                    || !h.verification.findings.is_empty()
+                    || !h.changed_files.is_empty()
+                    || h.token_usage.input_tokens + h.token_usage.output_tokens > 0
+            });
+            if settled && ran && !g.recorded {
                 g.recorded = true;
                 let outcome = match (&state.task_status, &state.handoff_packet) {
                     (TaskStatus::Failed { .. }, _) => record::Outcome::Failed,

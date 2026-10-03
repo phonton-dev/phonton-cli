@@ -10,7 +10,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 const MIN_RESIDENT_LIFETIME_SECONDS: i64 = 30;
-const CALIBRATION_HOST_RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
+const CALIBRATION_HOST_RESERVE_BYTES: u64 = crate::GPU_HOST_RESERVE_BYTES;
 const MAX_INVENTORY_WARNINGS: usize = 8;
 const MAX_SAVED_ATTEMPT_OUTPUT_CHARS: usize = 16 * 1024;
 
