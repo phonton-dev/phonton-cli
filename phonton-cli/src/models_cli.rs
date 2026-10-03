@@ -2818,14 +2818,11 @@ mod tests {
         assert!(error.to_string().contains("endpoint changed"));
         assert!(!shared.lock().unwrap().running);
 
-        let chosen = temp.path().join("chosen");
-        std::fs::create_dir(&chosen).unwrap();
-        changed.schema = 2;
-        changed.managed_root = Some(chosen.clone());
-        storage::save(&path, &changed).unwrap();
+        // A stale displayed root must fail even on platforms where choosing
+        // a custom managed storage folder is not supported.
         let current_endpoint = OperationExpectation {
             endpoint: changed.endpoint.clone(),
-            ..expected
+            root: temp.path().join("stale-runtime"),
         };
         let error = admit_model_operation(&path, &shared, accepted(), &current_endpoint)
             .err()
@@ -2834,12 +2831,67 @@ mod tests {
         assert!(!shared.lock().unwrap().running);
 
         let current = OperationExpectation {
-            root: chosen,
+            root: temp.path().join("runtime"),
             ..current_endpoint
         };
         let lease = admit_model_operation(&path, &shared, accepted(), &current).unwrap();
         assert!(shared.lock().unwrap().running);
         drop(lease);
+    }
+
+    #[test]
+    fn model_operation_admission_validates_selected_storage_for_platform() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("local-models.json");
+        let chosen = temp.path().join("chosen");
+        std::fs::create_dir(&chosen).unwrap();
+        let settings = LocalSettings {
+            schema: 2,
+            managed_root: Some(chosen.clone()),
+            ..Default::default()
+        };
+        storage::save(&path, &settings).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let shared = Arc::new(Mutex::new(Operation::default()));
+        let expected = OperationExpectation {
+            endpoint: settings.endpoint.clone(),
+            root: temp.path().join("runtime"),
+        };
+        let accepted = || Operation {
+            running: true,
+            kind: "install".into(),
+            ..Default::default()
+        };
+        let error = admit_model_operation(&path, &shared, accepted(), &expected)
+            .err()
+            .unwrap();
+        assert!(!shared.lock().unwrap().running);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert!(storage::acquire(&path).is_ok());
+
+        #[cfg(windows)]
+        let current = {
+            assert!(error.to_string().contains("storage changed"));
+            OperationExpectation {
+                root: chosen,
+                ..expected
+            }
+        };
+        #[cfg(not(windows))]
+        let current = {
+            assert!(error.to_string().contains("supports Windows only"));
+            // Recover by using supported default storage; rejection must not
+            // leave the operation running or retain the cross-process lease.
+            let mut settings = settings;
+            settings.managed_root = None;
+            storage::save(&path, &settings).unwrap();
+            expected
+        };
+        let lease = admit_model_operation(&path, &shared, accepted(), &current).unwrap();
+        assert!(shared.lock().unwrap().running);
+        assert!(storage::acquire(&path).is_err());
+        drop(lease);
+        assert!(storage::acquire(&path).is_ok());
     }
 
     #[cfg(all(windows, target_arch = "x86_64"))]
