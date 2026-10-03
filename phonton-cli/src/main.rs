@@ -3159,7 +3159,11 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(reason.clone(), Style::default().fg(PAPER)),
             ]));
             lines.push(Line::from(Span::styled(
-                "  Streak reset. The flight log (Shift+L) has every event.",
+                if g.recorded {
+                    "  Streak reset. The flight log (Shift+L) has every event."
+                } else {
+                    "  Nothing ran, so your record is unchanged. The flight log (Shift+L) has every event."
+                },
                 Style::default().fg(DIM),
             )));
             lines.push(Line::raw(""));
