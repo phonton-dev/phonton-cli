@@ -1534,7 +1534,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("package.json"),
-            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+            r#"{"type":"module","scripts":{"test":"node --test --test-reporter=tap"}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(tmp.path().join("test")).unwrap();
@@ -1553,7 +1553,15 @@ mod tests {
                 errors,
                 ..
             }) => {
-                assert!(errors.join("\n").contains("fails"));
+                // Reporter defaults vary by Node version. Verify the retained
+                // TAP failure evidence, not a test name outside the output tail.
+                let diagnostic = errors.join("\n");
+                for evidence in ["ERR_ASSERTION", "expected: 2", "actual: 1", "# fail 1"] {
+                    assert!(
+                        diagnostic.contains(evidence),
+                        "missing {evidence:?} in npm test failure: {diagnostic}"
+                    );
+                }
             }
             other => panic!("expected npm test failure, got {other:?}"),
         }
