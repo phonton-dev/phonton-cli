@@ -22,6 +22,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Keep Python bytecode and pytest cache directories out of local source
+  snapshots, so warmed test runs do not fail the baseline source-change guard.
+  Source edits and root-level runner bytecode remain checked.
+- [fixed] Refresh compatible Rust dependencies for published advisories in
+  Rustls, h2, Crossbeam Epoch, Quinn, Anyhow and CXX.
 - [fixed] Verify Node test failure diagnostics with an explicit TAP fixture
   across Node versions instead of depending on the default reporter's layout.
 - [fixed] Exercise model-operation admission with platform-appropriate storage

@@ -100,6 +100,10 @@ Local runs never silently fall back to a cloud model. Full workflow, permissions
 and limits: [docs/local-harness.md](docs/local-harness.md) and the
 [local harness reference](docs/local-harness-reference.md).
 
+Local source snapshots omit generated `__pycache__` and `.pytest_cache`
+directories. Baseline and candidate checks still reject changed source bytes,
+unexpected source files, and changes to captured root-level bytecode.
+
 ---
 
 ## Install
