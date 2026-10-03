@@ -22,6 +22,8 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Update async-trait's generated future annotations for strict Clippy
+  compatibility with Rust 1.99.
 - [fixed] Gate Windows-only sandbox diagnostics and managed-runtime metadata
   on their supported platform so strict Linux linting avoids unused declarations.
 - [fixed] Every calibrated local TUI goal requires review of its exact frozen
