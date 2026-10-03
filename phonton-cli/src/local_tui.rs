@@ -80,14 +80,24 @@ fn check_label(check: &phonton_types::local_run::CheckEvidence) -> String {
         .unwrap_or_else(|| "check".into())
 }
 
-/// Tokens the runtime reported across every candidate.
+/// Tokens the runtime reported across candidates and restart proposals.
 pub fn tokens(receipt: &LocalRunReceipt) -> (u64, u64) {
-    receipt.candidates.iter().fold((0, 0), |(i, o), c| {
-        (
-            i + c.input_tokens.unwrap_or(0),
-            o + c.output_tokens.unwrap_or(0),
+    receipt
+        .candidates
+        .iter()
+        .map(|c| (c.input_tokens, c.output_tokens))
+        .chain(
+            receipt
+                .hypotheses
+                .iter()
+                .map(|h| (h.input_tokens, h.output_tokens)),
         )
-    })
+        .fold((0, 0), |(i, o), (input, output)| {
+            (
+                i.saturating_add(input.unwrap_or(0)),
+                o.saturating_add(output.unwrap_or(0)),
+            )
+        })
 }
 
 /// Translate a (possibly intermediate) receipt into the TUI's state model.
@@ -307,6 +317,85 @@ fn failure_reason(receipt: &LocalRunReceipt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_totals_include_rejected_and_interrupted_restart_proposals() {
+        use phonton_types::local::{HardwareSnapshot, ModelProfile};
+        use phonton_types::local_run::{
+            HypothesisEvidence, HypothesisStatus, LocalRunRequest, SearchBudget,
+        };
+        let mut receipt = LocalRunReceipt {
+            schema: 1,
+            id: "fixture".into(),
+            state: "verifying_1".into(),
+            request: LocalRunRequest {
+                goal: "fixture".into(),
+                repository: ".".into(),
+                files: vec!["code.py".into()],
+                new_file: None,
+                editable_existing: vec![],
+                checks: vec![],
+                preparation: None,
+                approve_host_execution: false,
+                allow_unverified_runtime: false,
+                budget: SearchBudget::default(),
+                expected_source_hashes: Default::default(),
+                expected_baseline_sha256: None,
+            },
+            profile: ModelProfile {
+                schema: 1,
+                model: "fixture".into(),
+                digest: "fixture".into(),
+                runtime_version: "fixture".into(),
+                endpoint: "http://127.0.0.1:11434".into(),
+                context_tokens: 4096,
+                output_tokens: 512,
+                protocol: None,
+                thinking: None,
+                probes: vec![],
+                hardware: HardwareSnapshot::default(),
+                measured_at_unix: 0,
+            },
+            runtime_origin: phonton_types::local_run::RuntimeOrigin::Unknown,
+            hardware: HardwareSnapshot::default(),
+            resident_reuse: None,
+            baseline_sha256: "fixture".into(),
+            baseline_checks: vec![],
+            candidates: vec![],
+            hypotheses: vec![],
+            selected_candidate: Some(1),
+            checks_used: 1,
+            generated_tokens_reserved: 512,
+            model_calls_reserved: 0,
+            elapsed_ms: 0,
+            known_gaps: vec![],
+            contract: None,
+            git_index: None,
+        };
+        assert!(crate::record::record_local_receipt(&receipt)
+            .unwrap()
+            .is_none());
+        for (status, input, output) in [
+            (HypothesisStatus::Rejected, Some(80), Some(20)),
+            (HypothesisStatus::Pending, Some(30), None),
+        ] {
+            receipt.hypotheses.push(HypothesisEvidence {
+                candidate_number: 2,
+                status,
+                path: None,
+                search: None,
+                mechanism: None,
+                difference: None,
+                raw_output: String::new(),
+                input_tokens: input,
+                output_tokens: output,
+                elapsed_ms: 0,
+                detail: String::new(),
+                context: None,
+            });
+        }
+        assert_eq!(tokens(&receipt), (110, 20));
+    }
 
     #[test]
     fn diff_stats_count_per_file() {

@@ -18,6 +18,8 @@ pub struct Record {
     pub local_tokens: u64,
     /// Tokens sent to a hosted provider.
     pub cloud_tokens: u64,
+    /// Tokens whose inference location was not established.
+    pub unknown_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +29,34 @@ pub enum Outcome {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenOrigin {
+    ManagedLocal,
+    Hosted,
+    #[default]
+    Unknown,
+}
+
+impl From<phonton_types::local_run::RuntimeOrigin> for TokenOrigin {
+    fn from(origin: phonton_types::local_run::RuntimeOrigin) -> Self {
+        match origin {
+            phonton_types::local_run::RuntimeOrigin::ManagedVerified => Self::ManagedLocal,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 impl Record {
-    pub fn add(&mut self, outcome: Outcome, tokens: u64, local: bool) {
+    pub fn add(&mut self, outcome: Outcome, tokens: u64, origin: TokenOrigin) {
         self.runs += 1;
-        if local {
-            self.local_tokens += tokens;
-        } else {
-            self.cloud_tokens += tokens;
+        match origin {
+            TokenOrigin::ManagedLocal => {
+                self.local_tokens = self.local_tokens.saturating_add(tokens)
+            }
+            TokenOrigin::Hosted => self.cloud_tokens = self.cloud_tokens.saturating_add(tokens),
+            TokenOrigin::Unknown => {
+                self.unknown_tokens = self.unknown_tokens.saturating_add(tokens)
+            }
         }
         if outcome == Outcome::Verified {
             self.verified_runs += 1;
@@ -62,40 +85,82 @@ pub fn load() -> Record {
         .unwrap_or_default()
 }
 
-/// Add one finished run and save. Returns the updated record.
-// ponytail: last-writer-wins on concurrent runs; add a lock if two engines
-// finishing in the same millisecond ever matters.
-pub fn add_run(outcome: Outcome, tokens: u64, local: bool) -> Record {
-    let mut record = load();
-    record.add(outcome, tokens, local);
-    if let Some(path) = path() {
-        let tmp = path.with_extension("json.tmp");
-        if let Ok(bytes) = serde_json::to_vec_pretty(&record) {
-            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path))
-                .and_then(|_| std::fs::write(&tmp, bytes))
-                .and_then(|_| std::fs::rename(&tmp, &path));
+/// Add one finished run and save. Returns only the durable updated record.
+pub fn add_run(outcome: Outcome, tokens: u64, origin: TokenOrigin) -> Record {
+    match try_add_run(outcome, tokens, origin) {
+        Ok(record) => record,
+        Err(error) => {
+            eprintln!("Run receipt retained, but the aggregate record could not be saved: {error}");
+            load()
         }
     }
-    record
+}
+
+fn try_add_run(outcome: Outcome, tokens: u64, origin: TokenOrigin) -> std::io::Result<Record> {
+    let path = path().ok_or_else(|| std::io::Error::other("run record path unavailable"))?;
+    add_run_at(&path, outcome, tokens, origin)
+}
+
+fn add_run_at(
+    path: &std::path::Path,
+    outcome: Outcome,
+    tokens: u64,
+    origin: TokenOrigin,
+) -> std::io::Result<Record> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // All CLI/Desktop writers share this lock. Drop releases it after atomic replacement.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    let mut record: Record = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Record::default(),
+        Err(error) => return Err(error),
+    };
+    record.add(outcome, tokens, origin);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?,
+    )?;
+    std::fs::rename(tmp, path)?;
+    Ok(record)
 }
 
 /// Count a finished local-harness run (desktop or `phonton goal --local`).
 pub fn add_local_receipt(receipt: &phonton_types::local_run::LocalRunReceipt) -> Record {
-    if receipt.candidates.is_empty() {
-        // Stopped before any candidate (admission, baseline): nothing ran.
-        return load();
+    match record_local_receipt(receipt) {
+        Ok(Some(record)) => record,
+        Ok(None) => load(),
+        Err(error) => {
+            eprintln!("Run receipt retained, but the aggregate record could not be saved: {error}");
+            load()
+        }
     }
-    let tokens = receipt
-        .candidates
-        .iter()
-        .map(|c| c.input_tokens.unwrap_or(0) + c.output_tokens.unwrap_or(0))
-        .sum();
+}
+
+/// None means no model attempt qualified; success means the record is durable.
+pub fn record_local_receipt(
+    receipt: &phonton_types::local_run::LocalRunReceipt,
+) -> std::io::Result<Option<Record>> {
+    if receipt.candidates.is_empty() && receipt.hypotheses.is_empty() {
+        // Stopped before any model attempt (admission, baseline).
+        return Ok(None);
+    }
+    let (input, output) = crate::local_tui::tokens(receipt);
+    let tokens = input.saturating_add(output);
     let outcome = match receipt.state.as_str() {
         "review_ready" => Outcome::Verified,
         "review_unverified" => Outcome::Unverified,
         _ => Outcome::Failed,
     };
-    add_run(outcome, tokens, true)
+    try_add_run(outcome, tokens, receipt.runtime_origin.into()).map(Some)
 }
 
 /// `phonton record [--json]`.
@@ -111,6 +176,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     println!("  streak          {} (best {})", r.streak, r.best_streak);
     println!("  tokens local    {}", n(r.local_tokens));
     println!("  tokens cloud    {}", n(r.cloud_tokens));
+    println!("  tokens unknown  {}", n(r.unknown_tokens));
     println!("Only finished runs count. Unverified or failed runs end the streak.");
     Ok(())
 }
@@ -120,16 +186,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_finished_runs_do_not_lose_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    add_run_at(&path, Outcome::Verified, 10, TokenOrigin::ManagedLocal).unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let record: Record = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            (record.runs, record.streak, record.local_tokens),
+            (8, 8, 80)
+        );
+    }
+
+    #[test]
+    fn external_and_old_receipts_never_claim_local_inference() {
+        use phonton_types::local_run::RuntimeOrigin;
+        assert_eq!(
+            TokenOrigin::from(RuntimeOrigin::ManagedVerified),
+            TokenOrigin::ManagedLocal
+        );
+        for origin in [RuntimeOrigin::ExternalUnverified, RuntimeOrigin::Unknown] {
+            let mut r = Record::default();
+            r.add(Outcome::Verified, 99, origin.into());
+            assert_eq!(
+                (r.local_tokens, r.cloud_tokens, r.unknown_tokens),
+                (0, 0, 99)
+            );
+        }
+        let old: Record = serde_json::from_str(r#"{"local_tokens":12}"#).unwrap();
+        assert_eq!((old.local_tokens, old.unknown_tokens), (12, 0));
+    }
+
+    #[test]
     fn only_verified_runs_extend_the_streak() {
         let mut r = Record::default();
-        r.add(Outcome::Verified, 300, true);
-        r.add(Outcome::Verified, 200, true);
-        r.add(Outcome::Unverified, 50, false);
-        r.add(Outcome::Verified, 10, true);
+        r.add(Outcome::Verified, 300, TokenOrigin::ManagedLocal);
+        r.add(Outcome::Verified, 200, TokenOrigin::ManagedLocal);
+        r.add(Outcome::Unverified, 50, TokenOrigin::Hosted);
+        r.add(Outcome::Verified, 10, TokenOrigin::ManagedLocal);
         assert_eq!((r.runs, r.verified_runs), (4, 3));
         assert_eq!((r.streak, r.best_streak), (1, 2));
         assert_eq!((r.local_tokens, r.cloud_tokens), (510, 50));
-        r.add(Outcome::Failed, 0, true);
+        r.add(Outcome::Failed, 0, TokenOrigin::ManagedLocal);
         assert_eq!(r.streak, 0);
     }
 }

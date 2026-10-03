@@ -43,6 +43,7 @@ mod doctor;
 mod extensions_cli;
 mod index_cli;
 mod local_goal_cli;
+mod local_plan_approval;
 mod local_tui;
 mod mcp_cli;
 mod memory_cli;
@@ -326,6 +327,10 @@ pub struct GoalEntry {
     pub receipt_tick: Option<usize>,
     /// True once this goal has been added to the run record.
     pub recorded: bool,
+    /// Local harness records count only after the durable final receipt is saved.
+    pub local_harness: bool,
+    /// Route observed when this goal was dispatched; later settings do not change it.
+    pub token_origin: record::TokenOrigin,
     /// Latest local-harness receipt when this goal ran on the local model.
     pub local: Option<Box<phonton_types::local_run::LocalRunReceipt>>,
     /// Result of applying the local candidate: `Ok(summary)` or `Err(why)`.
@@ -404,6 +409,8 @@ impl GoalEntry {
             finished_at: None,
             receipt_tick: None,
             recorded: false,
+            local_harness: false,
+            token_origin: record::TokenOrigin::Unknown,
             local: None,
             applied: None,
         }
@@ -472,6 +479,8 @@ pub struct App {
     pub pending_mcp_approvals: Vec<PendingMcpApproval>,
     /// Cursor into `pending_mcp_approvals` when more than one request is queued.
     pub mcp_approval_selected: usize,
+    /// Local plans waiting for a per-goal approval.
+    pub pending_local_plans: Vec<local_plan_approval::PendingLocalPlan>,
     /// True when the pending prompt artifact drawer is visible.
     pub prompt_artifacts_open: bool,
     /// Cursor into pending prompt artifacts.
@@ -503,7 +512,7 @@ pub struct App {
     pub motion: bool,
     /// Finished runs not yet written to the record file (the event loop
     /// saves them; tests never touch the user's record).
-    pub unsaved_runs: Vec<(record::Outcome, u64, bool)>,
+    pub unsaved_runs: Vec<(record::Outcome, u64, record::TokenOrigin)>,
 }
 
 /// How long a first Esc/Ctrl+C stays armed waiting for confirmation.
@@ -537,6 +546,7 @@ impl App {
             store_path: None,
             pending_mcp_approvals: Vec::new(),
             mcp_approval_selected: 0,
+            pending_local_plans: Vec::new(),
             prompt_artifacts_open: false,
             prompt_artifact_selected: 0,
             clarifying_goal_idx: None,
@@ -765,7 +775,6 @@ impl App {
             }
         }
         let tick = self.spinner_frame;
-        let local = provider_is_local(&self.settings.provider, &self.settings.base_url);
         if let Some(g) = self.goals.get_mut(index) {
             let settled = matches!(
                 state.task_status,
@@ -785,7 +794,7 @@ impl App {
                     || !h.changed_files.is_empty()
                     || h.token_usage.input_tokens + h.token_usage.output_tokens > 0
             });
-            if settled && ran && !g.recorded {
+            if settled && ran && !g.recorded && !g.local_harness {
                 g.recorded = true;
                 let outcome = match (&state.task_status, &state.handoff_packet) {
                     (TaskStatus::Failed { .. }, _) => record::Outcome::Failed,
@@ -794,8 +803,9 @@ impl App {
                     }
                     _ => record::Outcome::Unverified,
                 };
-                self.record.add(outcome, state.tokens_used, local);
-                self.unsaved_runs.push((outcome, state.tokens_used, local));
+                self.record.add(outcome, state.tokens_used, g.token_origin);
+                self.unsaved_runs
+                    .push((outcome, state.tokens_used, g.token_origin));
             }
             g.status = state.task_status.clone();
             g.state = Some(state);
@@ -845,6 +855,16 @@ impl App {
     /// Returns `Some(Intent)` when the caller should act on the outside
     /// world (queue a new goal, issue an ask, exit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if let Some(prompt) = self.pending_local_plans.first_mut() {
+            let decision = prompt.key(key);
+            return decision.map(|approved| {
+                let prompt = self.pending_local_plans.remove(0);
+                Intent::ResolveLocalPlan {
+                    task_id: prompt.task_id,
+                    approved,
+                }
+            });
+        }
         if !self.pending_mcp_approvals.is_empty() {
             return self.handle_mcp_approval_key(key);
         }
@@ -1804,7 +1824,14 @@ pub enum Intent {
     /// User submitted an ask-mode question. Isolated from goal context.
     Ask(String),
     /// User approved or denied a pending MCP approval prompt.
-    ResolveMcpApproval { approval_id: u64, approved: bool },
+    ResolveMcpApproval {
+        approval_id: u64,
+        approved: bool,
+    },
+    ResolveLocalPlan {
+        task_id: TaskId,
+        approved: bool,
+    },
     /// Save settings.
     SaveSettings,
     /// Test the configured provider/model/api-key by issuing one tiny
@@ -2056,6 +2083,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.pending_host_goal.is_some() {
         render_host_checks_prompt(frame, area);
     }
+    if let Some(prompt) = app.pending_local_plans.first() {
+        render_local_plan(frame, area, prompt);
+    }
 }
 
 /// Once-per-session question before the first goal: verification runs the
@@ -2278,6 +2308,46 @@ fn artifact_preview(artifact: &PromptArtifact, width: usize) -> String {
         .unwrap_or("")
         .trim();
     short(preview, width.saturating_sub(4).max(12))
+}
+
+/// Scrollable exact scope, model and commands; Y is the only approval key.
+fn render_local_plan(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &local_plan_approval::PendingLocalPlan,
+) {
+    let width = area.width.saturating_sub(4).clamp(1, 108);
+    let height = area.height.saturating_sub(2).clamp(1, 34);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Review local plan ")
+        .title_bottom(" Y approve plan · N/Esc cancel · ↑↓/PgUp/PgDn scroll ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP).fg(PAPER));
+    let inner = block.inner(popup);
+    let lines: Vec<Line> = prompt
+        .wrapped_lines(inner.width.max(1) as usize)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    let max_scroll = lines
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((prompt.scroll.min(max_scroll), 0))
+            .style(Style::default().bg(BG_DEEP).fg(PAPER)),
+        inner,
+    );
 }
 
 /// Focused modal for approval-gated MCP operations.
@@ -3162,7 +3232,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 if g.recorded {
                     "  Streak reset. The flight log (Shift+L) has every event."
                 } else {
-                    "  Nothing ran, so your record is unchanged. The flight log (Shift+L) has every event."
+                    "  Run record unchanged. The flight log (Shift+L) has every event."
                 },
                 Style::default().fg(DIM),
             )));
@@ -3488,6 +3558,23 @@ fn fmt_elapsed(g: &GoalEntry) -> String {
     }
 }
 
+fn receipt_cost(g: &GoalEntry, cost: &CostReceipt) -> String {
+    let origin = g
+        .local
+        .as_ref()
+        .map(|r| r.runtime_origin.into())
+        .unwrap_or(g.token_origin);
+    match origin {
+        record::TokenOrigin::ManagedLocal => "$0.00 · managed local runtime".into(),
+        record::TokenOrigin::Hosted if cost.pricing_known => format!(
+            "${:.4} · hosted provider",
+            cost.actual_usd_micros as f64 / 1e6
+        ),
+        record::TokenOrigin::Hosted => "unpriced · hosted provider".into(),
+        record::TokenOrigin::Unknown => "unpriced · runtime origin unknown".into(),
+    }
+}
+
 /// The receipt card: counts up, then stamps what the evidence supports.
 fn receipt_lines(
     app: &App,
@@ -3508,7 +3595,6 @@ fn receipt_lines(
     let inner = width.saturating_sub(4);
     let n = |v: u64| art::thousands(art::count_up(v, since));
     let num = |s: String| Span::styled(s, Style::default().fg(PAPER).add_modifier(Modifier::BOLD));
-    let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
     let usage = &h.token_usage;
     let (tin, tout) = if usage.input_tokens + usage.output_tokens > 0 {
         (usage.input_tokens, usage.output_tokens)
@@ -3555,18 +3641,11 @@ fn receipt_lines(
         art::leader("tokens out", vec![num(n(tout))], inner),
         art::leader("time", vec![num(fmt_elapsed(g))], inner),
     ];
-    let cost = if local {
-        "$0.00 · ran on this machine".to_string()
-    } else if h.cost_receipt.pricing_known {
-        format!(
-            "${:.4} · sent to {}",
-            h.cost_receipt.actual_usd_micros as f64 / 1e6,
-            app.settings.provider
-        )
-    } else {
-        format!("unpriced · sent to {}", app.settings.provider)
-    };
-    body.push(art::leader("cost", vec![num(cost)], inner));
+    body.push(art::leader(
+        "API cost",
+        vec![num(receipt_cost(g, &h.cost_receipt))],
+        inner,
+    ));
     if g.recorded {
         let streak = app.record.streak;
         body.push(art::leader(
@@ -4380,6 +4459,11 @@ enum LoopEvent {
     /// Snapshot for the goal with this task id (indices shift as goals queue).
     StateUpdate(TaskId, Box<GlobalState>),
     AskAnswer(String),
+    LocalFinished(TaskId, Box<phonton_types::local_run::LocalRunReceipt>),
+    LocalPlanRequested {
+        prompt: local_plan_approval::PendingLocalPlan,
+        reply_tx: oneshot::Sender<bool>,
+    },
     McpApprovalRequested {
         prompt: PendingMcpApproval,
         reply_tx: oneshot::Sender<McpApprovalDecision>,
@@ -6484,6 +6568,7 @@ async fn run_app<B: Backend>(
     // until the user restarted the CLI.
     let mut ask_provider = ask_provider;
     let mut approval_replies: HashMap<u64, oneshot::Sender<McpApprovalDecision>> = HashMap::new();
+    let mut local_plan_replies: HashMap<TaskId, oneshot::Sender<bool>> = HashMap::new();
     app.record = record::load();
     {
         let tx = tx.clone();
@@ -6496,6 +6581,10 @@ async fn run_app<B: Backend>(
         });
     }
     loop {
+        let size = terminal.size()?;
+        for prompt in &mut app.pending_local_plans {
+            prompt.clamp_scroll(Rect::new(0, 0, size.width, size.height));
+        }
         terminal.draw(|f| render(f, app))?;
         let Some(evt) = rx.recv().await else { break };
         match evt {
@@ -6510,6 +6599,7 @@ async fn run_app<B: Backend>(
                     match intent {
                         Intent::Quit => {
                             deny_pending_mcp_approvals(&mut approval_replies);
+                            local_plan_replies.clear();
                             break;
                         }
                         Intent::QueueGoal(prompt) | Intent::QueueTask(prompt) => {
@@ -6549,6 +6639,9 @@ async fn run_app<B: Backend>(
                             {
                                 // Calibrated local model: run through the
                                 // search/replace harness it was measured on.
+                                if let Some(g) = app.goals.first_mut() {
+                                    g.local_harness = true;
+                                }
                                 spawn_local_goal(
                                     task_id,
                                     prompt.description.clone(),
@@ -6557,6 +6650,16 @@ async fn run_app<B: Backend>(
                                     app.host_checks_approved.unwrap_or(false),
                                 );
                             } else {
+                                if let Some(g) = app.goals.first_mut() {
+                                    g.token_origin = if provider_is_local(
+                                        &app.settings.provider,
+                                        &app.settings.base_url,
+                                    ) {
+                                        record::TokenOrigin::Unknown
+                                    } else {
+                                        record::TokenOrigin::Hosted
+                                    };
+                                }
                                 spawn_goal(
                                     0,
                                     task_id,
@@ -6593,6 +6696,13 @@ async fn run_app<B: Backend>(
                                         .map_err(|e| e.to_string());
                                     let _ = tx.send(LoopEvent::LocalApplied(id, result)).await;
                                 });
+                            }
+                        }
+                        Intent::ResolveLocalPlan { task_id, approved } => {
+                            if let Some(reply) = local_plan_replies.remove(&task_id) {
+                                let _ = reply.send(
+                                    approved && app.goals.iter().any(|g| g.task_id == task_id),
+                                );
                             }
                         }
                         Intent::ResolveMcpApproval {
@@ -6944,11 +7054,15 @@ async fn run_app<B: Backend>(
                 }
             }
             LoopEvent::Paste(text) => {
-                app.handle_paste(text);
+                if app.pending_local_plans.is_empty() {
+                    app.handle_paste(text);
+                }
             }
             LoopEvent::ClipboardPaste(result) => match result {
                 Ok(text) => {
-                    app.handle_paste(text);
+                    if app.pending_local_plans.is_empty() {
+                        app.handle_paste(text);
+                    }
                 }
                 Err(msg) => {
                     app.goal_prompt
@@ -6966,6 +7080,23 @@ async fn run_app<B: Backend>(
             LoopEvent::Machine(machine) => app.machine = *machine,
             LoopEvent::Local(id, receipt) => {
                 if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    g.local = Some(receipt);
+                }
+            }
+            LoopEvent::LocalFinished(id, receipt) => {
+                if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    if !g.recorded {
+                        match record::record_local_receipt(&receipt) {
+                            Ok(Some(record)) => {
+                                app.record = record;
+                                g.recorded = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("Receipt retained; run record was not updated: {error}")
+                            }
+                        }
+                    }
                     g.local = Some(receipt);
                 }
             }
@@ -6997,6 +7128,16 @@ async fn run_app<B: Backend>(
             LoopEvent::AskAnswer(a) => {
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
+            }
+            LoopEvent::LocalPlanRequested { prompt, reply_tx } => {
+                if app.goals.iter().any(|g| g.task_id == prompt.task_id)
+                    && !local_plan_replies.contains_key(&prompt.task_id)
+                {
+                    local_plan_replies.insert(prompt.task_id, reply_tx);
+                    app.pending_local_plans.push(prompt);
+                } else {
+                    let _ = reply_tx.send(false);
+                }
             }
             LoopEvent::McpApprovalRequested { prompt, reply_tx } => {
                 approval_replies.insert(prompt.id, reply_tx);
@@ -7041,6 +7182,7 @@ async fn run_app<B: Backend>(
         }
         if app.should_quit {
             deny_pending_mcp_approvals(&mut approval_replies);
+            local_plan_replies.clear();
             break;
         }
     }
@@ -7434,12 +7576,27 @@ fn spawn_local_goal(
             let _ = tx.try_send(LoopEvent::StateUpdate(task_id, Box::new(state)));
             let _ = tx.try_send(LoopEvent::Local(task_id, Box::new(receipt.clone())));
         };
+        let plan_tx = tx.clone();
+        let on_plan = move |reviewed: phonton_types::local_run::ReviewedLocalPlan| async move {
+            let prompt = local_plan_approval::PendingLocalPlan::new(task_id, &reviewed);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if plan_tx
+                .send(LoopEvent::LocalPlanRequested { prompt, reply_tx })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            reply_rx.await.unwrap_or(false)
+        };
         let result =
-            local_goal_cli::run_goal(goal, repository, host_approved, |_| {}, progress).await;
+            local_goal_cli::run_goal(goal, repository, host_approved, on_plan, progress).await;
         match result {
             Ok(receipt) => {
                 let state = local_tui::global_state(&receipt, task_id, worker);
-                let _ = tx.send(LoopEvent::Local(task_id, Box::new(receipt))).await;
+                let _ = tx
+                    .send(LoopEvent::LocalFinished(task_id, Box::new(receipt)))
+                    .await;
                 let _ = tx
                     .send(LoopEvent::StateUpdate(task_id, Box::new(state)))
                     .await;
@@ -8947,6 +9104,34 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(!dump.contains("✓ VERIFIED"));
         assert_eq!(app.record.streak, 0);
         assert_eq!(app.unsaved_runs.len(), 1);
+        // Intermediate terminal local progress must not count before the
+        // durable LocalFinished event. Later settings cannot relabel a route.
+        let state = app.goals[0].state.clone().unwrap();
+        app.goals[0].recorded = false;
+        app.goals[0].local_harness = true;
+        app.record = record::Record::default();
+        app.unsaved_runs.clear();
+        app.apply_state(0, state.clone());
+        assert_eq!(app.record.runs, 0);
+        assert!(app.unsaved_runs.is_empty());
+        app.goals[0].local_harness = false;
+        app.goals[0].token_origin = record::TokenOrigin::Hosted;
+        app.settings.provider = "ollama".into();
+        app.apply_state(0, state);
+        assert_eq!(app.record.cloud_tokens, 240);
+        assert_eq!(app.record.local_tokens, 0);
+    }
+
+    #[test]
+    fn receipt_cost_uses_saved_origin_not_current_provider_settings() {
+        let mut g = GoalEntry::new("old run".into());
+        let cost = CostReceipt::default();
+        g.token_origin = record::TokenOrigin::Hosted;
+        assert_eq!(receipt_cost(&g, &cost), "unpriced · hosted provider");
+        g.token_origin = record::TokenOrigin::Unknown;
+        assert_eq!(receipt_cost(&g, &cost), "unpriced · runtime origin unknown");
+        g.token_origin = record::TokenOrigin::ManagedLocal;
+        assert_eq!(receipt_cost(&g, &cost), "$0.00 · managed local runtime");
     }
 
     #[test]

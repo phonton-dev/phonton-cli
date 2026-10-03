@@ -228,3 +228,18 @@ Licensed under either of:
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 At your option.
+
+### TUI local plan approval
+
+On a calibrated local route, every goal pauses at its exact proposed scope,
+source hashes, check argument arrays, selected model/digest and budget. Press
+**Y** to approve that plan or **N / Esc** to cancel. Enter, paste and held-key
+repeats do not approve a plan. This is separate from host-check permission;
+plan approval never grants access to run project commands on the host.
+Changes remain in a copy until a verified candidate is explicitly applied.
+
+Local receipts and the run record include reported tokens from rejected and
+interrupted strategy proposals as well as edit candidates. Only a verified
+managed runtime counts as local inference; external or unobserved origins are
+reported as unknown. The TUI records a local result only after its final receipt
+has been saved.

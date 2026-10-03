@@ -22,6 +22,13 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Every calibrated local TUI goal requires review of its exact frozen
+  scope, model and commands before execution. Only an explicit Y approves;
+  repeated keys, Enter, paste and a dropped approval channel cannot approve.
+- [fixed] Local token totals include strategy proposals. The run record preserves
+  unknown runtime origins, uses the original route and waits for a durable final
+  receipt. Concurrent CLI/Desktop writers no longer lose aggregate updates.
+
 - [fixed] Esc and Ctrl+C at the top level now ask for a second press before
   quitting, matching the documented quit behavior.
 - [fixed] Ctrl+C no longer opens the clarification questionnaire when the

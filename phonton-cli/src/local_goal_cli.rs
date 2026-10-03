@@ -1528,13 +1528,17 @@ pub async fn run(args: &[String]) -> Result<i32> {
 /// selected calibrated model, run it, and save the receipt. Mirrors `run`
 /// without terminal prompts; `on_plan` sees the reviewed scope first and
 /// `progress` sees every intermediate receipt.
-pub(crate) async fn run_goal(
+pub(crate) async fn run_goal<F, Fut>(
     goal: String,
     repository: PathBuf,
     host_approved: bool,
-    on_plan: impl FnOnce(&LocalPlan),
+    on_plan: F,
     progress: impl FnMut(&LocalRunReceipt),
-) -> Result<LocalRunReceipt> {
+) -> Result<LocalRunReceipt>
+where
+    F: FnOnce(phonton_types::local_run::ReviewedLocalPlan) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
     let request = LocalRunRequest {
         goal,
         repository,
@@ -1552,11 +1556,17 @@ pub(crate) async fn run_goal(
     let mut plan = phonton_worker::local_run::plan::preview(request).await?;
     let selection = plan_model_selection(&mut plan).await?;
     adjust_reviewed_plan_budget(&mut plan, selection.as_ref(), false);
-    on_plan(&plan);
+    plan.request.approve_host_execution = host_approved;
+    let reviewed = phonton_types::local_run::ReviewedLocalPlan {
+        plan: plan.clone(),
+        model_selection: selection.clone(),
+    };
+    if !on_plan(reviewed).await {
+        anyhow::bail!("Local plan cancelled. No project commands or model generation ran.");
+    }
     let selection = selection.ok_or_else(|| {
         anyhow!("No calibrated local model is selected. Run `phonton models` to pick one")
     })?;
-    plan.request.approve_host_execution = host_approved;
     let request = plan.request;
     let (_lease, profile, runtime_guard, directory) = prepare(&request, None, &selection).await?;
     let attempt = begin_attempt(
