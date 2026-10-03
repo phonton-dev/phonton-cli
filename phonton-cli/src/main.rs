@@ -346,6 +346,9 @@ pub struct Machine {
     pub gpu: Option<(String, u64, u64)>,
     /// Host RAM: free bytes, total bytes.
     pub ram: Option<(u64, u64)>,
+    /// True once the local model selection has been read (hardware may
+    /// still be pending); until then panels say "checking", not "missing".
+    pub probed: bool,
 }
 
 /// Render-safe view of one MCP approval request.
@@ -2786,6 +2789,7 @@ fn render_machine(frame: &mut Frame, area: Rect, app: &App) {
                 app.machine.protocol.as_deref().unwrap_or("calibrated"),
                 art::thousands(ctx as u64)
             ),
+            _ if !app.machine.probed => "checking…".to_string(),
             _ => "not calibrated · phonton models".to_string(),
         };
         lines.push(Line::from(vec![
@@ -2901,6 +2905,13 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         };
         let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
         let local_line = match (&app.machine.local_model, local) {
+            (None, true) if !app.machine.probed => Line::from(vec![
+                Span::styled(
+                    format!("  {} ", art::spinner(app.spinner_frame)),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled("Checking the local model on this machine…", muted),
+            ]),
             (Some(model), true) => Line::from(vec![
                 Span::styled("  ● ", Style::default().fg(SUCCESS)),
                 Span::styled(
@@ -3129,6 +3140,9 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         if !state.active_workers.is_empty() {
             lines.push(Line::raw(""));
         }
+        if state.handoff_packet.is_none() {
+            append_local_attempts(&mut lines, g);
+        }
         // Receipt-first: once a handoff exists it leads the pane.
         if let Some(handoff) = &state.handoff_packet {
             let width = (inner_w as usize).saturating_sub(1).clamp(40, 66);
@@ -3213,6 +3227,77 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false })
         .block(block);
     frame.render_widget(p, area);
+}
+
+/// Attempts so far in a running local goal: what each tried and how its
+/// checks ended, so a 30-second run is not a blank screen.
+fn append_local_attempts(lines: &mut Vec<Line<'static>>, g: &GoalEntry) {
+    let Some(receipt) = &g.local else { return };
+    if receipt.candidates.is_empty() && receipt.baseline_checks.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        "Attempts",
+        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+    )));
+    if !receipt.baseline_checks.is_empty() {
+        let failing = receipt
+            .baseline_checks
+            .iter()
+            .filter(|c| c.status == phonton_types::local::CheckStatus::Failed)
+            .count();
+        lines.push(Line::from(vec![
+            Span::styled("  ○ baseline  ", Style::default().fg(MUTED)),
+            Span::styled(
+                if failing > 0 {
+                    "checks fail on the unchanged source, as expected".to_string()
+                } else {
+                    "checks pass on the unchanged source".to_string()
+                },
+                Style::default().fg(DIM),
+            ),
+        ]));
+    }
+    for c in &receipt.candidates {
+        let passed = !c.checks.is_empty()
+            && c.checks
+                .iter()
+                .all(|k| k.status == phonton_types::local::CheckStatus::Passed);
+        let (mark, color) = if c.rejection.is_none() && passed {
+            ("✓", SUCCESS)
+        } else if c.rejection.is_some() {
+            ("✗", DANGER)
+        } else {
+            ("·", MUTED)
+        };
+        let why = local_tui::check_failures(c, 1)
+            .into_iter()
+            .find(|l| l.starts_with("not ok"))
+            .or_else(|| c.rejection.clone())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {mark} candidate {}  ", c.number),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(short(&c.approach, 34), Style::default().fg(PAPER)),
+            Span::styled(
+                format!(
+                    "  {:.1} s · {} tok",
+                    c.elapsed_ms as f64 / 1000.0,
+                    c.output_tokens.unwrap_or(0)
+                ),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        if !why.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", short(&why, 70)),
+                Style::default().fg(if mark == "✗" { DANGER } else { MUTED }),
+            )));
+        }
+    }
+    lines.push(Line::raw(""));
 }
 
 /// The reviewed local candidate's diff and how to apply it.
@@ -6348,8 +6433,11 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
 }
 
 /// Selected local model (from calibration state) and hardware headroom.
-async fn probe_machine() -> Machine {
-    let mut machine = Machine::default();
+async fn probe_selection() -> Machine {
+    let mut machine = Machine {
+        probed: true,
+        ..Machine::default()
+    };
     if let Ok(Some(selection)) = local_goal_cli::current_model_selection().await {
         machine.local_model = Some(selection.model);
         machine.context_tokens = Some(selection.context_tokens);
@@ -6361,6 +6449,11 @@ async fn probe_machine() -> Machine {
             .to_string()
         });
     }
+    machine
+}
+
+/// Add hardware headroom to a probed selection (nvidia-smi and CIM are slow).
+async fn probe_hardware(mut machine: Machine) -> Machine {
     let hw = phonton_local::hardware::detect().await;
     machine.gpu = hw
         .gpus
@@ -6391,8 +6484,10 @@ async fn run_app<B: Backend>(
     {
         let tx = tx.clone();
         tokio::spawn(async move {
+            let machine = probe_selection().await;
+            let _ = tx.send(LoopEvent::Machine(Box::new(machine.clone()))).await;
             let _ = tx
-                .send(LoopEvent::Machine(Box::new(probe_machine().await)))
+                .send(LoopEvent::Machine(Box::new(probe_hardware(machine).await)))
                 .await;
         });
     }
