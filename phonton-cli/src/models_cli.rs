@@ -1133,9 +1133,33 @@ pub async fn status(requested_context: Option<u32>) -> Result<Value> {
             profile_error = Some(error.to_string());
         }
         let profile_sha256 = profile.map(profile_sha256).transpose()?;
+        let mut fit = fit_for_status(
+            model,
+            &hardware,
+            profile,
+            requested_context,
+            model_context_limit,
+        );
+        // A model already loaded in VRAM makes free VRAM look short of a cold
+        // load. Say what is true: it is resident and reusable while loaded.
+        if fit.status != phonton_types::local::FitStatus::LikelyFitsGpu && runtime_version.is_some()
+        {
+            if let Ok(Some(resident)) = runtime
+                .resident(&model.name, &model.digest, fit.context_tokens)
+                .await
+            {
+                if resident.size_vram_bytes >= resident.size_bytes && resident.size_bytes > 0 {
+                    fit.status = phonton_types::local::FitStatus::LikelyFitsGpu;
+                    fit.explanation = format!(
+                        "Loaded in VRAM now with {} context tokens. Goals reuse it while it stays loaded; a later cold load is estimated again.",
+                        resident.context_length
+                    );
+                }
+            }
+        }
         rows.push(json!({
             "model": model,
-            "fit": fit_for_status(model, &hardware, profile, requested_context, model_context_limit),
+            "fit": fit,
             "model_context_limit": model_context_limit,
             "context_error": context_error,
             "profile": profile,
