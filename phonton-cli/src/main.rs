@@ -3679,7 +3679,7 @@ fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
     let mut provider = false;
     for record in &goal.flight_log {
         if let OrchestratorEvent::SubtaskReviewReady { model_name, .. } = &record.event {
-            if model_name.contains("local-template") || model_name.contains("stub") {
+            if model_name.contains("stub") {
                 local = true;
             } else if !model_name.is_empty() {
                 provider = true;
@@ -3687,8 +3687,8 @@ fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
         }
     }
     match (local, provider) {
-        (true, true) => Some("mixed (local-template + provider)"),
-        (true, false) => Some("local-template — not a provider token-efficiency claim"),
+        (true, true) => Some("mixed (stub + provider)"),
+        (true, false) => Some("stub — not a provider token-efficiency claim"),
         (false, true) => Some("provider"),
         (false, false) => None,
     }
@@ -4529,7 +4529,7 @@ fn deny_pending_mcp_approvals(approvals: &mut HashMap<u64, oneshot::Sender<McpAp
 const SEMANTIC_INDEX_TIMEOUT_SECS: u64 = 120;
 
 fn default_store_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
+    phonton_extensions::phonton_home().map(|h| h.join("store.sqlite3"))
 }
 
 fn read_clipboard_text() -> Result<String, String> {

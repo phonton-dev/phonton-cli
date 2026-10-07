@@ -194,7 +194,10 @@ impl BudgetConfig {
 
 /// Return the config path, honoring an explicit per-process override.
 pub fn config_path() -> Option<PathBuf> {
-    config_path_for(std::env::var_os("PHONTON_CONFIG_PATH"), dirs::home_dir())
+    config_path_for(
+        std::env::var_os("PHONTON_CONFIG_PATH"),
+        phonton_extensions::phonton_home(),
+    )
 }
 
 fn config_path_for(
@@ -206,7 +209,7 @@ fn config_path_for(
             let path = PathBuf::from(path);
             path.is_absolute().then_some(path)
         }
-        None => home.map(|h| h.join(".phonton").join("config.toml")),
+        None => home.map(|h| h.join("config.toml")),
     }
 }
 
@@ -427,7 +430,7 @@ mode = "ask"
         );
         assert_eq!(
             config_path_for(Some(std::ffi::OsString::new()), Some(home.clone())),
-            Some(home.join(".phonton").join("config.toml"))
+            Some(home.join("config.toml"))
         );
         assert_eq!(
             config_path_for(Some("relative-config.toml".into()), Some(home)),

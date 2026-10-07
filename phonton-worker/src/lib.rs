@@ -53,7 +53,6 @@ pub mod dispatcher;
 
 /// Bounded, profile-bound local candidate execution shared by CLI and Desktop.
 pub mod local_run;
-mod local_templates;
 
 /// Maximum verification attempts before escalating model tier.
 pub const MAX_ATTEMPTS: u8 = 3;
@@ -272,29 +271,6 @@ impl Worker {
         prior_errors: Vec<String>,
     ) -> Result<SubtaskResult> {
         let model_tier = subtask.model_tier;
-        if prior_errors.is_empty() {
-            if let Some(result) = local_templates::try_dispatch(
-                &subtask,
-                self.guard.project_root(),
-                model_tier,
-                self.verification_execution,
-            )
-            .await?
-            {
-                if matches!(result.verify_result, VerifyResult::Pass { .. }) {
-                    if let Err(e) = self.persist_decisions(&subtask) {
-                        warn!(error = %e, "failed to persist subtask decisions");
-                    }
-                    if let Some(memory) = &self.memory {
-                        let rec = completion_memory_record(&subtask, true, self.task_id);
-                        if let Err(e) = memory.record(rec).await {
-                            warn!(error = %e, "failed to record completion memory");
-                        }
-                    }
-                }
-                return Ok(result);
-            }
-        }
         let system_prompt = base_system_prompt();
 
         let relevant_slices: Vec<CodeSlice> = if prior_errors.is_empty() {
@@ -595,7 +571,7 @@ impl Worker {
                         warn!(error = %e, "failed to persist subtask decisions");
                     }
                     if let Some(memory) = &self.memory {
-                        let rec = completion_memory_record(&subtask, false, self.task_id);
+                        let rec = completion_memory_record(&subtask, self.task_id);
                         if let Err(e) = memory.record(rec).await {
                             warn!(error = %e, "failed to record completion memory");
                         }
@@ -957,20 +933,11 @@ pub fn detect_decisions(subtask: &Subtask, task_id: Option<TaskId>) -> Vec<Memor
         .collect()
 }
 
-fn completion_memory_record(
-    subtask: &Subtask,
-    via_local_template: bool,
-    task_id: Option<TaskId>,
-) -> MemoryRecord {
+fn completion_memory_record(subtask: &Subtask, task_id: Option<TaskId>) -> MemoryRecord {
     let task = phonton_types::task_description_without_prior_context(&subtask.description);
-    let route = if via_local_template {
-        "completed via local template"
-    } else {
-        "completed"
-    };
     MemoryRecord::Decision {
         title: task.to_string(),
-        body: format!("{route}: {task}"),
+        body: format!("completed: {task}"),
         task_id,
     }
 }
@@ -2534,15 +2501,13 @@ mod tests {
             status: SubtaskStatus::Queued,
         };
         assert!(detect_decisions(&st, None).is_empty());
-        for template in [false, true] {
-            match completion_memory_record(&st, template, None) {
-                MemoryRecord::Decision { title, body, .. } => {
-                    assert_eq!(title, task);
-                    assert!(!body.contains("Prior context"));
-                    assert!(!body.contains("Unrelated"));
-                }
-                other => panic!("unexpected record: {other:?}"),
+        match completion_memory_record(&st, None) {
+            MemoryRecord::Decision { title, body, .. } => {
+                assert_eq!(title, task);
+                assert!(!body.contains("Prior context"));
+                assert!(!body.contains("Unrelated"));
             }
+            other => panic!("unexpected record: {other:?}"),
         }
     }
 

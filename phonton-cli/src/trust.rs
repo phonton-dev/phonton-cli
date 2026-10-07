@@ -70,7 +70,7 @@ fn default_version() -> u32 {
 }
 
 fn trust_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join(TRUST_FILENAME))
+    phonton_extensions::phonton_home().map(|h| h.join(TRUST_FILENAME))
 }
 
 fn load() -> TrustFile {

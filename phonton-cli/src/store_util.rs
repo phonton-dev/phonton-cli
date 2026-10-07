@@ -4,7 +4,7 @@ use anyhow::Result;
 use phonton_store::Store;
 
 pub fn default_store_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
+    phonton_extensions::phonton_home().map(|h| h.join("store.sqlite3"))
 }
 
 pub fn open_persistent_store() -> Result<Store> {

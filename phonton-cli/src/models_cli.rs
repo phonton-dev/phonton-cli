@@ -138,9 +138,8 @@ pub fn state_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("PHONTON_LOCAL_STATE") {
         return Ok(PathBuf::from(path));
     }
-    Ok(dirs::home_dir()
+    Ok(phonton_extensions::phonton_home()
         .ok_or_else(|| anyhow!("Cannot locate user home directory"))?
-        .join(".phonton")
         .join("local-models.json"))
 }
 

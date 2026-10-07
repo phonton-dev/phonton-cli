@@ -175,7 +175,7 @@ pub fn workspace_info() -> Result<Value> {
 }
 
 pub fn trust_list() -> Result<Value> {
-    let path = dirs::home_dir().map(|h| h.join(".phonton").join("trusted_workspaces.json"));
+    let path = phonton_extensions::phonton_home().map(|h| h.join("trusted_workspaces.json"));
     let trusted = if let Some(p) = path {
         if let Ok(raw) = std::fs::read_to_string(&p) {
             serde_json::from_str::<Value>(&raw)
@@ -209,7 +209,7 @@ pub fn trust_grant(params: Value) -> Result<Value> {
 
 fn extension_dir(scope: &str, workspace: &Path) -> Option<PathBuf> {
     match scope {
-        "user" => dirs::home_dir().map(|h| h.join(".phonton")),
+        "user" => phonton_extensions::phonton_home(),
         "workspace" => Some(workspace.join(".phonton")),
         _ => None,
     }
