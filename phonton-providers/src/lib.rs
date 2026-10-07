@@ -1339,9 +1339,17 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             json!(user)
         };
+        // DeepSeek's models reason before answering and reasoning counts
+        // against the cap; at 4096 harder edits came back empty with
+        // finish_reason "length".
+        let max_tokens = if self.endpoint.contains("api.deepseek.com") {
+            32_768
+        } else {
+            4096
+        };
         let body = json!({
             "model": self.model,
-            token_key: 4096,
+            token_key: max_tokens,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user_content },

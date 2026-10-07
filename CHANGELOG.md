@@ -6,7 +6,35 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ## 0.22.0 - Product Hunt beta
 
+### Added
+
+- [added] `PHONTON_HOME` (absolute path) relocates config, store, trust and
+  model state, for clean-room testing or several independent setups.
+- [added] Headless `phonton goal` prints a receipt: changed files with line
+  counts, checks that passed, tokens, estimated cost and the next command.
+  Failures print the reason.
+
 ### Changed
+
+- [changed] `phonton review reject` undoes the task: every file its
+  checkpoints changed goes back to its pre-task content in the worktree and
+  index. It refuses, changing nothing, if any of those files were edited
+  afterwards. Approved tasks can no longer be rejected.
+- [changed] Goals may add or edit tests. New test files run with the
+  candidate; if a candidate edits existing tests, the original versions must
+  also pass against its source changes, so a model cannot certify itself by
+  rewriting assertions. Manifest edits (`package.json`, `Cargo.toml`, lock
+  files) still need independent checks.
+- [changed] When a worker cannot produce a usable diff, the subtask escalates
+  to the next model tier instead of failing outright. Checks that cannot run
+  do not escalate.
+- [changed] First run with no usable model opens Settings instead of starting
+  a goal that cannot run; the goal text is kept. A pasted API key is routed to
+  Settings with its provider guessed. With no provider configured, Phonton
+  picks one from provider key environment variables, then a selected local
+  model.
+- [changed] Phonton no longer installs updates on exit; it prints the npm
+  command instead.
 
 - [changed] Workers now see the exact current source of the files a subtask
   edits (bounded: 4 files, 24 KB each, 48 KB total) instead of only symbol
@@ -22,6 +50,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Verification copies link the project's `node_modules` instead of
+  omitting it. Without dependencies, a model could "fix" a missing-module
+  error by deleting the dependency and still pass. Cleanup removes only the
+  link.
+- [fixed] DeepSeek requests allow 32k output tokens. Its models reason before
+  answering, and at 4096 harder edits came back empty.
+- [removed] Hardcoded local-template answers for benchmark tasks (chess rules,
+  config, receipt). They bypassed the model and could overwrite matching user
+  files.
 - [fixed] Keep Python bytecode and pytest cache directories out of local source
   snapshots, so warmed test runs do not fail the baseline source-change guard.
   Source edits and root-level runner bytecode remain checked.

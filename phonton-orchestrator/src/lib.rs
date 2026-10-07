@@ -1124,26 +1124,26 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 }
             }
 
-            // If the worker itself already surfaced a hard failure (no diff
-            // to verify), don't re-verify an empty hunk set and mask it.
+            // The worker surfaced a hard failure (no usable diff after its own
+            // retries). Don't verify an empty hunk set; treat it as a request
+            // to escalate, which fails terminally once the top tier is spent.
             if matches!(sr.status, SubtaskStatus::Failed { .. }) {
-                rt.verify_result = Some(sr.verify_result.clone());
-                let reason = failure_reason(&sr.status);
-                let attempt = rt.attempts_at_tier.saturating_add(1);
-                finish_route(rt, RouteOutcome::FailedVerify);
-                rt.status = SubtaskStatus::Failed {
-                    reason: reason.clone(),
-                    attempt,
-                };
-                self.emit(OrchestratorEvent::SubtaskFailed {
-                    subtask_id: id,
-                    reason,
-                    attempt,
-                });
-                return Ok(());
+                None
+            } else {
+                Some(sr.diff_hunks.clone())
             }
-
-            sr.diff_hunks.clone()
+        };
+        let Some(diff_hunks) = diff_hunks else {
+            let reason = failure_reason(&sr.status);
+            // Checks that could not run are a policy/environment limit, not a
+            // model-quality one: a stronger model would hit the same wall.
+            let verdict = match sr.verify_result {
+                VerifyResult::Unavailable { .. } | VerifyResult::NotRun { .. } => {
+                    sr.verify_result.clone()
+                }
+                _ => VerifyResult::Escalate { reason },
+            };
+            return self.apply_verdict(runtimes, id, verdict, joinset, worker_msg_tx);
         };
 
         // Hard rule: every worker diff passes through phonton-verify before
@@ -1373,7 +1373,10 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             match &rt.verify_result {
                 Some(VerifyResult::Pass { layer }) => {
                     reached_test_layer |= *layer == VerifyLayer::Test;
-                    verified.push(format!("{clean_desc} passed {}", verify_layer_name(*layer)));
+                    verified.push(format!(
+                        "{} passed: {clean_desc}",
+                        verify_layer_name(*layer)
+                    ));
                 }
                 Some(VerifyResult::Fail { errors, layer, .. }) => {
                     let detail = if errors.is_empty() {
@@ -2431,6 +2434,70 @@ mod tests {
         // At minimum: retries at initial tier plus at least one escalation.
         assert!(calls.len() >= 2);
         assert!(calls.iter().any(|t| *t != ModelTier::Cheap));
+    }
+
+    #[tokio::test]
+    async fn escalates_when_worker_cannot_produce_a_diff() {
+        /// Dispatcher whose model never returns a parseable diff.
+        struct EmptyDispatcher {
+            calls: Mutex<Vec<(ModelTier, Vec<String>)>>,
+        }
+        #[async_trait]
+        impl WorkerDispatcher for EmptyDispatcher {
+            async fn dispatch(
+                &self,
+                subtask: Subtask,
+                prior_errors: Vec<String>,
+                _attempt: u8,
+                _msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
+            ) -> Result<SubtaskResult> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((subtask.model_tier, prior_errors));
+                Ok(SubtaskResult {
+                    id: subtask.id,
+                    status: SubtaskStatus::Failed {
+                        reason: "model returned unparseable output after 3 attempts".into(),
+                        attempt: 3,
+                    },
+                    diff_hunks: Vec::new(),
+                    model_tier: subtask.model_tier,
+                    verify_result: VerifyResult::Fail {
+                        layer: VerifyLayer::Syntax,
+                        errors: vec!["no diff".into()],
+                        attempt: 3,
+                    },
+                    provider: ProviderKind::Anthropic,
+                    model_name: "test-empty".into(),
+                    token_usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let plan = PlannerOutput {
+            subtasks: vec![subtask("needs a stronger model", vec![])],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+            plan_graph: Default::default(),
+        };
+        let dispatcher = Arc::new(EmptyDispatcher {
+            calls: Mutex::new(Vec::new()),
+        });
+        let tmp = temp_workspace();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        let status = orch.run_task(plan, empty_state(), None).await.unwrap();
+        assert!(matches!(status, TaskStatus::Failed { .. }));
+        let calls = dispatcher.calls.lock().unwrap();
+        let tiers: Vec<ModelTier> = calls.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            tiers,
+            vec![ModelTier::Cheap, ModelTier::Standard, ModelTier::Frontier]
+        );
+        // The stronger tier hears why the weaker one failed.
+        assert!(calls[1].1.iter().any(|e| e.contains("unparseable")));
     }
 
     #[tokio::test]

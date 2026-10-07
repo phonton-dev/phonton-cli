@@ -251,6 +251,91 @@ impl DiffApplier {
         Ok(out)
     }
 
+    /// Undo a task's verified edits: every path its checkpoints changed goes
+    /// back to its pre-task content in both the worktree and the index.
+    /// Refuses before writing anything if any of those paths changed after
+    /// the task staged them, so unrelated or later work is never discarded.
+    /// Returns the repository-relative paths that were restored.
+    pub fn revert_task(&mut self, task_id: TaskId) -> Result<Vec<PathBuf>> {
+        let checkpoints = self.list_checkpoints(task_id)?;
+        let (Some(first), Some(last)) = (checkpoints.first(), checkpoints.last()) else {
+            return Ok(Vec::new());
+        };
+        let first = self
+            .repo
+            .find_commit(git2::Oid::from_str(&first.commit_oid)?)?;
+        let last = self
+            .repo
+            .find_commit(git2::Oid::from_str(&last.commit_oid)?)?;
+        let base_tree = match first.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let final_tree = last.tree()?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(base_tree.as_ref(), Some(&final_tree), None)?;
+
+        let mut index = self.repo.index()?;
+        index.read(true)?;
+        let mut restore = Vec::new();
+        let mut remove = Vec::new();
+        for delta in diff.deltas() {
+            let Some(path) = delta.new_file().path().or(delta.old_file().path()) else {
+                continue;
+            };
+            let path = path.to_path_buf();
+            let staged = index.get_path(&path, 0).map(|e| e.id);
+            let expected = delta.new_file().exists().then(|| delta.new_file().id());
+            let status = self.repo.status_file(&path).unwrap_or(git2::Status::WT_NEW);
+            let worktree_dirty = status.intersects(
+                git2::Status::WT_MODIFIED
+                    | git2::Status::WT_DELETED
+                    | git2::Status::WT_NEW
+                    | git2::Status::WT_TYPECHANGE
+                    | git2::Status::WT_RENAMED,
+            );
+            if staged != expected || (expected.is_some() && worktree_dirty) {
+                return Err(anyhow!(
+                    "{} changed after the task; nothing was reverted. Resolve it by hand.",
+                    path.display()
+                ));
+            }
+            if delta.old_file().exists() {
+                restore.push(path);
+            } else {
+                remove.push(path);
+            }
+        }
+
+        if let Some(base) = &base_tree {
+            if !restore.is_empty() {
+                let mut co = git2::build::CheckoutBuilder::new();
+                co.force();
+                for path in &restore {
+                    co.path(path);
+                }
+                self.repo.checkout_tree(base.as_object(), Some(&mut co))?;
+            }
+        }
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| anyhow!("repository has no worktree (bare repo)"))?
+            .to_path_buf();
+        index.read(true)?;
+        for path in &remove {
+            index.remove_path(path)?;
+            match std::fs::remove_file(workdir.join(path)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        index.write()?;
+        restore.extend(remove);
+        Ok(restore)
+    }
+
     /// Refuse legacy checkpoint rollback until it can restore only owned
     /// paths. The former hard reset moved HEAD and deleted unrelated work.
     /// Local Apply journals use a separate scoped rollback implementation.
@@ -345,6 +430,73 @@ mod tests {
             .unwrap();
         assert!(tree.get_path(Path::new("project/code.txt")).is_ok());
         assert!(tree.get_path(Path::new("code.txt")).is_err());
+    }
+
+    #[test]
+    fn revert_task_restores_owned_paths_and_refuses_after_later_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_seed(tmp.path());
+        std::fs::write(tmp.path().join("mine.txt"), "untouched\n").unwrap();
+        let edit_seed = DiffHunk {
+            file_path: "seed.txt".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed("seed".into()),
+                DiffLine::Added("changed".into()),
+            ],
+        };
+        let create = DiffHunk {
+            file_path: "new.txt".into(),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Added("fresh".into())],
+        };
+        let paths: Vec<PathBuf> = vec!["seed.txt".into(), "new.txt".into()];
+
+        // A later user edit to an owned path blocks the revert entirely.
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let task = TaskId::new();
+        applier
+            .apply_verified_hunks(&[edit_seed.clone(), create.clone()])
+            .unwrap();
+        applier
+            .commit_checkpoint(task, SubtaskId::new(), 1, "edit", &paths)
+            .unwrap();
+        std::fs::write(tmp.path().join("seed.txt"), "user edit\n").unwrap();
+        assert!(applier.revert_task(task).is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "user edit\n"
+        );
+        assert!(tmp.path().join("new.txt").exists());
+
+        // Untouched since the task: both paths go back, unrelated work stays.
+        std::fs::write(tmp.path().join("seed.txt"), "changed\n").unwrap();
+        let reverted = applier.revert_task(task).unwrap();
+        assert_eq!(reverted.len(), 2);
+        // Checkout honours core.autocrlf, exactly like `git restore`.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "seed\n"
+        );
+        assert!(!tmp.path().join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("mine.txt")).unwrap(),
+            "untouched\n"
+        );
+        let statuses = repo.statuses(None).unwrap();
+        let dirty: Vec<_> = statuses
+            .iter()
+            .filter_map(|s| s.path().map(str::to_string))
+            .collect();
+        assert_eq!(dirty, vec!["mine.txt".to_string()]);
     }
 
     #[test]

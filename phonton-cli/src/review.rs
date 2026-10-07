@@ -220,16 +220,52 @@ pub async fn run(args: &[String]) -> Result<i32> {
                     wall_time_ms: 0,
                 },
                 "approve",
+                "Task marked Done. Hosted edits were already staged before review.".into(),
                 request.options.json,
             )
             .await;
         }
         ReviewAction::Reject => {
+            // Undo only what this task's checkpoints changed; refuse if any of
+            // those files were edited afterwards. No checkpoints here (other
+            // repo, local run, or nothing applied) means nothing to undo.
+            let closed = match serde_json::from_value::<TaskStatus>(task.status.clone()) {
+                Ok(TaskStatus::Done { .. }) => Some("approved; undo it with git"),
+                Ok(TaskStatus::Rejected) => Some("already rejected"),
+                _ => None,
+            };
+            if let Some(why) = closed {
+                eprintln!("phonton review reject: task {} was {why}.", task.id);
+                return Ok(1);
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            let reverted = match DiffApplier::open(&cwd) {
+                Ok(mut diff) => match diff.revert_task(task.id) {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        eprintln!("phonton review reject: {e}");
+                        return Ok(1);
+                    }
+                },
+                Err(_) => Vec::new(),
+            };
+            let detail = if reverted.is_empty() {
+                "Task marked Rejected. No edits from this task were found in this repository."
+                    .to_string()
+            } else {
+                let files: Vec<String> = reverted.iter().map(|p| p.display().to_string()).collect();
+                format!(
+                    "Task marked Rejected. Restored {} file(s) to their pre-task state: {}",
+                    files.len(),
+                    files.join(", ")
+                )
+            };
             return finish_task(
                 &store,
                 task,
                 TaskStatus::Rejected,
                 "reject",
+                detail,
                 request.options.json,
             )
             .await;
@@ -379,31 +415,17 @@ async fn finish_task(
     task: TaskRecord,
     status: TaskStatus,
     action: &str,
+    detail: String,
     json: bool,
 ) -> Result<i32> {
     store.upsert_task(task.id, &task.goal_text, &status, task.total_tokens)?;
-    append_review_decision(
-        store,
-        task.id,
-        action,
-        match action {
-            "approve" => "Task marked Done. Hosted edits were already staged before review.",
-            "reject" => "Task marked Rejected. Hosted edits remain staged for manual review.",
-            _ => "Task updated.",
-        },
-    )?;
+    append_review_decision(store, task.id, action, &detail)?;
     let status_json = serde_json::to_value(&status)?;
     let report = ActionReport {
         task_id: task.id.to_string(),
         action: action.into(),
         status: status_json,
-        detail: match action {
-            "approve" => "Task marked Done. Hosted edits were already staged before review.".into(),
-            "reject" => {
-                "Task marked Rejected. Hosted edits remain staged for manual review.".into()
-            }
-            _ => "Task updated.".into(),
-        },
+        detail,
     };
     print_action_report(&report, json)?;
     Ok(0)

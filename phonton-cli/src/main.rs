@@ -6173,13 +6173,8 @@ pub(crate) async fn execute_headless_goal(
     if opts.json {
         print_headless_goal_json(task_id, &final_state)?;
     } else {
-        println!(
-            "phonton goal: {} ({})",
-            headless_status_label(&final_state.task_status),
-            task_id
-        );
-        if matches!(final_state.task_status, TaskStatus::Paused { .. }) {
-            println!("Resume with: phonton goal --resume {task_id}");
+        for line in headless_summary_lines(task_id, &final_state) {
+            println!("{line}");
         }
     }
 
@@ -6343,6 +6338,58 @@ fn headless_goal_succeeded(status: &TaskStatus) -> bool {
         status,
         TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
     )
+}
+
+/// Human-readable receipt for `phonton goal` without `--json`: what happened,
+/// what changed, what was checked, what it cost, and what to do next.
+fn headless_summary_lines(task_id: TaskId, state: &GlobalState) -> Vec<String> {
+    let mut out = vec![format!(
+        "phonton goal: {} ({task_id})",
+        headless_status_label(&state.task_status)
+    )];
+    let packet = state.handoff_packet.as_ref();
+    if let TaskStatus::Failed { reason, .. } = &state.task_status {
+        out.push(format!("  reason: {reason}"));
+    }
+    if let Some(p) = packet {
+        for f in &p.changed_files {
+            out.push(format!(
+                "  {}  +{} -{}",
+                f.path.display(),
+                f.added_lines,
+                f.removed_lines
+            ));
+        }
+        for passed in &p.verification.passed {
+            out.push(format!("  ✓ {passed}"));
+        }
+        for finding in p.verification.findings.iter().take(3) {
+            out.push(format!("  ! {finding}"));
+        }
+    }
+    if state.tokens_used > 0 {
+        let cost = if state.cost_receipt.pricing_known {
+            format!(
+                ", est. {}",
+                format_usd_micros(state.cost_receipt.actual_usd_micros)
+            )
+        } else {
+            String::new()
+        };
+        out.push(format!("  tokens: {}{cost}", state.tokens_used));
+    }
+    match &state.task_status {
+        TaskStatus::Reviewing { .. } => out.push(
+            "  next: phonton review latest, then phonton review approve latest (or reject latest)"
+                .into(),
+        ),
+        TaskStatus::Paused { .. } => out.push(format!("  next: phonton goal --resume {task_id}")),
+        TaskStatus::Failed { .. } => {
+            out.push("  next: phonton doctor, or phonton review latest for details".into())
+        }
+        _ => {}
+    }
+    out
 }
 
 fn headless_status_label(status: &TaskStatus) -> &'static str {
@@ -8615,6 +8662,33 @@ fn extract_id(line: &str) -> Option<String> {
             assert!(error.to_string().contains("resume it from that workspace"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn headless_summary_explains_failure_and_next_step() {
+        let task_id = TaskId::new();
+        let reason = "provider returned 401 Unauthorized";
+        let state = GlobalState {
+            task_status: TaskStatus::Failed {
+                reason: reason.into(),
+                failed_subtask: None,
+            },
+            goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: Some(failed_handoff_packet(task_id, "fix it", reason, 0)),
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
+        };
+        let text = headless_summary_lines(task_id, &state).join("\n");
+        assert!(text.starts_with("phonton goal: failed"), "{text}");
+        assert!(text.contains(reason), "{text}");
+        assert!(text.contains("next: phonton doctor"), "{text}");
     }
 
     #[test]

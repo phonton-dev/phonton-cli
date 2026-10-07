@@ -73,7 +73,6 @@ pub async fn verify_diff_with_execution(
     if let Some(fail) = verify_patch_applies(hunks, working_dir) {
         return Ok(fail);
     }
-    let mut pass_layer = None;
 
     if let Some(fail) = verify_syntax_with_worktree(hunks, Some(working_dir)) {
         return Ok(fail);
@@ -88,13 +87,54 @@ pub async fn verify_diff_with_execution(
     if policy == VerificationExecution::RequireIsolation {
         return Ok(VerifyResult::Unavailable { reason: "Executable verification unavailable: no isolation backend is configured and host execution was not approved. Static checks alone cannot verify a candidate.".into() });
     }
-    if hunks
-        .iter()
-        .any(|h| is_verification_definition_path(&h.file_path))
-    {
+    if hunks.iter().any(|h| is_manifest_path(&h.file_path)) {
         return Ok(VerifyResult::Unavailable { reason: "Verification definition changed in the candidate. Capture independent checks before executing this diff; candidate-authored tests or package scripts cannot authorize or certify themselves.".into() });
     }
 
+    let result = run_command_checks(hunks, working_dir, policy).await?;
+    // New test files run alongside the originals, which stay untouched. If the
+    // candidate edits existing tests, those originals must also pass against
+    // its source changes, so a candidate can never certify itself by
+    // rewriting the assertions it was checked against.
+    let edited_tests: Vec<&Path> = hunks
+        .iter()
+        .map(|h| h.file_path.as_path())
+        .filter(|p| is_test_path(p) && working_dir.join(p).is_file())
+        .collect();
+    if edited_tests.is_empty() || !matches!(result, VerifyResult::Pass { .. }) {
+        return Ok(result);
+    }
+    let without_test_edits: Vec<DiffHunk> = hunks
+        .iter()
+        .filter(|h| !edited_tests.contains(&h.file_path.as_path()))
+        .cloned()
+        .collect();
+    match run_command_checks(&without_test_edits, working_dir, policy).await? {
+        VerifyResult::Pass { .. } => Ok(result),
+        _ => {
+            let mut files: Vec<String> = edited_tests
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            files.dedup();
+            Ok(VerifyResult::Unavailable {
+                reason: format!(
+                    "The candidate edits existing tests ({}), and the original versions fail against its changes. Review whether the goal really requires changing those tests.",
+                    files.join(", ")
+                ),
+            })
+        }
+    }
+}
+
+/// Run the executable layers (crate check, workspace check, tests) against a
+/// temporary copy of the workspace with `hunks` applied.
+async fn run_command_checks(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<VerifyResult> {
+    let mut pass_layer = None;
     let packages = touched_packages(hunks, working_dir);
     let patched_worktree = if command_verification_relevant(hunks, working_dir) {
         Some(patched_verification_worktree(hunks, working_dir)?)
@@ -154,11 +194,30 @@ pub async fn verify_diff_with_execution(
     })
 }
 
+#[cfg(test)]
 fn is_verification_definition_path(file_path: &Path) -> bool {
-    let path = file_path
+    is_test_path(file_path) || is_manifest_path(file_path)
+}
+
+fn normalized_path(file_path: &Path) -> String {
+    file_path
         .to_string_lossy()
         .replace('\\', "/")
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+/// Package manifests define which command certifies a candidate.
+fn is_manifest_path(file_path: &Path) -> bool {
+    let path = normalized_path(file_path);
+    let file = path.rsplit('/').next().unwrap_or_default();
+    matches!(
+        file,
+        "package.json" | "cargo.toml" | "cargo.lock" | "package-lock.json"
+    )
+}
+
+fn is_test_path(file_path: &Path) -> bool {
+    let path = normalized_path(file_path);
     let file = path.rsplit('/').next().unwrap_or_default();
     path.split('/')
         .any(|part| matches!(part, "tests" | "test" | "__tests__" | "spec" | "specs"))
@@ -169,10 +228,6 @@ fn is_verification_definition_path(file_path: &Path) -> bool {
         || file.contains(".spec.")
         || file.contains("_test.")
         || file.contains("-test.")
-        || matches!(
-            file,
-            "package.json" | "cargo.toml" | "cargo.lock" | "package-lock.json"
-        )
 }
 
 fn command_verification_relevant(hunks: &[DiffHunk], working_dir: &Path) -> bool {
@@ -209,6 +264,14 @@ fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
         let dst_path = dest.join(&file_name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if file_name == "node_modules" {
+                // Checks need the installed packages; without them a model
+                // "fixes" a missing-module error by deleting the dependency.
+                // A link is fast and cleanup removes only the link. On
+                // failure the copy simply runs without dependencies.
+                let _ = link_dependency_dir(&src_path, &dst_path);
+                continue;
+            }
             if should_skip_verification_copy_dir(&file_name) {
                 continue;
             }
@@ -217,6 +280,27 @@ fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
             fs::copy(&src_path, &dst_path)?;
         }
     }
+    Ok(())
+}
+
+/// Point `dst` at the real dependency folder `src` (a junction on Windows,
+/// which needs no elevation; a symlink elsewhere).
+fn link_dependency_dir(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dst)
+            .arg(src)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("mklink /J failed for {}", dst.display());
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(src, dst)?;
     Ok(())
 }
 
@@ -1245,6 +1329,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Node package whose one existing test fails until `f` returns x + 1.
+    fn node_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"node --test test/"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("test")).unwrap();
+        std::fs::write(root.join("src/m.js"), "module.exports = { f: (x) => x };\n").unwrap();
+        std::fs::write(
+            root.join("test/m.test.js"),
+            "const t = require('node:test');\nconst a = require('node:assert');\nconst { f } = require('../src/m');\nt('f', () => a.strictEqual(f(1), 2));\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn replace_line(path: &str, old: &str, new: &str, line: u32) -> DiffHunk {
+        DiffHunk {
+            file_path: path.into(),
+            old_start: line,
+            old_count: 1,
+            new_start: line,
+            new_count: 1,
+            lines: vec![DiffLine::Removed(old.into()), DiffLine::Added(new.into())],
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_see_installed_dependencies_and_cleanup_spares_them() {
+        let tmp = node_fixture();
+        let dep = tmp.path().join("node_modules/inc");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("index.js"), "module.exports = (x) => x + 1;\n").unwrap();
+        let fix = replace_line(
+            "src/m.js",
+            "module.exports = { f: (x) => x };",
+            "module.exports = { f: require('inc') };",
+            1,
+        );
+        let worktree = patched_verification_worktree(std::slice::from_ref(&fix), tmp.path()).unwrap();
+        assert!(worktree.path().join("node_modules/inc/index.js").is_file());
+        drop(worktree);
+        assert!(
+            dep.join("index.js").is_file(),
+            "cleanup must remove the link, never the user's packages"
+        );
+
+        let result = verify_diff_with_execution(
+            &[fix],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, VerifyResult::Pass { .. }), "{result:?}");
+        assert!(dep.join("index.js").is_file());
+    }
+
+    #[tokio::test]
+    async fn candidate_may_add_tests_alongside_a_real_fix() {
+        let tmp = node_fixture();
+        let fix = replace_line(
+            "src/m.js",
+            "module.exports = { f: (x) => x };",
+            "module.exports = { f: (x) => x + 1 };",
+            1,
+        );
+        let new_test = DiffHunk {
+            file_path: "test/extra.test.js".into(),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine::Added("const t = require('node:test');".into()),
+                DiffLine::Added("const { f } = require('../src/m');".into()),
+                DiffLine::Added(
+                    "t('zero', () => require('node:assert').strictEqual(f(0), 1));".into(),
+                ),
+            ],
+        };
+        let result = verify_diff_with_execution(
+            &[fix, new_test],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, VerifyResult::Pass { .. }), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn candidate_cannot_pass_by_rewriting_an_existing_assertion() {
+        let tmp = node_fixture();
+        let rewrite = replace_line(
+            "test/m.test.js",
+            "t('f', () => a.strictEqual(f(1), 2));",
+            "t('f', () => a.strictEqual(f(1), 1));",
+            4,
+        );
+        let result = verify_diff_with_execution(
+            &[rewrite],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&result, VerifyResult::Unavailable { reason } if reason.contains("edits existing tests")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
