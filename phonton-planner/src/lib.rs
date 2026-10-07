@@ -199,7 +199,11 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
             let impl_id = SubtaskId::new();
             subtasks.push(Subtask {
                 id: impl_id,
-                description: format!("Implement {} `{}`", d.kind, d.name),
+                // Keep the goal: the symbol name alone drops what it must do.
+                description: format!(
+                    "Implement {} `{}` for this goal: {}",
+                    d.kind, d.name, goal.description
+                ),
                 model_tier: goal.default_tier,
                 dependencies: Vec::new(),
                 attachments: goal.attachments.clone(),
@@ -211,7 +215,10 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
                 tests_planned += 1;
                 subtasks.push(Subtask {
                     id: SubtaskId::new(),
-                    description: format!("Write integration tests for {}", d.name),
+                    description: format!(
+                        "Write integration tests for {} for this goal: {}",
+                        d.name, goal.description
+                    ),
                     model_tier: test_tier(goal.default_tier),
                     dependencies: vec![impl_id],
                     attachments: goal.attachments.clone(),
@@ -953,13 +960,20 @@ pub fn detect_new_symbols(text: &str) -> Vec<Detection> {
     //   "implement the verify_diff function"
     //   "introduce a trait Provider"
     //   "define enum VerifyLayer"
+    //   "add a count() method to TodoStore" (name before kind)
     let re = Regex::new(
         r"(?ix)
         \b(?P<verb>add|create|implement|introduce|write|define|build|make)\b
         [^\.\n]{0,40}?
-        \b(?P<kind>function|fn|struct|enum|trait|method|module|type)\b
-        [\s:`'(]*
-        (?P<name>[A-Za-z_][A-Za-z0-9_]*)
+        (?:
+            \b(?P<kind>function|fn|struct|enum|trait|method|module|type)\b
+            [\s:`'(]*
+            (?P<name>[A-Za-z_][A-Za-z0-9_]*)
+          |
+            (?:`(?P<name2>[A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?`
+              |\b(?P<name3>[A-Za-z_][A-Za-z0-9_]*)\([^)]*\))
+            \s+(?P<kind2>function|fn|method)\b
+        )
         ",
     )
     .expect("planner regex is well-formed");
@@ -968,15 +982,20 @@ pub fn detect_new_symbols(text: &str) -> Vec<Detection> {
     for caps in re.captures_iter(text) {
         let kind = caps
             .name("kind")
+            .or_else(|| caps.name("kind2"))
             .map(|m| normalise_kind(m.as_str()))
             .unwrap_or_else(|| "feature".to_string());
 
-        let Some(name_match) = caps.name("name") else {
+        let Some(name_match) = caps
+            .name("name")
+            .or_else(|| caps.name("name2"))
+            .or_else(|| caps.name("name3"))
+        else {
             continue;
         };
         let name = name_match.as_str().to_string();
 
-        if name.is_empty() || is_kind_word(&name) {
+        if name.is_empty() || is_kind_word(&name) || is_filler_word(&name) {
             continue;
         }
         let det = Detection { kind, name };
@@ -993,6 +1012,29 @@ fn normalise_kind(raw: &str) -> String {
         "fn" => "function".into(),
         other => other.into(),
     }
+}
+
+/// Words that follow "method"/"function" in prose ("a method to ...") and are
+/// never the symbol being asked for.
+fn is_filler_word(s: &str) -> bool {
+    matches!(
+        s.to_ascii_lowercase().as_str(),
+        "to" | "for"
+            | "in"
+            | "on"
+            | "of"
+            | "that"
+            | "which"
+            | "with"
+            | "from"
+            | "into"
+            | "so"
+            | "and"
+            | "or"
+            | "called"
+            | "named"
+            | "new"
+    )
 }
 
 fn is_kind_word(s: &str) -> bool {
@@ -1020,6 +1062,29 @@ mod tests {
         assert_eq!(dets[0].kind, "function");
         assert_eq!(dets[1].name, "ExecutionGuard");
         assert_eq!(dets[1].kind, "struct");
+    }
+
+    #[test]
+    fn reads_name_before_kind_and_never_takes_a_preposition() {
+        let dets = detect_new_symbols(
+            "Add a count() method to TodoStore that returns how many todos are not done.",
+        );
+        assert_eq!(
+            dets,
+            vec![Detection {
+                kind: "method".into(),
+                name: "count".into()
+            }]
+        );
+        // "method to" is not a method named `to`.
+        assert!(detect_new_symbols("Add a store.remove(id) method to TodoStore").is_empty());
+    }
+
+    #[test]
+    fn subtasks_keep_the_goal_text() {
+        let goal = "Add a count() method to TodoStore that returns how many todos are not done.";
+        let plan = decompose(&Goal::new(goal));
+        assert!(plan.subtasks.iter().all(|s| s.description.contains(goal)));
     }
 
     #[test]

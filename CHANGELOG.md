@@ -8,6 +8,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Added
 
+- [added] `benchmarks/smoke`: runs fixed goals on fresh copies of
+  `fixtures/todo-api` and scores them with hidden acceptance tests written
+  after the run (`node benchmarks/smoke/run.mjs --arm cloud|local`).
+
 - [added] `PHONTON_HOME` (absolute path) relocates config, store, trust and
   model state, for clean-room testing or several independent setups.
 - [added] Headless `phonton goal` prints a receipt: changed files with line
@@ -75,6 +79,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Goals like "Add a count() method to TodoStore that ..." no longer
+  become a subtask "Implement method `to`": the planner reads `name()` and
+  backticked names before the kind word, ignores words like "to" and "that"
+  after it, and every planned subtask keeps the full goal text so the
+  worker sees what the symbol must do.
 - [fixed] A diff the worker already checked is not built and tested again
   when the orchestrator verifies the identical patched tree; the verdict is
   reused within the run (timeouts and missing tools are retried). On a
