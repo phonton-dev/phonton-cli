@@ -254,6 +254,9 @@ struct SubtaskRuntime {
     escalations: u8,
     prior_errors: Vec<String>,
     tokens_used: u64,
+    /// Tokens from finished worker attempts. Progress reports a running total
+    /// for the current attempt only, so it is added to this, not summed.
+    committed_tokens: u64,
     token_usage: TokenUsage,
     diff_hunks: Vec<DiffHunk>,
     /// Provider that served the most recent successful LLM call. Used by
@@ -280,6 +283,7 @@ impl SubtaskRuntime {
             escalations: 0,
             prior_errors: Vec::new(),
             tokens_used: 0,
+            committed_tokens: 0,
             token_usage: TokenUsage::default(),
             diff_hunks: Vec::new(),
             provider: ProviderKind::Anthropic,
@@ -671,7 +675,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         }
                         Some(OrchestratorMessage::SubtaskProgress { id, tokens_so_far }) => {
                             if let Some(rt) = runtimes.get_mut(&id) {
-                                rt.tokens_used = tokens_so_far;
+                                rt.tokens_used = rt.committed_tokens.saturating_add(tokens_so_far);
                             }
                             continue;
                         }
@@ -873,25 +877,15 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                                             (*provider, model_name.clone(), inp, out)
                                         }
                                     }
+                                    // A failed dispatch reports no usage; charge
+                                    // only the unmetered progress, not the
+                                    // subtask's earlier (already charged) usage.
                                     None => {
-                                        let (p, m, usage) = runtimes
+                                        let (p, m) = runtimes
                                             .get(&id)
-                                            .map(|r| {
-                                                (r.provider, r.model_name.clone(), r.token_usage)
-                                            })
-                                            .unwrap_or((
-                                                ProviderKind::Anthropic,
-                                                String::new(),
-                                                TokenUsage::estimated(delta),
-                                            ));
-                                        let inp = if usage.budget_tokens() > 0 {
-                                            usage
-                                                .input_tokens
-                                                .saturating_add(usage.cache_creation_tokens)
-                                        } else {
-                                            delta
-                                        };
-                                        (p, m, inp, usage.output_tokens)
+                                            .map(|r| (r.provider, r.model_name.clone()))
+                                            .unwrap_or((ProviderKind::Anthropic, String::new()));
+                                        (p, m, delta, 0)
                                     }
                                 };
                             let _ = g.charge(charge_provider, &charge_model, input, output);
@@ -1113,8 +1107,32 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                 } => *tokens_used,
                 _ => 0,
             };
-            rt.tokens_used = rt.tokens_used.saturating_add(worker_tokens);
-            rt.token_usage = sr.token_usage;
+            // A failed attempt reports no total; its last progress still counts.
+            let progress = rt.tokens_used.saturating_sub(rt.committed_tokens);
+            rt.committed_tokens = rt
+                .committed_tokens
+                .saturating_add(worker_tokens.max(progress));
+            rt.tokens_used = rt.committed_tokens;
+            // Retries and escalations each bill; the receipt sums them.
+            rt.token_usage = TokenUsage {
+                input_tokens: rt
+                    .token_usage
+                    .input_tokens
+                    .saturating_add(sr.token_usage.input_tokens),
+                output_tokens: rt
+                    .token_usage
+                    .output_tokens
+                    .saturating_add(sr.token_usage.output_tokens),
+                cached_tokens: rt
+                    .token_usage
+                    .cached_tokens
+                    .saturating_add(sr.token_usage.cached_tokens),
+                cache_creation_tokens: rt
+                    .token_usage
+                    .cache_creation_tokens
+                    .saturating_add(sr.token_usage.cache_creation_tokens),
+                estimated: rt.token_usage.estimated || sr.token_usage.estimated,
+            };
             rt.diff_hunks = sr.diff_hunks.clone();
             rt.provider = sr.provider;
             rt.model_name = sr.model_name.clone();
@@ -2434,6 +2452,78 @@ mod tests {
         // At minimum: retries at initial tier plus at least one escalation.
         assert!(calls.len() >= 2);
         assert!(calls.iter().any(|t| *t != ModelTier::Cheap));
+    }
+
+    #[tokio::test]
+    async fn progress_and_final_totals_are_not_double_counted() {
+        /// Reports 700 tokens of progress, then fails; the retry reports
+        /// 300 of progress and fails again.
+        struct ProgressDispatcher {
+            calls: Mutex<u8>,
+        }
+        #[async_trait]
+        impl WorkerDispatcher for ProgressDispatcher {
+            async fn dispatch(
+                &self,
+                subtask: Subtask,
+                _prior_errors: Vec<String>,
+                _attempt: u8,
+                msg_tx: Option<tokio::sync::mpsc::Sender<OrchestratorMessage>>,
+            ) -> Result<SubtaskResult> {
+                let tokens = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    if *calls == 1 {
+                        700
+                    } else {
+                        300
+                    }
+                };
+                if let Some(tx) = msg_tx {
+                    let _ = tx
+                        .send(OrchestratorMessage::SubtaskProgress {
+                            id: subtask.id,
+                            tokens_so_far: tokens,
+                        })
+                        .await;
+                }
+                Ok(SubtaskResult {
+                    id: subtask.id,
+                    status: SubtaskStatus::Done {
+                        tokens_used: tokens,
+                        diff_hunk_count: 0,
+                    },
+                    diff_hunks: Vec::new(),
+                    model_tier: subtask.model_tier,
+                    verify_result: VerifyResult::Unavailable {
+                        reason: "fixture".into(),
+                    },
+                    provider: ProviderKind::Anthropic,
+                    model_name: "fixture".into(),
+                    token_usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let plan = PlannerOutput {
+            subtasks: vec![subtask("count", vec![])],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+            plan_graph: Default::default(),
+        };
+        let dispatcher = Arc::new(ProgressDispatcher {
+            calls: Mutex::new(0),
+        });
+        let tmp = temp_workspace();
+        let state = empty_state();
+        let mut rx = state.subscribe();
+        let orch = Orchestrator::new(Arc::clone(&dispatcher)).with_working_dir(tmp.path());
+        orch.run_task(plan, state, None).await.unwrap();
+        let calls = u64::from(*dispatcher.calls.lock().unwrap());
+        let expected = 700 + 300 * calls.saturating_sub(1);
+        assert_eq!(rx.borrow_and_update().tokens_used, expected);
     }
 
     #[tokio::test]

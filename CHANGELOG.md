@@ -75,6 +75,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Goal token totals no longer double-count a worker's tokens (progress
+  reports and the final total were added together) or drop earlier
+  attempts, and `why-tokens` and the receipt sum usage across retries and
+  escalations instead of showing only the last attempt.
 - [fixed] Escalation no longer targets model ids that do not exist
   (`claude-sonnet-4-5-20251001`, `claude-opus-4-7-20260115`,
   `gpt-5.2-preview`, `gemini-2.0-flash`, `grok-2`, `grok-2-mini`). Tier
