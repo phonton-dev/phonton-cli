@@ -2773,7 +2773,7 @@ mod tests {
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("external or unverified")
+                .contains("not started by Phonton")
         );
         assert!(!fixture.path().join("state/runs").exists());
         let (lease, selected, guard, directory) =
