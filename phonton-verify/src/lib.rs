@@ -141,10 +141,8 @@ async fn run_command_checks(
     } else {
         None
     };
-    let command_dir = patched_worktree
-        .as_ref()
-        .map(|temp| temp.path())
-        .unwrap_or(working_dir);
+    let copy_dir = patched_worktree.as_ref().map(VerifyCopy::path);
+    let command_dir = copy_dir.as_deref().unwrap_or(working_dir);
 
     if let Some(fail) = verify_crate_check_with_execution(&packages, command_dir, policy).await? {
         return Ok(fail);
@@ -245,14 +243,98 @@ fn command_verification_relevant(hunks: &[DiffHunk], working_dir: &Path) -> bool
         })
 }
 
-fn patched_verification_worktree(
-    hunks: &[DiffHunk],
-    working_dir: &Path,
-) -> Result<tempfile::TempDir> {
-    let temp = tempfile::tempdir()?;
-    copy_workspace_contents(working_dir, temp.path())?;
-    apply_hunks_to_worktree(hunks, working_dir, temp.path())?;
-    Ok(temp)
+/// The copy that checks run in, at `<root>/ws`. A sibling
+/// `<root>/.cargo/config.toml` points Cargo at `<root>/target`. The
+/// per-workspace cache root survives between runs, so Cargo reuses compiled
+/// dependencies instead of rebuilding them for every attempt; when another
+/// verification holds it, a throwaway root is used instead.
+struct VerifyCopy {
+    root: PathBuf,
+    lock: Option<PathBuf>,
+    _temp: Option<tempfile::TempDir>,
+}
+
+impl VerifyCopy {
+    fn path(&self) -> PathBuf {
+        self.root.join("ws")
+    }
+}
+
+impl Drop for VerifyCopy {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.lock {
+            let _ = fs::remove_file(lock);
+        }
+    }
+}
+
+fn verify_cache_root(working_dir: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| working_dir.to_path_buf())
+        .hash(&mut hasher);
+    std::env::temp_dir()
+        .join("phonton-verify")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+/// Take the cache lock. A lock older than an hour belongs to a crashed run.
+fn try_lock(lock: &Path) -> bool {
+    let open = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock)
+    };
+    if open().is_ok() {
+        return true;
+    }
+    let stale = fs::metadata(lock)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > Duration::from_secs(3600));
+    stale && fs::remove_file(lock).is_ok() && open().is_ok()
+}
+
+fn patched_verification_worktree(hunks: &[DiffHunk], working_dir: &Path) -> Result<VerifyCopy> {
+    let cache = verify_cache_root(working_dir);
+    let lock = cache.with_extension("lock");
+    let copy = if fs::create_dir_all(&cache).is_ok() && try_lock(&lock) {
+        VerifyCopy {
+            root: cache,
+            lock: Some(lock),
+            _temp: None,
+        }
+    } else {
+        let temp = tempfile::tempdir()?;
+        VerifyCopy {
+            root: temp.path().to_path_buf(),
+            lock: None,
+            _temp: Some(temp),
+        }
+    };
+    let ws = copy.path();
+    // std's remove_dir_all unlinks a linked node_modules; it never follows it.
+    if ws.exists() {
+        fs::remove_dir_all(&ws)?;
+    }
+    let cargo_dir = copy.root.join(".cargo");
+    fs::create_dir_all(&cargo_dir)?;
+    let target = copy.root.join("target").to_string_lossy().into_owned();
+    fs::write(
+        cargo_dir.join("config.toml"),
+        format!(
+            "[build]
+target-dir = {}
+",
+            toml::Value::String(target)
+        ),
+    )?;
+    copy_workspace_contents(working_dir, &ws)?;
+    apply_hunks_to_worktree(hunks, working_dir, &ws)?;
+    Ok(copy)
 }
 
 fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
@@ -1374,13 +1456,17 @@ mod tests {
             "module.exports = { f: require('inc') };",
             1,
         );
-        let worktree = patched_verification_worktree(std::slice::from_ref(&fix), tmp.path()).unwrap();
-        assert!(worktree.path().join("node_modules/inc/index.js").is_file());
-        drop(worktree);
-        assert!(
-            dep.join("index.js").is_file(),
-            "cleanup must remove the link, never the user's packages"
-        );
+        // Twice: the second run clears the cached copy made by the first.
+        for _ in 0..2 {
+            let worktree =
+                patched_verification_worktree(std::slice::from_ref(&fix), tmp.path()).unwrap();
+            assert!(worktree.path().join("node_modules/inc/index.js").is_file());
+            drop(worktree);
+            assert!(
+                dep.join("index.js").is_file(),
+                "cleanup must remove the link, never the user's packages"
+            );
+        }
 
         let result = verify_diff_with_execution(
             &[fix],

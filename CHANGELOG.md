@@ -54,6 +54,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   omitting it. Without dependencies, a model could "fix" a missing-module
   error by deleting the dependency and still pass. Cleanup removes only the
   link.
+- [fixed] Verification reuses a per-workspace Cargo target directory in the
+  system temp folder, so compiled dependencies survive between attempts and
+  runs instead of rebuilding in every fresh copy. A small serde/anyhow crate
+  fix went from 83s to 29s on a warm cache.
 - [fixed] DeepSeek requests allow 32k output tokens. Its models reason before
   answering, and at 4096 harder edits came back empty.
 - [removed] Hardcoded local-template answers for benchmark tasks (chess rules,
