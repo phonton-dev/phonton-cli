@@ -5834,10 +5834,15 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
     if !opts.json && !opts.direct_task && opts.resume_task_id.is_none() {
         let cfg = config::load()?;
         let base_url = cfg.provider.base_url.clone().unwrap_or_default();
-        if provider_is_local(&cfg.provider.name, &base_url)
-            && cfg.provider.model.as_deref().is_none_or(str::is_empty)
-            && matches!(local_goal_cli::current_model_selection().await, Ok(Some(_)))
-        {
+        let configured = cfg.provider.model.clone().unwrap_or_default();
+        let calibrated = provider_is_local(&cfg.provider.name, &base_url)
+            && match local_goal_cli::current_model_selection().await {
+                Ok(Some(selection)) => {
+                    configured.is_empty() || configured.eq_ignore_ascii_case(&selection.model)
+                }
+                _ => false,
+            };
+        if calibrated {
             // Same routing as the TUI: a calibrated local model runs through
             // the local harness built for small models.
             let mut local_args = vec![opts.goal_text.clone()];

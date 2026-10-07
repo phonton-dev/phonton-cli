@@ -53,6 +53,12 @@ impl PendingLocalPlan {
                 "MODEL {} · {} context tokens",
                 m.model, m.context_tokens
             ));
+            if r.allow_unverified_runtime {
+                lines.push(format!(
+                    "  Runtime at {} was not started by Phonton; it may relay repository context off this machine. Y runs this plan on it.",
+                    m.endpoint
+                ));
+            }
         }
         lines.extend([
             format!(

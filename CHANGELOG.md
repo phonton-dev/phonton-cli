@@ -22,6 +22,13 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   (`phonton goal --local show RUN_ID` keeps the full receipt). `goal --local`
   accepts flags before the goal text, and `apply`/`rollback` print one-line
   results.
+- [changed] Local goals in the TUI work with an Ollama that Phonton did not
+  start (macOS and Linux, where managed setup is unavailable, or a
+  self-installed runtime on Windows). The plan review says the runtime is
+  unverified and may relay repository context; approving the plan is
+  consent for that goal, and the receipt labels the runtime origin unknown.
+  Headless runs still need `phonton goal --local --allow-unverified-runtime`,
+  and the refusal now names that flag.
 - [changed] The TUI's local plan review lists files, checks, model, and
   budget without per-file hashes or model digests (they stay in the run
   receipt), and drops the "requires host approval" note once checks are

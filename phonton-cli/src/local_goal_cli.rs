@@ -574,9 +574,24 @@ fn runtime_guard_at(
         }
     }
     if !allow_unverified {
-        bail!("This loopback runtime is external or unverified and may relay repository context. Use Phonton-managed setup for verified local inference, or explicitly allow an unverified runtime for this goal");
+        bail!("This loopback runtime was not started by Phonton and may relay repository context. Use `phonton models setup` for verified local inference, or pass --allow-unverified-runtime to `phonton goal --local` to use it for this goal");
     }
     Ok(phonton_worker::local_run::RuntimeGuard::external_unverified(settings.endpoint.clone()))
+}
+
+/// Whether the configured runtime is a working service Phonton did not start
+/// (always the case where managed setup is unavailable).
+fn runtime_is_external() -> bool {
+    let Ok(path) = crate::models_cli::state_path() else {
+        return false;
+    };
+    let Ok(settings) = phonton_local::storage::load(&path) else {
+        return false;
+    };
+    matches!(
+        runtime_guard_at(&path, &settings, true),
+        Ok(guard) if guard.origin() == phonton_types::local_run::RuntimeOrigin::ExternalUnverified
+    )
 }
 
 fn prepare_at(
@@ -1594,8 +1609,14 @@ fn receipt_summary_lines(receipt: &LocalRunReceipt) -> Vec<String> {
         .map(|c| c.input_tokens.unwrap_or(0) + c.output_tokens.unwrap_or(0))
         .sum();
     if tokens > 0 {
+        let origin =
+            if receipt.runtime_origin == phonton_types::local_run::RuntimeOrigin::ManagedVerified {
+                "local, no API cost"
+            } else {
+                "runtime not verified as local"
+            };
         out.push(format!(
-            "  tokens: {tokens} across all candidates (local, no API cost)"
+            "  tokens: {tokens} across all candidates ({origin})"
         ));
     }
     out.push(format!(
@@ -1638,6 +1659,10 @@ where
     let selection = plan_model_selection(&mut plan).await?;
     adjust_reviewed_plan_budget(&mut plan, selection.as_ref(), false);
     plan.request.approve_host_execution = host_approved;
+    // The plan review names an Ollama that Phonton did not start, so approving
+    // that plan is this goal's consent. A damaged managed receipt is not
+    // "unverified" here and still refuses in `prepare`.
+    plan.request.allow_unverified_runtime = runtime_is_external();
     let reviewed = phonton_types::local_run::ReviewedLocalPlan {
         plan: plan.clone(),
         model_selection: selection.clone(),
