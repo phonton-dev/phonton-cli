@@ -1385,7 +1385,26 @@ pub async fn run(args: &[String]) -> Result<i32> {
             )
             .await?,
         )?;
-        println!("{}", serde_json::to_string_pretty(&applied)?);
+        let files: Vec<String> = applied
+            .files
+            .iter()
+            .map(|f| f.path.display().to_string())
+            .chain(
+                applied
+                    .created_file
+                    .iter()
+                    .map(|c| c.path.display().to_string()),
+            )
+            .collect();
+        println!(
+            "{}: {} — {}",
+            applied.state,
+            files.join(", "),
+            applied.detail
+        );
+        if action == "apply" {
+            println!("  undo: phonton goal --local rollback {id} --yes");
+        }
         return Ok(0);
     }
     let (request, expected_model_selection): (LocalRunRequest, ReviewedModelSelection) = if args
@@ -1502,7 +1521,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
     }
     match result {
         Ok(receipt) => {
-            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            for line in receipt_summary_lines(&receipt) {
+                println!("{line}");
+            }
             Ok(if receipt.state == "review_ready" {
                 0
             } else if receipt.selected_candidate.is_some() {
@@ -1522,6 +1543,66 @@ pub async fn run(args: &[String]) -> Result<i32> {
             Err(error)
         }
     }
+}
+
+/// Human summary of a finished local run; the full receipt stays available
+/// through `phonton goal --local show RUN_ID`.
+fn receipt_summary_lines(receipt: &LocalRunReceipt) -> Vec<String> {
+    let selected = receipt
+        .selected_candidate
+        .and_then(|number| receipt.candidates.iter().find(|c| c.number == number));
+    let mut out = vec![format!(
+        "phonton goal (local {}): {} in {:.1}s, {} candidate(s)",
+        receipt.profile.model,
+        receipt.state.replace('_', " "),
+        receipt.elapsed_ms as f64 / 1000.0,
+        receipt.candidates.len()
+    )];
+    let Some(candidate) = selected else {
+        if let Some(reason) = receipt
+            .candidates
+            .iter()
+            .rev()
+            .find_map(|c| c.rejection.as_ref())
+        {
+            out.push(format!("  last rejection: {reason}"));
+        }
+        out.push(format!(
+            "  details: phonton goal --local show {}",
+            receipt.id
+        ));
+        return out;
+    };
+    out.push(String::new());
+    out.extend(candidate.diff.lines().map(str::to_owned));
+    for check in &candidate.checks {
+        let command = check
+            .check
+            .as_ref()
+            .map(|c| format!("{} {}", c.program, c.args.join(" ")))
+            .unwrap_or_else(|| "check".into());
+        let mark = match check.status {
+            phonton_types::local::CheckStatus::Passed => "✓",
+            phonton_types::local::CheckStatus::Failed => "✗",
+            _ => "-",
+        };
+        out.push(format!("  {mark} {command} ({:?})", check.status));
+    }
+    let tokens: u64 = receipt
+        .candidates
+        .iter()
+        .map(|c| c.input_tokens.unwrap_or(0) + c.output_tokens.unwrap_or(0))
+        .sum();
+    if tokens > 0 {
+        out.push(format!(
+            "  tokens: {tokens} across all candidates (local, no API cost)"
+        ));
+    }
+    out.push(format!(
+        "  next: phonton goal --local apply {} --yes (details: phonton goal --local show {})",
+        receipt.id, receipt.id
+    ));
+    out
 }
 
 /// One local goal for the TUI: preview the plan, admit it against the
@@ -1630,13 +1711,9 @@ struct GoalOptions {
 fn parse_goal(args: &[String]) -> Result<GoalOptions> {
     let preview_only = args.first().is_some_and(|s| s == "--plan");
     let start = usize::from(preview_only);
-    let goal = args
-        .get(start)
-        .filter(|s| !s.starts_with("--") && !s.trim().is_empty())
-        .ok_or_else(|| anyhow!("{LOCAL_GOAL_USAGE}"))?;
     let mut options = GoalOptions {
         request: LocalRunRequest {
-            goal: goal.clone(),
+            goal: String::new(),
             repository: std::env::current_dir()?,
             files: vec![],
             new_file: None,
@@ -1654,9 +1731,15 @@ fn parse_goal(args: &[String]) -> Result<GoalOptions> {
         host_approved: false,
         runtime_approved: false,
     };
-    let mut index = start + 1;
+    let mut index = start;
     while let Some(flag) = args.get(index) {
         match flag.as_str() {
+            goal if !goal.starts_with("--") && options.request.goal.is_empty() => {
+                if goal.trim().is_empty() {
+                    bail!("{LOCAL_GOAL_USAGE}");
+                }
+                options.request.goal = goal.to_owned();
+            }
             "--yes" => options.approve_plan = true,
             "--allow-host-checks" => options.host_approved = true,
             "--allow-unverified-runtime" => options.runtime_approved = true,
@@ -1702,6 +1785,9 @@ fn parse_goal(args: &[String]) -> Result<GoalOptions> {
             _ => bail!("Unknown local goal option: {flag}"),
         }
         index += 1;
+    }
+    if options.request.goal.is_empty() {
+        bail!("{LOCAL_GOAL_USAGE}");
     }
     Ok(options)
 }
@@ -1981,6 +2067,9 @@ mod tests {
     #[test]
     fn accepting_a_plan_does_not_approve_host_checks() {
         let options = parse_goal(&["Fix parsePort".into(), "--yes".into()]).unwrap();
+        let flags_first = parse_goal(&["--yes".into(), "Fix parsePort".into()]).unwrap();
+        assert_eq!(flags_first.request.goal, "Fix parsePort");
+        assert!(flags_first.approve_plan);
         assert!(options.approve_plan);
         assert!(!options.host_approved);
         assert!(!options.runtime_approved);
@@ -2297,6 +2386,11 @@ mod tests {
             contract: None,
             git_index: None,
         };
+        let summary = receipt_summary_lines(&receipt);
+        assert!(summary[0].starts_with("phonton goal (local fixture): verifying 1"));
+        assert!(summary
+            .iter()
+            .any(|line| line.contains("phonton goal --local show fixture")));
         for unfinished_state in ["finalizing", "review_ready", "review_unverified"] {
             let mut saved = receipt.clone();
             saved.state = unfinished_state.into();

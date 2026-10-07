@@ -5178,7 +5178,12 @@ fn default_model_for(provider: &str) -> String {
         "gemini" => "gemini-flash-latest".into(),
         "agentrouter" => "claude-sonnet-4-5".into(),
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
-        "ollama" => "llama3.2:3b".into(),
+        // The model Phonton installed and calibrated, not a guess that may
+        // not be pulled.
+        "ollama" => models_cli::settings()
+            .ok()
+            .and_then(|settings| settings.active_model)
+            .unwrap_or_else(|| "llama3.2:3b".into()),
         "deepseek" => "deepseek-flash".into(),
         "xai" | "grok" => "grok-2-mini".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
@@ -5585,7 +5590,8 @@ pub(crate) struct HeadlessGoalResult {
 
 fn print_goal_help() {
     println!(
-        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nHost checks execute repository code and require explicit --allow-host-checks on each invocation."
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nHost checks execute repository code and require explicit --allow-host-checks on each invocation.
+With a local provider and a calibrated model, goals run through the local harness; see phonton goal --local --help."
     );
 }
 
@@ -5825,6 +5831,25 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         }
     };
 
+    if !opts.json && !opts.direct_task && opts.resume_task_id.is_none() {
+        let cfg = config::load()?;
+        let base_url = cfg.provider.base_url.clone().unwrap_or_default();
+        if provider_is_local(&cfg.provider.name, &base_url)
+            && cfg.provider.model.as_deref().is_none_or(str::is_empty)
+            && matches!(local_goal_cli::current_model_selection().await, Ok(Some(_)))
+        {
+            // Same routing as the TUI: a calibrated local model runs through
+            // the local harness built for small models.
+            let mut local_args = vec![opts.goal_text.clone()];
+            if opts.yes {
+                local_args.push("--yes".into());
+            }
+            if opts.host_checks_approved {
+                local_args.push("--allow-host-checks".into());
+            }
+            return Box::pin(local_goal_cli::run(&local_args)).await;
+        }
+    }
     let result = execute_headless_goal(opts, HeadlessGoalHooks::default()).await?;
     debug_assert_eq!(
         result.exit_code == 0,
@@ -6405,8 +6430,25 @@ fn headless_status_label(status: &TaskStatus) -> &'static str {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Local-harness and orchestrator futures are deep; unoptimized builds
+    // overflow Windows' 1 MiB main-thread and 2 MiB worker stacks.
+    const STACK: usize = 16 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("phonton-main".into())
+        .stack_size(STACK)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK)
+                .build()?
+                .block_on(run_main())
+        })?
+        .join()
+        .unwrap_or_else(|_| std::process::exit(101))
+}
+
+async fn run_main() -> Result<()> {
     if handle_cli_args().await? {
         return Ok(());
     }

@@ -615,8 +615,9 @@ fn require_setup_recovery_allowed(root: &Path, managed_runtime_installed: bool) 
     let store = model_store_status(root, MANAGED_MODEL_ENDPOINT, managed_runtime_installed);
     if store["recovery_required"] == true && store["setup_retryable"] != true {
         bail!(
-            "Managed setup cannot safely replace the saved launch receipt or model store: {}. Reconnect the original storage or repair the unsafe path, then retry.",
-            store["reason"].as_str().unwrap_or("storage verification failed")
+            "Managed setup cannot safely replace the saved launch receipt or model store: {}. Reconnect the original storage or repair the unsafe path, then retry. If you moved this folder on purpose, delete {} and rerun phonton models setup.",
+            store["reason"].as_str().unwrap_or("storage verification failed"),
+            root.join("managed-process.json").display()
         );
     }
     Ok(())
@@ -1609,7 +1610,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
             json!({"endpoint": settings.endpoint, "active_model": settings.active_model, "local_only": managed_local_only(&path, &settings), "loopback_only": true})
         }
         "endpoint" if args.len() == 2 => set_endpoint(&args[1])?,
-        "status" => status(parse_status_context(&args[1..])?).await?,
+        "status" => status(parse_status_context(args.get(1..).unwrap_or_default())?).await?,
         "catalog" if args.len() == 1 || (args.len() == 2 && args[1] == "--snapshot") => {
             catalog_cli_output(catalog_snapshot().await?, args.len() == 2)?
         }

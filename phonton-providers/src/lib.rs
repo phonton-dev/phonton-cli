@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use phonton_types::{
     LLMResponse, ModelMetricsSnapshot, ModelTier, PromptAttachment, ProviderConfig, ProviderError,
@@ -1727,18 +1727,23 @@ impl Provider for OllamaProvider {
             ],
         });
 
-        let resp: Value = self
+        let resp = self
             .http
             .post(&url)
             .json(&body)
             .send()
             .await
-            .context("ollama request failed")?
-            .error_for_status()
-            .context("ollama returned non-2xx")?
-            .json()
-            .await
-            .context("ollama response was not JSON")?;
+            .context("ollama request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            bail!(
+                "ollama returned {status} for model `{}`: {}",
+                self.model,
+                detail.trim()
+            );
+        }
+        let resp: Value = resp.json().await.context("ollama response was not JSON")?;
 
         let content = resp
             .pointer("/message/content")

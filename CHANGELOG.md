@@ -16,6 +16,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Changed
 
+- [changed] `phonton goal` with a local provider and a calibrated model runs
+  through the local harness, matching the TUI, and prints the candidate diff,
+  check results, and the apply command instead of the raw JSON receipt
+  (`phonton goal --local show RUN_ID` keeps the full receipt). `goal --local`
+  accepts flags before the goal text, and `apply`/`rollback` print one-line
+  results.
+- [changed] An Ollama provider with no configured model uses the model
+  Phonton calibrated instead of `llama3.2:3b`, and Ollama errors include the
+  HTTP status and response body.
 - [changed] `phonton review reject` undoes the task: every file its
   checkpoints changed goes back to its pre-task content in the worktree and
   index. It refuses, changing nothing, if any of those files were edited
@@ -50,6 +59,13 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Local goals no longer overflow the stack on Windows debug builds;
+  the CLI runs on a 16 MiB main thread and runtime workers.
+- [fixed] A piped `phonton models setup` returns once the managed runtime is
+  ready instead of hanging while the runtime holds the caller's pipe.
+- [fixed] `phonton models` with no subcommand prints status instead of
+  panicking. Setup refused over a moved runtime folder now names the stale
+  receipt to delete.
 - [fixed] Verification copies link the project's `node_modules` instead of
   omitting it. Without dependencies, a model could "fix" a missing-module
   error by deleting the dependency and still pass. Cleanup removes only the

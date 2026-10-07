@@ -1237,6 +1237,27 @@ pub async fn start(executable: &Path, root: &Path) -> Result<String> {
     start_command(command, &root, 11434).await
 }
 
+/// The managed runtime outlives this process. Windows children inherit every
+/// inheritable handle, so without this a piped `phonton models setup` never
+/// reaches EOF while the runtime holds the caller's stdout/stderr pipe. Child
+/// stdio set through `Stdio::inherit` is duplicated by std and unaffected.
+#[cfg(windows)]
+fn stop_std_handle_inheritance() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if !handle.is_null() {
+            // SAFETY: the handle belongs to this process; a failure only
+            // leaves inheritance as it was.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
 async fn start_command(
     mut command: tokio::process::Command,
     root: &Path,
@@ -1259,6 +1280,8 @@ async fn start_command(
     // spawning two managed children after installation completes.
     let root = canonical_start_root(root)?;
     let _start_lease = crate::storage::acquire(&root.join("runtime-install-state"))?;
+    #[cfg(windows)]
+    stop_std_handle_inheritance();
     let mut startup = StartupChild {
         child: command.spawn()?,
         ready: false,
