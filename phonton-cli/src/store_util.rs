@@ -13,5 +13,12 @@ pub fn open_persistent_store() -> Result<Store> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    Store::open(path)
+    let store = Store::open(path)?;
+    // Memory written and read here belongs to the repository Phonton runs in.
+    Ok(
+        match std::env::current_dir().and_then(std::fs::canonicalize) {
+            Ok(dir) => store.with_memory_scope(dir.display().to_string()),
+            Err(_) => store,
+        },
+    )
 }

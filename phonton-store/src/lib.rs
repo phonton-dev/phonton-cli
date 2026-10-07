@@ -90,6 +90,9 @@ pub const WARM_TTL_SECS: u64 = 60;
 pub struct Store {
     conn: Connection,
     path: PathBuf,
+    /// Workspace that new memory belongs to and that memory reads are
+    /// limited to. Rows without a workspace (older stores) stay visible.
+    memory_scope: Option<String>,
 }
 
 impl Store {
@@ -101,7 +104,19 @@ impl Store {
         conn.execute_batch(MIGRATIONS)
             .context("applying phonton-store migrations")?;
         ensure_memory_columns(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            memory_scope: None,
+        })
+    }
+
+    /// Limit memory to one workspace: new records are tagged with `scope`
+    /// and reads skip records tagged with another workspace, so one
+    /// repository's goals and paths never reach prompts for another.
+    pub fn with_memory_scope(mut self, scope: impl Into<String>) -> Self {
+        self.memory_scope = Some(scope.into());
+        self
     }
 
     /// Open an in-memory store. Useful for tests and ephemeral runs.
@@ -113,6 +128,7 @@ impl Store {
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
+            memory_scope: None,
         })
     }
 
@@ -208,9 +224,16 @@ impl Store {
         let task_id = memory_task_id(record).map(|t| t.to_string());
         let body = serde_json::to_string(record)?;
         self.conn.execute(
-            "INSERT INTO memory_records (kind, body_json, topic, task_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![kind, body, topic, task_id, now_secs() as i64],
+            "INSERT INTO memory_records (kind, body_json, topic, task_id, created_at, workspace)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                kind,
+                body,
+                topic,
+                task_id,
+                now_secs() as i64,
+                self.memory_scope
+            ],
         )?;
         Ok(())
     }
@@ -234,6 +257,10 @@ impl Store {
         if let Some(t) = topic {
             sql.push_str(" AND LOWER(topic) LIKE ?");
             binds.push(Box::new(format!("%{}%", t.to_lowercase())));
+        }
+        if let Some(scope) = &self.memory_scope {
+            sql.push_str(" AND (workspace IS NULL OR workspace = ?)");
+            binds.push(Box::new(scope.clone()));
         }
         sql.push_str(" ORDER BY pinned DESC, created_at DESC, id DESC LIMIT ?");
         binds.push(Box::new(limit as i64));
@@ -304,28 +331,28 @@ impl Store {
         kind_filter: Option<MemoryKind>,
         top_k: usize,
     ) -> Result<Vec<MemoryRecord>> {
-        let like = format!("%{}%", description.to_lowercase());
         let mut sql = String::from(
             "SELECT body_json FROM memory_records
-             WHERE LOWER(topic) LIKE ?1",
+             WHERE LOWER(topic) LIKE ?",
         );
-        if kind_filter.is_some() {
-            sql.push_str(" AND kind = ?2");
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(format!("%{}%", description.to_lowercase()))];
+        if let Some(kind) = kind_filter {
+            sql.push_str(" AND kind = ?");
+            binds.push(Box::new(kind.as_str().to_string()));
+        }
+        if let Some(scope) = &self.memory_scope {
+            sql.push_str(" AND (workspace IS NULL OR workspace = ?)");
+            binds.push(Box::new(scope.clone()));
         }
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
-        // The LIMIT placeholder index depends on whether kind is bound.
-        sql.push_str(if kind_filter.is_some() { "3" } else { "2" });
+        binds.push(Box::new(top_k as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let body_iter = if let Some(kind) = kind_filter {
-            stmt.query_map(params![like, kind.as_str(), top_k as i64], |r| {
-                r.get::<_, String>(0)
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map(params![like, top_k as i64], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+        let params_ref: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let body_iter = stmt
+            .query_map(params_ref.as_slice(), |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut out = Vec::with_capacity(body_iter.len());
         for body in body_iter {
@@ -547,6 +574,10 @@ impl Store {
             sql.push_str(" AND LOWER(topic) LIKE ?");
             binds.push(Box::new(format!("%{}%", t.to_lowercase())));
         }
+        if let Some(scope) = &self.memory_scope {
+            sql.push_str(" AND (workspace IS NULL OR workspace = ?)");
+            binds.push(Box::new(scope.clone()));
+        }
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
         binds.push(Box::new(limit as i64));
 
@@ -740,6 +771,16 @@ fn ensure_memory_columns(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    let has_workspace = {
+        let mut stmt = conn.prepare("PRAGMA table_info(memory_records)")?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        cols.iter().any(|c| c == "workspace")
+    };
+    if !has_workspace {
+        conn.execute("ALTER TABLE memory_records ADD COLUMN workspace TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -750,6 +791,36 @@ fn ensure_memory_columns(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_from_another_workspace_is_not_read() {
+        let path =
+            std::env::temp_dir().join(format!("phonton-scope-{}.sqlite3", uuid::Uuid::new_v4()));
+        let record = |summary: &str| MemoryRecord::RejectedApproach {
+            summary: summary.into(),
+            reason: "fixture".into(),
+        };
+        Store::open(&path)
+            .unwrap()
+            .append_memory(&record("legacy parser"))
+            .unwrap();
+        let a = Store::open(&path).unwrap().with_memory_scope("repo-a");
+        a.append_memory(&record("repo-a parser")).unwrap();
+        let b = Store::open(&path).unwrap().with_memory_scope("repo-b");
+        let seen: Vec<String> = b
+            .search_memory("parser", None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| match r {
+                MemoryRecord::RejectedApproach { summary, .. } => summary,
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(seen, vec!["legacy parser".to_string()]);
+        assert_eq!(a.search_memory("parser", None, 10).unwrap().len(), 2);
+        drop((a, b));
+        let _ = std::fs::remove_file(&path);
+    }
     use phonton_types::MemoryRecord;
 
     #[test]

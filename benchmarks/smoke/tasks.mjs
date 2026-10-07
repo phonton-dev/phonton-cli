@@ -65,7 +65,7 @@ test('hidden: due todos first, earliest first, undated keep order', () => {
     { id: 4, title: 'soon', done: false, due: '2026-06-02T00:00:00Z' },
   ];
   assert.deepStrictEqual(
-    formatList(todos).split('\\n').map((l) => l.split(' ')[2]),
+    formatList(todos).split('\\n').map((l) => l.split(' ')[3]),
     ['soon', 'late', 'none-a', 'none-b']
   );
 });

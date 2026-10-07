@@ -658,7 +658,11 @@ impl Worker {
         // the same subtask in a future goal decomposition.
         if let Some(memory) = &self.memory {
             let rec = MemoryRecord::RejectedApproach {
-                summary: subtask.description.clone(),
+                // Without the memory preamble, or each record nests the last.
+                summary: phonton_types::task_description_without_prior_context(
+                    &subtask.description,
+                )
+                .to_string(),
                 reason: format!(
                     "verify failed {} attempts: {}",
                     MAX_ATTEMPTS,
@@ -1410,7 +1414,10 @@ fn missing_required_touch_files(
     hunks: &[DiffHunk],
     project_root: &Path,
 ) -> Vec<PathBuf> {
-    let required = required_touch_files(&subtask.description);
+    // Paths quoted from memory are history, not targets for this edit.
+    let required = required_touch_files(phonton_types::task_description_without_prior_context(
+        &subtask.description,
+    ));
     if required.is_empty() {
         return Vec::new();
     }
@@ -2369,6 +2376,40 @@ mod tests {
         assert!(missing.contains(&PathBuf::from("broken_code.py")));
         assert!(missing.contains(&PathBuf::from("broken_code.ts")));
         assert!(!missing.contains(&PathBuf::from("broken_code.rs")));
+    }
+
+    #[test]
+    fn paths_quoted_from_memory_are_not_required_edits() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        for file in ["src/format.js", "src/store.js"] {
+            std::fs::write(temp.path().join(file), "x").unwrap();
+        }
+        let subtask = Subtask {
+            id: SubtaskId::new(),
+            description: format!(
+                "# Prior context from memory
+
+## Do NOT repeat these rejected approaches
+- Implement remove (rejected: Exact hunk verification failed for src/store.js)
+{}Fix the ordering in src/format.js",
+                phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR
+            ),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+        let hunks = vec![DiffHunk {
+            file_path: PathBuf::from("src/format.js"),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Removed("x".into()), DiffLine::Added("y".into())],
+        }];
+        assert!(missing_required_touch_files(&subtask, &hunks, temp.path()).is_empty());
     }
 
     #[test]

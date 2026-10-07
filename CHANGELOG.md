@@ -79,6 +79,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Memory is scoped to the repository it came from. Previously every
+  repository's rejected approaches and decisions (goal text and file paths)
+  were added to prompts for any other repository and sent to the provider.
+  Records from older stores stay visible everywhere.
+- [fixed] Rejected-approach memory no longer stores the memory preamble
+  itself, which nested a copy of all earlier memory into every new record.
+- [fixed] File paths quoted from memory no longer count as files the worker
+  must edit; a run could fail three attempts per tier, or add a no-op edit,
+  because an unrelated past failure mentioned `src/store.js`.
 - [fixed] Goals like "Add a count() method to TodoStore that ..." no longer
   become a subtask "Implement method `to`": the planner reads `name()` and
   backticked names before the kind word, ignores words like "to" and "that"
