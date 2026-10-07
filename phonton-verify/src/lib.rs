@@ -134,7 +134,6 @@ async fn run_command_checks(
     working_dir: &Path,
     policy: VerificationExecution,
 ) -> Result<VerifyResult> {
-    let mut pass_layer = None;
     let packages = touched_packages(hunks, working_dir);
     let patched_worktree = if command_verification_relevant(hunks, working_dir) {
         Some(patched_verification_worktree(hunks, working_dir)?)
@@ -143,7 +142,82 @@ async fn run_command_checks(
     };
     let copy_dir = patched_worktree.as_ref().map(VerifyCopy::path);
     let command_dir = copy_dir.as_deref().unwrap_or(working_dir);
+    // The worker verifies its diff and the orchestrator verifies it again;
+    // the same patched tree gives the same checks, so run them once.
+    let memo_key = copy_dir
+        .as_deref()
+        .and_then(|dir| tree_fingerprint(dir, &packages, policy).ok());
+    if let Some(cached) = memo_key.and_then(memo_get) {
+        return Ok(cached);
+    }
+    let result = run_checks_in(&packages, command_dir, policy).await?;
+    if let Some(key) = memo_key {
+        memo_put(key, &result);
+    }
+    Ok(result)
+}
 
+/// Verdicts of command checks keyed by [`tree_fingerprint`]. Unavailable
+/// results (timeouts, missing tools) are not kept so a retry can succeed.
+static CHECK_MEMO: std::sync::Mutex<Vec<(u64, VerifyResult)>> = std::sync::Mutex::new(Vec::new());
+
+fn memo_get(key: u64) -> Option<VerifyResult> {
+    let memo = CHECK_MEMO.lock().ok()?;
+    memo.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+}
+
+fn memo_put(key: u64, result: &VerifyResult) {
+    if matches!(result, VerifyResult::Unavailable { .. }) {
+        return;
+    }
+    if let Ok(mut memo) = CHECK_MEMO.lock() {
+        // ponytail: small FIFO; an LRU only matters for very long sessions.
+        if memo.len() >= 64 {
+            memo.remove(0);
+        }
+        memo.push((key, result.clone()));
+    }
+}
+
+/// Hash every file path and byte in the patched copy plus what the checks
+/// depend on. 64-bit SipHash: accidental collisions are negligible and the
+/// memo never leaves this process.
+fn tree_fingerprint(dir: &Path, packages: &[String], policy: VerificationExecution) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+    fn walk(root: &Path, dir: &Path, h: &mut impl Hasher) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(root, &path, h)?;
+            } else if kind.is_file() {
+                path.strip_prefix(root).unwrap_or(&path).hash(h);
+                fs::read(&path)?.hash(h);
+            } else {
+                // Linked dependency folders: their target identifies them.
+                path.strip_prefix(root).unwrap_or(&path).hash(h);
+                fs::read_link(&path).ok().hash(h);
+            }
+        }
+        Ok(())
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    walk(dir, dir, &mut h)?;
+    packages.hash(&mut h);
+    matches!(policy, VerificationExecution::HostApproved).hash(&mut h);
+    Ok(h.finish())
+}
+
+/// The executable layers against `command_dir`.
+async fn run_checks_in(
+    packages: &[String],
+    command_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<VerifyResult> {
+    let mut pass_layer = None;
+    let packages = packages.to_vec();
     if let Some(fail) = verify_crate_check_with_execution(&packages, command_dir, policy).await? {
         return Ok(fail);
     }
@@ -1505,6 +1579,46 @@ mod tests {
         .unwrap();
         assert!(matches!(result, VerifyResult::Pass { .. }), "{result:?}");
         assert!(dep.join("index.js").is_file());
+    }
+
+    #[test]
+    fn check_memo_keys_on_exact_tree_content_and_skips_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn a() {}
+",
+        )
+        .unwrap();
+        let policy = VerificationExecution::HostApproved;
+        let first = tree_fingerprint(dir.path(), &[], policy).unwrap();
+        assert_eq!(first, tree_fingerprint(dir.path(), &[], policy).unwrap());
+        assert_ne!(
+            first,
+            tree_fingerprint(dir.path(), &["p".into()], policy).unwrap()
+        );
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn b() {}
+",
+        )
+        .unwrap();
+        let second = tree_fingerprint(dir.path(), &[], policy).unwrap();
+        assert_ne!(first, second);
+
+        let pass = VerifyResult::Pass {
+            layer: VerifyLayer::Test,
+        };
+        memo_put(second, &pass);
+        assert!(matches!(memo_get(second), Some(VerifyResult::Pass { .. })));
+        memo_put(
+            first,
+            &VerifyResult::Unavailable {
+                reason: "timeout".into(),
+            },
+        );
+        assert!(memo_get(first).is_none());
     }
 
     #[test]

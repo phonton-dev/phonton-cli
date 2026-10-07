@@ -75,6 +75,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] A diff the worker already checked is not built and tested again
+  when the orchestrator verifies the identical patched tree; the verdict is
+  reused within the run (timeouts and missing tools are retried). On a
+  141-crate Rust workspace a warm goal went from 223 s to 159 s in one run
+  each.
 - [fixed] Applying a local run that was already applied and rolled back
   says so instead of reporting "different candidate evidence".
 - [fixed] Verification caches for workspaces unused for 7 days are deleted,
