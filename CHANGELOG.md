@@ -26,6 +26,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   budget without per-file hashes or model digests (they stay in the run
   receipt), and drops the "requires host approval" note once checks are
   allowed for the session.
+- [changed] `phonton doctor` checks only the toolchains the project uses
+  (cargo for Cargo projects, node for package.json projects), drops the
+  benchmark-Python, missing-Nexus, default-model, and probe-skipped
+  warnings, prints paths without the `\?\` prefix, and points a missing
+  key at `phonton models setup` as the no-key alternative.
 - [changed] An Ollama provider with no configured model uses the model
   Phonton calibrated instead of `llama3.2:3b`, and Ollama errors include the
   HTTP status and response body.

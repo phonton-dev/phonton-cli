@@ -1,8 +1,8 @@
 //! First-run diagnostics for the Phonton CLI.
 //!
 //! `phonton doctor` intentionally runs before the TUI. It checks the local
-//! environment, config, workspace trust, persistent store, git/cargo presence,
-//! and Nexus config shape, then prints actionable next steps.
+//! environment, config, workspace trust, persistent store, the toolchains the
+//! project uses, and Nexus config shape, then prints actionable next steps.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,10 +98,8 @@ pub fn parse_options(args: &[String]) -> Result<DoctorOptions> {
 }
 
 pub async fn build_report(workspace: &Path, opts: DoctorOptions) -> DoctorReport {
-    let workspace_display = std::fs::canonicalize(workspace)
-        .unwrap_or_else(|_| workspace.to_path_buf())
-        .display()
-        .to_string();
+    let workspace_display =
+        path_string(std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()));
     let config_path = config::config_path();
     let store_path = default_store_path();
     let mut checks = Vec::new();
@@ -117,15 +115,26 @@ pub async fn build_report(workspace: &Path, opts: DoctorOptions) -> DoctorReport
         "Install Git and make sure `git --version` works.",
         &mut checks,
     );
-    check_command(
-        "cargo",
-        &["--version"],
-        "cargo",
-        "Install the Rust toolchain from rustup.rs and make sure `cargo --version` works.",
-        &mut checks,
-    );
-    check_bench_python(&mut checks);
-    check_cargo_manifest(workspace, &mut checks);
+    // Toolchain checks only for the project kinds present; a Node repo has
+    // no use for a cargo warning.
+    if find_upwards(workspace, "Cargo.toml").is_some() {
+        check_command(
+            "cargo",
+            &["--version"],
+            "cargo",
+            "Install the Rust toolchain from rustup.rs and make sure `cargo --version` works.",
+            &mut checks,
+        );
+    }
+    if find_upwards(workspace, "package.json").is_some() {
+        check_command(
+            "node",
+            &["--version"],
+            "node",
+            "Install Node.js and make sure `node --version` works.",
+            &mut checks,
+        );
+    }
     check_nexus(workspace, &mut checks);
     check_index_backend(&mut checks).await;
     check_extensions(workspace, &mut checks);
@@ -164,16 +173,7 @@ pub async fn run(workspace: &Path, args: &[String]) -> Result<i32> {
 }
 
 fn check_workspace(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
-    if workspace.exists() {
-        push(
-            checks,
-            "workspace",
-            Severity::Ok,
-            "Workspace found",
-            format!("{}", workspace.display()),
-            None,
-        );
-    } else {
+    if !workspace.exists() {
         push(
             checks,
             "workspace",
@@ -250,7 +250,10 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
             Severity::Fail,
             "Provider API key is missing",
             format!("{provider} requires a key for network-backed runs"),
-            Some(provider_key_hint(provider)),
+            Some(format!(
+                "{} Or run `phonton models setup` to use a local model with no key.",
+                provider_key_hint(provider)
+            )),
         );
     } else if key.is_some() {
         push(
@@ -312,10 +315,8 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
         matches!(provider, "custom" | "openai-compatible") && cfg.provider.model.is_none();
     let model_severity = if custom_missing_model {
         Severity::Fail
-    } else if cfg.provider.model.is_some() {
-        Severity::Ok
     } else {
-        Severity::Warn
+        Severity::Ok
     };
     let model_for_probe = model.clone();
     push(
@@ -327,18 +328,13 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
         } else if cfg.provider.model.is_some() {
             "Model is configured"
         } else {
-            "Model is using CLI default"
+            "Model is the provider default"
         },
         model,
         if custom_missing_model {
             Some("Set provider.model in ~/.phonton/config.toml.".into())
-        } else if cfg.provider.model.is_some() {
-            None
         } else {
-            Some(
-                "Run `phonton` once with a key configured to auto-detect, or set provider.model."
-                    .into(),
-            )
+            None
         },
     );
 
@@ -355,18 +351,6 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
             &model_for_probe,
         )
         .await;
-    } else {
-        push(
-            checks,
-            "provider.probe",
-            Severity::Warn,
-            "Provider network probe skipped",
-            "local-only doctor run",
-            Some(
-                "Run `phonton doctor --provider` to validate model discovery and a tiny completion call."
-                    .into(),
-            ),
-        );
     }
 }
 
@@ -618,66 +602,6 @@ fn check_trust(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
-fn check_bench_python(checks: &mut Vec<DoctorCheck>) {
-    if let Ok(path) = std::env::var("PHONTON_BENCH_PYTHON") {
-        if !path.trim().is_empty() {
-            push(
-                checks,
-                "bench.python",
-                Severity::Ok,
-                "Benchmark Python is configured",
-                format!("PHONTON_BENCH_PYTHON={path}"),
-                None,
-            );
-            return;
-        }
-    }
-
-    let mut resolved: Option<String> = None;
-    for name in ["python", "python3"] {
-        if let Ok(output) = Command::new(name).args(["--version"]).output() {
-            if output.status.success() {
-                resolved = Some(name.into());
-                break;
-            }
-        }
-    }
-    if resolved.is_none()
-        && Command::new("py")
-            .args(["-3", "--version"])
-            .output()
-            .is_ok()
-    {
-        resolved = Some("py -3".into());
-    }
-
-    if let Some(cmd) = resolved {
-        push(
-            checks,
-            "bench.python",
-            Severity::Ok,
-            "Python available for syntax-preflight benchmarks",
-            cmd,
-            Some(
-                "Optional: set PHONTON_BENCH_PYTHON in your shell profile for a fixed interpreter."
-                    .into(),
-            ),
-        );
-    } else {
-        push(
-            checks,
-            "bench.python",
-            Severity::Warn,
-            "Python not found for syntax-preflight benchmarks",
-            "install Python 3 or set PHONTON_BENCH_PYTHON",
-            Some(
-                "Windows: install Python 3 and/or use `set PHONTON_BENCH_PYTHON=py -3` before benchmark runs."
-                    .into(),
-            ),
-        );
-    }
-}
-
 fn check_command(
     id: &'static str,
     args: &[&str],
@@ -717,28 +641,6 @@ fn check_command(
     }
 }
 
-fn check_cargo_manifest(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
-    let manifest = find_upwards(workspace, "Cargo.toml");
-    match manifest {
-        Some(path) => push(
-            checks,
-            "workspace.cargo",
-            Severity::Ok,
-            "Cargo manifest found",
-            path.display().to_string(),
-            None,
-        ),
-        None => push(
-            checks,
-            "workspace.cargo",
-            Severity::Warn,
-            "Cargo manifest not found",
-            "Rust verification may be limited outside Cargo workspaces",
-            Some("Run Phonton from a Rust workspace for the strongest initial workflow.".into()),
-        ),
-    }
-}
-
 fn check_nexus(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
     match phonton_index::discover_nexus_config(workspace) {
         Ok(Some(cfg)) => {
@@ -768,14 +670,7 @@ fn check_nexus(workspace: &Path, checks: &mut Vec<DoctorCheck>) {
                 );
             }
         }
-        Ok(None) => push(
-            checks,
-            "nexus",
-            Severity::Warn,
-            "Nexus config not found",
-            "single-workspace indexing only",
-            Some("Add nexus.json when this repo needs sibling-repo context.".into()),
-        ),
+        Ok(None) => {}
         Err(e) => push(
             checks,
             "nexus",
@@ -1016,17 +911,14 @@ fn print_text_report(report: &DoctorReport, opts: DoctorOptions) {
     println!();
     if report.has_failures() {
         println!(
-            "Result: {} failing check(s), {} warning(s). Fix failures before launch or real repo tasks.",
+            "Result: {} failing check(s), {} warning(s). Fix the failures above before running goals.",
             report.fail_count(),
             report.warn_count()
         );
     } else if report.warn_count() > 0 {
-        println!(
-            "Result: usable with {} warning(s). Tighten these before a trusted release run.",
-            report.warn_count()
-        );
+        println!("Result: usable with {} warning(s).", report.warn_count());
     } else {
-        println!("Result: ready for a trusted Phonton run.");
+        println!("Result: ready.");
     }
 
     if !opts.check_provider {
@@ -1086,7 +978,10 @@ fn find_upwards(start: &Path, filename: &str) -> Option<PathBuf> {
 }
 
 fn path_string(path: PathBuf) -> String {
-    path.display().to_string()
+    let path = path.display().to_string();
+    path.strip_prefix(r"\\?\")
+        .map(str::to_owned)
+        .unwrap_or(path)
 }
 
 #[cfg(test)]
