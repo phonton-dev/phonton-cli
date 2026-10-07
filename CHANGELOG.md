@@ -75,6 +75,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Verification caches for workspaces unused for 7 days are deleted,
+  so the shared Cargo target cache does not grow without bound in the temp
+  directory.
 - [fixed] Goal token totals no longer double-count a worker's tokens (progress
   reports and the final total were added together) or drop earlier
   attempts, and `why-tokens` and the receipt sum usage across retries and
@@ -87,8 +90,7 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   6 Astra, OpenRouter GPT-6 Luna / Claude Sonnet 5.5 / Opus 5.5, Gemini
   Flash-Lite / Flash / 3.1 Pro preview, xAI Grok Build 0.1 / 4.3 / 4.7, Groq
   gpt-oss-120b / Qwen3.8 27B, Together DeepSeek V4.1 Flash / GLM-5.3 /
-  Kimi K3. DeepSeek escalates from flash to `deepseek-v4-pro` at the
-  standard tier instead of retrying flash.
+  Kimi K3.
 - [fixed] OpenAI-compatible requests allow 16,384 output tokens (was
   4,096) so reasoning models do not spend the whole budget thinking.
 - [fixed] Provider transport errors include the underlying cause (DNS, TLS,

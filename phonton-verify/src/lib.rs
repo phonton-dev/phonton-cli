@@ -279,6 +279,30 @@ fn verify_cache_root(working_dir: &Path) -> PathBuf {
         .join(format!("{:016x}", hasher.finish()))
 }
 
+/// Unused workspace caches older than this are deleted.
+const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Delete other workspaces' caches untouched for `max_age`. Each run recreates
+/// `<root>/ws`, which refreshes the root's modification time. Locked caches
+/// are skipped; failures are ignored because pruning is housekeeping.
+fn prune_stale_caches(parent: &Path, keep: &Path, max_age: Duration) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if path != keep && path.is_dir() && old && !path.with_extension("lock").exists() {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// Take the cache lock. A lock older than an hour belongs to a crashed run.
 fn try_lock(lock: &Path) -> bool {
     let open = || {
@@ -302,6 +326,9 @@ fn patched_verification_worktree(hunks: &[DiffHunk], working_dir: &Path) -> Resu
     let cache = verify_cache_root(working_dir);
     let lock = cache.with_extension("lock");
     let copy = if fs::create_dir_all(&cache).is_ok() && try_lock(&lock) {
+        if let Some(parent) = cache.parent() {
+            prune_stale_caches(parent, &cache, CACHE_MAX_AGE);
+        }
         VerifyCopy {
             root: cache,
             lock: Some(lock),
@@ -1478,6 +1505,23 @@ mod tests {
         .unwrap();
         assert!(matches!(result, VerifyResult::Pass { .. }), "{result:?}");
         assert!(dep.join("index.js").is_file());
+    }
+
+    #[test]
+    fn stale_caches_are_pruned_but_current_and_locked_ones_stay() {
+        let parent = tempfile::tempdir().unwrap();
+        let keep = parent.path().join("keep");
+        let old = parent.path().join("old");
+        let locked = parent.path().join("locked");
+        for dir in [&keep, &old, &locked] {
+            fs::create_dir_all(dir.join("target")).unwrap();
+        }
+        fs::write(locked.with_extension("lock"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        prune_stale_caches(parent.path(), &keep, Duration::from_millis(1));
+        assert!(keep.exists());
+        assert!(!old.exists());
+        assert!(locked.exists());
     }
 
     #[tokio::test]

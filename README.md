@@ -76,7 +76,9 @@ receipt you can audit with `phonton review latest` and `phonton why-tokens`.
   local SQLite and steer the next plan.
 - **Designed for context efficiency.** Workers get only the files they edit
   plus retrieved symbols; finished subtasks are carried forward as one-line
-  notes instead of full transcripts; cheap models go first. We publish
+  notes instead of full transcripts; tests and boilerplate go to your
+  configured model, core logic starts one tier up, and only failures
+  escalate further. We publish
   measurements only with reproducible artifacts; see
   [Benchmark honesty](#benchmark-honesty).
 

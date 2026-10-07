@@ -72,9 +72,11 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
             ModelTier::Frontier => "claude-sonnet-4-5".into(),
         },
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
+        // The planner starts core logic at Standard; flash there keeps the
+        // default DeepSeek run cheap, and pro is the escalation.
         "deepseek" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "deepseek-flash".into(),
-            ModelTier::Standard | ModelTier::Frontier => "deepseek-v4-pro".into(),
+            ModelTier::Local | ModelTier::Cheap | ModelTier::Standard => "deepseek-flash".into(),
+            ModelTier::Frontier => "deepseek-v4-pro".into(),
         },
         "xai" | "grok" => match tier {
             ModelTier::Local | ModelTier::Cheap => "grok-build-0.1".into(),
@@ -1951,7 +1953,7 @@ mod tests {
         );
         assert_eq!(
             model_for_tier("deepseek", ModelTier::Standard),
-            "deepseek-v4-pro"
+            "deepseek-flash"
         );
         assert_eq!(
             model_for_tier("deepseek", ModelTier::Frontier),
