@@ -16,61 +16,60 @@ impl PendingLocalPlan {
     pub fn new(task_id: TaskId, reviewed: &ReviewedLocalPlan) -> Self {
         let p = &reviewed.plan;
         let r = &p.request;
+        let repository = r.repository.display().to_string();
         let mut lines = vec![
             format!("Goal: {}", r.goal),
-            format!("Repository: {}", r.repository.display()),
+            format!(
+                "Repository: {}",
+                repository.strip_prefix(r"\\?\").unwrap_or(&repository)
+            ),
             String::new(),
-            "SCOPE".into(),
+            "WILL EDIT".into(),
         ];
         for f in &p.files {
-            lines.push(format!("EDIT {}", f.path.display()));
-            lines.push(format!("  {}", f.reason));
-            lines.push(format!("  SHA-256 {}", f.source_sha256));
+            lines.push(format!("  {}  ({})", f.path.display(), f.reason));
         }
         if let Some(c) = &p.creation {
-            lines.push(format!("CREATE {} (currently absent)", c.path.display()));
+            lines.push(format!("  {}  (new file)", c.path.display()));
         }
-        lines.extend([String::new(), "COMMANDS (exact argument arrays)".into()]);
+        lines.extend([String::new(), "CHECKS (exact arguments)".into()]);
         if let Some(c) = &r.preparation {
-            lines.push(format!("SETUP {}", command(c)));
+            lines.push(format!("  setup {}", command(c)));
         }
         for c in &r.checks {
-            lines.push(format!("CHECK {}", command(c)));
+            lines.push(format!("  {}", command(c)));
         }
         lines.push(
             if r.approve_host_execution {
-                "Host checks: allowed by your session choice. Project code runs without isolation."
+                "  Allowed by your session choice; project code runs without isolation."
             } else {
-                "Host checks: NOT allowed. Plan approval does not grant command execution."
+                "  Not allowed: the candidate will stay unverified."
             }
             .into(),
         );
+        lines.push(String::new());
         if let Some(m) = &reviewed.model_selection {
-            lines.extend([
-                String::new(),
-                format!("MODEL {} at {}", m.model, m.endpoint),
-                format!("Digest {}", m.digest),
-                format!("Profile SHA-256 {}", m.profile_sha256),
-                format!(
-                    "Context {} / output ceiling {} tokens",
-                    m.context_tokens, m.output_tokens
-                ),
-            ]);
+            lines.push(format!(
+                "MODEL {} · {} context tokens",
+                m.model, m.context_tokens
+            ));
         }
         lines.extend([
-            String::new(),
             format!(
-                "BUDGET {} model calls / {} check slots / {} reserved output tokens / {} seconds",
-                r.budget.generations,
-                r.budget.check_runs,
-                r.budget.generated_tokens,
-                r.budget.wall_seconds
+                "BUDGET {} model calls · {} output tokens · {} s",
+                r.budget.generations, r.budget.generated_tokens, r.budget.wall_seconds
             ),
-            "Edits stay in a copy. Apply is a separate decision after verification.".into(),
+            "Edits stay in a copy until you apply the reviewed result.".into(),
         ]);
-        if !p.warnings.is_empty() {
+        // The pending-approval note is stale once the session allowed checks.
+        let notes: Vec<&String> = p
+            .warnings
+            .iter()
+            .filter(|w| !(r.approve_host_execution && w.contains("require separate host approval")))
+            .collect();
+        if !notes.is_empty() {
             lines.extend([String::new(), "NOTES".into()]);
-            lines.extend(p.warnings.iter().cloned());
+            lines.extend(notes.into_iter().cloned());
         }
         Self {
             task_id,

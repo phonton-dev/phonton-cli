@@ -22,6 +22,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   (`phonton goal --local show RUN_ID` keeps the full receipt). `goal --local`
   accepts flags before the goal text, and `apply`/`rollback` print one-line
   results.
+- [changed] The TUI's local plan review lists files, checks, model, and
+  budget without per-file hashes or model digests (they stay in the run
+  receipt), and drops the "requires host approval" note once checks are
+  allowed for the session.
 - [changed] An Ollama provider with no configured model uses the model
   Phonton calibrated instead of `llama3.2:3b`, and Ollama errors include the
   HTTP status and response body.
