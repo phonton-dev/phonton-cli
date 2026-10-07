@@ -513,6 +513,9 @@ pub struct App {
     /// Finished runs not yet written to the record file (the event loop
     /// saves them; tests never touch the user's record).
     pub unsaved_runs: Vec<(record::Outcome, u64, record::TokenOrigin)>,
+    /// False when the configured provider has no usable key. Goals are then
+    /// routed to Settings instead of starting a run that can only fail.
+    pub model_ready: bool,
 }
 
 /// How long a first Esc/Ctrl+C stays armed waiting for confirmation.
@@ -561,6 +564,7 @@ impl App {
             machine: Machine::default(),
             motion: std::env::var_os("PHONTON_REDUCED_MOTION").is_none(),
             unsaved_runs: Vec::new(),
+            model_ready: true,
         }
     }
 
@@ -688,6 +692,23 @@ fn char_count(s: &str) -> usize {
 /// (which is invariably multiple words separated by spaces) but should
 /// catch a pasted key whether or not the user knew which provider it
 /// came from.
+/// Provider implied by an unambiguous key prefix. Bare `sk-` is shared by
+/// OpenAI, DeepSeek and others, so it is left to the user.
+fn provider_for_key_prefix(key: &str) -> Option<&'static str> {
+    [
+        ("sk-ant-", "anthropic"),
+        ("sk-or-", "openrouter"),
+        ("sk-proj-", "openai"),
+        ("AIza", "gemini"),
+        ("xai-", "xai"),
+        ("gsk_", "groq"),
+        ("tgp_v1_", "together"),
+    ]
+    .iter()
+    .find(|(prefix, _)| key.starts_with(prefix))
+    .map(|(_, provider)| *provider)
+}
+
 pub fn looks_like_api_key(s: &str) -> bool {
     let s = s.trim();
     // Multi-word inputs are almost certainly goals, not keys. A pasted
@@ -1500,10 +1521,27 @@ impl App {
                 // and a credential leak. Detect, refuse, and surface a
                 // clear redirect to Settings instead.
                 if looks_like_api_key(prompt.description.trim()) {
+                    let pasted = prompt.description.trim().to_string();
+                    self.help_open = false;
+                    if let Some(provider) = provider_for_key_prefix(&pasted) {
+                        self.settings.provider = provider.into();
+                        self.settings.model.clear();
+                    }
+                    self.settings.api_key = pasted;
+                    self.settings.message = Some(format!(
+                        "That looked like an API key, so it went here instead of to a model. \
+                         Provider: {}. Check it, then Enter to save.",
+                        self.settings.provider
+                    ));
+                    self.mode = Mode::Settings;
+                    return None;
+                }
+                if !self.model_ready {
+                    self.goal_prompt.insert_text(&prompt.display_text);
                     self.help_open = false;
                     self.settings.message = Some(
-                        "That looked like an API key — open Settings (/settings) and \
-                         paste it into the API Key field, not the Goal bar."
+                        "Add a model first: paste an API key into the Key field and press \
+                         Enter, or quit and run `phonton models setup` to run on this machine."
                             .into(),
                     );
                     self.mode = Mode::Settings;
@@ -3003,14 +3041,21 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled("phonton models", key),
                 Span::styled(" picks one for your GPU.", muted),
             ]),
-            (_, false) => Line::from(vec![
+            (_, false) if !app.model_ready => Line::from(vec![
                 Span::styled("  ○ ", Style::default().fg(WARN)),
+                Span::styled("No model yet. Paste an API key, or run ", muted),
+                Span::styled("phonton models setup", key),
+                Span::styled(" to use this machine.", muted),
+            ]),
+            (_, false) => Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(SUCCESS)),
                 Span::styled(
-                    format!("Cloud provider ({}). ", app.settings.provider),
-                    muted,
+                    format!("{} ", app.settings.provider),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                 ),
+                Span::styled("ready. ", muted),
                 Span::styled("phonton models", key),
-                Span::styled(" sets up a model on this machine.", muted),
+                Span::styled(" adds a model on this machine.", muted),
             ]),
         };
         let inner_w = area.width.saturating_sub(2);
@@ -6403,6 +6448,7 @@ async fn main() -> Result<()> {
     // is uniform across the session.
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new(&cfg);
+    app.model_ready = provider_key_for_run(&cfg.provider).is_some();
     app.nexus_status = detect_nexus_status(&working_dir);
 
     let store = match open_persistent_store() {
@@ -6464,28 +6510,14 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    // Perform auto update if a new version was found in the background
+    // Never install software behind the user's back: say an update exists
+    // and how to get it. Installs may come from npm, cargo or a script.
     if let Ok(guard) = pending_update.lock() {
         if let Some(ref version) = *guard {
             println!(
-                "\n\x1b[32m[System] A new version of Phonton is available (v{}). Auto-updating globally via npm...\x1b[0m",
-                version
+                "phonton {version} is available (you have {}). Update: npm install -g phonton-cli@latest",
+                env!("CARGO_PKG_VERSION")
             );
-            let status = if cfg!(windows) {
-                std::process::Command::new("powershell")
-                    .args([
-                        "-Command",
-                        "Start-Sleep -Seconds 2; npm install -g phonton-cli@latest",
-                    ])
-                    .spawn()
-            } else {
-                std::process::Command::new("sh")
-                    .args(["-c", "sleep 2 && npm install -g phonton-cli@latest"])
-                    .spawn()
-            };
-            if let Ok(mut child) = status {
-                let _ = child.try_wait();
-            }
         }
     }
 
@@ -6744,6 +6776,7 @@ async fn run_app<B: Backend>(
                             // affect goals (which read cfg per-spawn) and
                             // leave Ask stuck on the startup provider.
                             ask_provider = load_ask_provider(&cfg);
+                            app.model_ready = provider_key_for_run(&cfg.provider).is_some();
 
                             match config::save(&cfg) {
                                 Ok(_) => {
@@ -9032,6 +9065,25 @@ fn extract_id(line: &str) -> Option<String> {
                 .contains("API key"),
             "user-facing toast should explain why"
         );
+        assert_eq!(app.settings.api_key, "sk-ant-FAKE_TEST_KEY_123456");
+        assert_eq!(app.settings.provider, "anthropic");
+    }
+
+    #[test]
+    fn goal_without_a_model_opens_settings_and_keeps_the_text() {
+        let mut app = App {
+            model_ready: false,
+            host_checks_approved: Some(true),
+            ..App::default()
+        };
+        for c in "fix the failing test".chars() {
+            app.handle_key(key(c));
+        }
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(intent.is_none());
+        assert!(app.goals.is_empty());
+        assert_eq!(app.mode, Mode::Settings);
+        assert_eq!(app.goal_prompt.text(), "fix the failing test");
     }
 
     #[test]

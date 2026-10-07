@@ -229,16 +229,66 @@ pub fn load() -> Result<Config> {
     };
 
     if !path.exists() {
-        return Ok(Config::default());
+        let mut cfg = Config::default();
+        autodetect_provider(&mut cfg.provider, local_model_selected());
+        return Ok(cfg);
     }
 
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
 
-    let cfg: Config = toml::from_str(&raw)
+    let mut cfg: Config = toml::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+    let provider_chosen = toml::from_str::<toml::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("provider")?.get("name").cloned())
+        .is_some();
+    if !provider_chosen {
+        autodetect_provider(&mut cfg.provider, local_model_selected());
+    }
 
     Ok(cfg)
+}
+
+/// Order in which environment keys pick a provider when the config file
+/// does not name one.
+const AUTODETECT_ORDER: &[&str] = &[
+    "anthropic",
+    "openai",
+    "deepseek",
+    "openrouter",
+    "gemini",
+    "groq",
+    "xai",
+    "together",
+];
+
+fn local_model_selected() -> bool {
+    crate::models_cli::settings().is_ok_and(|s| s.active_model.is_some())
+}
+
+/// With no provider named in the config, use the first one that has a key
+/// (config `[provider.keys]` or environment). With no key anywhere, a
+/// calibrated local model wins. Otherwise the default stays and doctor
+/// reports the missing key.
+fn autodetect_provider(provider: &mut ProviderConfig, local_model: bool) {
+    if resolve_api_key(provider).is_some() {
+        return;
+    }
+    for name in AUTODETECT_ORDER {
+        let probe = ProviderConfig {
+            name: (*name).to_string(),
+            keys: provider.keys.clone(),
+            ..ProviderConfig::default()
+        };
+        if resolve_api_key(&probe).is_some() {
+            provider.name = (*name).to_string();
+            return;
+        }
+    }
+    if local_model {
+        provider.name = "ollama".to_string();
+    }
 }
 
 /// Save configuration to the resolved config path.
@@ -328,6 +378,25 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autodetect_uses_configured_keys_then_local_model() {
+        let mut p = ProviderConfig::default();
+        p.keys.insert("deepseek".into(), "sk-test".into());
+        // Env may hold real keys on a dev machine; only assert when it does not.
+        if super::resolve_api_key(&ProviderConfig::default()).is_none()
+            && std::env::var_os("OPENAI_API_KEY").is_none()
+        {
+            super::autodetect_provider(&mut p, false);
+            assert_eq!(p.name, "deepseek");
+        }
+        let mut chosen = ProviderConfig {
+            api_key: Some("sk-ant-x".into()),
+            ..ProviderConfig::default()
+        };
+        super::autodetect_provider(&mut chosen, true);
+        assert_eq!(chosen.name, "anthropic");
+    }
+
     use super::*;
 
     #[test]
