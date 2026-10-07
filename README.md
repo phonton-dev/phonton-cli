@@ -82,27 +82,35 @@ receipt you can audit with `phonton review latest` and `phonton why-tokens`.
 
 ## Local models (preview)
 
-This branch adds a shared local model manager and a bounded local candidate
-runner on Ollama. It is a source-build preview, not yet in the npm package.
+Run on your own GPU with no key. Phonton measures what the model can do,
+asks it only for edits in a format it handled during calibration, runs your
+checks on a copy, and lands nothing until you apply the result.
 
 ```bash
-phonton models status              # hardware, runtime, installed models
-phonton models setup               # managed Ollama runtime
-phonton models install qwen2.5-coder:1.5b
-phonton models calibrate qwen2.5-coder:1.5b
-phonton models select qwen2.5-coder:1.5b
-phonton goal --local --plan "Fix parsePort validation" --repo ./my-project
-phonton goal --local "Fix parsePort validation" --repo ./my-project
-phonton goal --local apply RUN_ID --yes    # after reviewing the verified candidate
+phonton models setup                        # managed Ollama runtime (Windows x64)
+phonton models install qwen2.5-coder:3b
+phonton models calibrate qwen2.5-coder:3b   # probes which edit formats it can produce
+phonton models select qwen2.5-coder:3b
+phonton                                     # TUI: goals now run on the local model
+phonton goal "Add a count() method to TodoStore" --yes --allow-host-checks
+phonton goal --local apply RUN_ID --yes     # after reviewing the verified candidate
+phonton goal --local rollback RUN_ID --yes  # restore the original files
 ```
 
-Local runs never silently fall back to a cloud model. Full workflow, permissions
-and limits: [docs/local-harness.md](docs/local-harness.md) and the
-[local harness reference](docs/local-harness-reference.md).
+With provider `ollama` and a calibrated model selected, both the TUI and
+`phonton goal` use the local harness. Every goal pauses for plan approval,
+local runs never fall back to a cloud model, and the receipt says whether the
+runtime was verified as Phonton-managed.
 
-Local source snapshots omit generated `__pycache__` and `.pytest_cache`
-directories. Baseline and candidate checks still reject changed source bytes,
-unexpected source files, and changes to captured root-level bytecode.
+On macOS and Linux, install [Ollama](https://ollama.com/download) yourself.
+Phonton cannot verify a runtime it did not start (an Ollama install can relay
+cloud models), so the TUI plan review says so and your approval is consent
+for that goal; headless runs need `phonton goal --local ... --allow-unverified-runtime`.
+
+In our smoke runs, qwen2.5-coder:3b on a 6 GB laptop GPU finished small
+single-file edits in a Node repo in 20-30 s. Small models work best on one
+focused change at a time. Details and limits:
+[docs/local-harness.md](docs/local-harness.md).
 
 ---
 
@@ -145,7 +153,7 @@ phonton goal --prompt-file prompt.md --yes --allow-host-checks --json
 # Preview the task graph and GoalContract without editing files
 phonton plan --json "refactor auth layer"
 
-# Audit configuration, providers, store, trust, git, Cargo, and index backend
+# Audit configuration, provider key, store, trust, and the project's toolchains
 phonton doctor --provider
 
 # See where the latest goal spent tokens
@@ -235,8 +243,8 @@ At your option.
 
 ### TUI local plan approval
 
-On a calibrated local route, every goal pauses at its exact proposed scope,
-source hashes, check argument arrays, selected model/digest and budget. Press
+On a calibrated local route, every goal pauses at its proposed files, exact
+check arguments, model, runtime origin and budget. Press
 **Y** to approve that plan or **N / Esc** to cancel. Enter, paste and held-key
 repeats do not approve a plan. This is separate from host-check permission;
 plan approval never grants access to run project commands on the host.

@@ -5233,7 +5233,7 @@ fn print_help() {
          (none)            Launch the interactive TUI (default)\n  \
          ask <question>    One-shot Q&A using the configured provider\n  \
          benchmark         Export benchmark evidence from the latest run\n  \
-         doctor            Check config, store, trust, git, cargo, Nexus, and index backend\n  \
+         doctor            Check provider key, store, trust, and the project's toolchains\n  \
          extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
          skills            Inspect loaded skills\n  \
          steering          Inspect loaded steering rules\n  \

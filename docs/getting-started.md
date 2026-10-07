@@ -1,42 +1,73 @@
 # Getting started
 
-Install from npm or build from source. Configure a provider key in
-`~/.phonton/config.toml`, then run `phonton doctor`.
+## Install
 
-See `phonton doctor --provider` for a live completion probe.
+```bash
+npm install -g phonton-cli
+```
 
-## Five-minute path
+## Pick a model
+
+Either set a provider key in your environment (Anthropic, OpenAI, DeepSeek,
+OpenRouter, Gemini, Groq, Together, xAI):
+
+```bash
+export DEEPSEEK_API_KEY=...      # or ANTHROPIC_API_KEY, OPENAI_API_KEY, ...
+```
+
+or run a local model with no key (managed runtime on Windows x64; elsewhere
+install [Ollama](https://ollama.com/download) first):
+
+```bash
+phonton models setup
+phonton models install qwen2.5-coder:3b
+phonton models calibrate qwen2.5-coder:3b
+phonton models select qwen2.5-coder:3b
+```
+
+Then check the setup from your project folder:
 
 ```bash
 cd your-repo
-phonton demo trust-loop    # local proof without spending tokens
-phonton                     # TUI: submit a goal
-phonton goal "fix the failing test" --yes --allow-host-checks   # headless, after reviewing repo checks
-phonton review latest       # receipt + diffs
+phonton doctor             # key, store, trust, the project's toolchains
+phonton doctor --provider  # adds a live completion probe
 ```
 
-## Provider-only vs product-mode benchmarks
-
-- **Provider-only:** set `PHONTON_DISABLE_LOCAL_SEEDS=1` — all slices use your LLM.
-- **Syntax-preflight harness (Windows):** set `PHONTON_BENCH_PYTHON` to a Python 3
-  executable if `python` / `py -3` are not on PATH (`phonton doctor` reports status).
-- **Product-mode:** local templates may satisfy known benchmark slices with
-  `local-template` (zero provider tokens). Do not confuse with model efficiency.
-
-The TUI shows `execution: provider` or `local-template` on completed goals.
-
-## Pause / resume
-
-When a goal pauses on budget, resume with:
+## First goal
 
 ```bash
-phonton goal --resume <task-id>
+phonton                    # TUI: type a goal, press Enter
 ```
 
-Resume from the original repository. Pass `--allow-host-checks` again if you
-approve host verification for the resumed run.
+The first launch in a folder asks you to trust it. The first goal asks whether
+Phonton may run the project's own checks (build, tests) on this machine;
+without that, diffs are still written but cannot be marked verified.
 
-## Incremental index
+Headless, for scripts and CI:
+
+```bash
+phonton goal "fix the failing test" --yes --allow-host-checks
+phonton review latest            # receipt and diffs
+phonton review approve latest    # keep the change
+phonton review reject latest     # undo the task's edits
+```
+
+Local-model runs land nothing until you apply them:
+
+```bash
+phonton goal --local apply RUN_ID --yes
+phonton goal --local rollback RUN_ID --yes
+```
+
+## Pause and resume
+
+When a goal pauses on budget, resume it from the same repository:
+
+```bash
+phonton goal --resume <task-id> --allow-host-checks
+```
+
+## Keep the index fresh
 
 ```bash
 phonton index watch
@@ -44,5 +75,5 @@ phonton index watch
 
 ## Claims
 
-Public comparisons require fixture artifacts with `token_claim_eligible: true`.
-See [Benchmarks](https://phonton.dev/benchmarks.html).
+Public comparisons need reproducible artifacts; see
+[Benchmarks](BENCHMARKS.md).

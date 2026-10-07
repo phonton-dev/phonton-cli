@@ -16,12 +16,6 @@ Phonton benchmark claims must be reproducible. This repo should not publish broa
 
 This is useful for checking whether Phonton is producing compact plans and whether the planner's context strategy is moving in the right direction.
 
-## End-To-End Chess Suite
-
-The first public end-to-end method is [Chess Web v1](../benchmarks/suites/chess-web-v1/README.md).
-
-It uses one exact detailed prompt, a pinned web-app fixture, repeated runs, raw transcripts, final diffs, verification logs, token reports, and quality scoring. Use it to produce evidence, not slogans.
-
 ## What It Does Not Prove Yet
 
 The current harness does not prove end-to-end superiority over Codex, Claude Code, Cursor, or any other tool.
