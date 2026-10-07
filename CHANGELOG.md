@@ -75,6 +75,8 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Applying a local run that was already applied and rolled back
+  says so instead of reporting "different candidate evidence".
 - [fixed] Verification caches for workspaces unused for 7 days are deleted,
   so the shared Cargo target cache does not grow without bound in the temp
   directory.

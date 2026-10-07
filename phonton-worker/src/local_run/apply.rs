@@ -577,6 +577,11 @@ pub async fn apply_selected(
 
     let mut excluded = BTreeSet::new();
     if let Some(saved) = &previous {
+        if saved.state == "rolled_back" {
+            return Err(invalid(
+                "This run was already applied and rolled back; run the goal again to apply a fresh candidate",
+            ));
+        }
         if saved.run_id != receipt.id
             || saved.candidate_number != candidate_number
             || saved.baseline_sha256.as_deref() != Some(receipt.baseline_sha256.as_str())
