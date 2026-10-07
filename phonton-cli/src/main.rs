@@ -5167,8 +5167,8 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
 fn default_model_for(provider: &str) -> String {
     match provider {
         "anthropic" => "claude-haiku-4-5-20251001".into(),
-        "openai" => "gpt-4o-mini".into(),
-        "openrouter" => "openai/gpt-4o-mini".into(),
+        "openai" => "gpt-6-luna".into(),
+        "openrouter" => "openai/gpt-6-luna".into(),
         // `gemini-flash-latest` is an always-current alias that points at
         // whichever flash model is generally available on free-tier keys.
         // `gemini-2.5-flash` exists on most keys but the alias avoids
@@ -5185,9 +5185,9 @@ fn default_model_for(provider: &str) -> String {
             .and_then(|settings| settings.active_model)
             .unwrap_or_else(|| "llama3.2:3b".into()),
         "deepseek" => "deepseek-flash".into(),
-        "xai" | "grok" => "grok-2-mini".into(),
-        "groq" => "llama-3.3-70b-versatile".into(),
-        "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+        "xai" | "grok" => "grok-build-0.1".into(),
+        "groq" => "openai/gpt-oss-120b".into(),
+        "together" => "deepseek-ai/DeepSeek-V4.1-Flash".into(),
         _ => "unknown".into(),
     }
 }

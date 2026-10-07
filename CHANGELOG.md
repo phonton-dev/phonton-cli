@@ -63,6 +63,20 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Escalation no longer targets model ids that do not exist
+  (`claude-sonnet-4-5-20251001`, `claude-opus-4-7-20260115`,
+  `gpt-5.2-preview`, `gemini-2.0-flash`, `grok-2`, `grok-2-mini`). Tier
+  defaults now use current models checked against models.dev on 2026-10-07:
+  Anthropic Haiku 4.5 / Sonnet 5.5 / Opus 5.5, OpenAI GPT-6 Luna / 6.1 Sol /
+  6 Astra, OpenRouter GPT-6 Luna / Claude Sonnet 5.5 / Opus 5.5, Gemini
+  Flash-Lite / Flash / 3.1 Pro preview, xAI Grok Build 0.1 / 4.3 / 4.7, Groq
+  gpt-oss-120b / Qwen3.8 27B, Together DeepSeek V4.1 Flash / GLM-5.3 /
+  Kimi K3. DeepSeek escalates from flash to `deepseek-v4-pro` at the
+  standard tier instead of retrying flash.
+- [fixed] OpenAI-compatible requests allow 16,384 output tokens (was
+  4,096) so reasoning models do not spend the whole budget thinking.
+- [fixed] Provider transport errors include the underlying cause (DNS, TLS,
+  timeout) instead of only "error sending request".
 - [fixed] Local goals no longer overflow the stack on Windows debug builds;
   the CLI runs on a 16 MiB main thread and runtime workers.
 - [fixed] A piped `phonton models setup` returns once the managed runtime is

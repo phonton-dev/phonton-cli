@@ -12,8 +12,6 @@
 //! prepends a "Low Confidence Context" banner so the model treats the
 //! slices with caution. See `01-architecture/failure-modes.md` Risk 3.
 
-pub mod registry;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -27,32 +25,46 @@ use phonton_types::{
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 
+/// An error with its causes; reqwest's top-level message alone ("error
+/// sending request") does not say whether DNS, TLS, or a timeout failed.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// Maps a provider name and a requested [`ModelTier`] to a concrete model
 /// identifier.
 ///
-/// This is the heart of Phonton's multi-tier routing. For each tier, we
-/// pick the best-performing model in its price class as of April 2026.
+/// This is the heart of Phonton's multi-tier routing. Every id was checked
+/// against the models.dev catalog on 2026-10-07; a missing id makes
+/// escalation fail with a 404, so recheck when changing this table.
 pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
     match provider {
         "anthropic" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5-20251001".into(),
-            ModelTier::Standard => "claude-sonnet-4-5-20251001".into(),
-            ModelTier::Frontier => "claude-opus-4-7-20260115".into(),
+            ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5".into(),
+            ModelTier::Standard => "claude-sonnet-5-5".into(),
+            ModelTier::Frontier => "claude-opus-5-5".into(),
         },
         "openai" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "gpt-4o-mini".into(),
-            ModelTier::Standard => "gpt-4o".into(),
-            ModelTier::Frontier => "gpt-5.2-preview".into(),
+            ModelTier::Local | ModelTier::Cheap => "gpt-6-luna".into(),
+            ModelTier::Standard => "gpt-6.1-sol".into(),
+            ModelTier::Frontier => "gpt-6-astra".into(),
         },
         "openrouter" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "openai/gpt-4o-mini".into(),
-            ModelTier::Standard => "openai/gpt-4o".into(),
-            ModelTier::Frontier => "anthropic/claude-sonnet-4.5".into(),
+            ModelTier::Local | ModelTier::Cheap => "openai/gpt-6-luna".into(),
+            ModelTier::Standard => "anthropic/claude-sonnet-5.5".into(),
+            ModelTier::Frontier => "anthropic/claude-opus-5.5".into(),
         },
         "gemini" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "gemini-2.0-flash".into(),
-            ModelTier::Standard => "gemini-2.5-flash".into(),
-            ModelTier::Frontier => "gemini-2.5-pro".into(),
+            ModelTier::Local | ModelTier::Cheap => "gemini-flash-lite-latest".into(),
+            ModelTier::Standard => "gemini-flash-latest".into(),
+            ModelTier::Frontier => "gemini-3.1-pro-preview".into(),
         },
         "agentrouter" => match tier {
             ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5".into(),
@@ -62,23 +74,21 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
         "deepseek" => match tier {
             ModelTier::Local | ModelTier::Cheap => "deepseek-flash".into(),
-            ModelTier::Standard => "deepseek-flash".into(),
-            ModelTier::Frontier => "deepseek-v4-pro".into(),
+            ModelTier::Standard | ModelTier::Frontier => "deepseek-v4-pro".into(),
         },
         "xai" | "grok" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "grok-2-mini".into(),
-            ModelTier::Standard => "grok-2".into(),
-            ModelTier::Frontier => "grok-2".into(),
+            ModelTier::Local | ModelTier::Cheap => "grok-build-0.1".into(),
+            ModelTier::Standard => "grok-4.3".into(),
+            ModelTier::Frontier => "grok-4.7".into(),
         },
         "groq" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "llama-3.3-70b-versatile".into(),
-            ModelTier::Standard => "llama-3.3-70b-versatile".into(),
-            ModelTier::Frontier => "llama-3.3-70b-versatile".into(),
+            ModelTier::Local | ModelTier::Cheap => "openai/gpt-oss-120b".into(),
+            ModelTier::Standard | ModelTier::Frontier => "qwen/qwen3.8-27b".into(),
         },
         "together" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
-            ModelTier::Standard => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
-            ModelTier::Frontier => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+            ModelTier::Local | ModelTier::Cheap => "deepseek-ai/DeepSeek-V4.1-Flash".into(),
+            ModelTier::Standard => "zai-org/GLM-5.3".into(),
+            ModelTier::Frontier => "moonshotai/Kimi-K3".into(),
         },
         "ollama" => "llama3.2:3b".into(),
         _ => "unknown".into(),
@@ -458,6 +468,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
     let preferences: &[&str] = match name {
         "gemini" => &[
             // Strongest free-tier code generators first.
+            "gemini-flash-latest",
             "gemini-2.5-pro",
             "gemini-2.0-pro",
             "gemini-2.5-flash",
@@ -470,6 +481,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "flash",
         ],
         "anthropic" => &[
+            "claude-sonnet-5-5",
             "claude-sonnet-4-5",
             "claude-opus-4",
             "claude-haiku-4-5",
@@ -478,6 +490,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "opus",
         ],
         "openai" => &[
+            "gpt-6-luna",
             "gpt-4.1",
             "gpt-4o",
             "gpt-4o-mini",
@@ -486,6 +499,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "mini",
         ],
         "openrouter" => &[
+            "openai/gpt-6-luna",
             "anthropic/claude-sonnet",
             "openai/gpt-4o",
             "google/gemini-2.5-pro",
@@ -493,6 +507,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "anthropic/claude-haiku",
         ],
         "groq" => &[
+            "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
             "llama-3.1-70b",
             "mixtral",
@@ -500,8 +515,9 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "llama",
         ],
         "deepseek" => &["deepseek-flash", "deepseek-v4-pro", "deepseek"],
-        "xai" | "grok" => &["grok-2", "grok-beta", "grok"],
+        "xai" | "grok" => &["grok-build", "grok-4", "grok"],
         "together" => &[
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "meta-llama/Llama-3.3-70B-Instruct-Turbo",
             "Qwen/Qwen2.5-Coder-32B-Instruct",
             "Llama-3.3",
@@ -1169,7 +1185,7 @@ impl Provider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| ProviderError::Transport(error_chain(&e)))?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -1339,13 +1355,14 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             json!(user)
         };
-        // DeepSeek's models reason before answering and reasoning counts
-        // against the cap; at 4096 harder edits came back empty with
-        // finish_reason "length".
+        // Current models reason before answering and reasoning counts
+        // against the cap; at 4096 harder DeepSeek edits came back empty with
+        // finish_reason "length". 16k stays within every tier model's output
+        // limit (Groq's Qwen caps at 16,384); billing follows actual use.
         let max_tokens = if self.endpoint.contains("api.deepseek.com") {
             32_768
         } else {
-            4096
+            16_384
         };
         let body = json!({
             "model": self.model,
@@ -1374,7 +1391,7 @@ impl Provider for OpenAiCompatibleProvider {
         let http_resp = req
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| ProviderError::Transport(error_chain(&e)))?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -1486,7 +1503,7 @@ impl GeminiProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()).into())
+            .map_err(|e| ProviderError::Transport(error_chain(&e)).into())
     }
 
     async fn raw_generate_with_retry(
@@ -1934,15 +1951,12 @@ mod tests {
         );
         assert_eq!(
             model_for_tier("deepseek", ModelTier::Standard),
-            "deepseek-flash"
+            "deepseek-v4-pro"
         );
         assert_eq!(
             model_for_tier("deepseek", ModelTier::Frontier),
             "deepseek-v4-pro"
         );
-        let registry = registry::find_provider("deepseek").unwrap();
-        assert_eq!(registry.default_cheap, "deepseek-flash");
-        assert_eq!(registry.default_frontier, "deepseek-v4-pro");
     }
 
     /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`
