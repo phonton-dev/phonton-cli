@@ -19,10 +19,8 @@ or run a local model with no key (managed runtime on Windows x64; elsewhere
 install [Ollama](https://ollama.com/download) first):
 
 ```bash
-phonton models setup
-phonton models install qwen2.5-coder:3b
-phonton models calibrate qwen2.5-coder:3b
-phonton models select qwen2.5-coder:3b
+phonton models catalog                    # models that fit this machine
+phonton models setup qwen2.5-coder:3b     # runtime, download, calibrate, select
 ```
 
 Then check the setup from your project folder:
