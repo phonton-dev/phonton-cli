@@ -2093,7 +2093,9 @@ fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
             h.old_start = at as u32 + 1;
         }
     }
-    // new_start follows from the old positions and earlier hunks' growth.
+    // new_start follows from the old positions and earlier hunks' growth,
+    // by the materializer's rule: lines kept before the hunk, plus one when
+    // the new side is non-empty.
     let mut order: Vec<usize> = (0..hunks.len()).collect();
     order.sort_by_key(|&i| (hunks[i].file_path.clone(), hunks[i].old_start));
     let mut delta: i64 = 0;
@@ -2104,8 +2106,12 @@ fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
             file = Some(h.file_path.clone());
             delta = 0;
         }
-        let base = i64::from(h.old_start) + i64::from(h.old_count == 0);
-        h.new_start = (base + delta).max(0) as u32;
+        let kept_before = match h.old_count {
+            0 if h.old_start <= 1 && !root.join(&h.file_path).exists() => 0,
+            0 => i64::from(h.old_start),
+            _ => i64::from(h.old_start) - 1,
+        };
+        h.new_start = (kept_before + delta + i64::from(h.new_count > 0)).max(0) as u32;
         delta += i64::from(h.new_count) - i64::from(h.old_count);
     }
 }
@@ -2485,6 +2491,29 @@ mod tests {
         assert!(text.contains("line 9\nline ten\nline 11\n"));
         assert!(text.contains("line 29\ninserted\nline 30\n"));
         assert_eq!(text.lines().count(), 41);
+    }
+
+    #[test]
+    fn anchor_hunks_keeps_valid_deletions_and_new_files_applicable() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        // A context-free deletion's new side starts one line before it.
+        let mut hunks = parse_unified_diff(
+            "--- a/a.txt\n+++ b/a.txt\n@@ -5,1 +4,0 @@\n-five\n\
+             --- /dev/null\n+++ b/new.txt\n@@ -1,0 +1,1 @@\n+fresh\n",
+        )
+        .unwrap();
+        anchor_hunks(&mut hunks, temp.path());
+        assert_eq!((hunks[0].old_start, hunks[0].new_start), (5, 4));
+        assert_eq!(hunks[1].new_start, 1);
+        let applied = phonton_local::edit::materialize_hunks_with_new_files(
+            temp.path(),
+            &[PathBuf::from("a.txt"), PathBuf::from("new.txt")],
+            &hunks,
+        )
+        .unwrap();
+        assert_eq!(applied[&PathBuf::from("a.txt")], "one\ntwo\nthree\nfour\n");
+        assert_eq!(applied[&PathBuf::from("new.txt")], "fresh\n");
     }
 
     #[test]
