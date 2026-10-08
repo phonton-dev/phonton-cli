@@ -771,6 +771,19 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
                         // Git-backed path: apply hunks → stage → checkpoint commit.
                         let checkpoint = match diff.lock() {
                             Ok(mut d) => {
+                                // Reject restores this, not HEAD, so edits the
+                                // user made before the task are kept.
+                                if let Err(e) =
+                                    d.record_pre_task_state(self.task_id, &verified_paths)
+                                {
+                                    let reason =
+                                        format!("could not record pre-task file state: {e}");
+                                    warn!(error = %e, subtask = %sid, "record_pre_task_state failed");
+                                    fail_subtask(&mut runtimes, sid, reason.clone());
+                                    failure = Some((sid, reason));
+                                    checkpointed.insert(sid);
+                                    break;
+                                }
                                 if let Err(e) = d.apply_verified_hunks(&hunks) {
                                     let reason = format!("apply verified diff failed: {e}");
                                     warn!(error = %e, subtask = %sid, "apply_verified_hunks failed");

@@ -1520,7 +1520,7 @@ mod tests {
         let root = tmp.path();
         std::fs::write(
             root.join("package.json"),
-            r#"{"scripts":{"test":"node --test test/"}}"#,
+            r#"{"scripts":{"test":"node --test"}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();

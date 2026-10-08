@@ -95,7 +95,8 @@ for (const task of TASKS.filter((t) => !only || only.has(t.id))) {
     for (const [file, body] of Object.entries(task.hidden)) {
       fs.writeFileSync(path.join(dir, file), body);
     }
-    const accept = run("node", ["--test", "test/"], dir, 300);
+    // Bare --test: Node 22 reads "test/" as a file, not a directory.
+    const accept = run("node", ["--test"], dir, 300);
     const row = {
       task: task.id,
       arm,

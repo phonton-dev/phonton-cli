@@ -79,6 +79,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] `phonton review reject` restores each file to its state just before
+  the task, recorded when the task first edits it, not to `HEAD`: edits you
+  had not committed and untracked files the task changed are kept instead of
+  being reset or deleted.
 - [fixed] `phonton goal` with an unknown provider name in config stops with
   the list of valid names instead of planning and failing with "no provider
   API key configured".

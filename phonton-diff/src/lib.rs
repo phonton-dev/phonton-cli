@@ -109,6 +109,67 @@ impl DiffApplier {
         Ok(())
     }
 
+    /// Remember how `paths` look before a task first touches them: their
+    /// worktree bytes and index entry, or that they were absent. Call before
+    /// [`Self::apply_verified_hunks`]; paths already recorded for `task_id`
+    /// keep their first, pre-task snapshot. [`Self::revert_task`] restores
+    /// this snapshot, so edits the user made before the task survive a reject.
+    pub fn record_pre_task_state(&mut self, task_id: TaskId, paths: &[PathBuf]) -> Result<()> {
+        let ref_name = pre_task_ref(task_id);
+        let previous = self
+            .repo
+            .find_reference(&ref_name)
+            .ok()
+            .and_then(|r| r.peel_to_commit().ok());
+        let mut recorded = previous
+            .as_ref()
+            .map(|c| pre_task_manifest(c.message().unwrap_or_default()))
+            .unwrap_or_default();
+        let mut snapshot = git2::Index::new()?;
+        if let Some(commit) = &previous {
+            snapshot.read_tree(&commit.tree()?)?;
+        }
+        let mut live = self.repo.index()?;
+        live.read(true)?;
+        let mut added = false;
+        for path in paths {
+            let rel = repo_path_string(&self.repository_relative_path(path)?);
+            if !recorded.insert(rel.clone()) {
+                continue;
+            }
+            added = true;
+            let staged = live.get_path(Path::new(&rel), 0);
+            if let Ok(bytes) = std::fs::read(self.working_dir.join(path)) {
+                let mode = staged.as_ref().map_or(0o100644, |e| e.mode);
+                snapshot.add(&snapshot_entry(
+                    &format!("w/{rel}"),
+                    self.repo.blob(&bytes)?,
+                    mode,
+                ))?;
+            }
+            if let Some(entry) = staged {
+                snapshot.add(&snapshot_entry(&format!("i/{rel}"), entry.id, entry.mode))?;
+            }
+        }
+        if !added {
+            return Ok(());
+        }
+        let tree = self.repo.find_tree(snapshot.write_tree_to(&self.repo)?)?;
+        let sig = self
+            .repo
+            .signature()
+            .or_else(|_| Signature::now("phonton", "phonton@localhost"))?;
+        let manifest: Vec<&str> = recorded.iter().map(String::as_str).collect();
+        let message = format!("phonton:pretask task={task_id}\n\n{}", manifest.join("\n"));
+        let parents: Vec<&git2::Commit> = previous.iter().collect();
+        let oid = self
+            .repo
+            .commit(None, &sig, &sig, &message, &tree, &parents)?;
+        self.repo
+            .reference(&ref_name, oid, true, "phonton pre-task state")?;
+        Ok(())
+    }
+
     /// Borrow the underlying repository (for tests / advanced callers).
     pub fn repo(&self) -> &Repository {
         &self.repo
@@ -308,6 +369,58 @@ impl DiffApplier {
             }
         }
 
+        // Paths with a recorded pre-task snapshot go back to exactly that
+        // worktree and index state; others fall back to the first checkpoint's
+        // parent (tasks recorded before snapshots existed).
+        let pre_task = self
+            .repo
+            .find_reference(&pre_task_ref(task_id))
+            .ok()
+            .and_then(|r| r.peel_to_commit().ok());
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| anyhow!("repository has no worktree (bare repo)"))?
+            .to_path_buf();
+        let mut snapshotted = Vec::new();
+        if let Some(commit) = &pre_task {
+            let recorded = pre_task_manifest(commit.message().unwrap_or_default());
+            let tree = commit.tree()?;
+            for path in restore.iter().chain(remove.iter()) {
+                let rel = repo_path_string(path);
+                if !recorded.contains(&rel) {
+                    continue;
+                }
+                let full = workdir.join(path);
+                match tree.get_path(Path::new(&format!("w/{rel}"))) {
+                    Ok(entry) => {
+                        let blob = self.repo.find_blob(entry.id())?;
+                        if let Some(parent) = full.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&full, blob.content())?;
+                    }
+                    Err(_) => match std::fs::remove_file(&full) {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                        _ => {}
+                    },
+                }
+                match tree.get_path(Path::new(&format!("i/{rel}"))) {
+                    Ok(entry) => {
+                        index.add(&snapshot_entry(&rel, entry.id(), entry.filemode() as u32))?
+                    }
+                    Err(_) => {
+                        let _ = index.remove_path(path);
+                    }
+                }
+                snapshotted.push(path.clone());
+            }
+        }
+        index.write()?;
+        let restored: Vec<PathBuf> = snapshotted.clone();
+        restore.retain(|p| !snapshotted.contains(p));
+        remove.retain(|p| !snapshotted.contains(p));
+
         if let Some(base) = &base_tree {
             if !restore.is_empty() {
                 let mut co = git2::build::CheckoutBuilder::new();
@@ -318,11 +431,6 @@ impl DiffApplier {
                 self.repo.checkout_tree(base.as_object(), Some(&mut co))?;
             }
         }
-        let workdir = self
-            .repo
-            .workdir()
-            .ok_or_else(|| anyhow!("repository has no worktree (bare repo)"))?
-            .to_path_buf();
         index.read(true)?;
         for path in &remove {
             index.remove_path(path)?;
@@ -333,6 +441,7 @@ impl DiffApplier {
         }
         index.write()?;
         restore.extend(remove);
+        restore.extend(restored);
         Ok(restore)
     }
 
@@ -343,6 +452,45 @@ impl DiffApplier {
         Err(anyhow!(
             "Legacy checkpoint rollback is disabled: it could discard unrelated work. Use a local Apply journal for scoped rollback."
         ))
+    }
+}
+
+fn pre_task_ref(task_id: TaskId) -> String {
+    format!("refs/phonton/pretask/{task_id}")
+}
+
+/// Recorded paths, one per line after the pre-task commit's first blank line.
+fn pre_task_manifest(message: &str) -> BTreeSet<String> {
+    message
+        .split_once("\n\n")
+        .map(|(_, body)| {
+            body.lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Git paths use `/` on every platform.
+fn repo_path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn snapshot_entry(path: &str, id: git2::Oid, mode: u32) -> git2::IndexEntry {
+    git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: path.len().min(0xfff) as u16,
+        flags_extended: 0,
+        path: path.as_bytes().to_vec(),
     }
 }
 
@@ -497,6 +645,50 @@ mod tests {
             .filter_map(|s| s.path().map(str::to_string))
             .collect();
         assert_eq!(dirty, vec!["mine.txt".to_string()]);
+    }
+
+    #[test]
+    fn revert_keeps_edits_and_untracked_files_that_predate_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_repo_with_seed(tmp.path());
+        // Before the task: an unstaged edit to a tracked file and an
+        // untracked file, both of which the task then changes.
+        std::fs::write(tmp.path().join("seed.txt"), "user\n").unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "draft\n").unwrap();
+        let hunk = |path: &str, old: &str, new: &str| DiffHunk {
+            file_path: path.into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![DiffLine::Removed(old.into()), DiffLine::Added(new.into())],
+        };
+        let paths: Vec<PathBuf> = vec!["seed.txt".into(), "notes.txt".into()];
+        let mut applier = DiffApplier::open(tmp.path()).unwrap();
+        let task = TaskId::new();
+        applier.record_pre_task_state(task, &paths).unwrap();
+        applier
+            .apply_verified_hunks(&[
+                hunk("seed.txt", "user", "task"),
+                hunk("notes.txt", "draft", "task"),
+            ])
+            .unwrap();
+        applier
+            .commit_checkpoint(task, SubtaskId::new(), 1, "edit", &paths)
+            .unwrap();
+
+        assert_eq!(applier.revert_task(task).unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+            "user\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("notes.txt")).unwrap(),
+            "draft\n"
+        );
+        let status = |p: &str| repo.status_file(Path::new(p)).unwrap();
+        assert_eq!(status("seed.txt"), git2::Status::WT_MODIFIED);
+        assert_eq!(status("notes.txt"), git2::Status::WT_NEW);
     }
 
     #[test]
