@@ -79,6 +79,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] `phonton goal` with an unknown provider name in config stops with
+  the list of valid names instead of planning and failing with "no provider
+  API key configured".
 - [fixed] Local goal scope keeps a file whose text matches the goal at least
   as well as the best symbol match. "Reduce the maximum todo title length"
   selected only `src/store.js` (via `TodoStore`) and missed `MAX_TITLE` in

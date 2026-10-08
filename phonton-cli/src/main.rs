@@ -5831,6 +5831,17 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         }
     };
 
+    let provider = config::load()?.provider.name;
+    if !config::KNOWN_PROVIDERS.contains(&provider.as_str()) && provider != "grok" {
+        eprintln!(
+            "phonton goal: unknown provider `{provider}` in {}. Use one of: {}.",
+            config::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "config.toml".into()),
+            config::KNOWN_PROVIDERS.join(", ")
+        );
+        return Ok(2);
+    }
     if !opts.json && !opts.direct_task && opts.resume_task_id.is_none() {
         let cfg = config::load()?;
         let base_url = cfg.provider.base_url.clone().unwrap_or_default();
