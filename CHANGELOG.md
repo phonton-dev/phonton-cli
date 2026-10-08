@@ -4,6 +4,29 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.22.1 - Diffs that land
+
+### Fixed
+
+- [fixed] Workers' diffs no longer fail on miscounted `@@` line ranges. Phonton
+  recomputes each hunk's counts from its body and, when the stated line is
+  wrong, moves the hunk to where its unchanged and removed lines match the
+  current file (nearest match if several). Hunks that match nowhere still fail
+  verification. Asked directly, DeepSeek flash sent applicable ranges in 6 of
+  13 diffs; all 13 apply after this. On the new `ledger` smoke suite (4 tasks,
+  3 runs each, same model) acceptance stayed 12/12 while tokens fell 50%, cost
+  63% and wall time 55%, because fewer attempts were retries.
+- [fixed] `phonton models` progress prints stages without byte counts as plain
+  stages instead of `? / ? bytes`.
+
+### Added
+
+- [added] `phonton models setup MODEL` runs setup, install, calibrate and
+  select in one command and stops at the first failure. Plain
+  `phonton models setup` prints that next step.
+- [added] `fixtures/ledger` and four `ledger-*` smoke tasks: edits in the
+  middle of a 339-line module, scored by hidden tests.
+
 ## 0.22.0 - Product Hunt beta
 
 ### Added

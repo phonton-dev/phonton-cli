@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI Status" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars&color=ff69b4"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.22.0--beta-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.22.1--beta-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
@@ -89,10 +89,9 @@ asks it only for edits in a format it handled during calibration, runs your
 checks on a copy, and lands nothing until you apply the result.
 
 ```bash
-phonton models setup                        # managed Ollama runtime (Windows x64)
-phonton models install qwen2.5-coder:3b
-phonton models calibrate qwen2.5-coder:3b   # probes which edit formats it can produce
-phonton models select qwen2.5-coder:3b
+phonton models catalog                      # models that fit this machine
+phonton models setup qwen2.5-coder:3b       # runtime (Windows x64), download,
+                                            # calibrate edit formats, select
 phonton                                     # TUI: goals now run on the local model
 phonton goal "Add a count() method to TodoStore" --yes --allow-host-checks
 phonton goal --local apply RUN_ID --yes     # after reviewing the verified candidate
@@ -213,8 +212,9 @@ prompts, tool versions, model/provider names, provider-reported token usage
 where available, raw logs, final diffs, verification logs, quality review, and
 handoff evidence.
 
-Do not treat local-template runs, estimates, or incomplete artifact sets as
-token-efficiency wins.
+`benchmarks/smoke` runs fixed goals on fresh copies of `fixtures/` and scores
+them with hidden tests the run never sees; any build can be compared the same
+way. Method, commands and claim rules: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
 
