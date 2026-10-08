@@ -6,6 +6,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ## 0.22.1 - Diffs that land
 
+Smoke suite, DeepSeek flash, 12 tasks x 3 runs on three fixtures: 36/36
+accepted by hidden tests, 302,442 tokens, $0.186 in total.
+
 ### Fixed
 
 - [fixed] Workers' diffs no longer fail on miscounted `@@` line ranges. Phonton
