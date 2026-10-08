@@ -166,4 +166,109 @@ test('hidden: csv quoting', () => {
 `,
     },
   },
+  // shop: one 955-line, 28 KB module, larger than the worker inline limit.
+  {
+    id: "shop-coupon-expiry",
+    fixture: "shop",
+    goal: "In applyCoupon, reject a coupon whose `expires` date is before `today` with a ShopError whose message is `coupon <CODE> expired`. A coupon is still valid on its expires date, and coupons without `expires` never expire.",
+    hidden: {
+      "test/hidden-coupon-expiry.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const shop = require('../src/shop');
+function cart() {
+  const catalog = new shop.Catalog();
+  catalog.add({ sku: 'MUG-0001', name: 'Mug', price: 1000 });
+  const c = new shop.Cart(catalog);
+  c.add('MUG-0001');
+  return c;
+}
+const coupons = [
+  { code: 'OLD', kind: 'fixed', cents: 100, expires: '2026-05-31' },
+  { code: 'EDGE', kind: 'fixed', cents: 100, expires: '2026-06-01' },
+  { code: 'FOREVER', kind: 'fixed', cents: 100 },
+];
+test('hidden: expired coupons are rejected', () => {
+  assert.throws(() => shop.applyCoupon(cart(), coupons, 'old', '2026-06-01'), /coupon OLD expired/);
+});
+test('hidden: valid on the expiry date and without expiry', () => {
+  assert.strictEqual(shop.applyCoupon(cart(), coupons, 'edge', '2026-06-01').code, 'EDGE');
+  assert.strictEqual(shop.applyCoupon(cart(), coupons, 'forever', '2030-01-01').code, 'FOREVER');
+});
+`,
+    },
+  },
+  {
+    id: "shop-cancel-restock",
+    fixture: "shop",
+    goal: "When OrderBook.cancel cancels an order, release the stock that order reserved so it can be sold again.",
+    hidden: {
+      "test/hidden-cancel.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const shop = require('../src/shop');
+test('hidden: cancelling releases reserved stock', () => {
+  const catalog = new shop.Catalog();
+  catalog.add({ sku: 'TEE-0001', name: 'Tee', price: 2500 });
+  const stock = new shop.Stock();
+  stock.receive('TEE-0001', 5);
+  const book = new shop.OrderBook(stock);
+  const cart = new shop.Cart(catalog);
+  cart.add('TEE-0001', 2);
+  const order = book.place(cart, '2026-06-01');
+  assert.strictEqual(stock.available('TEE-0001'), 3);
+  book.cancel(order.id, '2026-06-01');
+  assert.strictEqual(stock.available('TEE-0001'), 5);
+  assert.strictEqual(stock.levels.get('TEE-0001'), 5);
+});
+`,
+    },
+  },
+  {
+    id: "shop-top-ties",
+    fixture: "shop",
+    goal: "Make topProducts order products with the same quantity by SKU, alphabetically, and leave out refunded orders as well as cancelled ones.",
+    hidden: {
+      "test/hidden-top.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const shop = require('../src/shop');
+test('hidden: ties by sku, refunded excluded', () => {
+  const orders = [
+    { status: 'paid', items: [{ sku: 'PEN-0001', qty: 2 }, { sku: 'CAP-0001', qty: 2 }] },
+    { status: 'refunded', items: [{ sku: 'MUG-0001', qty: 9 }] },
+    { status: 'cancelled', items: [{ sku: 'TEE-0001', qty: 9 }] },
+    { status: 'placed', items: [{ sku: 'BAG-0001', qty: 2 }] },
+  ];
+  assert.deepStrictEqual(shop.topProducts(orders, 3), [
+    { sku: 'BAG-0001', qty: 2 },
+    { sku: 'CAP-0001', qty: 2 },
+    { sku: 'PEN-0001', qty: 2 },
+  ]);
+});
+`,
+    },
+  },
+  {
+    id: "shop-review-duplicate",
+    fixture: "shop",
+    goal: "Reviews.add must reject a second review by the same customer for the same SKU with a ShopError whose code is `duplicate_review`. Different customers, or the same customer on another SKU, are fine.",
+    hidden: {
+      "test/hidden-review.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const shop = require('../src/shop');
+test('hidden: one review per customer per sku', () => {
+  const catalog = new shop.Catalog();
+  catalog.add({ sku: 'MUG-0001', name: 'Mug', price: 1000 });
+  catalog.add({ sku: 'TEE-0001', name: 'Tee', price: 1000 });
+  const r = new shop.Reviews(catalog);
+  r.add({ sku: 'MUG-0001', customer: 'ana', stars: 5, text: 'ok', date: '2026-06-01' });
+  assert.throws(
+    () => r.add({ sku: 'MUG-0001', customer: 'ana', stars: 4, text: 'again', date: '2026-06-02' }),
+    (e) => e.code === 'duplicate_review'
+  );
+  r.add({ sku: 'MUG-0001', customer: 'bo', stars: 4, text: 'ok', date: '2026-06-02' });
+  r.add({ sku: 'TEE-0001', customer: 'ana', stars: 3, text: 'ok', date: '2026-06-02' });
+  assert.strictEqual(r.items.length, 3);
+});
+`,
+    },
+  },
 ];

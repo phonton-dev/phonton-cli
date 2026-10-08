@@ -6,7 +6,8 @@ changes. It is not a comparison with any other tool.
 ## Method
 
 - Fixtures (Node, no dependencies, `node --test`): `fixtures/todo-api`, four
-  small files; `fixtures/ledger`, one 339-line module so edits land mid-file.
+  small files; `fixtures/ledger`, one 339-line module so edits land mid-file;
+  `fixtures/shop`, one 28 KB module, larger than the worker's whole-file limit.
 - Tasks: `tasks.mjs`. Each goal is a sentence a user might type.
 - Every run starts from a fresh git copy of the fixture in the temp
   directory, so runs are independent.
@@ -41,7 +42,7 @@ and USD per task.
 
 ## Limits
 
-- Eight small tasks on two fixtures; medians of three runs. Token use varies
+- Twelve small tasks on three fixtures; medians of three runs. Token use varies
   run to run (up to ~3x on the same goal in our runs), so single runs say
   little.
 - Wall time includes model latency and the fixture's own checks on this
