@@ -1268,10 +1268,15 @@ fn build_surgical_repair_context(
 
 /// Most files whose current source is inlined into one worker prompt.
 const MAX_TARGET_SOURCE_FILES: usize = 4;
-/// Largest single file inlined verbatim; bigger files are named, not sent.
+/// Largest single file inlined verbatim; bigger files are sent as excerpts.
 const MAX_TARGET_SOURCE_FILE_BYTES: usize = 24_000;
 /// Total inlined source budget per prompt.
 const MAX_TARGET_SOURCE_TOTAL_BYTES: usize = 48_000;
+/// Excerpt budget for one large file.
+const MAX_EXCERPT_BYTES: usize = 16_000;
+/// Lines shown before and after each excerpt anchor.
+const EXCERPT_LINES_BEFORE: usize = 15;
+const EXCERPT_LINES_AFTER: usize = 60;
 /// Completion notes sit in the compressible band so a long goal can
 /// summarise them instead of carrying every note verbatim.
 const COMPLETION_FRAME_PRIORITY: u8 = 2;
@@ -1375,12 +1380,29 @@ fn render_target_sources(
             continue;
         };
         let display = rel.to_string_lossy().replace('\\', "/");
+        let lang = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
         if bytes.len() > MAX_TARGET_SOURCE_FILE_BYTES
             || total + bytes.len() > MAX_TARGET_SOURCE_TOTAL_BYTES
         {
-            // ponytail: whole-file or nothing; windowed excerpts around the
-            // retrieved symbols would cover large files if this skips too often.
-            skipped.push(format!("{display} ({} bytes)", bytes.len()));
+            // Too big to send whole: send the regions around the names this
+            // subtask mentions or retrieved. Hunk anchoring places edits made
+            // against an excerpt.
+            let budget = MAX_EXCERPT_BYTES.min(MAX_TARGET_SOURCE_TOTAL_BYTES.saturating_sub(total));
+            let anchors = excerpt_anchors(subtask, slices, relevant, root, &rel);
+            let excerpt = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| source_excerpt(text, &anchors, budget, lang));
+            match excerpt {
+                Some(excerpt) => {
+                    total += excerpt.len();
+                    included += 1;
+                    out.push_str(&format!(
+                        "## {display} (excerpts of a {} byte file; edit only lines shown)\n{excerpt}",
+                        bytes.len()
+                    ));
+                }
+                None => skipped.push(format!("{display} ({} bytes)", bytes.len())),
+            }
             continue;
         }
         let Ok(text) = String::from_utf8(bytes) else {
@@ -1388,7 +1410,6 @@ fn render_target_sources(
         };
         total += text.len();
         included += 1;
-        let lang = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
         out.push_str(&format!("## {display}\n```{lang}\n{text}"));
         if !text.ends_with('\n') {
             out.push('\n');
@@ -1410,6 +1431,143 @@ fn render_target_sources(
     }
     section.push('\n');
     section
+}
+
+/// Names to look for in a large file, most specific first: identifiers the
+/// subtask text names (backticked, called, camelCase or dotted), then the
+/// symbols retrieval picked from this file.
+fn excerpt_anchors(
+    subtask: &Subtask,
+    slices: &[CodeSlice],
+    relevant: &[CodeSlice],
+    root: &Path,
+    rel: &Path,
+) -> Vec<String> {
+    let text = phonton_types::task_description_without_prior_context(&subtask.description);
+    let mut anchors: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if name.len() >= 3 && !anchors.iter().any(|a| a == name) {
+            anchors.push(name.to_string());
+        }
+    };
+    for (i, quoted) in text.split('`').enumerate() {
+        if i % 2 == 1 {
+            quoted
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .for_each(&mut push);
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut start = None;
+    for (i, c) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if c.is_alphanumeric() || c == '_' {
+            start.get_or_insert(i);
+            continue;
+        }
+        let Some(s) = start.take() else { continue };
+        let word = &text[s..i];
+        let called = c == '(';
+        let dotted = c == '.' || (s > 0 && bytes[s - 1] == b'.');
+        let cased = word.chars().skip(1).any(|ch| ch.is_uppercase()) || word.contains('_');
+        if called || dotted || cased {
+            push(word);
+        }
+    }
+    for s in slices.iter().chain(relevant) {
+        if relative_to_root(&s.file_path, root).as_deref() == Some(rel) {
+            if let Some(name) = s.symbol_name.rsplit(&[':', '.'][..]).next() {
+                push(name);
+            }
+        }
+    }
+    anchors
+}
+
+/// Line windows around each anchor's definitions first, then its uses (at
+/// most three hits per anchor), merged, rendered as fenced blocks with their
+/// line numbers, within `budget` bytes. `None` when no anchor occurs.
+fn source_excerpt(text: &str, anchors: &[String], budget: usize, lang: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mentions = |line: &str, name: &str| {
+        line.match_indices(name).any(|(at, _)| {
+            !line[..at].chars().next_back().is_some_and(is_word)
+                && !line[at + name.len()..].chars().next().is_some_and(is_word)
+        })
+    };
+    let defines = |line: &str, name: &str| {
+        let t = line.trim_start();
+        [
+            "function ",
+            "class ",
+            "fn ",
+            "pub fn ",
+            "async fn ",
+            "def ",
+            "struct ",
+            "enum ",
+            "impl ",
+            "const ",
+            "let ",
+            "export ",
+            "async ",
+            "static ",
+        ]
+        .iter()
+        .any(|kw| t.starts_with(kw))
+            || t.starts_with(&format!("{name}("))
+            || t.starts_with(&format!("{name} ="))
+    };
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    let size = |ws: &[(usize, usize)]| -> usize {
+        ws.iter()
+            .map(|&(a, b)| lines[a..b].iter().map(|l| l.len() + 1).sum::<usize>() + 40)
+            .sum()
+    };
+    for name in anchors {
+        let hits: Vec<usize> = (0..lines.len())
+            .filter(|&i| mentions(lines[i], name))
+            .collect();
+        let (defs, uses): (Vec<usize>, Vec<usize>) =
+            hits.into_iter().partition(|&i| defines(lines[i], name));
+        for hit in defs.into_iter().chain(uses).take(3) {
+            let window = (
+                hit.saturating_sub(EXCERPT_LINES_BEFORE),
+                (hit + EXCERPT_LINES_AFTER).min(lines.len()),
+            );
+            let mut next = windows.clone();
+            next.push(window);
+            next.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (a, b) in next {
+                match merged.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => merged.push((a, b)),
+                }
+            }
+            if size(&merged) > budget {
+                break;
+            }
+            windows = merged;
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (a, b) in windows {
+        out.push_str(&format!(
+            "lines {}-{} of {}:\n```{lang}\n{}\n```\n",
+            a + 1,
+            b,
+            lines.len(),
+            lines[a..b].join("\n")
+        ));
+    }
+    Some(out)
 }
 
 fn missing_required_touch_files(
@@ -2374,6 +2532,26 @@ mod tests {
         assert!(rendered.contains("Too large to inline"));
         assert!(!rendered.contains(&big));
         assert!(!rendered.contains("outside.rs"));
+    }
+
+    #[test]
+    fn large_files_are_sent_as_excerpts_around_named_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut big: String = (0..900)
+            .map(|n| format!("function filler{n}() {{ return {n}; }}\n"))
+            .collect();
+        big.push_str("function applyCoupon(cart, code) {\n  return cart;\n}\n");
+        std::fs::write(temp.path().join("shop.js"), &big).unwrap();
+        assert!(big.len() > MAX_TARGET_SOURCE_FILE_BYTES);
+        let subtask = plain_subtask("Fix shop.js so applyCoupon rejects expired coupons");
+        let rendered = render_target_sources(&subtask, &[], &[], temp.path());
+        assert!(
+            rendered.contains("function applyCoupon(cart, code) {"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("lines 886-904 of 904"));
+        assert!(!rendered.contains("filler10()"));
+        assert!(!rendered.contains("Too large to inline"));
     }
 
     #[test]
