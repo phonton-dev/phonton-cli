@@ -90,4 +90,80 @@ test('hidden: 80 characters allowed, 81 rejected', () => {
 `,
     },
   },
+  // ledger: one 339-line module, so edits land mid-file.
+  {
+    id: "ledger-thousands",
+    fixture: "ledger",
+    goal: "Add an optional second argument to formatAmount: with `{ grouped: true }` it groups thousands with commas, e.g. 1234567.5 becomes `1,234,567.50` and -1200 becomes `-1,200.00`. Without it the output is unchanged.",
+    hidden: {
+      "test/hidden-thousands.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const { formatAmount } = require('../src/ledger');
+test('hidden: grouped thousands', () => {
+  assert.strictEqual(formatAmount(1234567.5, { grouped: true }), '1,234,567.50');
+  assert.strictEqual(formatAmount(-1200, { grouped: true }), '-1,200.00');
+  assert.strictEqual(formatAmount(999.999, { grouped: true }), '1,000.00');
+  assert.strictEqual(formatAmount(12.5, { grouped: true }), '12.50');
+});
+test('hidden: default output unchanged', () => {
+  assert.strictEqual(formatAmount(1234567.5), '1234567.50');
+});
+`,
+    },
+  },
+  {
+    id: "ledger-parens",
+    fixture: "ledger",
+    goal: "Let journal amounts use accounting-style negatives in parentheses: `(12.50)` means -12.50. A sign inside the parentheses, like `(-3)`, is a bad amount. Other amount rules stay the same.",
+    hidden: {
+      "test/hidden-parens.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const { parseAmount, Ledger } = require('../src/ledger');
+test('hidden: parenthesized negatives', () => {
+  assert.strictEqual(parseAmount('(12.50)'), -12.5);
+  assert.strictEqual(parseAmount('7'), 7);
+  assert.throws(() => parseAmount('(-3)'));
+  assert.throws(() => parseAmount('(3'));
+  const l = Ledger.fromJournal('2026-06-01 Tea\\n  expenses:food  4\\n  assets:checking  (4)\\n');
+  assert.strictEqual(l.balance('assets'), -4);
+});
+`,
+    },
+  },
+  {
+    id: "ledger-balance-on",
+    fixture: "ledger",
+    goal: "Add a balanceOn(account, date) method to Ledger that works like balance(account) but counts only transactions dated on or before `date` (YYYY-MM-DD).",
+    hidden: {
+      "test/hidden-balance-on.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const { Ledger } = require('../src/ledger');
+const J = '2026-06-01 A\\n  expenses:food  10\\n  assets:checking  -10\\n\\n2026-06-05 B\\n  expenses:food:out  5\\n  assets:checking  -5\\n';
+test('hidden: balanceOn cuts off by date, inclusive', () => {
+  const l = Ledger.fromJournal(J);
+  assert.strictEqual(l.balanceOn('expenses', '2026-05-31'), 0);
+  assert.strictEqual(l.balanceOn('expenses', '2026-06-01'), 10);
+  assert.strictEqual(l.balanceOn('expenses', '2026-06-05'), 15);
+  assert.strictEqual(l.balanceOn('assets:checking', '2026-12-31'), -15);
+});
+`,
+    },
+  },
+  {
+    id: "ledger-csv-quote",
+    fixture: "ledger",
+    goal: "Make csvExport quote any field that contains a comma, a double quote, or a newline, doubling embedded double quotes (RFC 4180). Other fields stay unquoted.",
+    hidden: {
+      "test/hidden-csv.test.js": `const test = require('node:test');
+const assert = require('node:assert');
+const { Ledger, csvExport } = require('../src/ledger');
+test('hidden: csv quoting', () => {
+  const l = Ledger.fromJournal('2026-06-01 Tea, "fancy"\\n  expenses:food  4\\n  assets:checking  -4\\n');
+  const rows = csvExport(l).split('\\n');
+  assert.strictEqual(rows[0], 'date,description,account,amount');
+  assert.strictEqual(rows[1], '2026-06-01,"Tea, ""fancy""",expenses:food,4.00');
+});
+`,
+    },
+  },
 ];

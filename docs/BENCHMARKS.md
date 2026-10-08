@@ -1,100 +1,66 @@
 # Phonton CLI Benchmarks
 
-Phonton benchmark claims must be reproducible. This repo should not publish broad "saves X percent" claims from a single lucky run.
+Phonton benchmark claims must be reproducible from this repository. No broad
+"saves X percent" claims from a single lucky run.
 
-## What The Current Harness Measures
+## Smoke benchmark (end to end)
 
-`scripts/benchmark-plan.ps1` measures the planning layer:
+`benchmarks/smoke/run.mjs` runs real goals and scores them the way a reviewer
+would:
 
-- goal text;
-- generated subtask count;
-- estimated Phonton task tokens;
-- planner naive-baseline tokens;
-- estimated reduction versus the naive baseline;
-- wall-clock runtime;
-- pass/fail status.
+1. Copy a fixture from `fixtures/` into a fresh git repository.
+2. Run `phonton goal --yes --allow-host-checks --json "<goal>"` (cloud arm) or
+   `phonton goal --local ...` (local arm) on it.
+3. Write hidden tests the run never saw, then run `node --test`. Acceptance is
+   that exit code, not Phonton's own verdict.
+4. Record status, wall time, provider-reported tokens and cost, the diff, and
+   raw stdout/stderr under `benchmarks/results/` (git-ignored).
 
-This is useful for checking whether Phonton is producing compact plans and whether the planner's context strategy is moving in the right direction.
+Fixtures:
 
-## What It Does Not Prove Yet
+- `todo-api`: four small files; add methods, sort, change a limit.
+- `ledger`: one 339-line module; edits land mid-file.
 
-The current harness does not prove end-to-end superiority over Codex, Claude Code, Cursor, or any other tool.
-
-It does not yet measure:
-
-- actual provider billable input/output tokens;
-- cached-token behavior by provider;
-- diff correctness after human review;
-- time-to-merged-change;
-- quality compared with a competitor on the same task;
-- full autonomous edit success rate.
-
-Treat current benchmark numbers as internal release evidence, not public marketing claims.
-
-## Run The Benchmark
-
-From the repo root:
-
-```powershell
-.\scripts\benchmark-plan.ps1
+```bash
+cargo build --release -p phonton-cli
+node benchmarks/smoke/run.mjs --arm cloud --runs 3
+node benchmarks/smoke/run.mjs --arm local --runs 3 --tasks todo-count
+node benchmarks/smoke/run.mjs --arm cloud --bin path/to/other/phonton.exe --out benchmarks/results/other
 ```
 
-Use a custom set of goals:
+Set `PHONTON_HOME` to an isolated profile so runs do not touch your own
+memory or settings. Tasks and their hidden tests live in
+`benchmarks/smoke/tasks.mjs`; every hidden test fails on the untouched fixture
+and passes with a reference fix.
 
-```powershell
-.\scripts\benchmark-plan.ps1 -Goals @(
-  "add input validation to config loading",
-  "improve provider auth error messages",
-  "write tests for rollback failure handling"
-)
-```
+What it does not prove: anything about tasks unlike these, other machines, or
+other tools. n = 3 per task is enough to catch regressions and big wins, not
+small differences. Token use for the same goal can vary 2-3x between runs;
+report medians or totals over all runs, never the best run.
 
-Write reports somewhere else:
+## Plan benchmark (planner only)
+
+`scripts/benchmark-plan.ps1` measures the planning layer: subtask count,
+estimated tokens against a naive baseline, and runtime. It makes no model edits
+and proves nothing about end-to-end success.
 
 ```powershell
 .\scripts\benchmark-plan.ps1 -OutDir tmp\benchmarks
 ```
 
-## Interpreting Results
+## Public claim rules
 
-The report includes an estimated reduction:
+Allowed with artifacts from this harness:
 
-```text
-1 - (estimated_total_tokens / naive_baseline_tokens)
-```
+- Acceptance, wall time, tokens and cost on the named fixtures, model, and
+  version, with n stated.
+- Before/after comparisons of two Phonton builds run the same way.
 
-This number is only as good as the planner's baseline estimate. It is still useful because the same formula can be tracked across commits and tasks.
+Not allowed without new evidence:
 
-Good release evidence should include:
-
-- at least 10 real repo tasks;
-- raw JSON report;
-- Markdown summary;
-- exact commit hash;
-- exact Phonton version;
-- provider/model where live model calls are used;
-- verification command results;
-- failures, not just wins.
-
-## Public Claim Rules
-
-Allowed before broader data:
-
-- "Designed for context efficiency."
-- "Includes benchmark tooling for plan-token estimates."
-- "Measures compact plans against a naive baseline."
-
-Avoid until there is repeatable evidence:
-
-- "Saves 5x tokens."
-- "Cheaper than Claude Code/Codex/Cursor."
-- "Best ADE."
+- "Saves N% tokens" in general, or against another tool.
+- "Cheaper/better than Claude Code, Codex, Cursor" or "best ADE".
 - "Fully autonomous."
 
-## Next Benchmark Milestones
-
-1. Add end-to-end task benchmark support for goal -> diff -> verification -> review.
-2. Capture actual provider usage when providers expose token counts.
-3. Compare Phonton against a documented baseline workflow on the same repo and task.
-4. Store benchmark fixtures under `benchmarks/fixtures/`.
-5. Publish raw reports with every release candidate.
+Results from Phonton 0.16 to 0.21 are not used for claims: those builds
+contained hardcoded answers for some benchmark fixtures (removed in 0.22.0).
