@@ -61,17 +61,22 @@ impl ProgressPrinter {
             }
         }
         let count = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
-        let line = format!(
-            "{}{}: {} / {} bytes",
-            event.status,
-            event
-                .digest
-                .as_ref()
-                .map(|digest| format!(" {digest}"))
-                .unwrap_or_default(),
-            count(event.completed),
-            count(event.total)
-        );
+        let digest = event
+            .digest
+            .as_ref()
+            .map(|digest| format!(" {digest}"))
+            .unwrap_or_default();
+        // A stage with no byte counts ("verifying digest") prints as a stage.
+        let line = if event.completed.is_none() && event.total.is_none() {
+            format!("{}{digest}", event.status)
+        } else {
+            format!(
+                "{}{digest}: {} / {} bytes",
+                event.status,
+                count(event.completed),
+                count(event.total)
+            )
+        };
         self.last = Some(event);
         self.at = elapsed;
         Some(line)
@@ -1614,7 +1619,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     if matches!(verb, "--help" | "-h" | "help")
         || (verb == "status" && args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
     {
-        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup|catalog [--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nStatus always prints JSON; --json is accepted for consistency. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise, on Windows x64 setup downloads a hash-checked portable Ollama runtime (about 1.5 GB).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
+        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL]|catalog [--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus always prints JSON; --json is accepted for consistency. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise, on Windows x64 setup downloads a hash-checked portable Ollama runtime (about 1.5 GB).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
         return Ok(0);
     }
     let value = match verb {
@@ -1644,6 +1649,36 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 ctrl_c_requested(),
             )
             .await?
+        }
+        // One command from nothing to a selected model: runtime, weights,
+        // calibration, selection. Stops at the first step that fails.
+        "setup" if args.len() == 2 => {
+            let model = args[1].as_str();
+            let mut steps = serde_json::Map::new();
+            for step in ["setup", "install", "calibrate", "select"] {
+                let target = if step == "setup" { "" } else { model };
+                eprintln!("phonton models {}", format!("{step} {target}").trim_end());
+                let value = await_model_mutation(
+                    step,
+                    mutate(step, target, None, |event| {
+                        if let Some(line) = printer.line(event, started.elapsed()) {
+                            eprintln!("{line}");
+                        }
+                    }),
+                    ctrl_c_requested(),
+                )
+                .await?;
+                let failed = calibration_exit_code(step, &value) != 0;
+                steps.insert(step.into(), value);
+                if failed {
+                    println!("{}", serde_json::to_string_pretty(&steps)?);
+                    eprintln!("Calibration evidence was saved, but no edit format passed. Inspect the probe outputs above; {model} cannot be selected. Try another model from `phonton models catalog`.");
+                    return Ok(2);
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&steps)?);
+            eprintln!("Ready: {model} is calibrated and selected. Run `phonton` and type a goal, or `phonton goal \"<goal>\" --yes --allow-host-checks`.");
+            return Ok(0);
         }
         "deselect" if args.len() == 1 => {
             await_model_mutation(
@@ -1679,6 +1714,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
         _ => bail!("Unknown models command. Run phonton models --help"),
     };
     println!("{}", serde_json::to_string_pretty(&value)?);
+    if verb == "setup" {
+        eprintln!("Next: `phonton models setup MODEL` installs, calibrates and selects a model; `phonton models catalog` lists the ones that fit this machine.");
+    }
     let exit_code = calibration_exit_code(verb, &value);
     if exit_code != 0 {
         eprintln!("Calibration evidence was saved, but no edit format passed. Inspect the probe outputs above; this model cannot be selected yet.");
@@ -3589,7 +3627,7 @@ mod tests {
         };
         assert_eq!(
             printer.line(stage, Duration::from_millis(3)).unwrap(),
-            "verifying digest: ? / ? bytes"
+            "verifying digest"
         );
     }
 }

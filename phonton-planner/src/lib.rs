@@ -335,7 +335,7 @@ fn build_decomposer_prompt(goal: &str, memory_context: &str) -> String {
         memory_context.to_string()
     };
     format!(
-        "You are a software task decomposer. Break the following goal into 2–6 concrete subtasks.\n\
+        "You are a software task decomposer. Break the following goal into the fewest concrete subtasks that cover it, at most 6. A single focused change is one subtask. Split only when the goal asks for several independent changes, and add a test subtask only when the goal asks for tests.\n\
 \n\
 Prior context from memory:\n\
 {ctx}\n\
@@ -868,7 +868,6 @@ fn is_broad_goal(description: &str) -> bool {
         "architecture",
         "multi-agent",
         "swarm",
-        "release",
         "everything",
         "next update",
     ]
@@ -1170,6 +1169,15 @@ Validate maxRetries as an integer from 0 through 10.";
             !is_broad_goal(prompt),
             "single-file bugfix prompts should not activate swarm planning"
         );
+    }
+
+    #[test]
+    fn releasing_a_resource_is_not_broad_work() {
+        // "release" used to mark a goal broad, so this one-line fix got a
+        // multi-subtask LLM plan.
+        assert!(!is_broad_goal(
+            "When OrderBook.cancel cancels an order, release the stock that order reserved."
+        ));
     }
 
     #[test]

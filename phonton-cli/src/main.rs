@@ -5223,7 +5223,8 @@ fn print_help() {
          QUICK START:\n  \
          phonton doctor           check provider key, git, and local tools\n  \
          phonton                  open the TUI and type a goal\n  \
-         phonton models setup     run on local models instead of a cloud key\n  \
+         phonton models setup qwen2.5-coder:3b\n                           \
+         run on a local model instead of a cloud key\n  \
          phonton why-tokens       see where the last goal spent tokens\n\
          \n\
          USAGE:\n  \
@@ -6016,7 +6017,7 @@ pub(crate) async fn execute_headless_goal(
         }
     };
     if resume_from.is_none() {
-        contract_preflight::apply_workspace_preflight(&mut plan, &working_dir, &goal_text_for_run);
+        contract_preflight::apply_workspace_preflight(&mut plan, &working_dir);
     }
 
     let initial_state = GlobalState {
@@ -7858,7 +7859,7 @@ async fn spawn_goal(
             return;
         }
     };
-    contract_preflight::apply_workspace_preflight(&mut plan, working_dir, &text);
+    contract_preflight::apply_workspace_preflight(&mut plan, working_dir);
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,

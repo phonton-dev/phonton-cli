@@ -451,7 +451,10 @@ impl Worker {
             }
 
             let hunks = match parse_unified_diff(&response.content) {
-                Ok(h) => h,
+                Ok(mut h) => {
+                    anchor_hunks(&mut h, self.guard.project_root());
+                    h
+                }
                 Err(e) => {
                     warn!(attempt, error = %e, "worker could not parse diff; will retry with feedback");
                     let errors = vec![format!(
@@ -1265,10 +1268,15 @@ fn build_surgical_repair_context(
 
 /// Most files whose current source is inlined into one worker prompt.
 const MAX_TARGET_SOURCE_FILES: usize = 4;
-/// Largest single file inlined verbatim; bigger files are named, not sent.
+/// Largest single file inlined verbatim; bigger files are sent as excerpts.
 const MAX_TARGET_SOURCE_FILE_BYTES: usize = 24_000;
 /// Total inlined source budget per prompt.
 const MAX_TARGET_SOURCE_TOTAL_BYTES: usize = 48_000;
+/// Excerpt budget for one large file.
+const MAX_EXCERPT_BYTES: usize = 16_000;
+/// Lines shown before and after each excerpt anchor.
+const EXCERPT_LINES_BEFORE: usize = 15;
+const EXCERPT_LINES_AFTER: usize = 60;
 /// Completion notes sit in the compressible band so a long goal can
 /// summarise them instead of carrying every note verbatim.
 const COMPLETION_FRAME_PRIORITY: u8 = 2;
@@ -1372,12 +1380,29 @@ fn render_target_sources(
             continue;
         };
         let display = rel.to_string_lossy().replace('\\', "/");
+        let lang = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
         if bytes.len() > MAX_TARGET_SOURCE_FILE_BYTES
             || total + bytes.len() > MAX_TARGET_SOURCE_TOTAL_BYTES
         {
-            // ponytail: whole-file or nothing; windowed excerpts around the
-            // retrieved symbols would cover large files if this skips too often.
-            skipped.push(format!("{display} ({} bytes)", bytes.len()));
+            // Too big to send whole: send the regions around the names this
+            // subtask mentions or retrieved. Hunk anchoring places edits made
+            // against an excerpt.
+            let budget = MAX_EXCERPT_BYTES.min(MAX_TARGET_SOURCE_TOTAL_BYTES.saturating_sub(total));
+            let anchors = excerpt_anchors(subtask, slices, relevant, root, &rel);
+            let excerpt = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| source_excerpt(text, &anchors, budget, lang));
+            match excerpt {
+                Some(excerpt) => {
+                    total += excerpt.len();
+                    included += 1;
+                    out.push_str(&format!(
+                        "## {display} (excerpts of a {} byte file; edit only lines shown)\n{excerpt}",
+                        bytes.len()
+                    ));
+                }
+                None => skipped.push(format!("{display} ({} bytes)", bytes.len())),
+            }
             continue;
         }
         let Ok(text) = String::from_utf8(bytes) else {
@@ -1385,7 +1410,6 @@ fn render_target_sources(
         };
         total += text.len();
         included += 1;
-        let lang = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
         out.push_str(&format!("## {display}\n```{lang}\n{text}"));
         if !text.ends_with('\n') {
             out.push('\n');
@@ -1407,6 +1431,145 @@ fn render_target_sources(
     }
     section.push('\n');
     section
+}
+
+/// Names to look for in a large file, most specific first: identifiers the
+/// subtask text names (backticked, called, camelCase or dotted), then the
+/// symbols retrieval picked from this file.
+fn excerpt_anchors(
+    subtask: &Subtask,
+    slices: &[CodeSlice],
+    relevant: &[CodeSlice],
+    root: &Path,
+    rel: &Path,
+) -> Vec<String> {
+    let text = phonton_types::task_description_without_prior_context(&subtask.description);
+    let mut anchors: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if name.len() >= 3 && !anchors.iter().any(|a| a == name) {
+            anchors.push(name.to_string());
+        }
+    };
+    for (i, quoted) in text.split('`').enumerate() {
+        if i % 2 == 1 {
+            quoted
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .for_each(&mut push);
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut start = None;
+    for (i, c) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if c.is_alphanumeric() || c == '_' {
+            start.get_or_insert(i);
+            continue;
+        }
+        let Some(s) = start.take() else { continue };
+        let word = &text[s..i];
+        let called = c == '(';
+        // `a.b`, not a word ending a sentence.
+        let dotted = (c == '.' && bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric()))
+            || (s > 0 && bytes[s - 1] == b'.');
+        let cased = word.chars().skip(1).any(|ch| ch.is_uppercase()) || word.contains('_');
+        if called || dotted || cased {
+            push(word);
+        }
+    }
+    for s in slices.iter().chain(relevant) {
+        if relative_to_root(&s.file_path, root).as_deref() == Some(rel) {
+            if let Some(name) = s.symbol_name.rsplit(&[':', '.'][..]).next() {
+                push(name);
+            }
+        }
+    }
+    anchors
+}
+
+/// Line windows around each anchor's definitions first, then its uses (at
+/// most three hits per anchor), merged, rendered as fenced blocks with their
+/// line numbers, within `budget` bytes. `None` when no anchor occurs.
+fn source_excerpt(text: &str, anchors: &[String], budget: usize, lang: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mentions = |line: &str, name: &str| {
+        line.match_indices(name).any(|(at, _)| {
+            !line[..at].chars().next_back().is_some_and(is_word)
+                && !line[at + name.len()..].chars().next().is_some_and(is_word)
+        })
+    };
+    let defines = |line: &str, name: &str| {
+        let t = line.trim_start();
+        [
+            "function ",
+            "class ",
+            "fn ",
+            "pub fn ",
+            "async fn ",
+            "def ",
+            "struct ",
+            "enum ",
+            "impl ",
+            "const ",
+            "let ",
+            "export ",
+            "async ",
+            "static ",
+        ]
+        .iter()
+        .any(|kw| t.starts_with(kw))
+            || t.starts_with(&format!("{name}("))
+            || t.starts_with(&format!("{name} ="))
+    };
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    let size = |ws: &[(usize, usize)]| -> usize {
+        ws.iter()
+            .map(|&(a, b)| lines[a..b].iter().map(|l| l.len() + 1).sum::<usize>() + 40)
+            .sum()
+    };
+    for name in anchors {
+        let hits: Vec<usize> = (0..lines.len())
+            .filter(|&i| mentions(lines[i], name))
+            .collect();
+        let (defs, uses): (Vec<usize>, Vec<usize>) =
+            hits.into_iter().partition(|&i| defines(lines[i], name));
+        for hit in defs.into_iter().chain(uses).take(3) {
+            let window = (
+                hit.saturating_sub(EXCERPT_LINES_BEFORE),
+                (hit + EXCERPT_LINES_AFTER).min(lines.len()),
+            );
+            let mut next = windows.clone();
+            next.push(window);
+            next.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (a, b) in next {
+                match merged.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => merged.push((a, b)),
+                }
+            }
+            if size(&merged) > budget {
+                break;
+            }
+            windows = merged;
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (a, b) in windows {
+        out.push_str(&format!(
+            "lines {}-{} of {}:\n```{lang}\n{}\n```\n",
+            a + 1,
+            b,
+            lines.len(),
+            lines[a..b].join("\n")
+        ));
+    }
+    Some(out)
 }
 
 fn missing_required_touch_files(
@@ -1875,6 +2038,86 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
     Ok(hunks)
 }
 
+/// Models miscount `@@` ranges far more often than they misquote source.
+/// Recompute each hunk's counts from its body; when its old side is not at
+/// the stated line, move it to where it matches in the current file (the
+/// nearest match if several). Unmatched hunks are left for verify to reject.
+/// Measured on DeepSeek flash: 6 of 13 diffs applied as sent, 13 of 13 after
+/// this.
+fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
+    let mut sources: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    for h in hunks.iter_mut() {
+        let old: Vec<&str> = h
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                DiffLine::Context(s) | DiffLine::Removed(s) => Some(s.trim_end_matches('\r')),
+                DiffLine::Added(_) => None,
+            })
+            .collect();
+        h.old_count = old.len() as u32;
+        h.new_count = h
+            .lines
+            .iter()
+            .filter(|l| !matches!(l, DiffLine::Removed(_)))
+            .count() as u32;
+        if old.is_empty() {
+            continue;
+        }
+        let Some(file) = sources
+            .entry(h.file_path.clone())
+            .or_insert_with(|| {
+                std::fs::read_to_string(root.join(&h.file_path))
+                    .ok()
+                    .map(|t| {
+                        t.split('\n')
+                            .map(|l| l.trim_end_matches('\r').to_string())
+                            .collect()
+                    })
+            })
+            .as_ref()
+        else {
+            continue;
+        };
+        let matches_at = |at: usize| {
+            file.get(at..at + old.len())
+                .is_some_and(|window| window.iter().zip(&old).all(|(a, b)| a == b))
+        };
+        let stated = h.old_start.saturating_sub(1) as usize;
+        if matches_at(stated) {
+            continue;
+        }
+        if let Some(at) = (0..file.len())
+            .filter(|&at| matches_at(at))
+            .min_by_key(|&at| at.abs_diff(stated))
+        {
+            h.old_start = at as u32 + 1;
+        }
+    }
+    // new_start follows from the old positions and earlier hunks' growth,
+    // by the materializer's rule: lines kept before the hunk, plus one when
+    // the new side is non-empty.
+    let mut order: Vec<usize> = (0..hunks.len()).collect();
+    order.sort_by_key(|&i| (hunks[i].file_path.clone(), hunks[i].old_start));
+    let mut delta: i64 = 0;
+    let mut file: Option<PathBuf> = None;
+    for i in order {
+        let h = &mut hunks[i];
+        if file.as_ref() != Some(&h.file_path) {
+            file = Some(h.file_path.clone());
+            delta = 0;
+        }
+        let kept_before = match h.old_count {
+            0 if h.old_start <= 1 && !root.join(&h.file_path).exists() => 0,
+            0 => i64::from(h.old_start),
+            _ => i64::from(h.old_start) - 1,
+        };
+        h.new_start = (kept_before + delta + i64::from(h.new_count > 0)).max(0) as u32;
+        delta += i64::from(h.new_count) - i64::from(h.old_count);
+    }
+}
+
 /// Strip a single ```/```diff/```patch fenced code block out of `text`,
 /// returning its body. If no fence is present the original text is
 /// returned. If multiple fences are present the *first* one wins —
@@ -2226,6 +2469,72 @@ mod tests {
     }
 
     #[test]
+    fn anchor_hunks_fixes_miscounted_and_misplaced_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let source: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(temp.path().join("src/a.txt"), &source).unwrap();
+        // Both headers are wrong: the first edit is at line 10 with the
+        // counts off by one, the second at 30 but says 25.
+        let mut hunks = parse_unified_diff(
+            "--- a/src/a.txt\n+++ b/src/a.txt\n\
+             @@ -7,3 +7,3 @@\n line 9\n-line 10\n+line ten\n line 11\n\
+             @@ -25,2 +25,3 @@\n line 29\n+inserted\n line 30\n",
+        )
+        .unwrap();
+        anchor_hunks(&mut hunks, temp.path());
+        let applied = phonton_local::edit::materialize_hunks_with_new_files(
+            temp.path(),
+            &[PathBuf::from("src/a.txt")],
+            &hunks,
+        )
+        .unwrap();
+        let text = &applied[&PathBuf::from("src/a.txt")];
+        assert!(text.contains("line 9\nline ten\nline 11\n"));
+        assert!(text.contains("line 29\ninserted\nline 30\n"));
+        assert_eq!(text.lines().count(), 41);
+    }
+
+    #[test]
+    fn anchor_hunks_keeps_valid_deletions_and_new_files_applicable() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        // A context-free deletion's new side starts one line before it.
+        let mut hunks = parse_unified_diff(
+            "--- a/a.txt\n+++ b/a.txt\n@@ -5,1 +4,0 @@\n-five\n\
+             --- /dev/null\n+++ b/new.txt\n@@ -1,0 +1,1 @@\n+fresh\n",
+        )
+        .unwrap();
+        anchor_hunks(&mut hunks, temp.path());
+        assert_eq!((hunks[0].old_start, hunks[0].new_start), (5, 4));
+        assert_eq!(hunks[1].new_start, 1);
+        let applied = phonton_local::edit::materialize_hunks_with_new_files(
+            temp.path(),
+            &[PathBuf::from("a.txt"), PathBuf::from("new.txt")],
+            &hunks,
+        )
+        .unwrap();
+        assert_eq!(applied[&PathBuf::from("a.txt")], "one\ntwo\nthree\nfour\n");
+        assert_eq!(applied[&PathBuf::from("new.txt")], "fresh\n");
+    }
+
+    #[test]
+    fn anchor_hunks_leaves_unmatched_hunks_for_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let mut hunks =
+            parse_unified_diff("--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-three\n+3\n").unwrap();
+        anchor_hunks(&mut hunks, temp.path());
+        assert_eq!(hunks[0].old_start, 1);
+        assert!(phonton_local::edit::materialize_hunks_with_new_files(
+            temp.path(),
+            &[PathBuf::from("a.txt")],
+            &hunks,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn target_sources_inline_named_and_sliced_files_once() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
@@ -2254,6 +2563,35 @@ mod tests {
         assert!(rendered.contains("Too large to inline"));
         assert!(!rendered.contains(&big));
         assert!(!rendered.contains("outside.rs"));
+    }
+
+    #[test]
+    fn excerpt_anchors_take_named_code_not_sentence_words() {
+        let subtask = plain_subtask(
+            "When OrderBook.cancel cancels an order, call `release` so it can be sold again.",
+        );
+        let anchors = excerpt_anchors(&subtask, &[], &[], Path::new("."), Path::new("a.js"));
+        assert_eq!(anchors, ["release", "OrderBook", "cancel"]);
+    }
+
+    #[test]
+    fn large_files_are_sent_as_excerpts_around_named_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut big: String = (0..900)
+            .map(|n| format!("function filler{n}() {{ return {n}; }}\n"))
+            .collect();
+        big.push_str("function applyCoupon(cart, code) {\n  return cart;\n}\n");
+        std::fs::write(temp.path().join("shop.js"), &big).unwrap();
+        assert!(big.len() > MAX_TARGET_SOURCE_FILE_BYTES);
+        let subtask = plain_subtask("Fix shop.js so applyCoupon rejects expired coupons");
+        let rendered = render_target_sources(&subtask, &[], &[], temp.path());
+        assert!(
+            rendered.contains("function applyCoupon(cart, code) {"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("lines 886-904 of 904"));
+        assert!(!rendered.contains("filler10()"));
+        assert!(!rendered.contains("Too large to inline"));
     }
 
     #[test]
