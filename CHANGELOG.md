@@ -79,6 +79,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Local goal scope keeps a file whose text matches the goal at least
+  as well as the best symbol match. "Reduce the maximum todo title length"
+  selected only `src/store.js` (via `TodoStore`) and missed `MAX_TITLE` in
+  `src/validate.js`, so a 3B model "passed" by truncating titles.
 - [fixed] OpenAI-compatible and Anthropic requests retry twice on a dropped
   connection, 429 or 5xx before failing; one network blip used to fail the
   whole goal.

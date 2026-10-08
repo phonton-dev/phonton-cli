@@ -116,7 +116,11 @@ for (const task of TASKS.filter((t) => !only || only.has(t.id))) {
     fs.writeFileSync(path.join(logDir, "acceptance.txt"), accept.stdout + accept.stderr);
     fs.appendFileSync(path.join(out, "results.jsonl"), JSON.stringify(row) + "\n");
     console.log(JSON.stringify(row));
-    fs.rmSync(dir, { recursive: true, force: true });
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // A runtime or test process can still hold the copy on Windows.
+    }
   }
 }
 

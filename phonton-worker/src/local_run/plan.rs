@@ -181,7 +181,20 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
             warnings.push("No existing source matched the goal. The creation prompt will have no repository excerpt; add context files if the new file must follow an existing API or style.".into());
         } else {
             let threshold = if best >= 100 { 100 } else { (best / 2).max(1) };
-            ranked.retain(|r| !r.names.is_empty() || r.score() >= threshold);
+            // A goal that describes behavior ("title length") may name no
+            // symbol in the file that implements it. Keep a file whose text
+            // matches the goal at least as well as the best name match.
+            let named_content = ranked
+                .iter()
+                .filter(|r| !r.names.is_empty())
+                .map(|r| r.content_hits)
+                .max()
+                .unwrap_or(usize::MAX);
+            ranked.retain(|r| {
+                !r.names.is_empty()
+                    || r.score() >= threshold
+                    || (r.content_hits >= 3 && r.content_hits >= named_content)
+            });
             if ranked.len() > 8 {
                 warnings.push(format!("{} files matched; this bounded preview includes the top eight. Narrow the goal if more context is required.", ranked.len()));
             }
@@ -1129,6 +1142,59 @@ mod tests {
             .contains("every exact edited .py"));
         request.files = vec!["src/logic.mjs".into()];
         assert!(python_inclusion_warning(&request, root.path()).is_none());
+    }
+    #[tokio::test]
+    async fn behavior_goal_keeps_the_file_whose_text_matches_best() {
+        // "title length" names no symbol; the limit lives in validate.js while
+        // store.js only matches through the TodoStore name.
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        for (path, body) in [
+            (
+                "src/store.js",
+                include_str!("../../../fixtures/todo-api/src/store.js"),
+            ),
+            (
+                "src/validate.js",
+                include_str!("../../../fixtures/todo-api/src/validate.js"),
+            ),
+            (
+                "src/format.js",
+                include_str!("../../../fixtures/todo-api/src/format.js"),
+            ),
+        ] {
+            std::fs::write(root.path().join(path), body).unwrap();
+        }
+        let plan = preview(LocalRunRequest {
+            goal: "Reduce the maximum todo title length from 120 to 80 characters; titles longer than that must be rejected with the existing error message format.".into(),
+            repository: root.path().into(),
+            files: vec![],
+            new_file: None,
+            editable_existing: vec![],
+            checks: vec![],
+            preparation: None,
+            approve_host_execution: false,
+            allow_unverified_runtime: false,
+            budget: Default::default(),
+            expected_source_hashes: Default::default(),
+            expected_baseline_sha256: None,
+        })
+        .await
+        .unwrap();
+        assert!(
+            plan.request
+                .files
+                .contains(&PathBuf::from("src/validate.js")),
+            "{:?}",
+            plan.request.files
+        );
     }
     #[tokio::test]
     async fn inferred_scope_finds_supported_javascript_module_extensions() {
