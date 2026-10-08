@@ -1,4 +1,4 @@
-//! `~/.phonton/config.toml` loader.
+//! `~/.phonton/config.toml` loader with an optional per-process path override.
 //!
 //! Provides the [`Config`] struct and [`load`] function. On first run the
 //! file is absent; [`load`] returns a default config rather than an error.
@@ -192,38 +192,114 @@ impl BudgetConfig {
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Return the path to `~/.phonton/config.toml`.
+/// Return the config path, honoring an explicit per-process override.
 pub fn config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("config.toml"))
+    config_path_for(
+        std::env::var_os("PHONTON_CONFIG_PATH"),
+        phonton_extensions::phonton_home(),
+    )
 }
 
-/// Load configuration from `~/.phonton/config.toml`.
+fn config_path_for(
+    override_path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match override_path.filter(|path| !path.is_empty()) {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            path.is_absolute().then_some(path)
+        }
+        None => home.map(|h| h.join("config.toml")),
+    }
+}
+
+/// Load configuration from the resolved config path.
 ///
 /// Returns `Config::default()` when the file is absent. Returns an error
 /// only when the file exists but cannot be parsed.
 pub fn load() -> Result<Config> {
     let path = match config_path() {
         Some(p) => p,
+        None if std::env::var_os("PHONTON_CONFIG_PATH").is_some_and(|path| !path.is_empty()) => {
+            return Err(anyhow::anyhow!(
+                "PHONTON_CONFIG_PATH must be an absolute path"
+            ));
+        }
         None => return Ok(Config::default()),
     };
 
     if !path.exists() {
-        return Ok(Config::default());
+        let mut cfg = Config::default();
+        autodetect_provider(&mut cfg.provider, local_model_selected());
+        return Ok(cfg);
     }
 
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
 
-    let cfg: Config = toml::from_str(&raw)
+    let mut cfg: Config = toml::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+    let provider_chosen = toml::from_str::<toml::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("provider")?.get("name").cloned())
+        .is_some();
+    if !provider_chosen {
+        autodetect_provider(&mut cfg.provider, local_model_selected());
+    }
 
     Ok(cfg)
 }
 
-/// Save configuration to `~/.phonton/config.toml`.
+/// Order in which environment keys pick a provider when the config file
+/// does not name one.
+const AUTODETECT_ORDER: &[&str] = &[
+    "anthropic",
+    "openai",
+    "deepseek",
+    "openrouter",
+    "gemini",
+    "groq",
+    "xai",
+    "together",
+];
+
+fn local_model_selected() -> bool {
+    crate::models_cli::settings().is_ok_and(|s| s.active_model.is_some())
+}
+
+/// With no provider named in the config, use the first one that has a key
+/// (config `[provider.keys]` or environment). With no key anywhere, a
+/// calibrated local model wins. Otherwise the default stays and doctor
+/// reports the missing key.
+fn autodetect_provider(provider: &mut ProviderConfig, local_model: bool) {
+    if resolve_api_key(provider).is_some() {
+        return;
+    }
+    for name in AUTODETECT_ORDER {
+        let probe = ProviderConfig {
+            name: (*name).to_string(),
+            keys: provider.keys.clone(),
+            ..ProviderConfig::default()
+        };
+        if resolve_api_key(&probe).is_some() {
+            provider.name = (*name).to_string();
+            return;
+        }
+    }
+    if local_model {
+        provider.name = "ollama".to_string();
+    }
+}
+
+/// Save configuration to the resolved config path.
 pub fn save(cfg: &Config) -> Result<()> {
     let path = match config_path() {
         Some(p) => p,
+        None if std::env::var_os("PHONTON_CONFIG_PATH").is_some_and(|path| !path.is_empty()) => {
+            return Err(anyhow::anyhow!(
+                "PHONTON_CONFIG_PATH must be an absolute path"
+            ));
+        }
         None => return Err(anyhow::anyhow!("could not determine config path")),
     };
 
@@ -302,6 +378,25 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn autodetect_uses_configured_keys_then_local_model() {
+        let mut p = ProviderConfig::default();
+        p.keys.insert("deepseek".into(), "sk-test".into());
+        // Env may hold real keys on a dev machine; only assert when it does not.
+        if super::resolve_api_key(&ProviderConfig::default()).is_none()
+            && std::env::var_os("OPENAI_API_KEY").is_none()
+        {
+            super::autodetect_provider(&mut p, false);
+            assert_eq!(p.name, "deepseek");
+        }
+        let mut chosen = ProviderConfig {
+            api_key: Some("sk-ant-x".into()),
+            ..ProviderConfig::default()
+        };
+        super::autodetect_provider(&mut chosen, true);
+        assert_eq!(chosen.name, "anthropic");
+    }
+
     use super::*;
 
     #[test]
@@ -388,6 +483,29 @@ mode = "ask"
     fn empty_file_is_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.provider.name, "anthropic");
+    }
+
+    #[test]
+    fn config_path_override_is_isolated_from_normal_home() {
+        let home = PathBuf::from("normal-home");
+        let isolated = if cfg!(windows) {
+            PathBuf::from(r"C:\isolated\config.toml")
+        } else {
+            PathBuf::from("/isolated/config.toml")
+        };
+        assert_eq!(
+            config_path_for(Some(isolated.clone().into_os_string()), Some(home.clone())),
+            Some(isolated)
+        );
+        assert_eq!(
+            config_path_for(Some(std::ffi::OsString::new()), Some(home.clone())),
+            Some(home.join("config.toml"))
+        );
+        assert_eq!(
+            config_path_for(Some("relative-config.toml".into()), Some(home)),
+            None
+        );
+        assert_eq!(config_path_for(None, None), None);
     }
 
     #[test]

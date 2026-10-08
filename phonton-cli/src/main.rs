@@ -34,6 +34,7 @@
 //! is absent. The contract the TUI depends on is the
 //! `watch::Receiver<GlobalState>`.
 
+mod art;
 mod ask_context;
 mod benchmark_cli;
 mod config;
@@ -41,14 +42,21 @@ mod contract_preflight;
 mod doctor;
 mod extensions_cli;
 mod index_cli;
+mod local_goal_cli;
+mod local_plan_approval;
+mod local_tui;
 mod mcp_cli;
 mod memory_cli;
+mod models_cli;
 mod plan_preview;
 mod prompt_buffer;
+mod proof_cli;
+mod record;
 mod review;
 mod serve_cli;
 mod serve_desktop;
 mod store_util;
+mod tokens_cli;
 mod trust;
 
 pub(crate) use store_util::open_persistent_store;
@@ -83,8 +91,6 @@ use phonton_providers::{
 };
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_store::{Store, TaskRecord};
-#[cfg(test)]
-use phonton_types::VerifyResult;
 use phonton_types::{
     BudgetLimits, ContextManifest, CostReceipt, CoverageSummary, EventRecord, ExtensionId,
     GlobalState, HandoffPacket, MemoryRecord, ModelPricing, ModelTier, OrchestratorEvent,
@@ -103,240 +109,71 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 // ---------------------------------------------------------------------------
-// Visual identity
+// Visual identity: Ink & Photon (see art.rs)
 // ---------------------------------------------------------------------------
 
-// Curated palette - cool slate base with cyan/violet/magenta accents.
-const ACCENT: Color = Color::Rgb(99, 179, 237); // cyan-300
-const ACCENT_HI: Color = Color::Rgb(160, 215, 250); // cyan-200 highlight
-const SUCCESS: Color = Color::Rgb(72, 199, 142);
-const WARN: Color = Color::Rgb(246, 173, 85);
-const DANGER: Color = Color::Rgb(252, 129, 74);
-const MUTED: Color = Color::Rgb(113, 128, 150);
-const DIM: Color = Color::Rgb(74, 85, 104);
-const BG_PANEL: Color = Color::Rgb(26, 32, 44);
-const BG_DEEP: Color = Color::Rgb(18, 22, 33);
-const VIOLET: Color = Color::Rgb(159, 122, 234);
-#[allow(dead_code)]
-const PINK: Color = Color::Rgb(237, 100, 166);
-
-// Gradient endpoints used by the logo / accents.
-const GRAD_A: (u8, u8, u8) = (99, 179, 237); // cyan
-const GRAD_B: (u8, u8, u8) = (159, 122, 234); // violet
-const GRAD_C: (u8, u8, u8) = (237, 100, 166); // pink
-const GRAD_D: (u8, u8, u8) = (69, 144, 255); // electric blue
-const LOGO_GLOW: (u8, u8, u8) = (209, 232, 255);
-const LOGO_SHADOW: (u8, u8, u8) = (42, 48, 82);
+// Ink and paper, flat signal colours; the logo spectrum lives in art.rs.
+const ACCENT: Color = art::PHOTON;
+const ACCENT_HI: Color = art::PAPER;
+const PAPER: Color = art::PAPER;
+const SUCCESS: Color = art::VERIFIED;
+const WARN: Color = art::RUNNING;
+const DANGER: Color = art::FAILED;
+const MUTED: Color = art::MUTED;
+const DIM: Color = art::DIM;
+const RULE: Color = art::RULE;
+const BG_PANEL: Color = art::PANEL;
+const BG_DEEP: Color = art::INK;
+/// Side-channel accent (ask mode, flight log): quiet paper, not a new hue.
+const QUIET: Color = Color::Rgb(201, 198, 190);
 
 const UI_TICK_MS: u64 = 80;
-#[allow(dead_code)]
-const LOGO_SHIMMER_SPEED: f32 = 0.018;
-const LOGO_ROW_PHASE: f32 = 0.085;
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-const LOGO: &[&str] = &[
-    "██████╗ ██╗  ██╗ ██████╗ ███╗   ██╗████████╗ ██████╗ ███╗   ██╗",
-    "██╔══██╗██║  ██║██╔═══██╗████╗  ██║╚══██╔══╝██╔═══██╗████╗  ██║",
-    "██████╔╝███████║██║   ██║██╔██╗ ██║   ██║   ██║   ██║██╔██╗ ██║",
-    "██╔═══╝ ██╔══██║██║   ██║██║╚██╗██║   ██║   ██║   ██║██║╚██╗██║",
-    "██║     ██║  ██║╚██████╔╝██║ ╚████║   ██║   ╚██████╔╝██║ ╚████║",
-    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝",
-    "  ░▒▓█████████████████████████████████████████████████████▓▒░  ",
-];
-
 const LOGO_WIDTH_THRESHOLD: u16 = 72;
 static NEXT_MCP_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
 
-// ---------------------------------------------------------------------------
-// Visual helpers — gradient + pill primitives
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    let v = a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0);
-    v.round().clamp(0.0, 255.0) as u8
-}
-
-/// Linearly interpolate between two RGB colors.
-fn grad(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
-    Color::Rgb(
-        lerp_u8(a.0, b.0, t),
-        lerp_u8(a.1, b.1, t),
-        lerp_u8(a.2, b.2, t),
-    )
-}
-
-/// Three-stop gradient (a → b → c) sampled at t ∈ [0, 1].
-fn grad3(t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        grad(GRAD_A, GRAD_B, t * 2.0)
-    } else {
-        grad(GRAD_B, GRAD_C, (t - 0.5) * 2.0)
-    }
-}
-
-/// Four-stop animated logo palette. Starts in violet/pink like the splash
-/// mock, then travels through electric blue and cyan before looping.
-fn logo_grad(t: f32) -> Color {
-    let t = t - t.floor();
-    if t < 0.33 {
-        grad(GRAD_B, GRAD_C, t / 0.33)
-    } else if t < 0.66 {
-        grad(GRAD_C, GRAD_D, (t - 0.33) / 0.33)
-    } else {
-        grad(GRAD_D, GRAD_A, (t - 0.66) / 0.34)
-    }
-}
-
-/// Build a horizontally-gradient-colored line from `text`. `phase` shifts the
-/// gradient to produce a subtle shimmer when called per frame.
-fn gradient_line(text: &str, phase: f32, bold: bool) -> Line<'static> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len().max(1) as f32;
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let modifier = if bold {
-        Modifier::BOLD
-    } else {
-        Modifier::empty()
-    };
-    for (i, ch) in chars.into_iter().enumerate() {
-        if ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
-        }
-        let mut t = (i as f32) / n + phase;
-        t = t - t.floor();
-        let color = grad3(t);
-        spans.push(Span::styled(
-            ch.to_string(),
-            Style::default().fg(color).add_modifier(modifier),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn logo_line(text: &str, phase: f32, row_idx: usize) -> Line<'static> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len().max(1) as f32;
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(chars.len());
-    let wave_a = (phase + row_idx as f32 * LOGO_ROW_PHASE).fract();
-    let wave_b = (phase * 1.6 - row_idx as f32 * 0.045 + 0.37).fract();
-
-    for (i, ch) in chars.into_iter().enumerate() {
-        if ch == ' ' {
-            spans.push(Span::raw(" "));
-            continue;
-        }
-
-        let x = i as f32 / n;
-        let base = logo_grad((x * 0.9 + phase * 0.8 + row_idx as f32 * 0.05).fract());
-        let base_color = base_rgb(base);
-        let dist = |w: f32| -> f32 {
-            let raw = (x - w).abs();
-            raw.min(1.0 - raw)
-        };
-        let d_a = dist(wave_a);
-        let d_b = dist(wave_b);
-
-        let style = match ch {
-            '░' | '▒' | '▓' => {
-                let body = match ch {
-                    '▓' => 0.55,
-                    '▒' => 0.32,
-                    _ => 0.16,
-                };
-                let glow = if d_a < 0.14 {
-                    (1.0 - d_a / 0.14) * 0.45
-                } else {
-                    0.0
-                };
-                Style::default().fg(grad(LOGO_SHADOW, base_color, (body + glow).clamp(0.0, 0.9)))
-            }
-            '╗' | '╔' | '╝' | '╚' | '║' | '═' => {
-                let darkened = grad(LOGO_SHADOW, base_color, 0.6);
-                let lift = if d_a < 0.07 {
-                    (1.0 - d_a / 0.07) * 0.35
-                } else {
-                    0.0
-                };
-                Style::default()
-                    .fg(grad(base_rgb(darkened), LOGO_GLOW, lift))
-                    .add_modifier(Modifier::BOLD)
-            }
-            _ => {
-                let glint_a = if d_a < 0.08 {
-                    (1.0 - d_a / 0.08) * 0.65
-                } else {
-                    0.0
-                };
-                let glint_b = if d_b < 0.05 {
-                    (1.0 - d_b / 0.05) * 0.45
-                } else {
-                    0.0
-                };
-                let breathing = ((phase * std::f32::consts::TAU
-                    + x * std::f32::consts::TAU * 1.4
-                    + row_idx as f32 * 0.65)
-                    .sin()
-                    + 1.0)
-                    * 0.08;
-                Style::default()
-                    .fg(grad(
-                        base_color,
-                        LOGO_GLOW,
-                        (glint_a + glint_b + breathing).clamp(0.0, 0.78),
-                    ))
-                    .add_modifier(Modifier::BOLD)
-            }
-        };
-        spans.push(Span::styled(ch.to_string(), style));
-    }
-
-    Line::from(spans)
-}
-
-fn base_rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => GRAD_B,
-    }
-}
-
-/// Render text as a "pill" — small inline badge with a colored bg.
-fn pill(text: &str, bg: Color, fg: Color) -> Span<'static> {
+/// `[ text ]` tag in a flat signal colour.
+fn tag(text: &str, color: Color) -> Span<'static> {
     Span::styled(
-        format!(" {} ", text),
-        Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD),
+        format!("[{text}]"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
 }
 
-/// Build a unicode progress bar of `width` cells, filled `filled_frac` of the
-/// way through with the cyan→violet gradient.
-fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
-    let frac = filled_frac.clamp(0.0, 1.0);
-    let total_eighths = (frac * (width as f32) * 8.0).round() as usize;
-    let full = total_eighths / 8;
-    let rem = total_eighths % 8;
-    let partials = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-    let mut spans = Vec::with_capacity(width);
-    for i in 0..width {
-        let t = if width <= 1 {
-            0.0
-        } else {
-            i as f32 / (width as f32 - 1.0)
-        };
-        let color = grad3(t);
-        if i < full {
-            spans.push(Span::styled("█".to_string(), Style::default().fg(color)));
-        } else if i == full && rem > 0 {
-            let ch = partials[rem - 1];
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-        } else {
-            spans.push(Span::styled("·".to_string(), Style::default().fg(DIM)));
-        }
+/// What a handoff can honestly claim.
+fn handoff_verdict(h: &HandoffPacket) -> art::Verdict {
+    if !h.verification.findings.is_empty() {
+        art::Verdict::Review
+    } else if h.verification.passed.is_empty() {
+        art::Verdict::Unverified
+    } else if !h.verification.skipped.is_empty() {
+        art::Verdict::Partial
+    } else {
+        art::Verdict::Verified
     }
-    spans
+}
+
+/// True when the provider runs on this machine (Ollama, or a compatible
+/// server on a loopback address).
+fn provider_is_local(provider: &str, base_url: &str) -> bool {
+    match provider {
+        "ollama" => true,
+        "custom" | "openai-compatible" => {
+            let host = base_url
+                .split("://")
+                .nth(1)
+                .unwrap_or(base_url)
+                .split(['/', ':'])
+                .next()
+                .unwrap_or("");
+            matches!(host, "localhost" | "127.0.0.1" | "[" | "::1") || host.ends_with(".localhost")
+        }
+        _ => false,
+    }
+}
+
+/// Flat block bar, `width` cells, filled `filled_frac` of the way.
+fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
+    art::gauge(filled_frac, width, ACCENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +319,41 @@ pub struct GoalEntry {
     /// Index into `state.checkpoints` the user is hovering over in the
     /// checkpoint picker. `None` when the picker has no focus.
     pub checkpoint_cursor: Option<usize>,
+    /// When the goal was queued; drives the elapsed clock.
+    pub started_at: std::time::Instant,
+    /// When the goal reached a terminal or review state.
+    pub finished_at: Option<std::time::Instant>,
+    /// UI tick at which the receipt first appeared (count-up animation).
+    pub receipt_tick: Option<usize>,
+    /// True once this goal has been added to the run record.
+    pub recorded: bool,
+    /// Local harness records count only after the durable final receipt is saved.
+    pub local_harness: bool,
+    /// Route observed when this goal was dispatched; later settings do not change it.
+    pub token_origin: record::TokenOrigin,
+    /// Latest local-harness receipt when this goal ran on the local model.
+    pub local: Option<Box<phonton_types::local_run::LocalRunReceipt>>,
+    /// Result of applying the local candidate: `Ok(summary)` or `Err(why)`.
+    pub applied: Option<Result<String, String>>,
+}
+
+/// What this machine brings to a run, shown in the side panel. Filled in
+/// the background at startup; absent fields mean "not observed".
+#[derive(Debug, Clone, Default)]
+pub struct Machine {
+    /// Calibrated and selected local model, if any.
+    pub local_model: Option<String>,
+    /// Edit protocol the calibration chose for it.
+    pub protocol: Option<String>,
+    /// Calibrated context window.
+    pub context_tokens: Option<u32>,
+    /// First GPU: name, free bytes, total bytes.
+    pub gpu: Option<(String, u64, u64)>,
+    /// Host RAM: free bytes, total bytes.
+    pub ram: Option<(u64, u64)>,
+    /// True once the local model selection has been read (hardware may
+    /// still be pending); until then panels say "checking", not "missing".
+    pub probed: bool,
 }
 
 /// Render-safe view of one MCP approval request.
@@ -515,6 +387,16 @@ impl PendingMcpApproval {
 }
 
 impl GoalEntry {
+    /// A local candidate is reviewed and not yet applied.
+    fn can_apply(&self) -> bool {
+        self.applied.is_none()
+            && matches!(self.status, TaskStatus::Reviewing { .. })
+            && self
+                .local
+                .as_ref()
+                .is_some_and(|r| r.selected_candidate.is_some() && r.state == "review_ready")
+    }
+
     fn new(description: String) -> Self {
         Self {
             description,
@@ -523,6 +405,14 @@ impl GoalEntry {
             task_id: TaskId::new(),
             flight_log: Vec::new(),
             checkpoint_cursor: None,
+            started_at: std::time::Instant::now(),
+            finished_at: None,
+            receipt_tick: None,
+            recorded: false,
+            local_harness: false,
+            token_origin: record::TokenOrigin::Unknown,
+            local: None,
+            applied: None,
         }
     }
 }
@@ -589,6 +479,8 @@ pub struct App {
     pub pending_mcp_approvals: Vec<PendingMcpApproval>,
     /// Cursor into `pending_mcp_approvals` when more than one request is queued.
     pub mcp_approval_selected: usize,
+    /// Local plans waiting for a per-goal approval.
+    pub pending_local_plans: Vec<local_plan_approval::PendingLocalPlan>,
     /// True when the pending prompt artifact drawer is visible.
     pub prompt_artifacts_open: bool,
     /// Cursor into pending prompt artifacts.
@@ -603,7 +495,31 @@ pub struct App {
     pub clarifying_buffer: String,
     /// Caret position inside clarifying_buffer
     pub clarifying_cursor: usize,
+    /// Set by the first Esc/Ctrl+C at top level; a second press within
+    /// [`QUIT_CONFIRM_WINDOW`] quits. Prevents losing a session to one key.
+    pub quit_armed_at: Option<std::time::Instant>,
+    /// Session answer to "may verification run project code on this
+    /// machine?". `None` until the first goal of the session asks.
+    pub host_checks_approved: Option<bool>,
+    /// Goal held back while the host-check question is on screen, plus
+    /// whether it was submitted in Task mode.
+    pub pending_host_goal: Option<(SubmittedPrompt, bool)>,
+    /// Verified-run record; only finished receipts move it.
+    pub record: record::Record,
+    /// Local model and hardware observed at startup.
+    pub machine: Machine,
+    /// False when `PHONTON_REDUCED_MOTION` is set: art renders still.
+    pub motion: bool,
+    /// Finished runs not yet written to the record file (the event loop
+    /// saves them; tests never touch the user's record).
+    pub unsaved_runs: Vec<(record::Outcome, u64, record::TokenOrigin)>,
+    /// False when the configured provider has no usable key. Goals are then
+    /// routed to Settings instead of starting a run that can only fail.
+    pub model_ready: bool,
 }
+
+/// How long a first Esc/Ctrl+C stays armed waiting for confirmation.
+pub const QUIT_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl App {
     pub fn new(cfg: &crate::config::Config) -> Self {
@@ -633,6 +549,7 @@ impl App {
             store_path: None,
             pending_mcp_approvals: Vec::new(),
             mcp_approval_selected: 0,
+            pending_local_plans: Vec::new(),
             prompt_artifacts_open: false,
             prompt_artifact_selected: 0,
             clarifying_goal_idx: None,
@@ -640,6 +557,67 @@ impl App {
             clarifying_answers: Vec::new(),
             clarifying_buffer: String::new(),
             clarifying_cursor: 0,
+            quit_armed_at: None,
+            host_checks_approved: None,
+            pending_host_goal: None,
+            record: record::Record::default(),
+            machine: Machine::default(),
+            motion: std::env::var_os("PHONTON_REDUCED_MOTION").is_none(),
+            unsaved_runs: Vec::new(),
+            model_ready: true,
+        }
+    }
+
+    /// Animation tick for art helpers; `None` when motion is reduced.
+    fn tick(&self) -> Option<usize> {
+        self.motion.then_some(self.spinner_frame)
+    }
+
+    /// True while a first quit press is waiting for confirmation.
+    pub fn quit_armed(&self) -> bool {
+        self.quit_armed_at
+            .is_some_and(|at| at.elapsed() < QUIT_CONFIRM_WINDOW)
+    }
+
+    /// First press arms, second press (within the window) quits.
+    fn request_quit(&mut self) -> Option<Intent> {
+        if self.quit_armed() {
+            self.should_quit = true;
+            return Some(Intent::Quit);
+        }
+        self.quit_armed_at = Some(std::time::Instant::now());
+        None
+    }
+
+    /// Answer the host-check question for this session, then queue the
+    /// held goal. Esc puts the goal text back in the prompt instead.
+    fn handle_host_checks_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        let approved = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => true,
+            KeyCode::Char('n') | KeyCode::Char('N') => false,
+            KeyCode::Esc => {
+                if let Some((prompt, _)) = self.pending_host_goal.take() {
+                    // ponytail: collapsed paste artifacts are not restored;
+                    // only the visible text comes back.
+                    self.goal_prompt.insert_text(&prompt.display_text);
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        self.host_checks_approved = Some(approved);
+        let (prompt, direct_task) = self.pending_host_goal.take()?;
+        Some(self.queue_goal(prompt, direct_task))
+    }
+
+    fn queue_goal(&mut self, prompt: SubmittedPrompt, direct_task: bool) -> Intent {
+        self.goals
+            .insert(0, GoalEntry::new(prompt.display_text.clone()));
+        self.selected = 0;
+        if direct_task {
+            Intent::QueueTask(prompt)
+        } else {
+            Intent::QueueGoal(prompt)
         }
     }
 
@@ -714,6 +692,23 @@ fn char_count(s: &str) -> usize {
 /// (which is invariably multiple words separated by spaces) but should
 /// catch a pasted key whether or not the user knew which provider it
 /// came from.
+/// Provider implied by an unambiguous key prefix. Bare `sk-` is shared by
+/// OpenAI, DeepSeek and others, so it is left to the user.
+fn provider_for_key_prefix(key: &str) -> Option<&'static str> {
+    [
+        ("sk-ant-", "anthropic"),
+        ("sk-or-", "openrouter"),
+        ("sk-proj-", "openai"),
+        ("AIza", "gemini"),
+        ("xai-", "xai"),
+        ("gsk_", "groq"),
+        ("tgp_v1_", "together"),
+    ]
+    .iter()
+    .find(|(prefix, _)| key.starts_with(prefix))
+    .map(|(_, provider)| *provider)
+}
+
 pub fn looks_like_api_key(s: &str) -> bool {
     let s = s.trim();
     // Multi-word inputs are almost certainly goals, not keys. A pasted
@@ -800,7 +795,39 @@ impl App {
                 }
             }
         }
+        let tick = self.spinner_frame;
         if let Some(g) = self.goals.get_mut(index) {
+            let settled = matches!(
+                state.task_status,
+                TaskStatus::Reviewing { .. } | TaskStatus::Done { .. } | TaskStatus::Failed { .. }
+            );
+            if settled && g.finished_at.is_none() {
+                g.finished_at = Some(std::time::Instant::now());
+            }
+            if state.handoff_packet.is_some() && g.receipt_tick.is_none() {
+                g.receipt_tick = Some(tick);
+            }
+            // Only runs that produced evidence move the record; a goal refused
+            // before any model call (no RAM, no runtime) is not a lost run.
+            let ran = state.handoff_packet.as_ref().is_some_and(|h| {
+                !h.verification.passed.is_empty()
+                    || !h.verification.findings.is_empty()
+                    || !h.changed_files.is_empty()
+                    || h.token_usage.input_tokens + h.token_usage.output_tokens > 0
+            });
+            if settled && ran && !g.recorded && !g.local_harness {
+                g.recorded = true;
+                let outcome = match (&state.task_status, &state.handoff_packet) {
+                    (TaskStatus::Failed { .. }, _) => record::Outcome::Failed,
+                    (_, Some(h)) if handoff_verdict(h) == art::Verdict::Verified => {
+                        record::Outcome::Verified
+                    }
+                    _ => record::Outcome::Unverified,
+                };
+                self.record.add(outcome, state.tokens_used, g.token_origin);
+                self.unsaved_runs
+                    .push((outcome, state.tokens_used, g.token_origin));
+            }
             g.status = state.task_status.clone();
             g.state = Some(state);
         }
@@ -849,12 +876,33 @@ impl App {
     /// Returns `Some(Intent)` when the caller should act on the outside
     /// world (queue a new goal, issue an ask, exit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        if let Some(prompt) = self.pending_local_plans.first_mut() {
+            let decision = prompt.key(key);
+            return decision.map(|approved| {
+                let prompt = self.pending_local_plans.remove(0);
+                Intent::ResolveLocalPlan {
+                    task_id: prompt.task_id,
+                    approved,
+                }
+            });
+        }
         if !self.pending_mcp_approvals.is_empty() {
             return self.handle_mcp_approval_key(key);
         }
 
+        if self.pending_host_goal.is_some() {
+            return self.handle_host_checks_key(key);
+        }
+
         if self.prompt_artifacts_open {
             return self.handle_prompt_artifacts_key(key);
+        }
+
+        // Ctrl+Y applies a reviewed local candidate on the selected goal.
+        if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(g) = self.current_goal().filter(|g| g.can_apply()) {
+                return Some(Intent::ApplyLocal(g.task_id));
+            }
         }
 
         // Global shortcuts first, regardless of mode.
@@ -886,8 +934,7 @@ impl App {
                 self.mode = Mode::Goal;
                 return None;
             }
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit();
         }
 
         // `?` toggles the help overlay anywhere it isn't legitimate text input.
@@ -994,8 +1041,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
-                    self.should_quit = true;
-                    return Some(Intent::Quit);
+                    return self.request_quit();
                 }
                 // Cmd/Ctrl+; toggles the Ask side panel.
                 KeyCode::Char(';') => {
@@ -1033,8 +1079,7 @@ impl App {
 
     fn handle_clarify_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit();
         }
 
         match key.code {
@@ -1138,8 +1183,7 @@ impl App {
 
     fn handle_mcp_approval_key(&mut self, key: KeyEvent) -> Option<Intent> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return Some(Intent::Quit);
+            return self.request_quit();
         }
 
         match key.code {
@@ -1401,6 +1445,7 @@ impl App {
     fn handle_goal_key(&mut self, key: KeyEvent) -> Option<Intent> {
         // Intercept 'c' or 'C' when prompt is empty to start clarification if questions exist.
         if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
             && self.goal_prompt.is_empty()
         {
             if let Some(g) = self.goals.get(self.selected) {
@@ -1476,23 +1521,38 @@ impl App {
                 // and a credential leak. Detect, refuse, and surface a
                 // clear redirect to Settings instead.
                 if looks_like_api_key(prompt.description.trim()) {
+                    let pasted = prompt.description.trim().to_string();
+                    self.help_open = false;
+                    if let Some(provider) = provider_for_key_prefix(&pasted) {
+                        self.settings.provider = provider.into();
+                        self.settings.model.clear();
+                    }
+                    self.settings.api_key = pasted;
+                    self.settings.message = Some(format!(
+                        "That looked like an API key, so it went here instead of to a model. \
+                         Provider: {}. Check it, then Enter to save.",
+                        self.settings.provider
+                    ));
+                    self.mode = Mode::Settings;
+                    return None;
+                }
+                if !self.model_ready {
+                    self.goal_prompt.insert_text(&prompt.display_text);
                     self.help_open = false;
                     self.settings.message = Some(
-                        "That looked like an API key — open Settings (/settings) and \
-                         paste it into the API Key field, not the Goal bar."
+                        "Add a model first: paste an API key into the Key field and press \
+                         Enter, or quit and run `phonton models setup` to run on this machine."
                             .into(),
                     );
                     self.mode = Mode::Settings;
                     return None;
                 }
-                self.goals
-                    .insert(0, GoalEntry::new(prompt.display_text.clone()));
-                self.selected = 0;
-                if self.mode == Mode::Task {
-                    Some(Intent::QueueTask(prompt))
-                } else {
-                    Some(Intent::QueueGoal(prompt))
+                let direct_task = self.mode == Mode::Task;
+                if self.host_checks_approved.is_none() {
+                    self.pending_host_goal = Some((prompt, direct_task));
+                    return None;
                 }
+                Some(self.queue_goal(prompt, direct_task))
             }
             KeyCode::Backspace => {
                 self.goal_prompt.delete_char_before();
@@ -1522,23 +1582,6 @@ impl App {
                 if self.selected + 1 < self.goals.len() {
                     self.selected += 1;
                 }
-                None
-            }
-            KeyCode::Char('r') if self.goal_prompt.is_empty() => {
-                // Rollback shortcut — only when the goal bar is empty so the
-                // user can still type words starting with 'r' normally.
-                let goal_index = self.selected;
-                if let Some(g) = self.goals.get(goal_index) {
-                    if let (Some(cursor), Some(state)) = (g.checkpoint_cursor, g.state.as_ref()) {
-                        if let Some(cp) = state.checkpoints.get(cursor) {
-                            return Some(Intent::Rollback {
-                                goal_index,
-                                to_seq: cp.seq,
-                            });
-                        }
-                    }
-                }
-                self.goal_prompt.insert_char('r');
                 None
             }
             KeyCode::Char(c) => {
@@ -1818,11 +1861,15 @@ pub enum Intent {
     QueueTask(SubmittedPrompt),
     /// User submitted an ask-mode question. Isolated from goal context.
     Ask(String),
-    /// User triggered a rollback to a specific checkpoint seq for the
-    /// currently selected goal.
-    Rollback { goal_index: usize, to_seq: u32 },
     /// User approved or denied a pending MCP approval prompt.
-    ResolveMcpApproval { approval_id: u64, approved: bool },
+    ResolveMcpApproval {
+        approval_id: u64,
+        approved: bool,
+    },
+    ResolveLocalPlan {
+        task_id: TaskId,
+        approved: bool,
+    },
     /// Save settings.
     SaveSettings,
     /// Test the configured provider/model/api-key by issuing one tiny
@@ -1845,6 +1892,8 @@ pub enum Intent {
     AcceptTrust,
     /// User declined trust. Caller should exit cleanly.
     DeclineTrust,
+    /// Apply the selected goal's reviewed local candidate.
+    ApplyLocal(TaskId),
     /// Quit the TUI.
     Quit,
 }
@@ -1858,7 +1907,7 @@ pub enum Intent {
 /// uses [`render_savings_line_styled`] for the colored version.
 pub fn render_savings_line(state: Option<&GlobalState>) -> String {
     let Some(s) = state else {
-        return "  $—  |  saved — vs frontier  |  tokens: —".into();
+        return "  est. $—  |  est. saved — vs frontier  |  tokens: —".into();
     };
     if s.cost_receipt.frontier_equivalent_usd_micros > 0 {
         let pct = s
@@ -1867,7 +1916,7 @@ pub fn render_savings_line(state: Option<&GlobalState>) -> String {
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "—".into());
         return format!(
-            "  {}  |  saved {} vs frontier  |  {} tok",
+            "  est. {}  |  est. saved {} vs frontier  |  {} tok",
             format_usd_micros(s.cost_receipt.actual_usd_micros),
             pct,
             s.tokens_used
@@ -1904,7 +1953,7 @@ pub fn render_savings_line_styled(
 ) -> Line<'static> {
     let Some(s) = state else {
         return Line::from(Span::styled(
-            "  $—  |  saved — vs frontier  |  tokens: —",
+            "  est. $—  |  est. saved — vs frontier  |  tokens: —",
             Style::default().fg(MUTED),
         ));
     };
@@ -1924,10 +1973,13 @@ pub fn render_savings_line_styled(
         };
         return Line::from(vec![
             Span::styled(
-                format!("  {}", format_usd_micros(s.cost_receipt.actual_usd_micros)),
+                format!(
+                    "  est. {}",
+                    format_usd_micros(s.cost_receipt.actual_usd_micros)
+                ),
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  saved ", Style::default().fg(MUTED)),
+            Span::styled("  est. saved ", Style::default().fg(MUTED)),
             Span::styled(pct_txt, pct_style),
             Span::styled(" vs frontier  ", Style::default().fg(MUTED)),
             Span::styled(format!("{} tok", s.tokens_used), Style::default().fg(MUTED)),
@@ -1992,9 +2044,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
     // Once a goal is queued, collapse the giant ASCII logo down to a slim
     // one-line header so the work area gets the screen real estate.
-    let want_full_logo = app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD;
+    let want_full_logo =
+        app.goals.is_empty() && area.width >= LOGO_WIDTH_THRESHOLD && area.height >= 24;
     let splash_h: u16 = if want_full_logo {
-        LOGO.len() as u16 + 1
+        art::LOGO_ROWS + 1
     } else {
         1
     };
@@ -2065,6 +2118,65 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.pending_mcp_approvals.is_empty() {
         render_mcp_approval(frame, area, app);
     }
+    if app.pending_host_goal.is_some() {
+        render_host_checks_prompt(frame, area);
+    }
+    if let Some(prompt) = app.pending_local_plans.first() {
+        render_local_plan(frame, area, prompt);
+    }
+}
+
+/// Once-per-session question before the first goal: verification runs the
+/// project's own build and test commands, which is not sandboxed.
+fn render_host_checks_prompt(frame: &mut Frame, area: Rect) {
+    let w = 72.min(area.width.saturating_sub(4));
+    let h = 11.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+    let key = Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(MUTED);
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Verify runs your project's own checks (build, tests)",
+            Style::default().fg(PAPER),
+        )),
+        Line::from(Span::styled(
+            "  on this machine with your user permissions.",
+            Style::default().fg(PAPER),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  No isolation backend is configured. Without approval, Phonton",
+            muted,
+        )),
+        Line::from(Span::styled(
+            "  still plans and writes diffs, but cannot mark them verified.",
+            muted,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Y", key),
+            Span::styled(" allow for this session   ", muted),
+            Span::styled("N", key),
+            Span::styled(" run without checks   ", muted),
+            Span::styled("Esc", key),
+            Span::styled(" edit goal", muted),
+        ]),
+    ];
+    let block = Block::default()
+        .title(Span::styled(" Run checks on this machine? ", key))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Centred modal listing every keybinding in one place. Toggled by `?`,
@@ -2073,6 +2185,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let rows: &[(&str, &str)] = &[
         ("Enter", "submit goal / question"),
         ("/", "open the command palette"),
+        ("@", "attach a file, folder, symbol or MCP server"),
         ("?", "toggle this help"),
         ("Ctrl+V", "paste clipboard as text or artifact"),
         ("Ctrl+;", "toggle the Ask side panel"),
@@ -2085,17 +2198,23 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("Home / End", "jump to start/end of the input"),
         ("Ctrl+↑↓", "move the checkpoint cursor"),
         ("r", "rollback to the highlighted checkpoint (input empty)"),
-        ("Ctrl+C", "quit immediately"),
-        ("Esc", "close overlay / cancel / quit"),
+        ("Ctrl+C", "quit (press twice)"),
+        ("Esc", "close overlay / cancel / quit (press twice)"),
     ];
 
     // Fit the modal to the longest description so wrapping never bites.
+    // Row = 2 indent + padded key column + 3 gap + description.
+    let key_col = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8);
     let longest = rows
         .iter()
-        .map(|(k, v)| k.chars().count() + v.chars().count() + 4)
+        .map(|(_, v)| 2 + key_col + 3 + v.chars().count())
         .max()
         .unwrap_or(40);
-    let popup_w = (longest as u16 + 6)
+    let popup_w = (longest as u16 + 4)
         .min(area.width.saturating_sub(2))
         .max(40);
     let popup_h = (rows.len() as u16 + 6).min(area.height.saturating_sub(2));
@@ -2136,7 +2255,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
             ),
             Span::raw("   "),
-            Span::styled((*v).to_string(), Style::default().fg(Color::White)),
+            Span::styled((*v).to_string(), Style::default().fg(PAPER)),
         ]));
     }
     lines.push(Line::raw(""));
@@ -2194,7 +2313,7 @@ fn render_prompt_artifacts_drawer(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(ACCENT_HI)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).bg(BG_DEEP)
+            Style::default().fg(PAPER).bg(BG_DEEP)
         };
         lines.push(Line::from(Span::styled(
             format!("{} {}", idx + 1, artifact.label),
@@ -2227,6 +2346,46 @@ fn artifact_preview(artifact: &PromptArtifact, width: usize) -> String {
         .unwrap_or("")
         .trim();
     short(preview, width.saturating_sub(4).max(12))
+}
+
+/// Scrollable exact scope, model and commands; Y is the only approval key.
+fn render_local_plan(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &local_plan_approval::PendingLocalPlan,
+) {
+    let width = area.width.saturating_sub(4).clamp(1, 108);
+    let height = area.height.saturating_sub(2).clamp(1, 34);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Review local plan ")
+        .title_bottom(" Y approve plan · N/Esc cancel · ↑↓/PgUp/PgDn scroll ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(BG_DEEP).fg(PAPER));
+    let inner = block.inner(popup);
+    let lines: Vec<Line> = prompt
+        .wrapped_lines(inner.width.max(1) as usize)
+        .into_iter()
+        .map(Line::raw)
+        .collect();
+    let max_scroll = lines
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((prompt.scroll.min(max_scroll), 0))
+            .style(Style::default().bg(BG_DEEP).fg(PAPER)),
+        inner,
+    );
 }
 
 /// Focused modal for approval-gated MCP operations.
@@ -2292,9 +2451,7 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  tool    ", Style::default().fg(MUTED)),
             Span::styled(
                 prompt.tool_name.clone(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -2310,7 +2467,7 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
     for line in wrap_text(&prompt.reason, reason_width).into_iter().take(4) {
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(line, Style::default().fg(Color::White)),
+            Span::styled(line, Style::default().fg(PAPER)),
         ]));
     }
     lines.push(Line::raw(""));
@@ -2327,29 +2484,43 @@ fn render_mcp_approval(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_splash(frame: &mut Frame, area: Rect, _app: &App) {
-    // We set phase to 0.0 to render a gorgeous, static gradient without animation shimmer
-    let phase = 0.0;
-    if area.height > LOGO.len() as u16 && area.width >= LOGO_WIDTH_THRESHOLD {
-        let mut lines: Vec<Line> = Vec::with_capacity(LOGO.len() + 1);
+fn render_splash(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height > art::LOGO_ROWS && area.width >= LOGO_WIDTH_THRESHOLD {
+        let mut lines: Vec<Line> = Vec::with_capacity(art::LOGO_ROWS as usize + 1);
         lines.push(Line::raw(""));
-        lines.extend(
-            LOGO.iter()
-                .enumerate()
-                .map(|(row_idx, row)| logo_line(row, phase, row_idx)),
-        );
+        lines.extend(art::logo(app.tick()));
         let p = Paragraph::new(lines)
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
         frame.render_widget(p, area);
     } else {
-        // Compact one-line header - gradient "phonton" + dim subtitle.
-        let mut spans = gradient_line("✦ phonton", phase * 0.8, true).spans;
-        spans.push(Span::styled("  ── ", Style::default().fg(DIM)));
-        spans.push(Span::styled(
-            "agentic dev environment",
-            Style::default().fg(MUTED),
-        ));
+        // Compact one-line header: wordmark, version, where the model runs.
+        let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+        let spans = vec![
+            Span::styled(
+                "φ ",
+                Style::default()
+                    .fg(art::spectrum(0.35))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "phonton",
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                concat!(" ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(DIM),
+            ),
+            Span::styled("  ·  ", Style::default().fg(RULE)),
+            Span::styled(
+                if local { "local" } else { "cloud" },
+                Style::default().fg(if local { SUCCESS } else { WARN }),
+            ),
+            Span::styled(
+                format!(" · {}", display_model(app)),
+                Style::default().fg(MUTED),
+            ),
+        ];
         let p = Paragraph::new(Line::from(spans))
             .alignment(Alignment::Center)
             .style(Style::default().bg(BG_DEEP));
@@ -2357,14 +2528,28 @@ fn render_splash(frame: &mut Frame, area: Rect, _app: &App) {
     }
 }
 
+/// Model label for headers: the configured model, else the calibrated local
+/// model, else the provider default.
+fn display_model(app: &App) -> String {
+    if !app.settings.model.trim().is_empty() {
+        app.settings.model.clone()
+    } else if let Some(m) = app
+        .machine
+        .local_model
+        .as_ref()
+        .filter(|_| provider_is_local(&app.settings.provider, &app.settings.base_url))
+    {
+        m.clone()
+    } else {
+        default_model_for(&app.settings.provider)
+    }
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let key = Style::default()
-        .bg(DIM)
-        .fg(ACCENT_HI)
-        .add_modifier(Modifier::BOLD);
+    let key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
     let txt = Style::default().fg(MUTED);
     let dim = Style::default().fg(DIM);
-    let sep = Span::styled("  ·  ", dim);
+    let sep = Span::styled("   ", dim);
 
     if let Some(goal) = app.goals.get(app.selected) {
         if matches!(goal.status, TaskStatus::Paused { .. }) {
@@ -2380,86 +2565,95 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let spans: Vec<Span<'static>> = match app.mode {
-        Mode::Goal | Mode::Task => vec![
-            Span::styled("Enter", key),
-            Span::styled(" run  ", txt),
-            sep.clone(),
-            Span::styled("/", key),
-            Span::styled(" commands  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+V", key),
-            Span::styled(" paste  ", txt),
-            sep.clone(),
-            Span::styled("?", key),
-            Span::styled(" help  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+;", key),
-            Span::styled(" ask  ", txt),
-            sep.clone(),
-            Span::styled("Shift+L", key),
-            Span::styled(" log  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+D", key),
-            Span::styled(" del  ", txt),
-            sep,
+    if app.quit_armed() {
+        let hint = Line::from(vec![
             Span::styled("Esc", key),
-            Span::styled(" quit", txt),
+            Span::styled(" or ", txt),
+            Span::styled("Ctrl+C", key),
+            Span::styled(" again to quit", txt),
+            Span::styled("  ·  any other key keeps working", dim),
+        ]);
+        frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), area);
+        return;
+    }
+
+    // Hints in priority order; the last one (quit/close) is always kept and
+    // lower-priority hints drop off the tail when the terminal is narrow.
+    let can_apply = app.current_goal().is_some_and(GoalEntry::can_apply);
+    let hints: &[(&str, &str)] = match app.mode {
+        Mode::Goal | Mode::Task if can_apply => &[
+            ("Ctrl+Y", "apply"),
+            ("Enter", "run"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("Shift+L", "log"),
+            ("Esc", "quit"),
         ],
-        Mode::Ask => vec![
-            Span::styled("Enter", key),
-            Span::styled(" send  ", txt),
-            sep.clone(),
-            Span::styled("Ctrl+;", key),
-            Span::styled(" close ask  ", txt),
-            sep,
-            Span::styled("Esc", key),
-            Span::styled(" cancel", txt),
+        Mode::Goal | Mode::Task => &[
+            ("Enter", "run"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("@", "attach"),
+            ("Ctrl+;", "ask"),
+            ("Shift+L", "log"),
+            ("Ctrl+V", "paste"),
+            ("Ctrl+D", "delete"),
+            ("Esc", "quit"),
         ],
-        Mode::Settings => vec![
-            Span::styled("Enter", key),
-            Span::styled(" save  ", txt),
-            sep.clone(),
-            Span::styled("Tab", key),
-            Span::styled(" next field  ", txt),
-            sep.clone(),
-            Span::styled("←→", key),
-            Span::styled(" cycle provider  ", txt),
-            sep,
-            Span::styled("Esc", key),
-            Span::styled(" cancel", txt),
+        Mode::Ask => &[
+            ("Enter", "send"),
+            ("Ctrl+;", "close ask"),
+            ("Esc", "cancel"),
         ],
-        Mode::Memory | Mode::History => vec![
-            Span::styled("/", key),
-            Span::styled(" commands  ", txt),
-            sep.clone(),
-            Span::styled("Esc", key),
-            Span::styled(" back to goals", txt),
+        Mode::Settings => &[
+            ("Enter", "save"),
+            ("Tab", "next field"),
+            ("←→", "cycle provider"),
+            ("Esc", "cancel"),
         ],
-        Mode::CommandPalette => vec![
-            Span::styled("type", key),
-            Span::styled(" filter  ", txt),
-            sep.clone(),
-            Span::styled("↑↓", key),
-            Span::styled(" select  ", txt),
-            sep.clone(),
-            Span::styled("Enter", key),
-            Span::styled(" run  ", txt),
-            sep,
-            Span::styled("Esc", key),
-            Span::styled(" close", txt),
+        Mode::Memory | Mode::History => &[("/", "commands"), ("Esc", "back to goals")],
+        Mode::CommandPalette => &[
+            ("type", "filter"),
+            ("↑↓", "select"),
+            ("Enter", "run"),
+            ("Esc", "close"),
         ],
-        Mode::Clarify => vec![
-            Span::styled("Enter", key),
-            Span::styled(" submit answer  ", txt),
-            sep.clone(),
-            Span::styled("Esc", key),
-            Span::styled(" cancel clarification", txt),
-        ],
+        Mode::Clarify => &[("Enter", "submit answer"), ("Esc", "cancel clarification")],
     };
+    let spans = fit_footer_hints(hints, area.width as usize, key, txt, sep);
 
     let p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     frame.render_widget(p, area);
+}
+
+/// Lay out `(key, label)` footer hints, dropping lower-priority hints from the
+/// middle of the list until the row fits `width`. The final hint is kept.
+fn fit_footer_hints(
+    hints: &[(&str, &str)],
+    width: usize,
+    key: Style,
+    txt: Style,
+    sep: Span<'static>,
+) -> Vec<Span<'static>> {
+    let cost = |h: &[(&str, &str)]| -> usize {
+        h.iter()
+            .map(|(k, l)| k.chars().count() + 1 + l.chars().count())
+            .sum::<usize>()
+            + h.len().saturating_sub(1) * sep.content.chars().count()
+    };
+    let mut kept: Vec<(&str, &str)> = hints.to_vec();
+    while kept.len() > 2 && cost(&kept) > width {
+        kept.remove(kept.len() - 2);
+    }
+    let mut spans = Vec::new();
+    for (i, (k, l)) in kept.iter().enumerate() {
+        if i > 0 {
+            spans.push(sep.clone());
+        }
+        spans.push(Span::styled((*k).to_string(), key));
+        spans.push(Span::styled(format!(" {l}"), txt));
+    }
+    spans
 }
 
 fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
@@ -2495,7 +2689,7 @@ fn render_palette(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled("◆ ", Style::default().fg(VIOLET)),
+            Span::styled("◆ ", Style::default().fg(QUIET)),
             Span::styled(
                 "Command Palette",
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
@@ -2584,33 +2778,27 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, g)| {
             let selected = i == app.selected;
             let (marker, base_style) = if selected {
-                (
-                    "▍ ",
-                    Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-                )
+                ("▍", Style::default().fg(PAPER).add_modifier(Modifier::BOLD))
             } else {
-                ("  ", Style::default().fg(MUTED))
+                (" ", Style::default().fg(MUTED))
             };
-            let mut spans = vec![Span::styled(marker, base_style)];
+            let mut spans = vec![
+                Span::styled(marker, Style::default().fg(ACCENT)),
+                Span::raw(" "),
+            ];
             spans.extend(status_tag_spans(&g.status, app.spinner_frame));
-            // Parallel-worker indicator: one spinner glyph per concurrently
-            // active subtask, capped at 5 so the sidebar stays readable.
-            // Each glyph is drawn at a different phase of the spinner so
-            // the row visibly *moves* — making it obvious that multiple
-            // workers are in flight at once, not just one.
+            // One photon per concurrently active worker, capped at 5.
             let active_count = g
                 .state
                 .as_ref()
                 .map(|s| s.active_workers.len())
                 .unwrap_or(0);
-            if active_count > 0 {
+            if active_count > 1 {
                 spans.push(Span::raw(" "));
                 let visible = active_count.min(5);
                 for i in 0..visible {
-                    let frame_idx = (app.spinner_frame.wrapping_add(i * 2) / 4) % SPINNER.len();
-                    let ch = SPINNER[frame_idx];
                     spans.push(Span::styled(
-                        ch.to_string(),
+                        art::spinner(app.spinner_frame.wrapping_add(i * 3)).to_string(),
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ));
                 }
@@ -2622,252 +2810,279 @@ fn render_goals(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(short(&g.description, 40), base_style));
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let text_w = (area.width as usize).saturating_sub(used + 3).max(12);
+            spans.push(Span::styled(short(&g.description, text_w), base_style));
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let goal_count = app.goals.len();
-    let title_text = if goal_count == 0 {
-        " Goals ".to_string()
-    } else {
-        format!(" Goals ({}) ", goal_count)
-    };
     let goals_focused = matches!(app.mode, Mode::Goal | Mode::Task);
-    let goals_border = if goals_focused { ACCENT } else { DIM };
-    let goals_border_type = if goals_focused {
-        ratatui::widgets::BorderType::Thick
-    } else {
-        ratatui::widgets::BorderType::Rounded
-    };
-    let list = List::new(items).style(Style::default().bg(BG_PANEL)).block(
-        Block::default()
-            .title(Span::styled(
-                title_text,
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(goals_border_type)
-            .border_style(Style::default().fg(goals_border))
-            .style(Style::default().bg(BG_PANEL)),
-    );
+    let block = Block::default()
+        .title(Span::styled(
+            if app.goals.is_empty() {
+                " runs ".to_string()
+            } else {
+                format!(" runs · {} ", app.goals.len())
+            },
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if goals_focused { DIM } else { RULE }))
+        .style(Style::default().bg(BG_PANEL));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(8)])
+        .constraints([Constraint::Min(1), Constraint::Length(9)])
         .split(area);
 
-    frame.render_widget(list, chunks[0]);
+    if app.goals.is_empty() {
+        // Empty board: the φ, drawn from the logo's own pixels.
+        let inner = block.inner(chunks[0]);
+        frame.render_widget(block, chunks[0]);
+        let mut lines: Vec<Line> = Vec::new();
+        let hint = [
+            Line::from(Span::styled("No goals yet.", Style::default().fg(MUTED))),
+            Line::from(Span::styled("Type one below ↓", Style::default().fg(DIM))),
+        ];
+        let phi_h = art::PHI_HEIGHT;
+        if inner.width >= art::PHI_WIDTH && inner.height > phi_h {
+            // Centre the φ and as much of the hint as fits under it.
+            let room = (inner.height - phi_h - 1).min(2) as usize;
+            let pad = inner.height.saturating_sub(phi_h + 1 + room as u16) / 2;
+            lines.extend((0..pad).map(|_| Line::raw("")));
+            lines.extend(art::phi(app.tick()));
+            lines.push(Line::raw(""));
+            lines.extend(hint.into_iter().take(room));
+        } else {
+            lines.push(Line::raw(""));
+            lines.extend(hint);
+        }
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+    } else {
+        frame.render_widget(List::new(items).block(block), chunks[0]);
+    }
 
-    let sys_info = vec![
-        Line::from(vec![
-            Span::styled(" V ", Style::default().fg(SUCCESS)),
-            Span::styled("version   ", Style::default().fg(MUTED)),
-            Span::styled(
-                concat!("v", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(ACCENT_HI),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" ◆ ", Style::default().fg(ACCENT)),
-            Span::styled("provider  ", Style::default().fg(MUTED)),
-            Span::styled(
-                &app.settings.provider,
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" ⌬ ", Style::default().fg(VIOLET)),
-            Span::styled("model     ", Style::default().fg(MUTED)),
-            Span::styled(
-                if app.settings.model.is_empty() {
-                    "(default)"
-                } else {
-                    &app.settings.model
-                },
-                Style::default().fg(ACCENT_HI),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                " ▣ ",
-                Style::default().fg(if app.flight_log_open { SUCCESS } else { DIM }),
-            ),
-            Span::styled("log       ", Style::default().fg(MUTED)),
-            Span::styled(
-                if app.flight_log_open {
-                    "Open"
-                } else {
-                    "Closed"
-                },
-                Style::default().fg(if app.flight_log_open { SUCCESS } else { MUTED }),
-            ),
-        ]),
-    ];
-    let mut sys_info = sys_info;
-    sys_info.push(Line::from(vec![
+    render_machine(frame, chunks[1], app);
+}
+
+/// Side panel: what this machine brings to a run, and the run record.
+fn render_machine(frame: &mut Frame, area: Rect, app: &App) {
+    let label = |s: &str| Span::styled(format!(" {s:<7}"), Style::default().fg(MUTED));
+    let value = |s: String| Span::styled(s, Style::default().fg(PAPER));
+    let gib = |b: u64| b as f64 / 1_073_741_824.0;
+    let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+    let width = area.width.saturating_sub(11) as usize;
+
+    let mut lines = vec![Line::from(vec![
+        label("where"),
         Span::styled(
-            " N ",
-            Style::default().fg(if app.nexus_status.active {
-                SUCCESS
-            } else {
-                DIM
-            }),
+            if local { "this machine" } else { "cloud" },
+            Style::default()
+                .fg(if local { SUCCESS } else { WARN })
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("nexus     ", Style::default().fg(MUTED)),
         Span::styled(
-            nexus_label(&app.nexus_status),
-            Style::default().fg(if app.nexus_status.active {
-                SUCCESS
-            } else {
-                MUTED
-            }),
+            format!(" · {}", app.settings.provider),
+            Style::default().fg(DIM),
+        ),
+    ])];
+    lines.push(Line::from(vec![
+        label("model"),
+        value(short(&display_model(app), width)),
+    ]));
+    if local {
+        let calibrated = match (&app.machine.local_model, app.machine.context_tokens) {
+            (Some(_), Some(ctx)) => format!(
+                "{} · {} ctx",
+                app.machine.protocol.as_deref().unwrap_or("calibrated"),
+                art::thousands(ctx as u64)
+            ),
+            _ if !app.machine.probed => "checking…".to_string(),
+            _ => "not calibrated · phonton models".to_string(),
+        };
+        lines.push(Line::from(vec![
+            label("edits"),
+            Span::styled(short(&calibrated, width), Style::default().fg(MUTED)),
+        ]));
+    }
+    match &app.machine.gpu {
+        Some((name, free, total)) if *total > 0 => {
+            let mut spans = vec![label("vram")];
+            let bar = 8.min(width.saturating_sub(12));
+            spans.extend(art::gauge(1.0 - *free as f32 / *total as f32, bar, MUTED));
+            spans.push(value(format!(
+                " {:.1}/{:.1}G",
+                gib(total.saturating_sub(*free)),
+                gib(*total)
+            )));
+            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                label(""),
+                Span::styled(short(name, width), Style::default().fg(DIM)),
+            ]));
+        }
+        _ => {
+            if let Some((free, total)) = app.machine.ram {
+                lines.push(Line::from(vec![
+                    label("ram"),
+                    value(format!("{:.1} GiB free of {:.1}", gib(free), gib(total))),
+                ]));
+            }
+        }
+    }
+    let r = &app.record;
+    lines.push(Line::from(vec![
+        label("record"),
+        Span::styled(
+            format!("{} verified", art::thousands(r.verified_runs)),
+            Style::default().fg(if r.verified_runs > 0 { SUCCESS } else { MUTED }),
+        ),
+        Span::styled(
+            format!(" · streak {}", r.streak),
+            Style::default().fg(if r.streak > 0 { PAPER } else { DIM }),
         ),
     ]));
-    sys_info.push(Line::from(vec![
-        Span::styled(" DB ", Style::default().fg(ACCENT)),
-        Span::styled("store     ", Style::default().fg(MUTED)),
+    lines.push(Line::from(vec![
+        label(""),
         Span::styled(
-            app.store_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("(memory)"),
-            Style::default().fg(ACCENT_HI),
+            format!("{} tokens kept local", art::thousands(r.local_tokens)),
+            Style::default().fg(DIM),
         ),
     ]));
 
-    let sys_p = Paragraph::new(sys_info)
+    let p = Paragraph::new(lines)
         .style(Style::default().bg(BG_PANEL))
         .block(
             Block::default()
                 .title(Span::styled(
-                    " System ",
-                    Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                    concat!(" machine · v", env!("CARGO_PKG_VERSION"), " "),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::default().fg(DIM))
+                .border_style(Style::default().fg(RULE))
                 .style(Style::default().bg(BG_PANEL)),
         );
-    frame.render_widget(sys_p, chunks[1]);
+    frame.render_widget(p, area);
 }
 
 fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
-    let has_active = if let Some(g) = app.current_goal() {
-        g.state
-            .as_ref()
-            .map(|s| !s.active_workers.is_empty())
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    let border_color = if has_active { ACCENT_HI } else { DIM };
-
-    // Pulsing effect for the "Active" indicator
-    let pulse_colors = [SUCCESS, ACCENT_HI, SUCCESS, MUTED];
-    let pulse_idx = (app.spinner_frame / 8) % pulse_colors.len();
+    let has_active = app
+        .current_goal()
+        .and_then(|g| g.state.as_ref())
+        .is_some_and(|s| !s.active_workers.is_empty());
     let pulse_color = if has_active {
-        pulse_colors[pulse_idx]
+        art::spectrum(((app.spinner_frame / 3) % 20) as f32 / 19.0)
     } else {
         MUTED
     };
-
     let block = Block::default()
         .title(Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled("◉ ", Style::default().fg(pulse_color)),
+            Span::raw(" "),
             Span::styled(
-                "Active",
-                Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+                if has_active {
+                    art::spinner(app.spinner_frame).to_string()
+                } else {
+                    "○".to_string()
+                },
+                Style::default().fg(pulse_color),
             ),
-            Span::styled(" ", Style::default()),
+            Span::styled(
+                if app.current_goal().is_some() {
+                    " run "
+                } else {
+                    " welcome "
+                },
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+            ),
         ]))
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
+        .border_style(Style::default().fg(if has_active { DIM } else { RULE }))
         .style(Style::default().bg(BG_PANEL));
 
     let Some(g) = app.current_goal() else {
-        let label = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let head = Style::default().fg(PAPER).add_modifier(Modifier::BOLD);
         let muted = Style::default().fg(MUTED);
-        let example = Style::default().fg(Color::White);
-        let mut welcome_spans: Vec<Span<'static>> = vec![Span::styled("  Welcome to ", muted)];
-        let title_chars: Vec<char> = "phonton".chars().collect();
-        let n = title_chars.len() as f32;
-        for (i, ch) in title_chars.into_iter().enumerate() {
-            let t = (i as f32) / (n - 1.0).max(1.0);
-            welcome_spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(grad3(t)).add_modifier(Modifier::BOLD),
-            ));
-        }
-        welcome_spans.push(Span::styled(".", muted));
+        let dim = Style::default().fg(DIM);
+        let key = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let item = |k: &'static str, body: &'static str| {
+            Line::from(vec![
+                Span::styled("  › ", Style::default().fg(ACCENT)),
+                Span::styled(format!("{k:<24}"), Style::default().fg(PAPER)),
+                Span::styled(body, muted),
+            ])
+        };
+        let local = provider_is_local(&app.settings.provider, &app.settings.base_url);
+        let local_line = match (&app.machine.local_model, local) {
+            (None, true) if !app.machine.probed => Line::from(vec![
+                Span::styled(
+                    format!("  {} ", art::spinner(app.spinner_frame)),
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled("Checking the local model on this machine…", muted),
+            ]),
+            (Some(model), true) => Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(SUCCESS)),
+                Span::styled(
+                    model.clone(),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" runs on this machine", muted),
+                Span::styled(
+                    app.machine
+                        .context_tokens
+                        .map(|c| format!(" · {} ctx calibrated", art::thousands(c as u64)))
+                        .unwrap_or_default(),
+                    dim,
+                ),
+            ]),
+            (None, true) => Line::from(vec![
+                Span::styled("  ○ ", Style::default().fg(WARN)),
+                Span::styled("No calibrated local model yet. ", muted),
+                Span::styled("phonton models", key),
+                Span::styled(" picks one for your GPU.", muted),
+            ]),
+            (_, false) if !app.model_ready => Line::from(vec![
+                Span::styled("  ○ ", Style::default().fg(WARN)),
+                Span::styled("No model yet. Paste an API key, or run ", muted),
+                Span::styled("phonton models setup", key),
+                Span::styled(" to use this machine.", muted),
+            ]),
+            (_, false) => Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(SUCCESS)),
+                Span::styled(
+                    format!("{} ", app.settings.provider),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("ready. ", muted),
+                Span::styled("phonton models", key),
+                Span::styled(" adds a model on this machine.", muted),
+            ]),
+        };
+        let inner_w = area.width.saturating_sub(2);
         let lines = vec![
             Line::raw(""),
-            Line::from(welcome_spans),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "  Type a goal below and press Enter — it will be planned, executed",
-                muted,
-            )),
-            Line::from(Span::styled(
-                "  by parallel workers, and verified before any diff lands.",
-                muted,
-            )),
-            Line::raw(""),
-            Line::from(Span::styled("  Try one of:", label)),
             Line::from(vec![
-                Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(0.0)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Add a Cargo command for running tests in CI", example),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(0.5)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Refactor render_input into smaller helpers", example),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    ▸ ",
-                    Style::default().fg(grad3(1.0)).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("Write integration tests for the orchestrator", example),
+                Span::styled("  phonton", head),
+                Span::styled(" — the local-first ADE that proves its work.", muted),
             ]),
             Line::raw(""),
-            Line::from(Span::styled("  Shortcuts:", label)),
-            Line::from(vec![
-                Span::styled(
-                    "    /",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("       command palette", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Ctrl+;",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  toggle Ask side panel", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Shift+L",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" open the Flight Log", muted),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "    Esc",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("     quit", muted),
-            ]),
+            {
+                let mut track = vec![Span::raw("  ")];
+                track.extend(art::loop_track(art::Track::Idle, app.tick(), inner_w).spans);
+                Line::from(track)
+            },
+            Line::raw(""),
+            local_line,
+            Line::raw(""),
+            Line::from(Span::styled("  Every run gets", head)),
+            item("a plan first", "files, checks and budget before any edit"),
+            item("verified diffs", "your build and tests gate review"),
+            item("a receipt", "tokens, time, cost, what left the machine"),
+            Line::raw(""),
+            Line::from(Span::styled("  Try", head)),
+            item("Fix the failing test in", "@tests/…"),
+            item("Add input validation to", "@src/…"),
+            item("Explain this repo", "Ctrl+; asks without editing"),
         ];
         let p = Paragraph::new(lines)
             .block(block)
@@ -2932,18 +3147,13 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                     Span::styled(
                         questions[q_idx].clone(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
                     Span::styled("  Your Answer: ", Style::default().fg(ACCENT_HI)),
-                    Span::styled(
-                        app.clarifying_buffer.clone(),
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled(app.clarifying_buffer.clone(), Style::default().fg(PAPER)),
                     Span::styled("█", Style::default().fg(pulse_color)),
                 ]));
             }
@@ -2961,7 +3171,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                         .map(|c| c.confidence_percent)
                         .unwrap_or(0)
                 ),
-                Style::default().fg(Color::White),
+                Style::default().fg(PAPER),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
@@ -2974,7 +3184,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                         format!("    {}. ", idx + 1),
                         Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(q.clone(), Style::default().fg(Color::White)),
+                    Span::styled(q.clone(), Style::default().fg(PAPER)),
                 ]));
             }
             lines.push(Line::raw(""));
@@ -2989,53 +3199,97 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let inner_w = area.width.saturating_sub(2);
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(vec![
+        Span::styled("goal  ", Style::default().fg(MUTED)),
         Span::styled(
-            "goal: ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            g.description.clone(),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(g.description.clone()),
     ]));
+    let mut track = art::loop_track(goal_track(g), app.tick(), inner_w).spans;
+    track.push(Span::styled(
+        format!("   {}", fmt_elapsed(g)),
+        Style::default().fg(DIM),
+    ));
+    lines.push(Line::from(track));
     lines.push(Line::raw(""));
 
     if let Some(state) = &g.state {
-        // Receipt-first: when a handoff exists, show the merge gate summary
-        // before in-flight worker noise.
-        if let Some(handoff) = &state.handoff_packet {
-            append_handoff_lines(&mut lines, handoff);
-            lines.push(Line::raw(""));
-        }
-
         for w in &state.active_workers {
-            let mut spans = status_tag_spans(&w.status_as_task(), app.spinner_frame);
-            spans.push(Span::raw(" "));
-            spans.push(Span::raw(short(&w.subtask_description, 50)));
+            // Worker descriptions can carry a "Prior context from memory"
+            // preamble for the model; show the user the task itself.
+            let task =
+                phonton_types::task_description_without_prior_context(&w.subtask_description);
+            let mut spans = vec![
+                Span::styled(
+                    format!("  {} ", art::spinner(app.spinner_frame)),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    short(task.lines().next().unwrap_or(""), 52),
+                    Style::default().fg(PAPER),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} · {} tok",
+                        if w.model_name.is_empty() {
+                            w.model_tier.to_string()
+                        } else {
+                            w.model_name.clone()
+                        },
+                        art::thousands(w.tokens_used)
+                    ),
+                    Style::default().fg(DIM),
+                ),
+            ];
             if w.is_thinking {
-                let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
-                let frame_ch = SPINNER[frame_idx];
                 spans.push(Span::styled(
-                    format!("  {} thinking…", frame_ch),
-                    Style::default()
-                        .fg(Color::Rgb(180, 100, 255))
-                        .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                    "  thinking…",
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                 ));
             }
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("({})", w.model_tier),
-                Style::default().fg(MUTED),
-            ));
             lines.push(Line::from(spans));
         }
         if !state.active_workers.is_empty() {
             lines.push(Line::raw(""));
         }
-        lines.push(render_savings_line_styled(
-            Some(state),
-            app.best_savings_pct,
-            app.new_best_ticks,
-        ));
+        if state.handoff_packet.is_none() {
+            append_local_attempts(&mut lines, g);
+        }
+        // Receipt-first: once a handoff exists it leads the pane.
+        if let Some(handoff) = &state.handoff_packet {
+            let width = (inner_w as usize).saturating_sub(1).clamp(40, 66);
+            lines.extend(receipt_lines(app, g, state, handoff, width));
+            append_local_review(&mut lines, g);
+            append_handoff_lines(&mut lines, handoff);
+            lines.push(Line::raw(""));
+        } else if let TaskStatus::Failed { reason, .. } = &g.status {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "✗ ",
+                    Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(reason.clone(), Style::default().fg(PAPER)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                if g.recorded {
+                    "  Streak reset. The flight log (Shift+L) has every event."
+                } else {
+                    "  Run record unchanged. The flight log (Shift+L) has every event."
+                },
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::raw(""));
+        }
+        if state.estimated_naive_tokens > 0 {
+            lines.push(render_savings_line_styled(
+                Some(state),
+                app.best_savings_pct,
+                app.new_best_ticks,
+            ));
+        }
         if let Some(label) = execution_mode_label(g) {
             lines.push(Line::from(vec![
                 Span::styled("execution: ", Style::default().fg(MUTED)),
@@ -3043,19 +3297,16 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             ]));
         }
 
-        // Checkpoint picker — one line per landed subtask, newest last.
-        // Marked with a "↶ N" tag for "Rollback to step N" — the actual
-        // rollback is dispatched through the orchestrator's control
-        // channel (see `OrchestratorMessage::RollbackRequest`); this
-        // panel only surfaces the picker.
+        // Checkpoint history is inspectable; legacy reset-based rollback is
+        // disabled until it can leave unrelated user work intact.
         if !state.checkpoints.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 format!(
-                    "Checkpoints ({} — Ctrl+↑↓ select, 'r' rollback):",
+                    "Checkpoints ({} — history only; legacy rollback disabled):",
                     state.checkpoints.len()
                 ),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
             )));
             let cursor = g.checkpoint_cursor;
             for (i, cp) in state.checkpoints.iter().enumerate() {
@@ -3069,7 +3320,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
                 let marker = if is_selected {
                     format!("  ▶ #{:>2}  ", cp.seq)
                 } else {
-                    format!("  ↶ #{:>2}  ", cp.seq)
+                    format!("    #{:>2}  ", cp.seq)
                 };
                 lines.push(Line::from(vec![
                     Span::styled(marker, marker_style),
@@ -3079,14 +3330,393 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     } else {
-        lines.push(Line::from(Span::styled(
-            "(waiting for first state snapshot…)",
-            Style::default().fg(MUTED),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", art::spinner(app.spinner_frame)),
+                Style::default().fg(ACCENT),
+            ),
+            Span::styled(
+                "Planning — reading the workspace and drafting the goal contract…",
+                Style::default().fg(MUTED),
+            ),
+        ]));
     }
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: true }).block(block);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block);
     frame.render_widget(p, area);
+}
+
+/// Attempts so far in a running local goal: what each tried and how its
+/// checks ended, so a 30-second run is not a blank screen.
+fn append_local_attempts(lines: &mut Vec<Line<'static>>, g: &GoalEntry) {
+    let Some(receipt) = &g.local else { return };
+    if receipt.candidates.is_empty() && receipt.baseline_checks.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        "Attempts",
+        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+    )));
+    if !receipt.baseline_checks.is_empty() {
+        let failing = receipt
+            .baseline_checks
+            .iter()
+            .filter(|c| c.status == phonton_types::local::CheckStatus::Failed)
+            .count();
+        lines.push(Line::from(vec![
+            Span::styled("  ○ baseline  ", Style::default().fg(MUTED)),
+            Span::styled(
+                if failing > 0 {
+                    "checks fail on the unchanged source, as expected".to_string()
+                } else {
+                    "checks pass on the unchanged source".to_string()
+                },
+                Style::default().fg(DIM),
+            ),
+        ]));
+    }
+    for c in &receipt.candidates {
+        let passed = !c.checks.is_empty()
+            && c.checks
+                .iter()
+                .all(|k| k.status == phonton_types::local::CheckStatus::Passed);
+        let (mark, color) = if c.rejection.is_none() && passed {
+            ("✓", SUCCESS)
+        } else if c.rejection.is_some() {
+            ("✗", DANGER)
+        } else {
+            ("·", MUTED)
+        };
+        let why = local_tui::check_failures(c, 1)
+            .into_iter()
+            .find(|l| l.starts_with("not ok"))
+            .or_else(|| c.rejection.clone())
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {mark} candidate {}  ", c.number),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(short(&c.approach, 34), Style::default().fg(PAPER)),
+            Span::styled(
+                format!(
+                    "  {:.1} s · {} tok",
+                    c.elapsed_ms as f64 / 1000.0,
+                    c.output_tokens.unwrap_or(0)
+                ),
+                Style::default().fg(DIM),
+            ),
+        ]));
+        if !why.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", short(&why, 70)),
+                Style::default().fg(if mark == "✗" { DANGER } else { MUTED }),
+            )));
+        }
+    }
+    lines.push(Line::raw(""));
+}
+
+/// The reviewed local candidate's diff and how to apply it.
+fn append_local_review(lines: &mut Vec<Line<'static>>, g: &GoalEntry) {
+    let Some(receipt) = &g.local else { return };
+    let selected = receipt
+        .selected_candidate
+        .and_then(|n| receipt.candidates.iter().find(|c| c.number == n));
+    // Show the most informative attempt: the selected one, else the last
+    // with a diff; explain failure from the last attempt whose checks failed.
+    let Some(candidate) = selected
+        .or_else(|| receipt.candidates.iter().rev().find(|c| !c.diff.is_empty()))
+        .or(receipt.candidates.last())
+    else {
+        return;
+    };
+    let failed_attempt = selected.or_else(|| {
+        receipt.candidates.iter().rev().find(|c| {
+            c.checks
+                .iter()
+                .any(|k| k.status == phonton_types::local::CheckStatus::Failed)
+        })
+    });
+    lines.push(Line::raw(""));
+    match &g.applied {
+        None if selected.is_none() => lines.push(Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                match &g.status {
+                    TaskStatus::Failed { reason, .. } => {
+                        format!("{reason}. Your files are unchanged. ")
+                    }
+                    _ => "Nothing to apply. Your files are unchanged. ".to_string(),
+                },
+                Style::default().fg(PAPER),
+            ),
+            Span::styled(
+                format!("Evidence: phonton goal --local show {}", receipt.id),
+                Style::default().fg(DIM),
+            ),
+        ])),
+        None if receipt.state != "review_ready" => lines.push(Line::from(vec![
+            Span::styled("○ ", Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Not appliable: only a candidate whose checks passed can land. ",
+                Style::default().fg(PAPER),
+            ),
+            Span::styled(
+                format!("Evidence: phonton goal --local show {}", receipt.id),
+                Style::default().fg(DIM),
+            ),
+        ])),
+        None => lines.push(Line::from(vec![
+            Span::styled(
+                "Ctrl+Y",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " apply to the working tree · originals kept for rollback",
+                Style::default().fg(MUTED),
+            ),
+        ])),
+        Some(Ok(done)) => lines.push(Line::from(vec![
+            Span::styled(
+                "✓ ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(done.clone(), Style::default().fg(PAPER)),
+        ])),
+        Some(Err(why)) => lines.push(Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("Not applied: {why}"), Style::default().fg(PAPER)),
+        ])),
+    }
+    lines.push(Line::raw(""));
+    let failures = failed_attempt
+        .map(|c| local_tui::check_failures(c, 8))
+        .unwrap_or_default();
+    if let (false, Some(attempt)) = (failures.is_empty(), failed_attempt) {
+        lines.push(Line::from(Span::styled(
+            format!("Why candidate {} failed", attempt.number),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+        )));
+        for line in failures {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(if line.starts_with("not ok") {
+                    DANGER
+                } else {
+                    MUTED
+                }),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(Span::styled(
+        if selected.is_some() {
+            format!("Diff · candidate {}", candidate.number)
+        } else {
+            format!("Diff · candidate {} · not applied", candidate.number)
+        },
+        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
+    )));
+    let diff: Vec<&str> = candidate.diff.lines().collect();
+    for line in diff.iter().take(40) {
+        let color = if line.starts_with("+++") || line.starts_with("---") {
+            DIM
+        } else if line.starts_with('+') {
+            SUCCESS
+        } else if line.starts_with('-') {
+            DANGER
+        } else if line.starts_with("@@") {
+            ACCENT
+        } else {
+            MUTED
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(color),
+        )));
+    }
+    if diff.len() > 40 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  … {} more lines · phonton goal --local show {}",
+                diff.len() - 40,
+                receipt.id
+            ),
+            Style::default().fg(DIM),
+        )));
+    }
+}
+
+/// Where a goal sits on the ADE loop.
+fn goal_track(g: &GoalEntry) -> art::Track {
+    let verifying = g.flight_log.iter().rev().take(6).any(|r| {
+        matches!(
+            r.event,
+            OrchestratorEvent::VerifyPass { .. }
+                | OrchestratorEvent::VerifyFail { .. }
+                | OrchestratorEvent::RepairPlanned { .. }
+                | OrchestratorEvent::VerifyEscalated { .. }
+        )
+    });
+    match (&g.local, &g.status) {
+        (Some(local), TaskStatus::Running { .. }) => {
+            return art::Track::Active(local_tui::stage(local));
+        }
+        (Some(local), TaskStatus::Reviewing { .. }) if local.state != "review_ready" => {
+            return art::Track::Failed(3);
+        }
+        _ => {}
+    }
+    match &g.status {
+        TaskStatus::Queued => art::Track::Active(0),
+        TaskStatus::Planning => art::Track::Active(1),
+        TaskStatus::Running { .. } | TaskStatus::Paused { .. } => {
+            art::Track::Active(if verifying { 3 } else { 2 })
+        }
+        TaskStatus::Reviewing { .. } => art::Track::Active(4),
+        TaskStatus::Done { .. } => art::Track::Complete,
+        TaskStatus::Failed { .. } => art::Track::Failed(if verifying { 3 } else { 2 }),
+        TaskStatus::Rejected => art::Track::Failed(4),
+    }
+}
+
+/// `12.4 s` or `3m 05s` since the goal was queued (frozen once settled).
+fn fmt_elapsed(g: &GoalEntry) -> String {
+    let d = g
+        .finished_at
+        .unwrap_or_else(std::time::Instant::now)
+        .saturating_duration_since(g.started_at);
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1} s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
+fn receipt_cost(g: &GoalEntry, cost: &CostReceipt) -> String {
+    let origin = g
+        .local
+        .as_ref()
+        .map(|r| r.runtime_origin.into())
+        .unwrap_or(g.token_origin);
+    match origin {
+        record::TokenOrigin::ManagedLocal => "$0.00 · managed local runtime".into(),
+        record::TokenOrigin::Hosted if cost.pricing_known => format!(
+            "${:.4} · hosted provider",
+            cost.actual_usd_micros as f64 / 1e6
+        ),
+        record::TokenOrigin::Hosted => "unpriced · hosted provider".into(),
+        record::TokenOrigin::Unknown => "unpriced · runtime origin unknown".into(),
+    }
+}
+
+/// The receipt card: counts up, then stamps what the evidence supports.
+fn receipt_lines(
+    app: &App,
+    g: &GoalEntry,
+    state: &GlobalState,
+    h: &HandoffPacket,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let since = g
+        .receipt_tick
+        .filter(|_| app.motion)
+        .map(|t| app.spinner_frame.wrapping_sub(t));
+    let verdict = if matches!(g.status, TaskStatus::Failed { .. }) {
+        art::Verdict::Failed
+    } else {
+        handoff_verdict(h)
+    };
+    let inner = width.saturating_sub(4);
+    let n = |v: u64| art::thousands(art::count_up(v, since));
+    let num = |s: String| Span::styled(s, Style::default().fg(PAPER).add_modifier(Modifier::BOLD));
+    let usage = &h.token_usage;
+    let (tin, tout) = if usage.input_tokens + usage.output_tokens > 0 {
+        (usage.input_tokens, usage.output_tokens)
+    } else {
+        (state.tokens_used, 0)
+    };
+    let mut body = vec![
+        Line::from(Span::styled(
+            short(&h.headline, inner),
+            Style::default().fg(PAPER),
+        )),
+        Line::raw(""),
+        art::leader(
+            "files",
+            vec![
+                num(h.diff_stats.files_changed.to_string()),
+                Span::styled(
+                    format!("  +{}", h.diff_stats.added_lines),
+                    Style::default().fg(SUCCESS),
+                ),
+                Span::styled(
+                    format!(" −{}", h.diff_stats.removed_lines),
+                    Style::default().fg(DANGER),
+                ),
+            ],
+            inner,
+        ),
+        art::leader(
+            "checks",
+            vec![
+                num(format!("{} passed", h.verification.passed.len())),
+                Span::styled(
+                    if h.verification.findings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {} findings", h.verification.findings.len())
+                    },
+                    Style::default().fg(WARN),
+                ),
+            ],
+            inner,
+        ),
+        art::leader("tokens in", vec![num(n(tin))], inner),
+        art::leader("tokens out", vec![num(n(tout))], inner),
+        art::leader("time", vec![num(fmt_elapsed(g))], inner),
+    ];
+    body.push(art::leader(
+        "API cost",
+        vec![num(receipt_cost(g, &h.cost_receipt))],
+        inner,
+    ));
+    if g.recorded {
+        let streak = app.record.streak;
+        body.push(art::leader(
+            "streak",
+            vec![Span::styled(
+                if verdict == art::Verdict::Verified {
+                    format!("{streak} verified in a row")
+                } else {
+                    "reset · needs passing tests".to_string()
+                },
+                Style::default().fg(if verdict == art::Verdict::Verified {
+                    SUCCESS
+                } else {
+                    DIM
+                }),
+            )],
+            inner,
+        ));
+    }
+    art::boxed(
+        "receipt",
+        Some(art::stamp(verdict, since)),
+        body,
+        width,
+        RULE,
+    )
 }
 
 fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
@@ -3094,7 +3724,7 @@ fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
     let mut provider = false;
     for record in &goal.flight_log {
         if let OrchestratorEvent::SubtaskReviewReady { model_name, .. } = &record.event {
-            if model_name.contains("local-template") || model_name.contains("stub") {
+            if model_name.contains("stub") {
                 local = true;
             } else if !model_name.is_empty() {
                 provider = true;
@@ -3102,55 +3732,26 @@ fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
         }
     }
     match (local, provider) {
-        (true, true) => Some("mixed (local-template + provider)"),
-        (true, false) => Some("local-template — not a provider token-efficiency claim"),
+        (true, true) => Some("mixed (stub + provider)"),
+        (true, false) => Some("stub — not a provider token-efficiency claim"),
         (false, true) => Some("provider"),
         (false, false) => None,
     }
 }
 
 fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket) {
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Result",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(handoff.headline.clone(), Style::default().fg(Color::White)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  files ", Style::default().fg(MUTED)),
-        Span::styled(
-            handoff.diff_stats.files_changed.to_string(),
-            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  +", Style::default().fg(MUTED)),
-        Span::styled(
-            handoff.diff_stats.added_lines.to_string(),
-            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  -", Style::default().fg(MUTED)),
-        Span::styled(
-            handoff.diff_stats.removed_lines.to_string(),
-            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-
     if !handoff.changed_files.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Changed files",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         )));
         for file in handoff.changed_files.iter().take(6) {
             lines.push(Line::from(vec![
                 Span::styled("  - ", Style::default().fg(ACCENT_HI)),
                 Span::styled(
                     short(&file.path.display().to_string(), 44),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("  +", Style::default().fg(MUTED)),
                 Span::styled(file.added_lines.to_string(), Style::default().fg(SUCCESS)),
@@ -3172,7 +3773,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Verification",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         )));
         for passed in handoff.verification.passed.iter().take(4) {
             lines.push(Line::from(vec![
@@ -3197,7 +3798,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Run",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
     )));
     if handoff.run_commands.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -3211,7 +3812,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
                     "  $ ",
                     Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(command.command.join(" "), Style::default().fg(Color::White)),
+                Span::styled(command.command.join(" "), Style::default().fg(PAPER)),
             ]));
         }
     }
@@ -3248,7 +3849,7 @@ fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title(Span::styled(
             " Flight Log ",
-            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
             scroll_hint,
@@ -3256,7 +3857,7 @@ fn render_flight_log(frame: &mut Frame, area: Rect, app: &App) {
         )))
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(VIOLET));
+        .border_style(Style::default().fg(QUIET));
 
     let Some(g) = app.current_goal() else {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -3486,16 +4087,6 @@ fn memory_record_summary(record: &MemoryRecord) -> (&'static str, String) {
     }
 }
 
-fn nexus_label(status: &NexusStatus) -> String {
-    if !status.message.is_empty() {
-        short(&status.message, 22)
-    } else if status.active {
-        format!("{} repos", status.repo_count)
-    } else {
-        "single repo".into()
-    }
-}
-
 fn permissions_label(permissions: &[Permission]) -> String {
     if permissions.is_empty() {
         return "none".into();
@@ -3553,12 +4144,12 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::TaskCompleted { .. } => (SUCCESS, "task-done"),
         E::TaskFailed { .. } => (DANGER, "task-failed"),
         E::SubtaskDispatched { .. } => (ACCENT, "dispatch"),
-        E::ContextSelected { .. } => (VIOLET, "context"),
+        E::ContextSelected { .. } => (QUIET, "context"),
         E::ExtensionLoaded { .. } => (ACCENT, "ext-loaded"),
         E::ExtensionSkipped { .. } => (WARN, "ext-skipped"),
         E::ExtensionConflict { .. } => (WARN, "ext-conflict"),
-        E::SteeringApplied { .. } => (VIOLET, "steering"),
-        E::SkillApplied { .. } => (VIOLET, "skill"),
+        E::SteeringApplied { .. } => (QUIET, "steering"),
+        E::SkillApplied { .. } => (QUIET, "skill"),
         E::McpServerAvailable { .. } => (ACCENT, "mcp-server"),
         E::McpToolRequested { .. } => (WARN, "mcp-request"),
         E::McpToolApproved { .. } => (SUCCESS, "mcp-approve"),
@@ -3573,7 +4164,7 @@ fn event_style(rec: &EventRecord) -> (Color, &'static str) {
         E::RepairPlanned { .. } => (WARN, "repair"),
         E::VerifyEscalated { .. } => (WARN, "escalate"),
         E::TokenMilestone { .. } => (MUTED, "tokens"),
-        E::Thinking { .. } => (VIOLET, "thinking"),
+        E::Thinking { .. } => (QUIET, "thinking"),
         E::CheckpointCreated { .. } => (SUCCESS, "checkpoint"),
         E::RollbackPerformed { .. } => (WARN, "rollback"),
         E::ReviewDecision { .. } => (ACCENT, "review"),
@@ -3596,17 +4187,16 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(Span::styled(
             "Ask mode (Ctrl+; to close, Esc to cancel)",
-            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
     ];
     if app.ask_pending {
-        let frame_idx = (app.spinner_frame / 4) % SPINNER.len();
-        let frame_ch = SPINNER[frame_idx];
+        let frame_ch = art::spinner(app.spinner_frame);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{frame_ch} "),
-                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
             ),
             Span::styled("thinking…", Style::default().fg(MUTED)),
         ]));
@@ -3628,11 +4218,11 @@ fn render_ask(frame: &mut Frame, area: Rect, app: &App) {
         Block::default()
             .title(Span::styled(
                 " Ask ",
-                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+                Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(VIOLET)),
+            .border_style(Style::default().fg(QUIET)),
     );
     frame.render_widget(p, area);
 }
@@ -3694,7 +4284,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             .fg(BG_PANEL)
             .add_modifier(Modifier::BOLD),
         Mode::Ask => Style::default()
-            .bg(VIOLET)
+            .bg(QUIET)
             .fg(BG_PANEL)
             .add_modifier(Modifier::BOLD),
         Mode::Settings => Style::default()
@@ -3716,7 +4306,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let border_color = match app.mode {
-        Mode::Ask => VIOLET,
+        Mode::Ask => QUIET,
         Mode::Task | Mode::Clarify => WARN,
         Mode::Memory | Mode::History => SUCCESS,
         _ => ACCENT,
@@ -3759,7 +4349,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                 label,
                 Style::default()
                     .fg(BG_DEEP)
-                    .bg(VIOLET)
+                    .bg(QUIET)
                     .add_modifier(Modifier::BOLD),
             ));
             chip_spans.push(Span::raw(" "));
@@ -3797,10 +4387,10 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(DANGER),
             ));
         } else {
-            prompt_spans.push(Span::styled(visible, Style::default().fg(Color::White)));
+            prompt_spans.push(Span::styled(visible, Style::default().fg(PAPER)));
         }
     } else {
-        prompt_spans.push(Span::styled(visible, Style::default().fg(Color::White)));
+        prompt_spans.push(Span::styled(visible, Style::default().fg(PAPER)));
     }
 
     let prompt = Paragraph::new(Line::from(prompt_spans)).style(Style::default().bg(BG_DEEP));
@@ -3830,47 +4420,28 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 /// the running-state animation; callers increment it once per tick.
 fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> {
     match s {
-        TaskStatus::Queued => vec![pill("queued", Color::Rgb(60, 60, 60), ACCENT_HI)],
-        TaskStatus::Planning => vec![pill("plan", ACCENT, BG_DEEP)],
+        TaskStatus::Queued => vec![tag("queued", DIM)],
+        TaskStatus::Planning => vec![tag(
+            &format!("{} plan", art::spinner(spinner_frame)),
+            ACCENT,
+        )],
         TaskStatus::Running {
             completed, total, ..
-        } => {
-            let frame_idx = (spinner_frame / 4) % SPINNER.len();
-            let ch = SPINNER[frame_idx];
-            vec![
-                Span::styled(
-                    format!("{ch} "),
-                    Style::default()
-                        .fg(Color::Rgb(255, 170, 0))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                pill(
-                    &format!("run {completed}/{total}"),
-                    Color::Rgb(255, 150, 0),
-                    BG_DEEP,
-                ),
-            ]
-        }
-        TaskStatus::Reviewing { .. } => vec![pill("review", Color::Rgb(180, 100, 255), BG_DEEP)],
-        TaskStatus::Done { .. } => vec![pill("done", Color::Rgb(0, 200, 100), BG_DEEP)],
-        TaskStatus::Failed { .. } => vec![pill("fail", Color::Rgb(255, 50, 50), Color::White)],
+        } => vec![tag(
+            &format!("{} run {completed}/{total}", art::spinner(spinner_frame)),
+            WARN,
+        )],
+        TaskStatus::Reviewing { .. } => vec![tag("review", ACCENT)],
+        TaskStatus::Done { .. } => vec![tag("✓ done", SUCCESS)],
+        TaskStatus::Failed { .. } => vec![tag("✗ fail", DANGER)],
         TaskStatus::Paused {
             limit,
             observed,
             ceiling,
-        } => {
-            vec![pill(
-                &format!("paused — {limit} {observed}/{ceiling}"),
-                Color::Rgb(255, 200, 0),
-                BG_DEEP,
-            )]
-        }
+        } => vec![tag(&format!("paused — {limit} {observed}/{ceiling}"), WARN)],
         TaskStatus::Rejected => vec![Span::styled(
-            " rej ",
-            Style::default()
-                .bg(Color::Rgb(100, 0, 0))
-                .fg(Color::Rgb(200, 200, 200))
-                .add_modifier(Modifier::CROSSED_OUT),
+            "[rej]",
+            Style::default().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
         )],
     }
 }
@@ -3882,33 +4453,6 @@ fn short(s: &str, n: usize) -> String {
         out
     } else {
         s.to_string()
-    }
-}
-
-/// Helper for rendering a `SubtaskStatus` using the same taxonomy as a
-/// `TaskStatus` — lets the centre pane reuse [`status_tag`] on workers.
-trait SubtaskStatusExt {
-    fn status_as_task(&self) -> TaskStatus;
-}
-impl SubtaskStatusExt for phonton_types::WorkerState {
-    fn status_as_task(&self) -> TaskStatus {
-        match &self.status {
-            SubtaskStatus::Queued => TaskStatus::Queued,
-            SubtaskStatus::Ready => TaskStatus::Queued,
-            SubtaskStatus::Dispatched | SubtaskStatus::Running { .. } => TaskStatus::Running {
-                active_subtasks: vec![self.subtask_id],
-                completed: 0,
-                total: 1,
-            },
-            SubtaskStatus::Done { .. } => TaskStatus::Done {
-                tokens_used: self.tokens_used,
-                wall_time_ms: 0,
-            },
-            SubtaskStatus::Failed { reason, .. } => TaskStatus::Failed {
-                reason: reason.clone(),
-                failed_subtask: Some(self.subtask_id),
-            },
-        }
     }
 }
 
@@ -3957,8 +4501,14 @@ enum LoopEvent {
     Key(KeyEvent),
     Paste(String),
     ClipboardPaste(Result<String, String>),
-    StateUpdate(usize, Box<GlobalState>),
+    /// Snapshot for the goal with this task id (indices shift as goals queue).
+    StateUpdate(TaskId, Box<GlobalState>),
     AskAnswer(String),
+    LocalFinished(TaskId, Box<phonton_types::local_run::LocalRunReceipt>),
+    LocalPlanRequested {
+        prompt: local_plan_approval::PendingLocalPlan,
+        reply_tx: oneshot::Sender<bool>,
+    },
     McpApprovalRequested {
         prompt: PendingMcpApproval,
         reply_tx: oneshot::Sender<McpApprovalDecision>,
@@ -3974,19 +4524,15 @@ enum LoopEvent {
     /// Background model-list fetch completed for the picker overlay.
     /// Carries the full list on success or an error string.
     ModelsLoaded(Result<Vec<String>, String>),
-    FlightEvent(usize, EventRecord),
+    FlightEvent(TaskId, EventRecord),
+    /// Local model and hardware observed by the startup probe.
+    Machine(Box<Machine>),
+    /// Latest local-harness receipt for a goal running on the local model.
+    Local(TaskId, Box<phonton_types::local_run::LocalRunReceipt>),
+    /// Outcome of applying a local candidate to the working tree.
+    LocalApplied(TaskId, Result<String, String>),
     Tick,
 }
-
-/// Per-goal control channel sender, stored so the event loop can dispatch
-/// rollback requests to the right orchestrator instance.
-struct GoalControl {
-    /// Sender end of the orchestrator's control channel.
-    control_tx: mpsc::Sender<OrchestratorMessage>,
-}
-
-/// Shared registry mapping goal index → control handle.
-type ControlRegistry = Arc<std::sync::Mutex<HashMap<usize, GoalControl>>>;
 
 /// Approval bridge from the MCP runtime into the TUI event loop.
 #[derive(Clone)]
@@ -4028,7 +4574,7 @@ fn deny_pending_mcp_approvals(approvals: &mut HashMap<u64, oneshot::Sender<McpAp
 const SEMANTIC_INDEX_TIMEOUT_SECS: u64 = 120;
 
 fn default_store_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
+    phonton_extensions::phonton_home().map(|h| h.join("store.sqlite3"))
 }
 
 fn read_clipboard_text() -> Result<String, String> {
@@ -4078,7 +4624,7 @@ async fn build_semantic_context_with_warnings(
     let index_cfg = cfg.clone();
     let build = async move {
         let retriever: Arc<dyn phonton_index::CodeRetriever> = if index_cfg.backend == "qdrant" {
-            let embedder = phonton_index::Embedder::new()?;
+            let embedder = phonton_index::Embedder::new_for_workspace(&root)?;
             let url = index_cfg
                 .qdrant_url
                 .clone()
@@ -4092,7 +4638,7 @@ async fn build_semantic_context_with_warnings(
                 embedder,
             ))
         } else {
-            let embedder = phonton_index::Embedder::new()?;
+            let embedder = phonton_index::Embedder::new_for_workspace(&root)?;
             let index = match phonton_index::discover_nexus_config(&root) {
                 Ok(Some(cfg)) => {
                     phonton_index::index_workspace_with_nexus_using_embedder(&root, &cfg, &embedder)
@@ -4314,7 +4860,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled("⚙ ", Style::default().fg(VIOLET)),
+            Span::styled("⚙ ", Style::default().fg(QUIET)),
             Span::styled(
                 "Settings",
                 Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
@@ -4506,7 +5052,7 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
 
     // Title: loading spinner or count
     let title = if picker.loading {
-        let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
+        let spinner = art::spinner(app.spinner_frame);
         format!(" {spinner} Fetching models… ")
     } else {
         let n = picker.filtered.len();
@@ -4522,7 +5068,7 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(title.as_str())
-        .border_style(Style::default().fg(VIOLET))
+        .border_style(Style::default().fg(QUIET))
         .style(Style::default().bg(BG_DEEP));
 
     frame.render_widget(block, picker_area);
@@ -4576,7 +5122,7 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
             } else if is_current {
                 Style::default().fg(SUCCESS)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(PAPER)
             };
             ListItem::new(label).style(style)
         })
@@ -4621,8 +5167,8 @@ fn render_model_picker(frame: &mut Frame, settings_area: Rect, app: &App) {
 fn default_model_for(provider: &str) -> String {
     match provider {
         "anthropic" => "claude-haiku-4-5-20251001".into(),
-        "openai" => "gpt-4o-mini".into(),
-        "openrouter" => "openai/gpt-4o-mini".into(),
+        "openai" => "gpt-6-luna".into(),
+        "openrouter" => "openai/gpt-6-luna".into(),
         // `gemini-flash-latest` is an always-current alias that points at
         // whichever flash model is generally available on free-tier keys.
         // `gemini-2.5-flash` exists on most keys but the alias avoids
@@ -4632,11 +5178,16 @@ fn default_model_for(provider: &str) -> String {
         "gemini" => "gemini-flash-latest".into(),
         "agentrouter" => "claude-sonnet-4-5".into(),
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
-        "ollama" => "llama3.2:3b".into(),
-        "deepseek" => "deepseek-chat".into(),
-        "xai" | "grok" => "grok-2-mini".into(),
-        "groq" => "llama-3.3-70b-versatile".into(),
-        "together" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+        // The model Phonton installed and calibrated, not a guess that may
+        // not be pulled.
+        "ollama" => models_cli::settings()
+            .ok()
+            .and_then(|settings| settings.active_model)
+            .unwrap_or_else(|| "llama3.2:3b".into()),
+        "deepseek" => "deepseek-flash".into(),
+        "xai" | "grok" => "grok-build-0.1".into(),
+        "groq" => "openai/gpt-oss-120b".into(),
+        "together" => "deepseek-ai/DeepSeek-V4.1-Flash".into(),
         _ => "unknown".into(),
     }
 }
@@ -4644,6 +5195,14 @@ fn default_model_for(provider: &str) -> String {
 /// Cheap/local use the configured model when set. Standard and frontier use
 /// per-tier ids so escalation is not the same model as cheap.
 fn model_for_dispatch(provider: &str, configured: Option<&str>, tier: ModelTier) -> String {
+    // Keyless providers (Ollama, custom/OpenAI-compatible endpoints) serve
+    // whatever the user installed; there is no tier ladder to escalate to,
+    // so every tier uses the configured model.
+    if !provider_requires_key(provider) {
+        if let Some(model) = configured.filter(|s| !s.trim().is_empty()) {
+            return model.to_string();
+        }
+    }
     match tier {
         ModelTier::Local | ModelTier::Cheap => configured
             .map(str::to_string)
@@ -4659,7 +5218,13 @@ fn model_for_dispatch(provider: &str, configured: Option<&str>, tier: ModelTier)
 /// touches the terminal, so it composes with shell pipes / `less`.
 fn print_help() {
     println!(
-        "phonton — agentic dev environment\n\
+        "phonton — local-first ADE: goal → plan → edit → verify → review → remember\n\
+         \n\
+         QUICK START:\n  \
+         phonton doctor           check provider key, git, and local tools\n  \
+         phonton                  open the TUI and type a goal\n  \
+         phonton models setup     run on local models instead of a cloud key\n  \
+         phonton why-tokens       see where the last goal spent tokens\n\
          \n\
          USAGE:\n  \
          phonton [SUBCOMMAND]\n\
@@ -4668,7 +5233,7 @@ fn print_help() {
          (none)            Launch the interactive TUI (default)\n  \
          ask <question>    One-shot Q&A using the configured provider\n  \
          benchmark         Export benchmark evidence from the latest run\n  \
-         doctor            Check config, store, trust, git, cargo, Nexus, and index backend\n  \
+         doctor            Check provider key, store, trust, and the project's toolchains\n  \
          extensions        Inspect loaded steering, skills, MCP, and profiles\n  \
          skills            Inspect loaded skills\n  \
          steering          Inspect loaded steering rules\n  \
@@ -4677,7 +5242,11 @@ fn print_help() {
          mcp               List configured MCP servers and explicitly call tools\n  \
          plan <goal>       Preview the task DAG without changing files\n  \
          review [task-id]  Show verified diff review payloads\n  \
+         why-tokens        Per-subtask token usage for the latest goal\n  \
+         record            Verified runs, streak, and tokens kept local\n  \
+         proof export      Export typed proof evidence for audit\n  \
          memory            List, edit, delete, and pin persistent memory\n  \
+         models            Detect hardware, install and calibrate local coding models\n  \
          config path       Print the resolved config file path\n  \
          config edit       Open the config in $EDITOR (or notepad on Windows)\n  \
          config show       Dump the resolved config as TOML\n  \
@@ -4689,15 +5258,24 @@ fn print_help() {
          -V, --version     Same as `version`\n\
          \n\
          CONFIG:\n  \
-         Settings live in ~/.phonton/config.toml. Override the provider key with\n  \
-         ANTHROPIC_API_KEY, OPENAI_API_KEY, TOGETHER_API_KEY, etc.\n\
+         Settings live in ~/.phonton/config.toml; PHONTON_CONFIG_PATH selects\n  \
+         another config file for this process. Provider keys may use\n  \
+         ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, etc.\n\
          \n\
          DOCTOR:\n  \
          phonton doctor [--json] [--provider]\n\
          \n\
          GOAL:\n  \
+         phonton goal --local [--plan] <goal> [--repo <path>] [--files a,b]\n  \
+         phonton goal --local <goal> [--check <JSON-array>] [--yes] [--allow-host-checks]\n  \
+         phonton goal --local --reviewed-plan <path> --sha256 <hash> --yes [--allow-host-checks]\n  \
+         phonton goal --local --request <path> [--allow-host-checks]\n  \
+         phonton goal --local apply RUN_ID --yes\n  \
+         phonton goal --local rollback RUN_ID --yes\n  \
+         phonton goal --local list\n  \
+         phonton goal --local show RUN_ID\n  \
          phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  \
-         phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n\
+         phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n\
          \n\
          BENCHMARK:\n  \
          phonton benchmark export --latest --format json\n\
@@ -4709,7 +5287,7 @@ fn print_help() {
          phonton review [--json] [latest|<task-id>]\n  \
          phonton review approve [--json] [latest|<task-id>]\n  \
          phonton review reject [--json] [latest|<task-id>]\n  \
-         phonton review rollback [--json] [latest|<task-id>] <seq>\n\
+         phonton review rollback [--json] [latest|<task-id>] <seq>  (disabled: unsafe legacy reset)\n\
          \n\
          MCP:\n  \
          phonton mcp list [--json]\n  \
@@ -4776,8 +5354,8 @@ async fn handle_cli_args() -> Result<bool> {
                     if !path.exists() {
                         // Seed with current resolved config so the editor opens
                         // a non-empty buffer with the keys the user can tweak.
-                        let cfg = config::load().unwrap_or_default();
-                        let _ = config::save(&cfg);
+                        let cfg = config::load()?;
+                        config::save(&cfg)?;
                     }
                     let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
                         if cfg!(windows) {
@@ -4800,7 +5378,7 @@ async fn handle_cli_args() -> Result<bool> {
                     }
                 }
                 "show" => {
-                    let cfg = config::load().unwrap_or_default();
+                    let cfg = config::load()?;
                     match toml::to_string_pretty(&cfg) {
                         Ok(s) => println!("{}", s),
                         Err(e) => {
@@ -4814,6 +5392,13 @@ async fn handle_cli_args() -> Result<bool> {
                     print_help();
                     std::process::exit(2);
                 }
+            }
+            Ok(true)
+        }
+        "models" => {
+            let code = models_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
             }
             Ok(true)
         }
@@ -4863,7 +5448,13 @@ async fn handle_cli_args() -> Result<bool> {
             Ok(true)
         }
         "goal" => {
-            let code = run_headless_goal(&args[1..]).await?;
+            let code = if args.get(1).is_some_and(|arg| arg == "--local") {
+                // The local run future holds candidate-search state. Keep it
+                // off the main thread's stack, including for plan previews.
+                Box::pin(local_goal_cli::run(&args[2..])).await?
+            } else {
+                run_headless_goal(&args[1..]).await?
+            };
             if code != 0 {
                 std::process::exit(code);
             }
@@ -4904,6 +5495,24 @@ async fn handle_cli_args() -> Result<bool> {
             }
             Ok(true)
         }
+        "why-tokens" | "tokens" => {
+            let code = tokens_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
+        "record" => {
+            record::run(&args[1..])?;
+            Ok(true)
+        }
+        "proof" => {
+            let code = proof_cli::run(&args[1..]).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(true)
+        }
         "serve" => {
             let code = serve_cli::run(&args[1..]).await?;
             if code != 0 {
@@ -4917,7 +5526,7 @@ async fn handle_cli_args() -> Result<bool> {
                 eprintln!("phonton: `ask` requires a question.\n  e.g. phonton ask \"how do I add a feature flag?\"");
                 std::process::exit(2);
             }
-            let cfg = config::load().unwrap_or_default();
+            let cfg = config::load()?;
             let provider = load_ask_provider(&cfg).ok_or_else(|| {
                 anyhow::anyhow!(
                     "no provider configured — set an API key (e.g. ANTHROPIC_API_KEY) \
@@ -4966,6 +5575,7 @@ pub(crate) struct HeadlessGoalOptions {
     display_text: String,
     json: bool,
     yes: bool,
+    host_checks_approved: bool,
     direct_task: bool,
     timeout_seconds: u64,
     resume_task_id: Option<TaskId>,
@@ -4973,16 +5583,15 @@ pub(crate) struct HeadlessGoalOptions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HeadlessGoalResult {
-    #[allow(dead_code)]
     pub task_id: TaskId,
-    #[allow(dead_code)]
     pub final_state: GlobalState,
     pub exit_code: i32,
 }
 
 fn print_goal_help() {
     println!(
-        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--permission-mode <mode>] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id>\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop."
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nHost checks execute repository code and require explicit --allow-host-checks on each invocation.
+With a local provider and a calibrated model, goals run through the local harness; see phonton goal --local --help."
     );
 }
 
@@ -5024,22 +5633,35 @@ fn apply_budget_pricing(guard: BudgetGuard, cfg: &config::Config) -> BudgetGuard
             },
         );
     }
-    if provider == "deepseek"
-        || (provider == "openai-compatible"
-            && cfg
-                .provider
-                .base_url
-                .as_deref()
-                .is_some_and(|url| url.contains("deepseek")))
-    {
-        return guard.with_price(
-            kind,
-            &model,
-            ModelPricing {
-                input_usd_micros_per_mtok: 270_000,
-                output_usd_micros_per_mtok: 1_100_000,
-            },
-        );
+    let official_deepseek_endpoint = match cfg.provider.base_url.as_deref() {
+        None => provider == "deepseek",
+        Some(url) => matches!(
+            url.trim_end_matches('/'),
+            "https://api.deepseek.com" | "https://api.deepseek.com/v1"
+        ),
+    };
+    if matches!(provider, "deepseek" | "openai-compatible") && official_deepseek_endpoint {
+        // Published peak cache-miss prices are conservative for the
+        // discounted off-peak and cache-hit periods. Register every tier the
+        // dispatcher can select, not only the configured cheap model.
+        let flash = ModelPricing {
+            input_usd_micros_per_mtok: 300_000,
+            output_usd_micros_per_mtok: 1_200_000,
+        };
+        let pro = ModelPricing {
+            input_usd_micros_per_mtok: 1_320_000,
+            output_usd_micros_per_mtok: 3_960_000,
+        };
+        let mut guard = guard;
+        for id in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            guard = guard.with_price(kind, id, flash);
+        }
+        guard = guard.with_price(kind, "deepseek-v4-pro", pro);
+        return guard;
     }
     guard
 }
@@ -5047,6 +5669,7 @@ fn apply_budget_pricing(guard: BudgetGuard, cfg: &config::Config) -> BudgetGuard
 fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
     let mut json = false;
     let mut yes = false;
+    let mut host_checks_approved = false;
     let mut direct_task = false;
     let mut timeout_seconds = 900;
     let mut prompt_file: Option<PathBuf> = None;
@@ -5068,6 +5691,7 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
             }
             "--json" => json = true,
             "--yes" | "-y" => yes = true,
+            "--allow-host-checks" => host_checks_approved = true,
             "--task" => direct_task = true,
             "--stdin" => read_stdin = true,
             "--prompt-file" => {
@@ -5095,6 +5719,9 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
                 i += 1;
                 args.get(i)
                     .ok_or_else(|| anyhow::anyhow!("--permission-mode requires a value"))?;
+                return Err(anyhow::anyhow!(
+                    "--permission-mode is unsupported for headless goals; use --allow-host-checks to explicitly approve repository checks"
+                ));
             }
             "--" => {
                 positionals.extend(args[i + 1..].iter().cloned());
@@ -5155,6 +5782,7 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
         display_text,
         json,
         yes,
+        host_checks_approved,
         direct_task,
         timeout_seconds,
         resume_task_id,
@@ -5168,6 +5796,20 @@ fn summarize_goal_display(text: &str) -> String {
         .map(str::trim)
         .unwrap_or("goal");
     short(first_line, 96)
+}
+
+fn ensure_resume_workspace(saved_working_dir: &str, current_working_dir: &Path) -> Result<()> {
+    let saved = std::fs::canonicalize(saved_working_dir)
+        .map_err(|e| anyhow::anyhow!("cannot resolve the paused goal workspace: {e}"))?;
+    let current = std::fs::canonicalize(current_working_dir)
+        .map_err(|e| anyhow::anyhow!("cannot resolve the current workspace: {e}"))?;
+    if saved != current {
+        return Err(anyhow::anyhow!(
+            "paused goal belongs to {}; resume it from that workspace",
+            saved.display()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_headless_goal(args: &[String]) -> Result<i32> {
@@ -5189,7 +5831,49 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         }
     };
 
+    let provider = config::load()?.provider.name;
+    if !config::KNOWN_PROVIDERS.contains(&provider.as_str()) && provider != "grok" {
+        eprintln!(
+            "phonton goal: unknown provider `{provider}` in {}. Use one of: {}.",
+            config::config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "config.toml".into()),
+            config::KNOWN_PROVIDERS.join(", ")
+        );
+        return Ok(2);
+    }
+    if !opts.json && !opts.direct_task && opts.resume_task_id.is_none() {
+        let cfg = config::load()?;
+        let base_url = cfg.provider.base_url.clone().unwrap_or_default();
+        let configured = cfg.provider.model.clone().unwrap_or_default();
+        if provider_is_local(&cfg.provider.name, &base_url) {
+            start_managed_runtime_if_needed().await;
+        }
+        let calibrated = provider_is_local(&cfg.provider.name, &base_url)
+            && match local_goal_cli::current_model_selection().await {
+                Ok(Some(selection)) => {
+                    configured.is_empty() || configured.eq_ignore_ascii_case(&selection.model)
+                }
+                _ => false,
+            };
+        if calibrated {
+            // Same routing as the TUI: a calibrated local model runs through
+            // the local harness built for small models.
+            let mut local_args = vec![opts.goal_text.clone()];
+            if opts.yes {
+                local_args.push("--yes".into());
+            }
+            if opts.host_checks_approved {
+                local_args.push("--allow-host-checks".into());
+            }
+            return Box::pin(local_goal_cli::run(&local_args)).await;
+        }
+    }
     let result = execute_headless_goal(opts, HeadlessGoalHooks::default()).await?;
+    debug_assert_eq!(
+        result.exit_code == 0,
+        headless_goal_succeeded(&result.final_state.task_status)
+    );
     Ok(result.exit_code)
 }
 
@@ -5197,9 +5881,16 @@ pub(crate) async fn execute_headless_goal(
     opts: HeadlessGoalOptions,
     hooks: HeadlessGoalHooks,
 ) -> Result<HeadlessGoalResult> {
-    let cfg = config::load().unwrap_or_default();
+    let cfg = config::load()?;
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if !opts.yes && !hooks.skip_trust_prompt && !trust::prompt_if_needed(&working_dir)? {
+    let workspace_trusted = if opts.yes {
+        true
+    } else if hooks.skip_trust_prompt {
+        trust::is_trusted(&working_dir)
+    } else {
+        trust::prompt_if_needed(&working_dir)?
+    };
+    if !workspace_trusted {
         return Ok(HeadlessGoalResult {
             task_id: hooks.fixed_task_id.unwrap_or_default(),
             final_state: GlobalState {
@@ -5235,7 +5926,10 @@ pub(crate) async fn execute_headless_goal(
             .ok()
             .and_then(|g| g.load_paused_run(resume_id).ok().flatten());
         match paused {
-            Some(snapshot) => Some(snapshot),
+            Some(snapshot) => {
+                ensure_resume_workspace(&snapshot.working_dir, &working_dir)?;
+                Some(snapshot)
+            }
             None => {
                 return print_headless_failure(
                     opts.json,
@@ -5353,20 +6047,36 @@ pub(crate) async fn execute_headless_goal(
     };
     let mut event_rx_store = event_tx.subscribe();
     let store_for_events = Arc::clone(&store);
+    let (event_writer_stop, mut event_writer_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let event_writer = tokio::spawn(async move {
+        let persist = |rec: EventRecord| {
+            let store = Arc::clone(&store_for_events);
+            async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(g) = store.lock() {
+                        let _ = g.append_event(&rec);
+                    }
+                })
+                .await;
+            }
+        };
         loop {
-            match event_rx_store.recv().await {
-                Ok(rec) => {
-                    let store = Arc::clone(&store_for_events);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(g) = store.lock() {
-                            let _ = g.append_event(&rec);
+            tokio::select! {
+                event = event_rx_store.recv() => match event {
+                    Ok(rec) => persist(rec).await,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut event_writer_stop_rx => {
+                    loop {
+                        match event_rx_store.try_recv() {
+                            Ok(rec) => persist(rec).await,
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => break,
                         }
-                    })
-                    .await;
+                    }
+                    break;
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -5396,6 +6106,11 @@ pub(crate) async fn execute_headless_goal(
         ))
     };
 
+    let verification_execution = if opts.host_checks_approved {
+        phonton_types::verification::VerificationExecution::HostApproved
+    } else {
+        phonton_types::verification::VerificationExecution::RequireIsolation
+    };
     let dispatcher: Arc<dyn WorkerDispatcher> =
         if let Some(api_key) = provider_key_for_run(&cfg.provider) {
             let provider_name = cfg.provider.name.clone();
@@ -5420,7 +6135,8 @@ pub(crate) async fn execute_headless_goal(
             let mut dispatcher =
                 phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
                     .with_task_id(task_id)
-                    .with_memory(memory_store.clone());
+                    .with_memory(memory_store.clone())
+                    .with_verification_execution(verification_execution);
             if let Some(ctx) = semantic_context.clone() {
                 dispatcher = dispatcher.with_semantic_context(ctx);
             }
@@ -5443,6 +6159,7 @@ pub(crate) async fn execute_headless_goal(
     let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), &cfg);
 
     let mut orchestrator = Orchestrator::new(dispatcher)
+        .with_verification_execution(verification_execution)
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
@@ -5494,18 +6211,14 @@ pub(crate) async fn execute_headless_goal(
     }
 
     drop(event_tx);
+    let _ = event_writer_stop.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), event_writer).await;
 
     if opts.json {
         print_headless_goal_json(task_id, &final_state)?;
     } else {
-        println!(
-            "phonton goal: {} ({})",
-            headless_status_label(&final_state.task_status),
-            task_id
-        );
-        if matches!(final_state.task_status, TaskStatus::Paused { .. }) {
-            println!("Resume with: phonton goal --resume {task_id}");
+        for line in headless_summary_lines(task_id, &final_state) {
+            println!("{line}");
         }
     }
 
@@ -5631,7 +6344,6 @@ fn print_headless_goal_json(task_id: TaskId, state: &GlobalState) -> Result<()> 
 async fn fail_spawned_goal(
     tx: &mpsc::Sender<LoopEvent>,
     store: &Arc<std::sync::Mutex<Store>>,
-    goal_index: usize,
     task_id: TaskId,
     display_text: &str,
     reason: String,
@@ -5661,7 +6373,7 @@ async fn fail_spawned_goal(
         }
     }
     let _ = tx
-        .send(LoopEvent::StateUpdate(goal_index, Box::new(state)))
+        .send(LoopEvent::StateUpdate(task_id, Box::new(state)))
         .await;
 }
 
@@ -5670,6 +6382,58 @@ fn headless_goal_succeeded(status: &TaskStatus) -> bool {
         status,
         TaskStatus::Reviewing { .. } | TaskStatus::Done { .. }
     )
+}
+
+/// Human-readable receipt for `phonton goal` without `--json`: what happened,
+/// what changed, what was checked, what it cost, and what to do next.
+fn headless_summary_lines(task_id: TaskId, state: &GlobalState) -> Vec<String> {
+    let mut out = vec![format!(
+        "phonton goal: {} ({task_id})",
+        headless_status_label(&state.task_status)
+    )];
+    let packet = state.handoff_packet.as_ref();
+    if let TaskStatus::Failed { reason, .. } = &state.task_status {
+        out.push(format!("  reason: {reason}"));
+    }
+    if let Some(p) = packet {
+        for f in &p.changed_files {
+            out.push(format!(
+                "  {}  +{} -{}",
+                f.path.display(),
+                f.added_lines,
+                f.removed_lines
+            ));
+        }
+        for passed in &p.verification.passed {
+            out.push(format!("  ✓ {passed}"));
+        }
+        for finding in p.verification.findings.iter().take(3) {
+            out.push(format!("  ! {finding}"));
+        }
+    }
+    if state.tokens_used > 0 {
+        let cost = if state.cost_receipt.pricing_known {
+            format!(
+                ", est. {}",
+                format_usd_micros(state.cost_receipt.actual_usd_micros)
+            )
+        } else {
+            String::new()
+        };
+        out.push(format!("  tokens: {}{cost}", state.tokens_used));
+    }
+    match &state.task_status {
+        TaskStatus::Reviewing { .. } => out.push(
+            "  next: phonton review latest, then phonton review approve latest (or reject latest)"
+                .into(),
+        ),
+        TaskStatus::Paused { .. } => out.push(format!("  next: phonton goal --resume {task_id}")),
+        TaskStatus::Failed { .. } => {
+            out.push("  next: phonton doctor, or phonton review latest for details".into())
+        }
+        _ => {}
+    }
+    out
 }
 
 fn headless_status_label(status: &TaskStatus) -> &'static str {
@@ -5685,13 +6449,30 @@ fn headless_status_label(status: &TaskStatus) -> &'static str {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Local-harness and orchestrator futures are deep; unoptimized builds
+    // overflow Windows' 1 MiB main-thread and 2 MiB worker stacks.
+    const STACK: usize = 16 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("phonton-main".into())
+        .stack_size(STACK)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK)
+                .build()?
+                .block_on(run_main())
+        })?
+        .join()
+        .unwrap_or_else(|_| std::process::exit(101))
+}
+
+async fn run_main() -> Result<()> {
     if handle_cli_args().await? {
         return Ok(());
     }
     // Load configuration first so the rest of startup can use it.
-    let mut cfg = config::load().unwrap_or_default();
+    let mut cfg = config::load()?;
 
     // Start background auto-update check
     let pending_update = Arc::new(std::sync::Mutex::new(None));
@@ -5775,6 +6556,7 @@ async fn main() -> Result<()> {
     // is uniform across the session.
     let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new(&cfg);
+    app.model_ready = provider_key_for_run(&cfg.provider).is_some();
     app.nexus_status = detect_nexus_status(&working_dir);
 
     let store = match open_persistent_store() {
@@ -5802,7 +6584,6 @@ async fn main() -> Result<()> {
     }
 
     let sandbox = Arc::new(Sandbox::new(working_dir.clone(), "phonton-cli".to_string()));
-    let controls: ControlRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -5822,7 +6603,6 @@ async fn main() -> Result<()> {
         store,
         ask_provider,
         sandbox,
-        controls,
         cfg,
         working_dir,
     )
@@ -5838,28 +6618,14 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    // Perform auto update if a new version was found in the background
+    // Never install software behind the user's back: say an update exists
+    // and how to get it. Installs may come from npm, cargo or a script.
     if let Ok(guard) = pending_update.lock() {
         if let Some(ref version) = *guard {
             println!(
-                "\n\x1b[32m[System] A new version of Phonton is available (v{}). Auto-updating globally via npm...\x1b[0m",
-                version
+                "phonton {version} is available (you have {}). Update: npm install -g phonton-cli@latest",
+                env!("CARGO_PKG_VERSION")
             );
-            let status = if cfg!(windows) {
-                std::process::Command::new("powershell")
-                    .args([
-                        "-Command",
-                        "Start-Sleep -Seconds 2; npm install -g phonton-cli@latest",
-                    ])
-                    .spawn()
-            } else {
-                std::process::Command::new("sh")
-                    .args(["-c", "sleep 2 && npm install -g phonton-cli@latest"])
-                    .spawn()
-            };
-            if let Ok(mut child) = status {
-                let _ = child.try_wait();
-            }
         }
     }
 
@@ -5894,6 +6660,56 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
     });
 }
 
+/// Bring up the installed managed runtime before a local goal, telling the
+/// user why the goal pauses. A failure is reported and the goal continues,
+/// so its own error explains what is missing.
+pub(crate) async fn start_managed_runtime_if_needed() {
+    match models_cli::ensure_managed_runtime().await {
+        Ok(true) => eprintln!("Started the local model runtime."),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "Local model runtime is not running and could not be started: {error}. Run `phonton models setup`."
+        ),
+    }
+}
+
+/// Selected local model (from calibration state) and hardware headroom.
+async fn probe_selection() -> Machine {
+    let mut machine = Machine {
+        probed: true,
+        ..Machine::default()
+    };
+    if let Ok(cfg) = config::load() {
+        let base_url = cfg.provider.base_url.clone().unwrap_or_default();
+        if provider_is_local(&cfg.provider.name, &base_url) {
+            let _ = models_cli::ensure_managed_runtime().await;
+        }
+    }
+    if let Ok(Some(selection)) = local_goal_cli::current_model_selection().await {
+        machine.local_model = Some(selection.model);
+        machine.context_tokens = Some(selection.context_tokens);
+        machine.protocol = selection.protocol.map(|p| {
+            match p {
+                phonton_types::local::EditProtocol::SearchReplace => "search/replace",
+                phonton_types::local::EditProtocol::UnifiedDiff => "unified diff",
+            }
+            .to_string()
+        });
+    }
+    machine
+}
+
+/// Add hardware headroom to a probed selection (nvidia-smi and CIM are slow).
+async fn probe_hardware(mut machine: Machine) -> Machine {
+    let hw = phonton_local::hardware::detect().await;
+    machine.gpu = hw
+        .gpus
+        .first()
+        .map(|g| (g.name.clone(), g.available_bytes, g.total_bytes));
+    machine.ram = hw.ram_available_bytes.zip(hw.ram_total_bytes);
+    machine
+}
+
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -5902,7 +6718,6 @@ async fn run_app<B: Backend>(
     store: Arc<std::sync::Mutex<Store>>,
     ask_provider: Option<Arc<dyn Provider>>,
     sandbox: Arc<Sandbox>,
-    controls: ControlRegistry,
     mut cfg: config::Config,
     working_dir: std::path::PathBuf,
 ) -> Result<()> {
@@ -5912,7 +6727,23 @@ async fn run_app<B: Backend>(
     // until the user restarted the CLI.
     let mut ask_provider = ask_provider;
     let mut approval_replies: HashMap<u64, oneshot::Sender<McpApprovalDecision>> = HashMap::new();
+    let mut local_plan_replies: HashMap<TaskId, oneshot::Sender<bool>> = HashMap::new();
+    app.record = record::load();
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let machine = probe_selection().await;
+            let _ = tx.send(LoopEvent::Machine(Box::new(machine.clone()))).await;
+            let _ = tx
+                .send(LoopEvent::Machine(Box::new(probe_hardware(machine).await)))
+                .await;
+        });
+    }
     loop {
+        let size = terminal.size()?;
+        for prompt in &mut app.pending_local_plans {
+            prompt.clamp_scroll(Rect::new(0, 0, size.width, size.height));
+        }
         terminal.draw(|f| render(f, app))?;
         let Some(evt) = rx.recv().await else { break };
         match evt {
@@ -5927,6 +6758,7 @@ async fn run_app<B: Backend>(
                     match intent {
                         Intent::Quit => {
                             deny_pending_mcp_approvals(&mut approval_replies);
+                            local_plan_replies.clear();
                             break;
                         }
                         Intent::QueueGoal(prompt) | Intent::QueueTask(prompt) => {
@@ -5961,27 +6793,75 @@ async fn run_app<B: Backend>(
                             } else {
                                 Some(app.settings.base_url.clone())
                             };
-                            spawn_goal(
-                                0,
-                                task_id,
-                                prompt,
-                                direct_task,
-                                &tx,
-                                &store,
-                                &sandbox,
-                                &controls,
-                                &cfg,
-                                &working_dir,
-                            )
-                            .await;
-                        }
-                        Intent::Rollback { goal_index, to_seq } => {
-                            if let Ok(reg) = controls.lock() {
-                                if let Some(gc) = reg.get(&goal_index) {
-                                    let _ = gc
-                                        .control_tx
-                                        .try_send(OrchestratorMessage::RollbackRequest { to_seq });
+                            if provider_is_local(&app.settings.provider, &app.settings.base_url)
+                                && app.machine.local_model.is_some()
+                            {
+                                // Calibrated local model: run through the
+                                // search/replace harness it was measured on.
+                                if let Some(g) = app.goals.first_mut() {
+                                    g.local_harness = true;
                                 }
+                                spawn_local_goal(
+                                    task_id,
+                                    prompt.description.clone(),
+                                    tx.clone(),
+                                    working_dir.clone(),
+                                    app.host_checks_approved.unwrap_or(false),
+                                );
+                            } else {
+                                if let Some(g) = app.goals.first_mut() {
+                                    g.token_origin = if provider_is_local(
+                                        &app.settings.provider,
+                                        &app.settings.base_url,
+                                    ) {
+                                        record::TokenOrigin::Unknown
+                                    } else {
+                                        record::TokenOrigin::Hosted
+                                    };
+                                }
+                                spawn_goal(
+                                    0,
+                                    task_id,
+                                    prompt,
+                                    direct_task,
+                                    &tx,
+                                    &store,
+                                    &sandbox,
+                                    &cfg,
+                                    &working_dir,
+                                    app.host_checks_approved.unwrap_or(false),
+                                )
+                                .await;
+                            }
+                        }
+                        Intent::ApplyLocal(id) => {
+                            let receipt = app
+                                .goals
+                                .iter()
+                                .find(|g| g.task_id == id)
+                                .and_then(|g| g.local.clone());
+                            if let Some(receipt) = receipt {
+                                let tx = tx.clone();
+                                let repo = working_dir.clone();
+                                tokio::spawn(async move {
+                                    let result = local_goal_cli::apply_selected(&receipt, &repo)
+                                        .await
+                                        .map(|applied| {
+                                            format!(
+                                                "Applied candidate {} · original files kept for rollback",
+                                                applied.candidate_number
+                                            )
+                                        })
+                                        .map_err(|e| e.to_string());
+                                    let _ = tx.send(LoopEvent::LocalApplied(id, result)).await;
+                                });
+                            }
+                        }
+                        Intent::ResolveLocalPlan { task_id, approved } => {
+                            if let Some(reply) = local_plan_replies.remove(&task_id) {
+                                let _ = reply.send(
+                                    approved && app.goals.iter().any(|g| g.task_id == task_id),
+                                );
                             }
                         }
                         Intent::ResolveMcpApproval {
@@ -6023,6 +6903,7 @@ async fn run_app<B: Backend>(
                             // affect goals (which read cfg per-spawn) and
                             // leave Ask stuck on the startup provider.
                             ask_provider = load_ask_provider(&cfg);
+                            app.model_ready = provider_key_for_run(&cfg.provider).is_some();
 
                             match config::save(&cfg) {
                                 Ok(_) => {
@@ -6333,22 +7214,90 @@ async fn run_app<B: Backend>(
                 }
             }
             LoopEvent::Paste(text) => {
-                app.handle_paste(text);
+                if app.pending_local_plans.is_empty() {
+                    app.handle_paste(text);
+                }
             }
             LoopEvent::ClipboardPaste(result) => match result {
                 Ok(text) => {
-                    app.handle_paste(text);
+                    if app.pending_local_plans.is_empty() {
+                        app.handle_paste(text);
+                    }
                 }
                 Err(msg) => {
                     app.goal_prompt
                         .set_notice(format!("Clipboard unavailable: {msg}"));
                 }
             },
-            LoopEvent::StateUpdate(idx, state) => app.apply_state(idx, *state),
-            LoopEvent::FlightEvent(idx, ev) => app.apply_event(idx, ev),
+            LoopEvent::StateUpdate(id, state) => {
+                if let Some(idx) = app.goals.iter().position(|g| g.task_id == id) {
+                    app.apply_state(idx, *state);
+                }
+                for (outcome, tokens, local) in std::mem::take(&mut app.unsaved_runs) {
+                    app.record = record::add_run(outcome, tokens, local);
+                }
+            }
+            LoopEvent::Machine(machine) => app.machine = *machine,
+            LoopEvent::Local(id, receipt) => {
+                if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    g.local = Some(receipt);
+                }
+            }
+            LoopEvent::LocalFinished(id, receipt) => {
+                if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    if !g.recorded {
+                        match record::record_local_receipt(&receipt) {
+                            Ok(Some(record)) => {
+                                app.record = record;
+                                g.recorded = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("Receipt retained; run record was not updated: {error}")
+                            }
+                        }
+                    }
+                    g.local = Some(receipt);
+                }
+            }
+            LoopEvent::LocalApplied(id, result) => {
+                if let Some(g) = app.goals.iter_mut().find(|g| g.task_id == id) {
+                    if result.is_ok() {
+                        let tokens_used = g.state.as_ref().map(|s| s.tokens_used).unwrap_or(0);
+                        let wall_time_ms = g
+                            .finished_at
+                            .unwrap_or_else(std::time::Instant::now)
+                            .saturating_duration_since(g.started_at)
+                            .as_millis() as u64;
+                        g.status = TaskStatus::Done {
+                            tokens_used,
+                            wall_time_ms,
+                        };
+                        if let Some(state) = g.state.as_mut() {
+                            state.task_status = g.status.clone();
+                        }
+                    }
+                    g.applied = Some(result);
+                }
+            }
+            LoopEvent::FlightEvent(id, ev) => {
+                if let Some(idx) = app.goals.iter().position(|g| g.task_id == id) {
+                    app.apply_event(idx, ev);
+                }
+            }
             LoopEvent::AskAnswer(a) => {
                 app.ask_pending = false;
                 app.ask_answer = Some(a);
+            }
+            LoopEvent::LocalPlanRequested { prompt, reply_tx } => {
+                if app.goals.iter().any(|g| g.task_id == prompt.task_id)
+                    && !local_plan_replies.contains_key(&prompt.task_id)
+                {
+                    local_plan_replies.insert(prompt.task_id, reply_tx);
+                    app.pending_local_plans.push(prompt);
+                } else {
+                    let _ = reply_tx.send(false);
+                }
             }
             LoopEvent::McpApprovalRequested { prompt, reply_tx } => {
                 approval_replies.insert(prompt.id, reply_tx);
@@ -6393,6 +7342,7 @@ async fn run_app<B: Backend>(
         }
         if app.should_quit {
             deny_pending_mcp_approvals(&mut approval_replies);
+            local_plan_replies.clear();
             break;
         }
     }
@@ -6753,6 +7703,84 @@ fn outcome_ledger_from_state(task_id: TaskId, state: &GlobalState) -> Option<Out
     })
 }
 
+/// Run a goal on the calibrated local model through the local harness. The
+/// working tree changes only when the user applies the reviewed candidate.
+fn spawn_local_goal(
+    task_id: TaskId,
+    goal: String,
+    tx: mpsc::Sender<LoopEvent>,
+    repository: std::path::PathBuf,
+    host_approved: bool,
+) {
+    tokio::spawn(async move {
+        let worker = SubtaskId::new();
+        let planning = GlobalState {
+            task_status: TaskStatus::Planning,
+            goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
+        };
+        let _ = tx
+            .send(LoopEvent::StateUpdate(task_id, Box::new(planning.clone())))
+            .await;
+        let progress = |receipt: &phonton_types::local_run::LocalRunReceipt| {
+            let state = local_tui::global_state(receipt, task_id, worker);
+            let _ = tx.try_send(LoopEvent::StateUpdate(task_id, Box::new(state)));
+            let _ = tx.try_send(LoopEvent::Local(task_id, Box::new(receipt.clone())));
+        };
+        let plan_tx = tx.clone();
+        let on_plan = move |reviewed: phonton_types::local_run::ReviewedLocalPlan| async move {
+            let prompt = local_plan_approval::PendingLocalPlan::new(task_id, &reviewed);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if plan_tx
+                .send(LoopEvent::LocalPlanRequested { prompt, reply_tx })
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            reply_rx.await.unwrap_or(false)
+        };
+        let result =
+            local_goal_cli::run_goal(goal, repository, host_approved, on_plan, progress).await;
+        match result {
+            Ok(receipt) => {
+                let state = local_tui::global_state(&receipt, task_id, worker);
+                let _ = tx
+                    .send(LoopEvent::LocalFinished(task_id, Box::new(receipt)))
+                    .await;
+                let _ = tx
+                    .send(LoopEvent::StateUpdate(task_id, Box::new(state)))
+                    .await;
+            }
+            Err(error) => {
+                let mut reason = error.to_string();
+                if reason.contains("11434") || reason.to_lowercase().contains("connect") {
+                    reason.push_str(
+                        " · Is the local runtime running? `phonton models setup` starts it.",
+                    );
+                }
+                let mut failed = planning;
+                failed.task_status = TaskStatus::Failed {
+                    reason,
+                    failed_subtask: None,
+                };
+                let _ = tx
+                    .send(LoopEvent::StateUpdate(task_id, Box::new(failed)))
+                    .await;
+            }
+        }
+    });
+}
+
 async fn spawn_goal(
     goal_index: usize,
     task_id: TaskId,
@@ -6761,10 +7789,15 @@ async fn spawn_goal(
     tx: &mpsc::Sender<LoopEvent>,
     store: &Arc<std::sync::Mutex<Store>>,
     sandbox: &Arc<Sandbox>,
-    controls: &ControlRegistry,
     cfg: &config::Config,
     working_dir: &std::path::PathBuf,
+    host_checks_approved: bool,
 ) {
+    let verification_execution = if host_checks_approved {
+        phonton_types::verification::VerificationExecution::HostApproved
+    } else {
+        phonton_types::verification::VerificationExecution::RequireIsolation
+    };
     let attachments = prepare_prompt_attachments(&prompt, working_dir);
     let display_text = prompt.display_text.clone();
     let prompt_artifacts = prompt.prompt_artifacts.clone();
@@ -6794,7 +7827,6 @@ async fn spawn_goal(
                 fail_spawned_goal(
                     tx,
                     store,
-                    goal_index,
                     task_id,
                     &display_text,
                     "persistent store lock was poisoned".into(),
@@ -6817,7 +7849,6 @@ async fn spawn_goal(
             fail_spawned_goal(
                 tx,
                 store,
-                goal_index,
                 task_id,
                 &display_text,
                 format!("planning failed: {e}"),
@@ -6896,7 +7927,8 @@ async fn spawn_goal(
             let mut d =
                 phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
                     .with_task_id(task_id)
-                    .with_memory(memory_store.clone());
+                    .with_memory(memory_store.clone())
+                    .with_verification_execution(verification_execution);
             if let Some(ctx) = semantic_context.clone() {
                 d = d.with_semantic_context(ctx);
             }
@@ -6914,17 +7946,6 @@ async fn spawn_goal(
         .ok()
         .map(|d| Arc::new(std::sync::Mutex::new(d)));
 
-    // Control channel for rollback requests from the UI.
-    let (ctrl_tx, ctrl_rx) = mpsc::channel::<OrchestratorMessage>(8);
-    if let Ok(mut reg) = controls.lock() {
-        reg.insert(
-            goal_index,
-            GoalControl {
-                control_tx: ctrl_tx,
-            },
-        );
-    }
-
     let limits = BudgetLimits {
         max_tokens: cfg.budget.max_tokens,
         max_usd_micros: cfg.budget.max_usd_micros(),
@@ -6932,13 +7953,13 @@ async fn spawn_goal(
     let budget_guard = apply_budget_pricing(BudgetGuard::new(limits), cfg);
 
     let mut orch = Orchestrator::new(dispatcher)
+        .with_verification_execution(verification_execution)
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
         .with_index_backend(cfg.index.backend.clone())
         .with_memory(memory_store)
-        .with_event_sink(task_id, display_text.clone(), event_tx)
-        .with_control_channel(ctrl_rx);
+        .with_event_sink(task_id, display_text.clone(), event_tx);
     if let Some(da) = diff_applier {
         orch = orch.with_diff_applier(da);
     }
@@ -6981,7 +8002,7 @@ async fn spawn_goal(
                 }
             }
             if tx_updates
-                .send(LoopEvent::StateUpdate(goal_index, Box::new(s)))
+                .send(LoopEvent::StateUpdate(task_id, Box::new(s)))
                 .await
                 .is_err()
             {
@@ -6997,7 +8018,7 @@ async fn spawn_goal(
             match event_rx_ui.recv().await {
                 Ok(rec) => {
                     if tx_events
-                        .send(LoopEvent::FlightEvent(goal_index, rec))
+                        .send(LoopEvent::FlightEvent(task_id, rec))
                         .await
                         .is_err()
                     {
@@ -7043,7 +8064,11 @@ fn apply_extension_context_to_plan(plan: &mut PlannerOutput, extension_set: &Ext
     }
 
     for subtask in &mut plan.subtasks {
-        subtask.description = format!("{preamble}\n\n{}", subtask.description);
+        subtask.description = format!(
+            "{preamble}{}{}",
+            phonton_types::PRIOR_CONTEXT_TASK_SEPARATOR,
+            subtask.description
+        );
     }
 }
 
@@ -7191,6 +8216,102 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[test]
+    fn deepseek_cli_default_uses_current_flash_id() {
+        assert_eq!(default_model_for("deepseek"), "deepseek-flash");
+    }
+
+    #[test]
+    fn deepseek_budget_prices_flash_and_frontier_escalation() {
+        let mut cfg = config::Config::default();
+        cfg.provider.name = "deepseek".into();
+        let mut guard = apply_budget_pricing(
+            BudgetGuard::new(BudgetLimits {
+                max_tokens: None,
+                max_usd_micros: Some(1_000_000),
+            }),
+            &cfg,
+        );
+        assert_eq!(
+            guard
+                .estimate(
+                    ProviderKind::OpenAiCompatible,
+                    "deepseek-flash",
+                    TokenUsage {
+                        input_tokens: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                )
+                .total_usd_micros,
+            300_000
+        );
+        assert_eq!(
+            guard
+                .estimate(
+                    ProviderKind::OpenAiCompatible,
+                    "deepseek-v4-pro",
+                    TokenUsage {
+                        output_tokens: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                )
+                .total_usd_micros,
+            3_960_000
+        );
+        assert_eq!(
+            guard
+                .estimate(
+                    ProviderKind::OpenAiCompatible,
+                    "deepseek-v4-flash",
+                    TokenUsage {
+                        input_tokens: 1_000_000,
+                        ..TokenUsage::default()
+                    },
+                )
+                .total_usd_micros,
+            300_000
+        );
+        assert!(matches!(
+            guard.charge(
+                ProviderKind::OpenAiCompatible,
+                "deepseek-flash",
+                1_000_000,
+                0
+            ),
+            phonton_types::BudgetDecision::Ok
+        ));
+        assert!(matches!(
+            guard.charge(ProviderKind::OpenAiCompatible, "deepseek-v4-pro", 1_000_000, 0),
+            phonton_types::BudgetDecision::Pause { limit, .. } if limit == "usd"
+        ));
+    }
+
+    #[test]
+    fn deepseek_prices_do_not_apply_to_custom_or_lookalike_endpoints() {
+        let mut cfg = config::Config::default();
+        cfg.provider.name = "deepseek".into();
+        cfg.provider.base_url = Some("https://proxy.example/v1".into());
+        let guard = apply_budget_pricing(BudgetGuard::new(BudgetLimits::default()), &cfg);
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            ..TokenUsage::default()
+        };
+        assert!(
+            !guard
+                .estimate(ProviderKind::OpenAiCompatible, "deepseek-flash", usage)
+                .pricing_known
+        );
+
+        cfg.provider.name = "openai-compatible".into();
+        cfg.provider.base_url = Some("https://notdeepseek.example/v1".into());
+        let guard = apply_budget_pricing(BudgetGuard::new(BudgetLimits::default()), &cfg);
+        assert!(
+            !guard
+                .estimate(ProviderKind::OpenAiCompatible, "deepseek-flash", usage)
+                .pricing_known
+        );
+    }
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -7397,7 +8518,10 @@ fn extract_id(line: &str) -> Option<String> {
 
     #[test]
     fn enter_queues_a_goal_and_clears_input() {
-        let mut app = App::default();
+        let mut app = App {
+            host_checks_approved: Some(false),
+            ..App::default()
+        };
         for c in "hello".chars() {
             app.handle_key(key(c));
         }
@@ -7414,6 +8538,7 @@ fn extract_id(line: &str) -> Option<String> {
     fn enter_in_task_mode_emits_direct_task_intent() {
         let mut app = App {
             mode: Mode::Task,
+            host_checks_approved: Some(false),
             ..App::default()
         };
         for c in "write one focused test".chars() {
@@ -7459,7 +8584,10 @@ fn extract_id(line: &str) -> Option<String> {
 
     #[test]
     fn enter_after_multiline_paste_queues_one_goal() {
-        let mut app = App::default();
+        let mut app = App {
+            host_checks_approved: Some(false),
+            ..App::default()
+        };
         assert!(app.handle_paste("do x\ndo y\ndo z".into()).is_none());
 
         let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -7551,8 +8679,6 @@ fn extract_id(line: &str) -> Option<String> {
             "--prompt-file".to_string(),
             prompt_path.display().to_string(),
             "--yes".to_string(),
-            "--permission-mode".to_string(),
-            "full-access".to_string(),
             "--timeout-seconds".to_string(),
             "900".to_string(),
             "--json".to_string(),
@@ -7563,10 +8689,86 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(opts.goal_text, "Fix the fixture bug\n\nUse tests.");
         assert_eq!(opts.display_text, "Fix the fixture bug");
         assert!(opts.yes);
+        assert!(!opts.host_checks_approved);
         assert!(opts.json);
         assert!(!opts.direct_task);
         assert_eq!(opts.timeout_seconds, 900);
         Ok(())
+    }
+
+    #[test]
+    fn headless_goal_host_checks_require_separate_explicit_flag() -> Result<()> {
+        let default = parse_headless_goal_options(&["fix bug".into(), "--yes".into()])?;
+        assert!(!default.host_checks_approved);
+
+        let approved =
+            parse_headless_goal_options(&["fix bug".into(), "--allow-host-checks".into()])?;
+        assert!(approved.host_checks_approved);
+        assert!(!approved.yes);
+
+        let resumed =
+            parse_headless_goal_options(&["--resume".into(), uuid::Uuid::new_v4().to_string()])?;
+        assert!(!resumed.host_checks_approved);
+
+        let err = parse_headless_goal_options(&[
+            "fix bug".into(),
+            "--permission-mode".into(),
+            "full-access".into(),
+        ])
+        .expect_err("legacy mode must not silently approve host checks");
+        assert!(err.to_string().contains("--allow-host-checks"));
+        Ok(())
+    }
+
+    #[test]
+    fn headless_resume_requires_original_workspace_with_or_without_host_approval() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let original = root.path().join("original");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&original)?;
+        std::fs::create_dir_all(&other)?;
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        for approve_host in [false, true] {
+            let mut args = vec!["--resume".to_string(), task_id.clone()];
+            if approve_host {
+                args.push("--allow-host-checks".into());
+            }
+            let opts = parse_headless_goal_options(&args)?;
+            assert_eq!(opts.host_checks_approved, approve_host);
+            ensure_resume_workspace(&original.display().to_string(), &original)?;
+            let error = ensure_resume_workspace(&original.display().to_string(), &other)
+                .expect_err("a paused plan must not run in another repository");
+            assert!(error.to_string().contains("resume it from that workspace"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn headless_summary_explains_failure_and_next_step() {
+        let task_id = TaskId::new();
+        let reason = "provider returned 401 Unauthorized";
+        let state = GlobalState {
+            task_status: TaskStatus::Failed {
+                reason: reason.into(),
+                failed_subtask: None,
+            },
+            goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: Some(failed_handoff_packet(task_id, "fix it", reason, 0)),
+            active_workers: Vec::new(),
+            tokens_used: 0,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+            cost_receipt: CostReceipt::default(),
+        };
+        let text = headless_summary_lines(task_id, &state).join("\n");
+        assert!(text.starts_with("phonton goal: failed"), "{text}");
+        assert!(text.contains(reason), "{text}");
+        assert!(text.contains("next: phonton doctor"), "{text}");
     }
 
     #[test]
@@ -7635,7 +8837,7 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[tokio::test]
-    async fn worker_mcp_e2e_uses_tui_approval_and_verified_diff() -> Result<()> {
+    async fn worker_mcp_approval_does_not_grant_verification_execution() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let server_exe = compile_fake_mcp_server(temp.path())?;
 
@@ -7711,20 +8913,23 @@ fn extract_id(line: &str) -> Option<String> {
         let approvals = tokio::time::timeout(Duration::from_secs(5), approval_driver).await??;
 
         assert!(
-            matches!(result.status, SubtaskStatus::Done { .. }),
-            "worker should finish after MCP result, got {:?}",
+            matches!(result.status, SubtaskStatus::Failed { .. }),
+            "MCP approval must not certify a diff without execution authority, got {:?}",
             result.status
         );
         assert!(
-            matches!(result.verify_result, VerifyResult::Pass { .. }),
-            "final diff must be verified, got {:?}",
+            matches!(
+                result.verify_result,
+                phonton_types::VerifyResult::Unavailable { .. }
+            ),
+            "MCP approval is separate from project verification, got {:?}",
             result.verify_result
         );
-        assert_eq!(result.diff_hunks.len(), 1);
-        assert_eq!(
-            result.diff_hunks[0].file_path,
-            PathBuf::from("src/mcp_fixture.rs")
+        assert!(
+            result.diff_hunks.is_empty(),
+            "unverified output must not reach apply"
         );
+        assert!(!temp.path().join("src/mcp_fixture.rs").exists());
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
         assert!(
             approvals.len() >= 2,
@@ -7769,11 +8974,72 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn esc_from_goal_quits() {
+    fn esc_from_goal_quits_after_confirmation() {
         let mut app = App::default();
-        let r = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(r, Some(Intent::Quit));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.handle_key(esc), None);
+        assert!(!app.should_quit);
+        assert!(app.quit_armed());
+        assert_eq!(app.handle_key(esc), Some(Intent::Quit));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn local_providers_use_the_configured_model_on_every_tier() {
+        for tier in [ModelTier::Cheap, ModelTier::Standard, ModelTier::Frontier] {
+            assert_eq!(
+                model_for_dispatch("ollama", Some("qwen2.5-coder:7b"), tier),
+                "qwen2.5-coder:7b"
+            );
+        }
+        // Keyed providers still escalate along their tier ladder.
+        assert_ne!(
+            model_for_dispatch(
+                "anthropic",
+                Some("claude-haiku-4-5-20251001"),
+                ModelTier::Frontier
+            ),
+            "claude-haiku-4-5-20251001"
+        );
+    }
+
+    #[test]
+    fn first_goal_asks_for_host_checks_once() {
+        let mut app = App::default();
+        app.goal_prompt.insert_text("fix the parser");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.handle_key(enter), None);
+        assert!(app.pending_host_goal.is_some());
+        assert!(app.goals.is_empty());
+        let r = app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(matches!(r, Some(Intent::QueueGoal(_))));
+        assert_eq!(app.host_checks_approved, Some(true));
+        assert_eq!(app.goals.len(), 1);
+
+        app.goal_prompt.insert_text("second goal");
+        assert!(matches!(app.handle_key(enter), Some(Intent::QueueGoal(_))));
+    }
+
+    #[test]
+    fn esc_on_host_checks_prompt_restores_goal_text() {
+        let mut app = App::default();
+        app.goal_prompt.insert_text("fix the parser");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
+        assert!(app.pending_host_goal.is_none());
+        assert_eq!(app.host_checks_approved, None);
+        assert_eq!(app.goal_prompt.text(), "fix the parser");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_needs_confirmation_too() {
+        let mut app = App::default();
+        assert_eq!(app.handle_key(ctrl('c')), None);
+        assert_eq!(app.handle_key(ctrl('c')), Some(Intent::Quit));
     }
 
     #[test]
@@ -7848,6 +9114,24 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn footer_hints_fit_width_and_keep_quit() {
+        let hints = [
+            ("Enter", "run"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("Esc", "quit"),
+        ];
+        let sep = Span::raw("  ·  ");
+        let wide = fit_footer_hints(&hints, 200, Style::default(), Style::default(), sep.clone());
+        let wide_text: String = wide.iter().map(|s| s.content.to_string()).collect();
+        assert!(wide_text.contains("commands") && wide_text.ends_with("Esc quit"));
+        let narrow = fit_footer_hints(&hints, 24, Style::default(), Style::default(), sep);
+        let narrow_text: String = narrow.iter().map(|s| s.content.to_string()).collect();
+        assert!(narrow_text.chars().count() <= 24, "{narrow_text}");
+        assert!(narrow_text.starts_with("Enter run") && narrow_text.ends_with("Esc quit"));
+    }
+
+    #[test]
     fn renders_without_panicking_on_empty_state() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -7857,16 +9141,17 @@ fn extract_id(line: &str) -> Option<String> {
 
     #[test]
     fn splash_logo_is_compact_and_shadowed() {
-        let max_width = LOGO.iter().map(|row| char_count(row)).max().unwrap_or(0);
+        let max_width = art::LOGO
+            .iter()
+            .map(|row| char_count(row))
+            .max()
+            .unwrap_or(0);
         assert!(max_width <= LOGO_WIDTH_THRESHOLD as usize);
         assert!(
-            LOGO[0].contains("██████╗"),
+            art::LOGO[0].contains("██████╗"),
             "logo should use the standard ANSI Shadow wordmark"
         );
-        assert!(
-            LOGO.last().unwrap_or(&"").contains("░▒▓"),
-            "logo should keep the soft glow strip"
-        );
+        assert_eq!(art::logo(None).len(), art::LOGO_ROWS as usize);
     }
 
     #[test]
@@ -7934,6 +9219,25 @@ fn extract_id(line: &str) -> Option<String> {
                 .contains("API key"),
             "user-facing toast should explain why"
         );
+        assert_eq!(app.settings.api_key, "sk-ant-FAKE_TEST_KEY_123456");
+        assert_eq!(app.settings.provider, "anthropic");
+    }
+
+    #[test]
+    fn goal_without_a_model_opens_settings_and_keeps_the_text() {
+        let mut app = App {
+            model_ready: false,
+            host_checks_approved: Some(true),
+            ..App::default()
+        };
+        for c in "fix the failing test".chars() {
+            app.handle_key(key(c));
+        }
+        let intent = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(intent.is_none());
+        assert!(app.goals.is_empty());
+        assert_eq!(app.mode, Mode::Settings);
+        assert_eq!(app.goal_prompt.text(), "fix the failing test");
     }
 
     #[test]
@@ -7997,10 +9301,43 @@ fn extract_id(line: &str) -> Option<String> {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(dump.contains("Result"));
+        assert!(dump.contains("receipt"));
         assert!(dump.contains("Changed files"));
         assert!(dump.contains("chess.py"));
         assert!(dump.contains("Known gaps"));
+        // Syntax passed but no test ran: the receipt must not claim VERIFIED,
+        // and the run does not extend the streak.
+        assert!(!dump.contains("✓ VERIFIED"));
+        assert_eq!(app.record.streak, 0);
+        assert_eq!(app.unsaved_runs.len(), 1);
+        // Intermediate terminal local progress must not count before the
+        // durable LocalFinished event. Later settings cannot relabel a route.
+        let state = app.goals[0].state.clone().unwrap();
+        app.goals[0].recorded = false;
+        app.goals[0].local_harness = true;
+        app.record = record::Record::default();
+        app.unsaved_runs.clear();
+        app.apply_state(0, state.clone());
+        assert_eq!(app.record.runs, 0);
+        assert!(app.unsaved_runs.is_empty());
+        app.goals[0].local_harness = false;
+        app.goals[0].token_origin = record::TokenOrigin::Hosted;
+        app.settings.provider = "ollama".into();
+        app.apply_state(0, state);
+        assert_eq!(app.record.cloud_tokens, 240);
+        assert_eq!(app.record.local_tokens, 0);
+    }
+
+    #[test]
+    fn receipt_cost_uses_saved_origin_not_current_provider_settings() {
+        let mut g = GoalEntry::new("old run".into());
+        let cost = CostReceipt::default();
+        g.token_origin = record::TokenOrigin::Hosted;
+        assert_eq!(receipt_cost(&g, &cost), "unpriced · hosted provider");
+        g.token_origin = record::TokenOrigin::Unknown;
+        assert_eq!(receipt_cost(&g, &cost), "unpriced · runtime origin unknown");
+        g.token_origin = record::TokenOrigin::ManagedLocal;
+        assert_eq!(receipt_cost(&g, &cost), "$0.00 · managed local runtime");
     }
 
     #[test]
@@ -8146,5 +9483,49 @@ fn extract_id(line: &str) -> Option<String> {
         assert_eq!(app.clarifying_question_idx, 0);
         assert!(app.clarifying_answers.is_empty());
         assert!(app.clarifying_buffer.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tui_screen_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn screen(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn idle_screen_pitches_the_loop_and_footer_fits() {
+        let rows = screen(&App::default(), 120, 36);
+        let all = rows.join("\n");
+        assert!(all.contains("· goal"), "{all}");
+        assert!(all.contains("· remember"), "{all}");
+        assert!(all.contains("No goals yet."));
+        assert!(all.contains("machine"), "{all}");
+        let footer = rows.last().unwrap().trim_end();
+        assert!(footer.contains("Esc quit"), "footer clipped: {footer}");
+    }
+
+    #[test]
+    fn help_overlay_rows_are_not_clipped() {
+        let app = App {
+            help_open: true,
+            ..Default::default()
+        };
+        let all = screen(&app, 120, 40).join("\n");
+        assert!(all.contains("rollback to the highlighted checkpoint (input empty)"));
+    }
+
+    #[test]
+    fn narrow_footer_still_offers_quit() {
+        let rows = screen(&App::default(), 70, 30);
+        assert!(rows.last().unwrap().contains("Esc quit"));
     }
 }

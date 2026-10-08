@@ -1,6 +1,6 @@
 [package]
 name = "phonton-cli"
-version = "0.21.2"
+version = "0.22.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,6 +20,7 @@ phonton-store        = { path = "../phonton-store" }
 phonton-memory       = { path = "../phonton-memory" }
 phonton-verify       = { path = "../phonton-verify" }
 phonton-providers    = { path = "../phonton-providers" }
+phonton-local        = { path = "../phonton-local" }
 phonton-sandbox      = { path = "../phonton-sandbox" }
 phonton-diff         = { path = "../phonton-diff" }
 phonton-worker       = { path = "../phonton-worker" }
@@ -35,6 +36,7 @@ ratatui              = "0.28"
 crossterm            = { version = "0.28", features = ["bracketed-paste"] }
 serde                = { workspace = true }
 serde_json           = "1"
+sha2                 = "0.10"
 reqwest              = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml                 = "0.8"
 dirs                 = "5"
@@ -42,10 +44,8 @@ clipboard-win       = "5"
 uuid                = { workspace = true }
 axum                = { version = "0.7", features = ["json"] }
 tokio-stream        = { version = "0.1", features = ["sync"] }
+git2                = "0.18"
+tempfile            = "3"
 
 [features]
 integration-tests = []
-
-[dev-dependencies]
-tempfile = "3"
-git2 = "0.18"

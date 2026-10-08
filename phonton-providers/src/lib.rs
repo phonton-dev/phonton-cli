@@ -12,13 +12,11 @@
 //! prepends a "Low Confidence Context" banner so the model treats the
 //! slices with caution. See `01-architecture/failure-modes.md` Risk 3.
 
-pub mod registry;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use phonton_types::{
     LLMResponse, ModelMetricsSnapshot, ModelTier, PromptAttachment, ProviderConfig, ProviderError,
@@ -27,32 +25,46 @@ use phonton_types::{
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 
+/// An error with its causes; reqwest's top-level message alone ("error
+/// sending request") does not say whether DNS, TLS, or a timeout failed.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// Maps a provider name and a requested [`ModelTier`] to a concrete model
 /// identifier.
 ///
-/// This is the heart of Phonton's multi-tier routing. For each tier, we
-/// pick the best-performing model in its price class as of April 2026.
+/// This is the heart of Phonton's multi-tier routing. Every id was checked
+/// against the models.dev catalog on 2026-10-07; a missing id makes
+/// escalation fail with a 404, so recheck when changing this table.
 pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
     match provider {
         "anthropic" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5-20251001".into(),
-            ModelTier::Standard => "claude-sonnet-4-5-20251001".into(),
-            ModelTier::Frontier => "claude-opus-4-7-20260115".into(),
+            ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5".into(),
+            ModelTier::Standard => "claude-sonnet-5-5".into(),
+            ModelTier::Frontier => "claude-opus-5-5".into(),
         },
         "openai" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "gpt-4o-mini".into(),
-            ModelTier::Standard => "gpt-4o".into(),
-            ModelTier::Frontier => "gpt-5.2-preview".into(),
+            ModelTier::Local | ModelTier::Cheap => "gpt-6-luna".into(),
+            ModelTier::Standard => "gpt-6.1-sol".into(),
+            ModelTier::Frontier => "gpt-6-astra".into(),
         },
         "openrouter" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "openai/gpt-4o-mini".into(),
-            ModelTier::Standard => "openai/gpt-4o".into(),
-            ModelTier::Frontier => "anthropic/claude-sonnet-4.5".into(),
+            ModelTier::Local | ModelTier::Cheap => "openai/gpt-6-luna".into(),
+            ModelTier::Standard => "anthropic/claude-sonnet-5.5".into(),
+            ModelTier::Frontier => "anthropic/claude-opus-5.5".into(),
         },
         "gemini" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "gemini-2.0-flash".into(),
-            ModelTier::Standard => "gemini-2.5-flash".into(),
-            ModelTier::Frontier => "gemini-2.5-pro".into(),
+            ModelTier::Local | ModelTier::Cheap => "gemini-flash-lite-latest".into(),
+            ModelTier::Standard => "gemini-flash-latest".into(),
+            ModelTier::Frontier => "gemini-3.1-pro-preview".into(),
         },
         "agentrouter" => match tier {
             ModelTier::Local | ModelTier::Cheap => "claude-haiku-4-5".into(),
@@ -60,25 +72,25 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
             ModelTier::Frontier => "claude-sonnet-4-5".into(),
         },
         "cloudflare" => "@cf/moonshotai/kimi-k2.6".into(),
+        // The planner starts core logic at Standard; flash there keeps the
+        // default DeepSeek run cheap, and pro is the escalation.
         "deepseek" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "deepseek-chat".into(),
-            ModelTier::Standard => "deepseek-chat".into(),
-            ModelTier::Frontier => "deepseek-reasoner".into(),
+            ModelTier::Local | ModelTier::Cheap | ModelTier::Standard => "deepseek-flash".into(),
+            ModelTier::Frontier => "deepseek-v4-pro".into(),
         },
         "xai" | "grok" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "grok-2-mini".into(),
-            ModelTier::Standard => "grok-2".into(),
-            ModelTier::Frontier => "grok-2".into(),
+            ModelTier::Local | ModelTier::Cheap => "grok-build-0.1".into(),
+            ModelTier::Standard => "grok-4.3".into(),
+            ModelTier::Frontier => "grok-4.7".into(),
         },
         "groq" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "llama-3.3-70b-versatile".into(),
-            ModelTier::Standard => "llama-3.3-70b-versatile".into(),
-            ModelTier::Frontier => "llama-3.3-70b-versatile".into(),
+            ModelTier::Local | ModelTier::Cheap => "openai/gpt-oss-120b".into(),
+            ModelTier::Standard | ModelTier::Frontier => "qwen/qwen3.8-27b".into(),
         },
         "together" => match tier {
-            ModelTier::Local | ModelTier::Cheap => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
-            ModelTier::Standard => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
-            ModelTier::Frontier => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
+            ModelTier::Local | ModelTier::Cheap => "deepseek-ai/DeepSeek-V4.1-Flash".into(),
+            ModelTier::Standard => "zai-org/GLM-5.3".into(),
+            ModelTier::Frontier => "moonshotai/Kimi-K3".into(),
         },
         "ollama" => "llama3.2:3b".into(),
         _ => "unknown".into(),
@@ -458,6 +470,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
     let preferences: &[&str] = match name {
         "gemini" => &[
             // Strongest free-tier code generators first.
+            "gemini-flash-latest",
             "gemini-2.5-pro",
             "gemini-2.0-pro",
             "gemini-2.5-flash",
@@ -470,6 +483,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "flash",
         ],
         "anthropic" => &[
+            "claude-sonnet-5-5",
             "claude-sonnet-4-5",
             "claude-opus-4",
             "claude-haiku-4-5",
@@ -478,6 +492,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "opus",
         ],
         "openai" => &[
+            "gpt-6-luna",
             "gpt-4.1",
             "gpt-4o",
             "gpt-4o-mini",
@@ -486,6 +501,7 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "mini",
         ],
         "openrouter" => &[
+            "openai/gpt-6-luna",
             "anthropic/claude-sonnet",
             "openai/gpt-4o",
             "google/gemini-2.5-pro",
@@ -493,15 +509,17 @@ pub fn pick_default_from_list(name: &str, models: &[String]) -> Option<String> {
             "anthropic/claude-haiku",
         ],
         "groq" => &[
+            "openai/gpt-oss-120b",
             "llama-3.3-70b-versatile",
             "llama-3.1-70b",
             "mixtral",
             "llama-3.1-8b-instant",
             "llama",
         ],
-        "deepseek" => &["deepseek-chat", "deepseek-coder", "deepseek"],
-        "xai" | "grok" => &["grok-2", "grok-beta", "grok"],
+        "deepseek" => &["deepseek-flash", "deepseek-v4-pro", "deepseek"],
+        "xai" | "grok" => &["grok-build", "grok-4", "grok"],
         "together" => &[
+            "deepseek-ai/DeepSeek-V4.1-Flash",
             "meta-llama/Llama-3.3-70B-Instruct-Turbo",
             "Qwen/Qwen2.5-Coder-32B-Instruct",
             "Llama-3.3",
@@ -1160,16 +1178,15 @@ impl Provider for AnthropicProvider {
             "messages": [{ "role": "user", "content": anthropic_user_content(user, attachments) }],
         });
 
-        let http_resp = self
-            .http
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let http_resp = send_with_retry(
+            self.http
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body),
+        )
+        .await?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -1339,9 +1356,18 @@ impl Provider for OpenAiCompatibleProvider {
         } else {
             json!(user)
         };
+        // Current models reason before answering and reasoning counts
+        // against the cap; at 4096 harder DeepSeek edits came back empty with
+        // finish_reason "length". 16k stays within every tier model's output
+        // limit (Groq's Qwen caps at 16,384); billing follows actual use.
+        let max_tokens = if self.endpoint.contains("api.deepseek.com") {
+            32_768
+        } else {
+            16_384
+        };
         let body = json!({
             "model": self.model,
-            token_key: 4096,
+            token_key: max_tokens,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user_content },
@@ -1363,10 +1389,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .header("X-Title", "Phonton");
         }
 
-        let http_resp = req
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let http_resp = send_with_retry(req).await?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -1478,7 +1501,7 @@ impl GeminiProvider {
             .json(body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transport(e.to_string()).into())
+            .map_err(|e| ProviderError::Transport(error_chain(&e)).into())
     }
 
     async fn raw_generate_with_retry(
@@ -1497,6 +1520,30 @@ impl GeminiProvider {
         }
         unreachable!("retry loop always returns")
     }
+}
+
+/// Send `req`, retrying twice (after 0.5 s and 1 s) on a failed connection or
+/// a transient status (429, 5xx), so one dropped connection or brief overload
+/// does not fail a goal. The final attempt's response or error is returned.
+async fn send_with_retry(
+    req: reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, ProviderError> {
+    let mut delay = std::time::Duration::from_millis(500);
+    for _ in 0..2 {
+        let Some(attempt) = req.try_clone() else {
+            break;
+        };
+        if let Ok(resp) = attempt.send().await {
+            if !is_transient_http_status(resp.status()) {
+                return Ok(resp);
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2);
+    }
+    req.send()
+        .await
+        .map_err(|e| ProviderError::Transport(error_chain(&e)))
 }
 
 fn is_transient_http_status(status: StatusCode) -> bool {
@@ -1719,18 +1766,23 @@ impl Provider for OllamaProvider {
             ],
         });
 
-        let resp: Value = self
+        let resp = self
             .http
             .post(&url)
             .json(&body)
             .send()
             .await
-            .context("ollama request failed")?
-            .error_for_status()
-            .context("ollama returned non-2xx")?
-            .json()
-            .await
-            .context("ollama response was not JSON")?;
+            .map_err(|e| anyhow!("ollama request failed: {}", error_chain(&e)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            bail!(
+                "ollama returned {status} for model `{}`: {}",
+                self.model,
+                detail.trim()
+            );
+        }
+        let resp: Value = resp.json().await.context("ollama response was not JSON")?;
 
         let content = resp
             .pointer("/message/content")
@@ -1810,6 +1862,49 @@ mod tests {
             classify_http(StatusCode::INTERNAL_SERVER_ERROR),
             ProviderError::ServerError(500)
         ));
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried_before_the_goal_sees_them() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // First connection: dropped without a response. Second: 503.
+            // Third: a valid completion.
+            for n in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = match n {
+                    0 => continue,
+                    1 => "HTTP/1.1 503 Service Unavailable
+Content-Length: 0
+
+"
+                    .to_string(),
+                    _ => {
+                        let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+                        format!(
+                            "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let endpoint = format!("http://{addr}/chat/completions");
+        let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
+        let resp = p.call("sys", "u", &[]).await.unwrap();
+        assert_eq!(resp.content, "ok");
     }
 
     #[test]
@@ -1906,6 +2001,27 @@ mod tests {
                 assert_ne!(model_for_tier(provider, tier), "unknown", "{provider:?}");
             }
         }
+    }
+
+    #[test]
+    fn deepseek_current_models_are_the_defaults() {
+        let available = vec!["deepseek-v4-pro".into(), "deepseek-flash".into()];
+        assert_eq!(
+            pick_default_from_list("deepseek", &available).as_deref(),
+            Some("deepseek-flash")
+        );
+        assert_eq!(
+            model_for_tier("deepseek", ModelTier::Cheap),
+            "deepseek-flash"
+        );
+        assert_eq!(
+            model_for_tier("deepseek", ModelTier::Standard),
+            "deepseek-flash"
+        );
+        assert_eq!(
+            model_for_tier("deepseek", ModelTier::Frontier),
+            "deepseek-v4-pro"
+        );
     }
 
     /// Regression: OpenAI's chat-completions spec uses `max_completion_tokens`

@@ -52,7 +52,24 @@ impl ExtensionLoadOptions {
 }
 
 fn default_user_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(USER_EXTENSION_DIR))
+    phonton_home()
+}
+
+/// Per-user Phonton state directory: `PHONTON_HOME` when set to an absolute
+/// path, otherwise `~/.phonton`. Config, store, trust, local models and
+/// user extensions all live here, so one variable isolates a whole install.
+pub fn phonton_home() -> Option<PathBuf> {
+    phonton_home_for(std::env::var_os("PHONTON_HOME"), dirs::home_dir())
+}
+
+fn phonton_home_for(
+    override_dir: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match override_dir.map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => Some(dir),
+        _ => home.map(|h| h.join(USER_EXTENSION_DIR)),
+    }
 }
 
 /// Result of local extension loading and resolution.
@@ -791,6 +808,21 @@ fn default_true() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn phonton_home_honours_absolute_override_only() {
+        let home = std::path::PathBuf::from("home");
+        let abs = std::env::temp_dir().join("phonton-home");
+        assert_eq!(
+            super::phonton_home_for(Some(abs.clone().into_os_string()), Some(home.clone())),
+            Some(abs)
+        );
+        assert_eq!(
+            super::phonton_home_for(Some("relative".into()), Some(home.clone())),
+            Some(home.join(".phonton"))
+        );
+        assert_eq!(super::phonton_home_for(None, None), None);
+    }
+
     use super::*;
 
     fn write(path: &Path, content: &str) {

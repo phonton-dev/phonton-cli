@@ -22,10 +22,6 @@ struct AcceptanceSlice {
 /// verification contract before any worker is dispatched.
 pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, goal_text: &str) {
     let lower_goal = goal_text.to_ascii_lowercase();
-    if is_receipt_refactor_goal(&lower_goal) {
-        apply_receipt_refactor_plan(plan, goal_text, working_dir);
-        return;
-    }
     let Some(contract) = plan.goal_contract.as_mut() else {
         return;
     };
@@ -84,7 +80,9 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
             "cargo test",
             vec!["cargo".into(), "test".into(), "--locked".into()],
         );
-        push_run_command(contract, "Run binary", vec!["cargo".into(), "run".into()]);
+        if cargo_has_default_binary(working_dir) {
+            push_run_command(contract, "Run binary", vec!["cargo".into(), "run".into()]);
+        }
     }
 
     if working_dir.join("Makefile").is_file() || working_dir.join("makefile").is_file() {
@@ -204,8 +202,43 @@ pub fn apply_workspace_preflight(plan: &mut PlannerOutput, working_dir: &Path, g
     }
 }
 
-fn is_receipt_refactor_goal(lower: &str) -> bool {
-    lower.contains("receipt") && (lower.contains("refactor") || lower.contains("buildreceipt"))
+/// Suggest plain `cargo run` only for the simple single-binary layout.
+/// Other Cargo layouts need an explicit binary name or have no binary.
+fn cargo_has_default_binary(root: &Path) -> bool {
+    if !root.join("src/main.rs").is_file() {
+        return false;
+    }
+    let Ok(raw_manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(manifest) = toml::from_str::<toml::Value>(&raw_manifest) else {
+        return false;
+    };
+    let Some(package) = manifest.get("package") else {
+        return false;
+    };
+    let autobins = package.get("autobins").and_then(toml::Value::as_bool);
+    let edition_2015 = package
+        .get("edition")
+        .and_then(toml::Value::as_str)
+        .is_none_or(|edition| edition == "2015");
+    let has_explicit_target = ["lib", "bin", "example", "test", "bench"]
+        .iter()
+        .any(|target| manifest.get(*target).is_some());
+    if autobins == Some(false)
+        || (autobins != Some(true) && edition_2015 && has_explicit_target)
+        || manifest
+            .get("bin")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|bins| !bins.is_empty())
+    {
+        return false;
+    }
+    match std::fs::read_dir(root.join("src/bin")) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 fn collect_node_preflight_attachments(working_dir: &Path) -> Vec<PromptAttachment> {
@@ -669,47 +702,6 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn apply_receipt_refactor_plan(plan: &mut PlannerOutput, goal_text: &str, working_dir: &Path) {
-    let Some(contract) = plan.goal_contract.as_mut() else {
-        return;
-    };
-    contract.acceptance_criteria.extend([
-        "Run `npm test` before and after refactoring `src/receipt.js`.".into(),
-        "Preserve `buildReceipt(run)` export; add `## Commands` section via `renderCommands`."
-            .into(),
-        "Support command previews, knownGaps severity sorting, and per-file verifiedBy metadata."
-            .into(),
-    ]);
-    push_verify_step(contract, "npm test", vec!["npm".into(), "test".into()]);
-
-    let attachments = collect_node_preflight_attachments(working_dir);
-    let slices = [
-        AcceptanceSlice {
-            id: "receipt_tests".into(),
-            criterion: "read existing receipt tests and confirm failing expectations for commands, gap sorting, and verifiedBy before editing implementation".into(),
-            artifact_path: Some(PathBuf::from("src/receipt.js")),
-        },
-        AcceptanceSlice {
-            id: "receipt_impl".into(),
-            criterion: "refactor `src/receipt.js` into helpers with `renderCommands` producing a `## Commands` section; keep `buildReceipt` API stable".into(),
-            artifact_path: Some(PathBuf::from("src/receipt.js")),
-        },
-        AcceptanceSlice {
-            id: "receipt_verify".into(),
-            criterion: "finish with passing `npm test` and list verification command plus any known gaps in the final response".into(),
-            artifact_path: Some(PathBuf::from("src/receipt.js")),
-        },
-    ];
-    plan.subtasks = preflight_acceptance_slice_subtasks(
-        goal_text,
-        "Node receipt refactor",
-        &slices,
-        attachments,
-    );
-    plan.estimated_total_tokens = plan.subtasks.len() as u64 * 1_200;
-    plan.naive_baseline_tokens = plan.subtasks.len() as u64 * 4_000;
-}
-
 fn compact_goal_label(goal_text: &str) -> String {
     let lower = goal_text.to_ascii_lowercase();
     if lower.contains("chess")
@@ -903,6 +895,122 @@ Expected final state:
             .attachments
             .iter()
             .any(|attachment| attachment.path == Path::new("test/receipt.test.js")));
+    }
+
+    #[test]
+    fn receipt_wording_does_not_replace_a_rust_workspace_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"receipt\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let goal = "refactor the receipt formatter";
+        let mut plan = plan_for(goal);
+        let original: Vec<_> = plan
+            .subtasks
+            .iter()
+            .map(|task| task.description.clone())
+            .collect();
+
+        apply_workspace_preflight(&mut plan, temp.path(), goal);
+
+        let updated: Vec<_> = plan
+            .subtasks
+            .iter()
+            .map(|task| task.description.clone())
+            .collect();
+        assert_eq!(updated, original);
+        let contract = plan.goal_contract.as_ref().unwrap();
+        assert!(contract.verify_plan.iter().any(|step| step
+            .command
+            .as_ref()
+            .is_some_and(|command| command.command == ["cargo", "test", "--locked"])));
+        assert!(!contract
+            .acceptance_criteria
+            .iter()
+            .any(|criterion| criterion.contains("src/receipt.js")));
+    }
+
+    #[test]
+    fn library_only_cargo_project_does_not_suggest_cargo_run() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"add-one\"\nversion = \"0.1.0\"\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn add_one(n: i32) -> i32 { n + 1 }\n",
+        )
+        .unwrap();
+        let mut plan = plan_for("fix add_one");
+
+        apply_workspace_preflight(&mut plan, temp.path(), "fix add_one");
+
+        let contract = plan.goal_contract.as_ref().unwrap();
+        assert!(contract
+            .verify_plan
+            .iter()
+            .any(|step| step.name == "cargo test"));
+        assert!(!contract
+            .run_plan
+            .iter()
+            .any(|command| command.command == ["cargo", "run"]));
+    }
+
+    #[test]
+    fn single_binary_cargo_project_suggests_cargo_run() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"hello\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut plan = plan_for("fix hello");
+
+        apply_workspace_preflight(&mut plan, temp.path(), "fix hello");
+
+        let contract = plan.goal_contract.as_ref().unwrap();
+        assert!(contract
+            .run_plan
+            .iter()
+            .any(|command| command.command == ["cargo", "run"]));
+
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nautobins= false\n",
+        )
+        .unwrap();
+        let mut disabled = plan_for("fix hello");
+        apply_workspace_preflight(&mut disabled, temp.path(), "fix hello");
+        assert!(!disabled
+            .goal_contract
+            .as_ref()
+            .unwrap()
+            .run_plan
+            .iter()
+            .any(|command| command.command == ["cargo", "run"]));
+
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nedition = \"2015\"\n[lib]\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub fn library() {}\n").unwrap();
+        let mut edition_2015 = plan_for("fix hello");
+        apply_workspace_preflight(&mut edition_2015, temp.path(), "fix hello");
+        assert!(!edition_2015
+            .goal_contract
+            .as_ref()
+            .unwrap()
+            .run_plan
+            .iter()
+            .any(|command| command.command == ["cargo", "run"]));
     }
 
     #[test]
@@ -1193,7 +1301,7 @@ Expected final state:
             first.description.contains("slice 1/5")
                 && first
                     .description
-                    .contains("create a compile-safe local chess rules module"),
+                    .contains("compile-safe local chess rules module"),
             "existing Vite chess should start with a local verified rules seed: {}",
             first.description
         );

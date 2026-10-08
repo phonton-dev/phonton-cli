@@ -9,10 +9,13 @@ integration-tests = []
 [dependencies]
 phonton-types     = { path = "../phonton-types" }
 phonton-memory    = { path = "../phonton-memory" }
+phonton-sandbox   = { path = "../phonton-sandbox" }
+phonton-local     = { path = "../phonton-local" }
 anyhow            = { workspace = true }
 tokio             = { workspace = true }
 serde             = { workspace = true }
 serde_json        = "1"
+toml              = "0.8"
 tempfile          = "3"
 tree-sitter       = "0.22"
 tree-sitter-python = "0.21"

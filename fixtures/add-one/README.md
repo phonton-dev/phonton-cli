@@ -14,7 +14,7 @@ git init   # if this folder is not already a git repo
 cargo test # expected: FAIL on adds_one
 
 phonton doctor --provider
-phonton goal "Make add_one return n + 1 so the unit tests in src/lib.rs pass." --yes
+phonton goal "Make add_one return n + 1 so the unit tests in src/lib.rs pass." --yes --allow-host-checks
 phonton review latest
 phonton review latest --json
 ```

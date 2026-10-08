@@ -2,133 +2,133 @@
   <img src="assets/readme/phonton-cli-logo.png" width="128" alt="Phonton CLI logo">
 </p>
 
-<h1 align="center">Phonton CLI - v0.21.2</h1>
+<h1 align="center">Phonton</h1>
 
 <p align="center">
-  <strong>A local-first ADE for verified, accountable code changes.</strong><br>
-  Phonton turns a goal into a visible plan, diff-only work, layered verification,
-  reviewable receipts, and inspectable memory.
+  <strong>The local-first ADE that proves its work.</strong><br>
+  Give it a goal. It shows a plan, writes diffs, runs your checks, and hands you
+  a receipt: what changed, what passed, and what it cost.
 </p>
 
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI Status" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars&color=ff69b4"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.21.2-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.22.0--beta-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
----
-
-## Quick Start
-
-```powershell
-npm install -g phonton-cli
-phonton doctor --provider
-phonton config edit   # add your provider API key if doctor asked for one
-phonton goal "fix the failing npm test in this repo"
-```
-
-Smallest verified loop (this repo): `fixtures/add-one`. See that folder's README.
-
-Headless benchmark-style runs:
-
-```powershell
-phonton goal --prompt-file prompt.md --yes --json --permission-mode full-access
-phonton review latest --json
-phonton benchmark export --latest
-```
-
-When a run finishes, open the **Receipt** focus in the TUI (or `phonton review
-latest`) for changed files, verification evidence, run commands, known gaps,
-and rollback points. Use `/why-tokens` to see index, memory, and attachment
-contributions.
-
----
-
-## What Is Phonton?
-
-Phonton CLI is a local-first agentic development environment (ADE), not a
-generic chatbot. It is built around the accountable development loop:
-
-```text
-goal -> plan -> edit -> verify -> review -> remember
-```
-
-You bring your own model keys or local model runtime. Phonton runs locally,
-keeps its state in local files and SQLite, and sends selected task context only
-to the provider or local model you configure. There is no Phonton-hosted proxy
-between your workspace and your chosen provider.
+<p align="center">
+  <a href="https://phonton.dev">Website</a> ·
+  <a href="docs/getting-started.md">Getting started</a> ·
+  <a href="https://discord.gg/avcJb4PjhM">Discord</a>
+</p>
 
 <p align="center">
-  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI terminal UI preview" width="800">
+  <img src="assets/readme/phonton-cli-hero.png" alt="Phonton CLI terminal UI" width="800">
 </p>
 
 ---
 
-## Why Phonton?
+<p align="center">
+  <img src="assets/readme/phonton-demo.gif" alt="Phonton fixing a failing parsePort test in the terminal UI" width="800"><br>
+  <sub>Real recording (sped up): two failing tests in, a verified diff and receipt out.</sub>
+</p>
 
-### Visible Goal Contracts
-
-Before broad work starts, Phonton turns the request into a `GoalContract` with
-acceptance criteria, expected artifacts, likely files, verification commands,
-assumptions, and clarification questions.
-
-### Interactive Clarification Questionnaire
-
-v0.19.6 integrates a fully Interactive Clarification Questionnaire inside the TUI. When requirements are under-specified (confidence < 70% or unanswered questions), execution suspends, guiding the user step-by-step directly in the terminal, automatically appending answers to the prompt, and initiating a clean planning rerun.
-
-### Diff-Only Workers
-
-Workers produce code changes as diffs. Phonton does not treat worker prose as
-the primary artifact, and unverified changes are not promoted as review-ready.
-
-### Layered Verification
-
-Phonton verifies changes with the checks that fit the workspace: patch
-applicability, syntax checks, memory/decision checks, Cargo checks and tests,
-Node test scripts, and browser rendering checks for web projects when
-applicable.
-
-### Typed Handoff Packets
-
-After verification, Phonton writes a typed `HandoffPacket` with changed files,
-verification evidence, run commands, known gaps, rollback points, token/cost
-summary, and context influence. Review starts from evidence rather than a chat
-summary.
-
-### Local Memory And Code Retrieval
-
-Phonton stores task history, decisions, rejected approaches, and conventions in
-local SQLite. Code context is retrieved through local symbol indexing and HNSW
-search by default, with an optional Qdrant backend for code retrieval in larger
-workspaces.
-
-### BYOK Providers And MCP Approval Gates
-
-Phonton supports Anthropic, OpenAI, OpenRouter, Gemini, Ollama, AgentRouter,
-Cloudflare, DeepSeek, xAI/Grok, Groq, Together, and custom OpenAI-compatible
-endpoints. MCP servers and extension packs are inspectable local config, and
-networked or mutating tool use goes through approval-aware flows.
-
----
-
-## Quick Install
-
-Install from npm:
+## 60-second start
 
 ```bash
 npm install -g phonton-cli
-phonton version
-phonton doctor
+phonton doctor     # checks your provider key, git, and local tools
+phonton            # opens the TUI; type a goal and press Enter
 ```
 
-Install this exact release from source:
+No account, no Phonton server. Bring a key from Anthropic, OpenAI, DeepSeek,
+OpenRouter, Gemini, Groq and others, or run on local models (preview, below).
+
+## What a run looks like
+
+From the recorded run above (DeepSeek Flash, small JavaScript repo):
+
+```text
+goal     Make parsePort reject ports outside 1-65535 and trailing garbage
+plan     1 subtask, verify with the repo's own `node --test`
+edit     unified diff against the exact current src/port.js
+verify   patch applies · syntax · tests: 3 pass, 0 fail (was 1 pass, 2 fail)
+review   receipt: 1 file (+6/-2) · 8.8k tokens · est. $0.003 · checkpoint #1
+remember completion stored locally for the next goal
+```
+
+Nothing lands in your tree until it passes verification, and every run leaves a
+receipt you can audit with `phonton review latest` and `phonton why-tokens`.
+
+## Why Phonton
+
+- **Plan before edits.** Each goal becomes a visible `GoalContract` with
+  acceptance criteria and a verify plan before any worker starts.
+- **Diffs, not rewrites.** Workers return unified diffs against the current
+  source. No prose, no whole-file regeneration.
+- **Verification gates review.** Patch apply, syntax, decision memory, Cargo,
+  Node and browser checks decide what is review-ready. Failures repair first,
+  then escalate to a stronger model.
+- **Receipts with real numbers.** Changed files, checks, provider-reported
+  tokens, cost, and rollback points in a typed `HandoffPacket`.
+- **Local memory.** Decisions, rejected approaches and conventions live in
+  local SQLite and steer the next plan.
+- **Designed for context efficiency.** Workers get only the files they edit
+  plus retrieved symbols; finished subtasks are carried forward as one-line
+  notes instead of full transcripts; tests and boilerplate go to your
+  configured model, core logic starts one tier up, and only failures
+  escalate further. We publish
+  measurements only with reproducible artifacts; see
+  [Benchmark honesty](#benchmark-honesty).
+
+## Local models (preview)
+
+Run on your own GPU with no key. Phonton measures what the model can do,
+asks it only for edits in a format it handled during calibration, runs your
+checks on a copy, and lands nothing until you apply the result.
 
 ```bash
-cargo install --git https://github.com/phonton-dev/phonton-cli --tag v0.19.6 phonton-cli --locked --force
+phonton models setup                        # managed Ollama runtime (Windows x64)
+phonton models install qwen2.5-coder:3b
+phonton models calibrate qwen2.5-coder:3b   # probes which edit formats it can produce
+phonton models select qwen2.5-coder:3b
+phonton                                     # TUI: goals now run on the local model
+phonton goal "Add a count() method to TodoStore" --yes --allow-host-checks
+phonton goal --local apply RUN_ID --yes     # after reviewing the verified candidate
+phonton goal --local rollback RUN_ID --yes  # restore the original files
 ```
 
-Alternative installers:
+With provider `ollama` and a calibrated model selected, both the TUI and
+`phonton goal` use the local harness. Every goal pauses for plan approval,
+local runs never fall back to a cloud model, and the receipt says whether the
+runtime was verified as Phonton-managed.
+
+On macOS and Linux, install [Ollama](https://ollama.com/download) yourself.
+Phonton cannot verify a runtime it did not start (an Ollama install can relay
+cloud models), so the TUI plan review says so and your approval is consent
+for that goal; headless runs need `phonton goal --local ... --allow-unverified-runtime`.
+
+In our smoke runs, qwen2.5-coder:3b on a 6 GB laptop GPU finished small
+single-file edits in a Node repo in 20-30 s. Small models work best on one
+focused change at a time. Details and limits:
+[docs/local-harness.md](docs/local-harness.md).
+
+---
+
+## Install
+
+```bash
+npm install -g phonton-cli
+```
+
+From source:
+
+```bash
+cargo install --git https://github.com/phonton-dev/phonton-cli phonton-cli --locked --force
+```
+
+Script installers:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.sh | sh
@@ -140,19 +140,6 @@ curl -fsSL https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/script
 
 ---
 
-## v0.19.6 Highlights
-
-- Beautiful, guided Interactive Clarification step questionnaire (`Mode::Clarify`) directly inside the Ratatui TUI.
-- Automatic prompt self-refinement by appending answers to the original goal description.
-- Programmatic plan-rerun queueing with strict state, flight log, and checkpoint cleanup to prevent state leaks.
-- Full verification coverage via new automated TUI unit testing.
-
-Recent v0.19.x work also includes typed swarm planning metadata, conflict-group
-scheduling, pluggable local/Qdrant code retrieval, MCP capability previews,
-browser verifier cleanup, TUI version display, and auto-update controls.
-
----
-
 ## Commands
 
 ```bash
@@ -160,19 +147,23 @@ browser verifier cleanup, TUI version display, and auto-update controls.
 phonton
 
 # Run a goal non-interactively through plan/edit/verify/review
-phonton goal "add input validation to config loading" --yes
+phonton goal "add input validation to config loading" --yes --allow-host-checks
 
 # Run an exact prompt file, useful for benchmark and CI harnesses
-phonton goal --prompt-file prompt.md --yes --permission-mode full-access --json
+phonton goal --prompt-file prompt.md --yes --allow-host-checks --json
 
 # Preview the task graph and GoalContract without editing files
 phonton plan --json "refactor auth layer"
 
-# Audit configuration, providers, store, trust, git, Cargo, and index backend
+# Audit configuration, provider key, store, trust, and the project's toolchains
 phonton doctor --provider
 
-# Export evidence from the latest run
-phonton benchmark export --latest --format json
+# See where the latest goal spent tokens
+phonton why-tokens
+
+# Review the latest receipt, then export typed proof
+phonton review latest
+phonton proof export --latest --format json
 
 # Inspect MCP capability proposals without invoking tools
 phonton mcp capabilities <server-id> --json
@@ -183,11 +174,16 @@ phonton mcp capabilities <server-id> --json
 ## Configuration
 
 Configure providers and the code index in `~/.phonton/config.toml`:
+Set `PHONTON_CONFIG_PATH` to an absolute config path outside repositories for
+an isolated CLI run. Local-model state stays at its usual location unless
+`PHONTON_LOCAL_STATE` is also set. Provider keys can remain in process
+environment variables instead of the isolated file; config-file keys take
+precedence when present. The normal config is left untouched.
 
 ```toml
 [provider]
 name = "deepseek"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 
 [provider.keys]
 deepseek = "sk-deepseek-api-key-here"
@@ -234,6 +230,7 @@ token-efficiency wins.
 - `phonton-memory` and `phonton-store`: local memory facade and SQLite persistence.
 - `phonton-sandbox`: command and tool execution guardrails.
 - `phonton-extensions` and `phonton-mcp`: local extension loading and MCP runtime.
+- `phonton-local`: hardware detection, managed Ollama runtime, local model install and calibration (preview).
 
 ---
 
@@ -245,3 +242,18 @@ Licensed under either of:
 - MIT License ([LICENSE-MIT](LICENSE-MIT))
 
 At your option.
+
+### TUI local plan approval
+
+On a calibrated local route, every goal pauses at its proposed files, exact
+check arguments, model, runtime origin and budget. Press
+**Y** to approve that plan or **N / Esc** to cancel. Enter, paste and held-key
+repeats do not approve a plan. This is separate from host-check permission;
+plan approval never grants access to run project commands on the host.
+Changes remain in a copy until a verified candidate is explicitly applied.
+
+Local receipts and the run record include reported tokens from rejected and
+interrupted strategy proposals as well as edit candidates. Only a verified
+managed runtime counts as local inference; external or unobserved origins are
+reported as unknown. The TUI records a local result only after its final receipt
+has been saved.

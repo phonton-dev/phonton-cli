@@ -216,7 +216,7 @@ fn print_help() {
 }
 
 fn default_store_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join("store.sqlite3"))
+    phonton_extensions::phonton_home().map(|h| h.join("store.sqlite3"))
 }
 
 fn open_persistent_store() -> Result<Store> {

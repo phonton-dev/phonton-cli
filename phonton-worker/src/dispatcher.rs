@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use phonton_mcp::McpRuntime;
 use phonton_orchestrator::WorkerDispatcher;
 use phonton_sandbox::{ExecutionGuard, Sandbox};
+use phonton_types::verification::VerificationExecution;
 use phonton_types::{CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskResult, TaskId};
 
 use crate::Worker;
@@ -53,6 +54,7 @@ pub struct RealDispatcher {
     semantic: Option<Arc<crate::SemanticContext>>,
     /// Optional MCP runtime shared by all workers for this goal.
     mcp: Option<Arc<McpRuntime>>,
+    verification_execution: VerificationExecution,
 }
 
 impl RealDispatcher {
@@ -89,7 +91,15 @@ impl RealDispatcher {
             context: Arc::new(tokio::sync::Mutex::new(context)),
             semantic: None,
             mcp: None,
+            verification_execution: VerificationExecution::RequireIsolation,
         }
+    }
+
+    /// Set caller-owned authority for the worker's first verification pass.
+    /// The orchestrator must independently use the same policy.
+    pub fn with_verification_execution(mut self, policy: VerificationExecution) -> Self {
+        self.verification_execution = policy;
+        self
     }
 
     /// Attach a memory store. When present, the worker writes completion and
@@ -149,7 +159,8 @@ impl WorkerDispatcher for RealDispatcher {
         }
         let mut worker = Worker::new(provider, self.guard.clone())
             .with_sandbox(Arc::clone(&self.sandbox))
-            .with_context_manager(Arc::clone(&self.context));
+            .with_context_manager(Arc::clone(&self.context))
+            .with_verification_execution(self.verification_execution);
 
         if let Some(tx) = msg_tx {
             worker = worker.with_msg_tx(tx);
@@ -195,5 +206,114 @@ impl RealDispatcher {
             .query(&query, 5)
             .await
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phonton_providers::Provider;
+    use phonton_types::{
+        LLMResponse, ProviderKind, SliceOrigin, SubtaskId, SubtaskStatus, VerifyLayer, VerifyResult,
+    };
+
+    #[derive(Clone)]
+    struct DiffProvider;
+
+    #[async_trait]
+    impl Provider for DiffProvider {
+        async fn call(
+            &self,
+            _system: &str,
+            _user: &str,
+            _slice_origins: &[SliceOrigin],
+        ) -> Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: "--- a/src/math.js\n+++ b/src/math.js\n@@ -1,3 +1,3 @@\n export function add(a, b) {\n-  return a - b;\n+  return a + b;\n }\n".into(),
+                input_tokens: 12,
+                output_tokens: 20,
+                cached_tokens: 0,
+                cache_creation_tokens: 0,
+                provider: ProviderKind::OpenAiCompatible,
+                model_name: "fixture".into(),
+            })
+        }
+
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAiCompatible
+        }
+
+        fn model(&self) -> String {
+            "fixture".into()
+        }
+
+        fn clone_box(&self) -> Box<dyn Provider> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_host_approval_reaches_worker_verification() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp.path().join("src"))?;
+        std::fs::create_dir_all(temp.path().join("test"))?;
+        std::fs::write(
+            temp.path().join("src/math.js"),
+            "export function add(a, b) {\n  return a - b;\n}\n",
+        )?;
+        std::fs::write(
+            temp.path().join("test/math.test.js"),
+            "import assert from 'node:assert/strict';\nimport test from 'node:test';\nimport { add } from '../src/math.js';\ntest('add', () => assert.equal(add(2, 3), 5));\n",
+        )?;
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+        )?;
+
+        let sandbox = Arc::new(Sandbox::new(
+            temp.path().to_path_buf(),
+            "approval-test".into(),
+        ));
+        let make_dispatcher = || {
+            RealDispatcher::new(
+                |_| Box::new(DiffProvider) as Box<dyn Provider>,
+                ExecutionGuard::new(temp.path().to_path_buf()),
+                Arc::clone(&sandbox),
+            )
+        };
+        let subtask = || Subtask {
+            id: SubtaskId::new(),
+            description: "Fix add in src/math.js".into(),
+            model_tier: ModelTier::Cheap,
+            dependencies: Vec::new(),
+            attachments: Vec::new(),
+            prompt_artifacts: Vec::new(),
+            status: SubtaskStatus::Queued,
+        };
+
+        let denied = make_dispatcher()
+            .dispatch(subtask(), Vec::new(), 0, None)
+            .await?;
+        assert!(matches!(
+            denied.verify_result,
+            VerifyResult::Unavailable { .. }
+        ));
+
+        let approved = make_dispatcher()
+            .with_verification_execution(VerificationExecution::HostApproved)
+            .dispatch(subtask(), Vec::new(), 0, None)
+            .await?;
+        assert!(matches!(
+            approved.verify_result,
+            VerifyResult::Pass {
+                layer: VerifyLayer::Test
+            }
+        ));
+        assert!(matches!(approved.status, SubtaskStatus::Done { .. }));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src/math.js"))?,
+            "export function add(a, b) {\n  return a - b;\n}\n"
+        );
+        Ok(())
     }
 }

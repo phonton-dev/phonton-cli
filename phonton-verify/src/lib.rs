@@ -12,6 +12,7 @@
 //! * Layer 4 — `Test`: `cargo test --package <crate>`, 120s timeout.
 
 pub mod browser;
+mod executor;
 pub use browser::verify_browser_check;
 
 use std::fs;
@@ -20,8 +21,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use phonton_memory::MemoryStore;
+use phonton_types::verification::VerificationExecution;
 use phonton_types::{DiffHunk, DiffLine, MemoryRecord, VerifyLayer, VerifyResult};
-use tokio::process::Command;
 use tree_sitter::{Node, Parser};
 
 /// Run layered verification against `hunks`, with cargo commands executed
@@ -52,10 +53,26 @@ pub async fn verify_diff_with_memory(
     working_dir: &Path,
     memory: Option<&MemoryStore>,
 ) -> Result<VerifyResult> {
+    verify_diff_with_execution(
+        hunks,
+        working_dir,
+        memory,
+        VerificationExecution::RequireIsolation,
+    )
+    .await
+}
+
+/// Verify with explicit caller-owned execution authority. Host approval grants
+/// no filesystem/network containment; default entry points never infer it.
+pub async fn verify_diff_with_execution(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+    memory: Option<&MemoryStore>,
+    policy: VerificationExecution,
+) -> Result<VerifyResult> {
     if let Some(fail) = verify_patch_applies(hunks, working_dir) {
         return Ok(fail);
     }
-    let mut pass_layer = VerifyLayer::PatchApply;
 
     if let Some(fail) = verify_syntax_with_worktree(hunks, Some(working_dir)) {
         return Ok(fail);
@@ -67,46 +84,222 @@ pub async fn verify_diff_with_memory(
         }
     }
 
-    let packages = touched_packages(hunks);
+    if policy == VerificationExecution::RequireIsolation {
+        return Ok(VerifyResult::Unavailable { reason: "Executable verification unavailable: no isolation backend is configured and host execution was not approved. Static checks alone cannot verify a candidate.".into() });
+    }
+    if hunks.iter().any(|h| is_manifest_path(&h.file_path)) {
+        return Ok(VerifyResult::Unavailable { reason: "Verification definition changed in the candidate. Capture independent checks before executing this diff; candidate-authored tests or package scripts cannot authorize or certify themselves.".into() });
+    }
+
+    let result = run_command_checks(hunks, working_dir, policy).await?;
+    // New test files run alongside the originals, which stay untouched. If the
+    // candidate edits existing tests, those originals must also pass against
+    // its source changes, so a candidate can never certify itself by
+    // rewriting the assertions it was checked against.
+    let edited_tests: Vec<&Path> = hunks
+        .iter()
+        .map(|h| h.file_path.as_path())
+        .filter(|p| is_test_path(p) && working_dir.join(p).is_file())
+        .collect();
+    if edited_tests.is_empty() || !matches!(result, VerifyResult::Pass { .. }) {
+        return Ok(result);
+    }
+    let without_test_edits: Vec<DiffHunk> = hunks
+        .iter()
+        .filter(|h| !edited_tests.contains(&h.file_path.as_path()))
+        .cloned()
+        .collect();
+    match run_command_checks(&without_test_edits, working_dir, policy).await? {
+        VerifyResult::Pass { .. } => Ok(result),
+        _ => {
+            let mut files: Vec<String> = edited_tests
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            files.dedup();
+            Ok(VerifyResult::Unavailable {
+                reason: format!(
+                    "The candidate edits existing tests ({}), and the original versions fail against its changes. Review whether the goal really requires changing those tests.",
+                    files.join(", ")
+                ),
+            })
+        }
+    }
+}
+
+/// Run the executable layers (crate check, workspace check, tests) against a
+/// temporary copy of the workspace with `hunks` applied.
+async fn run_command_checks(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<VerifyResult> {
+    let packages = touched_packages(hunks, working_dir);
     let patched_worktree = if command_verification_relevant(hunks, working_dir) {
         Some(patched_verification_worktree(hunks, working_dir)?)
     } else {
         None
     };
-    let command_dir = patched_worktree
-        .as_ref()
-        .map(|temp| temp.path())
-        .unwrap_or(working_dir);
+    let copy_dir = patched_worktree.as_ref().map(VerifyCopy::path);
+    let command_dir = copy_dir.as_deref().unwrap_or(working_dir);
+    // The worker verifies its diff and the orchestrator verifies it again;
+    // the same patched tree gives the same checks, so run them once.
+    let memo_key = copy_dir
+        .as_deref()
+        .and_then(|dir| tree_fingerprint(dir, &packages, policy).ok());
+    if let Some(cached) = memo_key.and_then(memo_get) {
+        return Ok(cached);
+    }
+    let result = run_checks_in(&packages, command_dir, policy).await?;
+    if let Some(key) = memo_key {
+        memo_put(key, &result);
+    }
+    Ok(result)
+}
 
-    if let Some(fail) = verify_crate_check(&packages, command_dir).await? {
+/// Verdicts of command checks keyed by [`tree_fingerprint`]. Unavailable
+/// results (timeouts, missing tools) are not kept so a retry can succeed.
+static CHECK_MEMO: std::sync::Mutex<Vec<(u64, VerifyResult)>> = std::sync::Mutex::new(Vec::new());
+
+fn memo_get(key: u64) -> Option<VerifyResult> {
+    let memo = CHECK_MEMO.lock().ok()?;
+    memo.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+}
+
+fn memo_put(key: u64, result: &VerifyResult) {
+    if matches!(result, VerifyResult::Unavailable { .. }) {
+        return;
+    }
+    if let Ok(mut memo) = CHECK_MEMO.lock() {
+        // ponytail: small FIFO; an LRU only matters for very long sessions.
+        if memo.len() >= 64 {
+            memo.remove(0);
+        }
+        memo.push((key, result.clone()));
+    }
+}
+
+/// Hash every file path and byte in the patched copy plus what the checks
+/// depend on. 64-bit SipHash: accidental collisions are negligible and the
+/// memo never leaves this process.
+fn tree_fingerprint(dir: &Path, packages: &[String], policy: VerificationExecution) -> Result<u64> {
+    use std::hash::{Hash, Hasher};
+    fn walk(root: &Path, dir: &Path, h: &mut impl Hasher) -> Result<()> {
+        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(root, &path, h)?;
+            } else if kind.is_file() {
+                path.strip_prefix(root).unwrap_or(&path).hash(h);
+                fs::read(&path)?.hash(h);
+            } else {
+                // Linked dependency folders: their target identifies them.
+                path.strip_prefix(root).unwrap_or(&path).hash(h);
+                fs::read_link(&path).ok().hash(h);
+            }
+        }
+        Ok(())
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    walk(dir, dir, &mut h)?;
+    packages.hash(&mut h);
+    matches!(policy, VerificationExecution::HostApproved).hash(&mut h);
+    Ok(h.finish())
+}
+
+/// The executable layers against `command_dir`.
+async fn run_checks_in(
+    packages: &[String],
+    command_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<VerifyResult> {
+    let mut pass_layer = None;
+    let packages = packages.to_vec();
+    if let Some(fail) = verify_crate_check_with_execution(&packages, command_dir, policy).await? {
         return Ok(fail);
     }
 
-    if let Some(fail) = verify_workspace_check(command_dir).await? {
+    if let Some(fail) = verify_workspace_check_with_execution(command_dir, policy).await? {
         return Ok(fail);
     }
-
-    if let Some(fail) = verify_test(&packages, command_dir).await? {
-        return Ok(fail);
+    if find_cargo_workspace(command_dir).is_some() {
+        pass_layer = Some(VerifyLayer::WorkspaceCheck);
     }
 
-    if let Some(node_result) = verify_node_test(command_dir).await? {
-        match node_result {
-            VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => return Ok(node_result),
-            VerifyResult::Pass { layer } => pass_layer = layer,
+    if let Some(test_result) = verify_test_with_execution(&packages, command_dir, policy).await? {
+        match test_result {
+            VerifyResult::Pass { layer } => pass_layer = Some(layer),
+            other => return Ok(other),
         }
     }
 
-    if let Some(browser_result) = verify_browser_check(command_dir).await? {
+    if let Some(node_result) = verify_node_test_with_execution(command_dir, policy).await? {
+        match node_result {
+            VerifyResult::Fail { .. }
+            | VerifyResult::Unavailable { .. }
+            | VerifyResult::NotRun { .. }
+            | VerifyResult::Escalate { .. } => return Ok(node_result),
+            VerifyResult::Pass { layer } => pass_layer = Some(layer),
+        }
+    }
+
+    if let Some(browser_result) =
+        browser::verify_browser_check_with_execution(command_dir, policy).await?
+    {
         match browser_result {
-            VerifyResult::Fail { .. } | VerifyResult::Escalate { .. } => {
+            VerifyResult::Fail { .. }
+            | VerifyResult::Unavailable { .. }
+            | VerifyResult::NotRun { .. }
+            | VerifyResult::Escalate { .. } => {
                 return Ok(browser_result);
             }
-            VerifyResult::Pass { layer } => pass_layer = layer,
+            VerifyResult::Pass { layer } => pass_layer = Some(layer),
         }
     }
 
-    Ok(VerifyResult::Pass { layer: pass_layer })
+    Ok(match pass_layer {
+        Some(layer) => VerifyResult::Pass { layer },
+        None => VerifyResult::NotRun { reason: "Verification not run: static patch/syntax checks found no error, but no executable verification was available. Select explicit checks before accepting the candidate.".into() },
+    })
+}
+
+#[cfg(test)]
+fn is_verification_definition_path(file_path: &Path) -> bool {
+    is_test_path(file_path) || is_manifest_path(file_path)
+}
+
+fn normalized_path(file_path: &Path) -> String {
+    file_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+/// Package manifests define which command certifies a candidate.
+fn is_manifest_path(file_path: &Path) -> bool {
+    let path = normalized_path(file_path);
+    let file = path.rsplit('/').next().unwrap_or_default();
+    matches!(
+        file,
+        "package.json" | "cargo.toml" | "cargo.lock" | "package-lock.json"
+    )
+}
+
+fn is_test_path(file_path: &Path) -> bool {
+    let path = normalized_path(file_path);
+    let file = path.rsplit('/').next().unwrap_or_default();
+    path.split('/')
+        .any(|part| matches!(part, "tests" | "test" | "__tests__" | "spec" | "specs"))
+        || file.starts_with("test_")
+        || file.starts_with("test-")
+        || file.starts_with("test.")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+        || file.contains("_test.")
+        || file.contains("-test.")
 }
 
 fn command_verification_relevant(hunks: &[DiffHunk], working_dir: &Path) -> bool {
@@ -124,14 +317,125 @@ fn command_verification_relevant(hunks: &[DiffHunk], working_dir: &Path) -> bool
         })
 }
 
-fn patched_verification_worktree(
-    hunks: &[DiffHunk],
-    working_dir: &Path,
-) -> Result<tempfile::TempDir> {
-    let temp = tempfile::tempdir()?;
-    copy_workspace_contents(working_dir, temp.path())?;
-    apply_hunks_to_worktree(hunks, working_dir, temp.path())?;
-    Ok(temp)
+/// The copy that checks run in, at `<root>/ws`. A sibling
+/// `<root>/.cargo/config.toml` points Cargo at `<root>/target`. The
+/// per-workspace cache root survives between runs, so Cargo reuses compiled
+/// dependencies instead of rebuilding them for every attempt; when another
+/// verification holds it, a throwaway root is used instead.
+struct VerifyCopy {
+    root: PathBuf,
+    lock: Option<PathBuf>,
+    _temp: Option<tempfile::TempDir>,
+}
+
+impl VerifyCopy {
+    fn path(&self) -> PathBuf {
+        self.root.join("ws")
+    }
+}
+
+impl Drop for VerifyCopy {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.lock {
+            let _ = fs::remove_file(lock);
+        }
+    }
+}
+
+fn verify_cache_root(working_dir: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| working_dir.to_path_buf())
+        .hash(&mut hasher);
+    std::env::temp_dir()
+        .join("phonton-verify")
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+/// Unused workspace caches older than this are deleted.
+const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Delete other workspaces' caches untouched for `max_age`. Each run recreates
+/// `<root>/ws`, which refreshes the root's modification time. Locked caches
+/// are skipped; failures are ignored because pruning is housekeeping.
+fn prune_stale_caches(parent: &Path, keep: &Path, max_age: Duration) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if path != keep && path.is_dir() && old && !path.with_extension("lock").exists() {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Take the cache lock. A lock older than an hour belongs to a crashed run.
+fn try_lock(lock: &Path) -> bool {
+    let open = || {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock)
+    };
+    if open().is_ok() {
+        return true;
+    }
+    let stale = fs::metadata(lock)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > Duration::from_secs(3600));
+    stale && fs::remove_file(lock).is_ok() && open().is_ok()
+}
+
+fn patched_verification_worktree(hunks: &[DiffHunk], working_dir: &Path) -> Result<VerifyCopy> {
+    let cache = verify_cache_root(working_dir);
+    let lock = cache.with_extension("lock");
+    let copy = if fs::create_dir_all(&cache).is_ok() && try_lock(&lock) {
+        if let Some(parent) = cache.parent() {
+            prune_stale_caches(parent, &cache, CACHE_MAX_AGE);
+        }
+        VerifyCopy {
+            root: cache,
+            lock: Some(lock),
+            _temp: None,
+        }
+    } else {
+        let temp = tempfile::tempdir()?;
+        VerifyCopy {
+            root: temp.path().to_path_buf(),
+            lock: None,
+            _temp: Some(temp),
+        }
+    };
+    let ws = copy.path();
+    // std's remove_dir_all unlinks a linked node_modules; it never follows it.
+    if ws.exists() {
+        fs::remove_dir_all(&ws)?;
+    }
+    let cargo_dir = copy.root.join(".cargo");
+    fs::create_dir_all(&cargo_dir)?;
+    let target = copy.root.join("target").to_string_lossy().into_owned();
+    fs::write(
+        cargo_dir.join("config.toml"),
+        format!(
+            "[build]
+target-dir = {}
+",
+            toml::Value::String(target)
+        ),
+    )?;
+    copy_workspace_contents(working_dir, &ws)?;
+    apply_hunks_to_worktree(hunks, working_dir, &ws)?;
+    Ok(copy)
 }
 
 fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
@@ -143,6 +447,14 @@ fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
         let dst_path = dest.join(&file_name);
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if file_name == "node_modules" {
+                // Checks need the installed packages; without them a model
+                // "fixes" a missing-module error by deleting the dependency.
+                // A link is fast and cleanup removes only the link. On
+                // failure the copy simply runs without dependencies.
+                let _ = link_dependency_dir(&src_path, &dst_path);
+                continue;
+            }
             if should_skip_verification_copy_dir(&file_name) {
                 continue;
             }
@@ -151,6 +463,27 @@ fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
             fs::copy(&src_path, &dst_path)?;
         }
     }
+    Ok(())
+}
+
+/// Point `dst` at the real dependency folder `src` (a junction on Windows,
+/// which needs no elevation; a symlink elsewhere).
+fn link_dependency_dir(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dst)
+            .arg(src)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("mklink /J failed for {}", dst.display());
+        }
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(src, dst)?;
     Ok(())
 }
 
@@ -208,109 +541,46 @@ fn safe_join(root: &Path, rel: &Path) -> Option<PathBuf> {
 /// Layer 0: prove each modified-file hunk can be located in the current
 /// worktree before more expensive verification runs.
 pub fn verify_patch_applies(hunks: &[DiffHunk], working_dir: &Path) -> Option<VerifyResult> {
-    let mut errors = Vec::new();
-
-    for hunk in hunks {
-        let full_path = working_dir.join(&hunk.file_path);
-        if !full_path.exists() {
-            if hunk_old_side(hunk).is_empty() {
-                continue;
-            }
-            errors.push(format!(
-                "{} does not exist but hunk removes or matches existing lines",
-                hunk.file_path.display()
-            ));
-            continue;
-        }
-
-        let has_context = hunk
-            .lines
-            .iter()
-            .any(|line| matches!(line, DiffLine::Context(_)));
-        if !has_context && hunk.old_start <= 1 && has_added_and_removed(hunk) {
-            // Small full-file replacements are handled directly by the
-            // diff applier; they intentionally do not need exact old-side
-            // text because the model often summarizes the removed file.
-            continue;
-        }
-
-        let Ok(text) = std::fs::read_to_string(&full_path) else {
-            errors.push(format!("could not read {}", hunk.file_path.display()));
-            continue;
-        };
-        let file_lines: Vec<&str> = text.lines().collect();
-        let expected = hunk_old_side(hunk);
-        if expected.is_empty() {
-            continue;
-        }
-
-        let start = hunk.old_start.saturating_sub(1) as usize;
-        if start + expected.len() > file_lines.len() {
-            errors.push(format!(
-                "{} hunk at old line {} spans past end of file",
-                hunk.file_path.display(),
-                hunk.old_start
-            ));
-            continue;
-        }
-
-        let actual = &file_lines[start..start + expected.len()];
-        if actual
-            .iter()
-            .zip(expected.iter())
-            .all(|(actual, expected)| old_line_matches(actual, expected))
-        {
-            continue;
-        }
-
-        let mismatch_index = actual
-            .iter()
-            .zip(expected.iter())
-            .position(|(actual, expected)| !old_line_matches(actual, expected))
-            .unwrap_or(0);
-        errors.push(format!(
-            "{} hunk at old line {} does not match worktree context near line {}: expected `{}`, found `{}`",
-            hunk.file_path.display(),
-            hunk.old_start,
-            hunk.old_start as usize + mismatch_index,
-            truncate_for_diagnostic(expected[mismatch_index]),
-            truncate_for_diagnostic(actual[mismatch_index])
-        ));
-    }
-
-    if errors.is_empty() {
-        None
-    } else {
-        Some(VerifyResult::Fail {
+    let allowed: Vec<_> = hunks.iter().map(|h| h.file_path.clone()).collect();
+    phonton_local::edit::materialize_hunks_with_new_files(working_dir, &allowed, hunks)
+        .err()
+        .map(|error| VerifyResult::Fail {
             layer: VerifyLayer::PatchApply,
-            errors,
+            errors: vec![error.to_string()],
             attempt: 1,
         })
-    }
 }
 
 /// Run `npm test` when the workspace is a Node package with an explicit
 /// test script.
 pub async fn verify_node_test(working_dir: &Path) -> Result<Option<VerifyResult>> {
+    verify_node_test_with_execution(working_dir, VerificationExecution::RequireIsolation).await
+}
+
+/// Execute the package's test script only with explicit execution authority.
+pub async fn verify_node_test_with_execution(
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<Option<VerifyResult>> {
     let package_json = working_dir.join("package.json");
     if !package_json_has_test_script(&package_json) {
         return Ok(None);
     }
 
-    let output = tokio::time::timeout(
-        Duration::from_secs(600),
-        Command::new(npm_command())
-            .current_dir(working_dir)
-            .arg("test")
-            .output(),
+    let output = executor::run(
+        working_dir,
+        npm_command(),
+        vec!["test".into()],
+        Duration::from_secs(120),
+        policy,
     )
     .await;
 
     match output {
-        Ok(Ok(out)) if out.status.success() => Ok(Some(VerifyResult::Pass {
+        Ok(out) if out.status.success() => Ok(Some(VerifyResult::Pass {
             layer: VerifyLayer::Test,
         })),
-        Ok(Ok(out)) => {
+        Ok(out) => {
             let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&out.stderr));
             Ok(Some(VerifyResult::Fail {
@@ -319,16 +589,7 @@ pub async fn verify_node_test(working_dir: &Path) -> Result<Option<VerifyResult>
                 attempt: 1,
             }))
         }
-        Ok(Err(e)) => Ok(Some(VerifyResult::Fail {
-            layer: VerifyLayer::Test,
-            errors: vec![format!("could not invoke npm test: {e}")],
-            attempt: 1,
-        })),
-        Err(_) => Ok(Some(VerifyResult::Fail {
-            layer: VerifyLayer::Test,
-            errors: vec!["npm test timed out after 600s".into()],
-            attempt: 1,
-        })),
+        Err(unavailable) => Ok(Some(unavailable)),
     }
 }
 
@@ -373,7 +634,7 @@ fn verify_syntax_with_worktree(
         };
         let mut parser = Parser::new();
         if set_parser_language(&mut parser, language).is_err() {
-            return Some(VerifyResult::Escalate {
+            return Some(VerifyResult::Unavailable {
                 reason: format!("failed to load {} grammar", language.label()),
             });
         }
@@ -472,59 +733,12 @@ fn group_hunks_by_file(hunks: &[DiffHunk]) -> Vec<(&Path, Vec<&DiffHunk>)> {
 }
 
 fn post_diff_source(root: &Path, path: &Path, hunks: &[&DiffHunk]) -> Result<String> {
-    if hunks.iter().all(|hunk| hunk_old_side(hunk).is_empty()) {
-        return Ok(hunks
-            .iter()
-            .map(|hunk| reconstruct_new_side(hunk))
-            .collect::<Vec<_>>()
-            .join("\n"));
-    }
-
-    let full_path = root.join(path);
-    let original = std::fs::read_to_string(&full_path)?;
-    let trailing_newline = original.ends_with('\n');
-    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
-    let mut sorted = hunks.to_vec();
-    sorted.sort_by_key(|hunk| std::cmp::Reverse(hunk.old_start));
-
-    for hunk in sorted {
-        let start = hunk.old_start.saturating_sub(1) as usize;
-        let old = hunk_old_side(hunk);
-        if start + old.len() > lines.len() {
-            anyhow::bail!(
-                "{} hunk at old line {} spans past end of file",
-                path.display(),
-                hunk.old_start
-            );
-        }
-        let actual = &lines[start..start + old.len()];
-        if !actual
-            .iter()
-            .zip(old.iter())
-            .all(|(actual, expected)| old_line_matches(actual, expected))
-        {
-            anyhow::bail!(
-                "{} hunk at old line {} does not match worktree context",
-                path.display(),
-                hunk.old_start
-            );
-        }
-
-        let mut replacement = Vec::new();
-        for line in &hunk.lines {
-            match line {
-                DiffLine::Context(s) | DiffLine::Added(s) => replacement.push(s.clone()),
-                DiffLine::Removed(_) => {}
-            }
-        }
-        lines.splice(start..start + old.len(), replacement);
-    }
-
-    let mut out = lines.join("\n");
-    if trailing_newline {
-        out.push('\n');
-    }
-    Ok(out)
+    let owned: Vec<_> = hunks.iter().map(|h| (*h).clone()).collect();
+    let mut changes =
+        phonton_local::edit::materialize_hunks_with_new_files(root, &[path.to_path_buf()], &owned)?;
+    changes
+        .remove(path)
+        .ok_or_else(|| anyhow::anyhow!("No materialized content for {}", path.display()))
 }
 
 /// Layer 1.5 — Decision Check.
@@ -573,7 +787,7 @@ pub async fn verify_decisions(
     let records = match memory.query(&query, 16).await {
         Ok(r) => r,
         Err(e) => {
-            return Ok(Some(VerifyResult::Escalate {
+            return Ok(Some(VerifyResult::Unavailable {
                 reason: format!("memory query failed: {e}"),
             }));
         }
@@ -654,6 +868,20 @@ pub async fn verify_crate_check(
     packages: &[String],
     working_dir: &Path,
 ) -> Result<Option<VerifyResult>> {
+    verify_crate_check_with_execution(
+        packages,
+        working_dir,
+        VerificationExecution::RequireIsolation,
+    )
+    .await
+}
+
+/// Check packages through the shared executor under explicit authority.
+pub async fn verify_crate_check_with_execution(
+    packages: &[String],
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<Option<VerifyResult>> {
     // Skip when we're not in a Rust workspace — `cargo check` would just
     // error with "could not find Cargo.toml" and turn every legitimate
     // create-a-new-project goal into a failure. Syntax (Layer 1) still
@@ -663,20 +891,33 @@ pub async fn verify_crate_check(
     }
     let mut errors = Vec::new();
     for pkg in packages {
-        let output = Command::new("cargo")
-            .current_dir(working_dir)
-            .args(["check", "--package", pkg, "--message-format", "json"])
-            .output()
-            .await;
+        let output = executor::run(
+            working_dir,
+            "cargo",
+            vec![
+                "check".into(),
+                "--package".into(),
+                pkg.clone(),
+                "--message-format".into(),
+                "json".into(),
+            ],
+            Duration::from_secs(120),
+            policy,
+        )
+        .await;
 
         match output {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 errors.extend(parse_cargo_errors(&stdout, pkg));
+                if !out.status.success() && errors.is_empty() {
+                    errors.push(format!(
+                        "cargo check for {pkg} exited unsuccessfully: {}",
+                        last_lines(&String::from_utf8_lossy(&out.stderr), 10)
+                    ));
+                }
             }
-            Err(e) => {
-                errors.push(format!("could not invoke cargo check for {pkg}: {e}"));
-            }
+            Err(unavailable) => return Ok(Some(unavailable)),
         }
     }
 
@@ -697,6 +938,15 @@ pub async fn verify_crate_check(
 /// this scans every crate in the workspace and is the expensive cousin of
 /// Layer 2.
 pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyResult>> {
+    verify_workspace_check_with_execution(working_dir, VerificationExecution::RequireIsolation)
+        .await
+}
+
+/// Check a Cargo workspace through the shared executor under explicit authority.
+pub async fn verify_workspace_check_with_execution(
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<Option<VerifyResult>> {
     // Same short-circuit as the crate check — no Cargo.toml means there's
     // nothing for cargo to verify. The previous behaviour was to surface
     // "cargo check --workspace failed: could not find `Cargo.toml`" as a
@@ -704,11 +954,19 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
     if find_cargo_workspace(working_dir).is_none() {
         return Ok(None);
     }
-    let output = Command::new("cargo")
-        .current_dir(working_dir)
-        .args(["check", "--workspace", "--message-format", "json"])
-        .output()
-        .await;
+    let output = executor::run(
+        working_dir,
+        "cargo",
+        vec![
+            "check".into(),
+            "--workspace".into(),
+            "--message-format".into(),
+            "json".into(),
+        ],
+        Duration::from_secs(120),
+        policy,
+    )
+    .await;
 
     let errors = match output {
         Ok(out) => {
@@ -724,11 +982,13 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
                         "cargo check --workspace failed: {}",
                         last_lines(msg, 5)
                     ));
+                } else {
+                    errs.push("cargo check --workspace exited unsuccessfully without compiler diagnostics".into());
                 }
             }
             errs
         }
-        Err(e) => vec![format!("could not invoke cargo check --workspace: {e}")],
+        Err(unavailable) => return Ok(Some(unavailable)),
     };
 
     if errors.is_empty() {
@@ -745,46 +1005,124 @@ pub async fn verify_workspace_check(working_dir: &Path) -> Result<Option<VerifyR
 /// Layer 4: `cargo test --package <crate>` per affected crate, capped at
 /// 120s per invocation.
 ///
-/// A non-zero exit or timeout surfaces the last 20 lines of combined
-/// stdout+stderr as the failure message — enough to point at a failing
-/// assertion without flooding the UI.
+/// A non-zero exit surfaces the last 20 lines of combined stdout+stderr.
+/// A successful process reports Test only when its output records a completed
+/// passing test; empty or missing summaries remain NotRun.
 pub async fn verify_test(packages: &[String], working_dir: &Path) -> Result<Option<VerifyResult>> {
+    verify_test_with_execution(
+        packages,
+        working_dir,
+        VerificationExecution::RequireIsolation,
+    )
+    .await
+}
+
+/// Run Cargo tests through the shared executor under explicit authority.
+pub async fn verify_test_with_execution(
+    packages: &[String],
+    working_dir: &Path,
+    policy: VerificationExecution,
+) -> Result<Option<VerifyResult>> {
     // Skip for the same reason the cargo check layers do.
-    if find_cargo_workspace(working_dir).is_none() {
+    if find_cargo_workspace(working_dir).is_none() || packages.is_empty() {
         return Ok(None);
     }
     let mut errors = Vec::new();
+    let mut unavailable_packages = Vec::new();
+    let mut no_test_packages = Vec::new();
     for pkg in packages {
-        let fut = Command::new("cargo")
-            .current_dir(working_dir)
-            .args(["test", "--package", pkg, "--", "--nocapture"])
-            .output();
-
-        match tokio::time::timeout(Duration::from_secs(600), fut).await {
-            Ok(Ok(out)) if out.status.success() => {}
-            Ok(Ok(out)) => {
+        let output = executor::run(
+            working_dir,
+            "cargo",
+            vec![
+                "test".into(),
+                "--package".into(),
+                pkg.clone(),
+                "--".into(),
+                "--nocapture".into(),
+            ],
+            Duration::from_secs(120),
+            policy,
+        )
+        .await;
+        match output {
+            Ok(out) if out.status.success() => {
+                if !cargo_tests_completed(&String::from_utf8_lossy(&out.stdout)) {
+                    no_test_packages.push(pkg.as_str());
+                }
+            }
+            Ok(out) => {
                 let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
                 combined.push_str(&String::from_utf8_lossy(&out.stderr));
                 errors.push(last_lines(&combined, 20));
             }
-            Ok(Err(e)) => {
-                errors.push(format!("could not invoke cargo test for {pkg}: {e}"));
+            Err(VerifyResult::Unavailable { reason }) => {
+                unavailable_packages.push(format!("{pkg}: {reason}"));
             }
-            Err(_) => {
-                errors.push(format!("cargo test for {pkg} timed out after 600s"));
-            }
+            Err(other) => return Ok(Some(other)),
         }
     }
 
-    if errors.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(VerifyResult::Fail {
+    Ok(Some(cargo_test_verdict(
+        errors,
+        unavailable_packages,
+        no_test_packages,
+    )))
+}
+
+fn cargo_test_verdict(
+    errors: Vec<String>,
+    unavailable_packages: Vec<String>,
+    no_test_packages: Vec<&str>,
+) -> VerifyResult {
+    if !errors.is_empty() {
+        VerifyResult::Fail {
             layer: VerifyLayer::Test,
             errors,
             attempt: 1,
-        }))
+        }
+    } else if !unavailable_packages.is_empty() {
+        VerifyResult::Unavailable {
+            reason: format!(
+                "cargo test unavailable in: {}",
+                unavailable_packages.join("; ")
+            ),
+        }
+    } else if !no_test_packages.is_empty() {
+        VerifyResult::NotRun {
+            reason: format!(
+                "cargo test exited successfully without a completed passing test in: {}",
+                no_test_packages.join(", ")
+            ),
+        }
+    } else {
+        VerifyResult::Pass {
+            layer: VerifyLayer::Test,
+        }
     }
+}
+
+fn cargo_tests_completed(stdout: &str) -> bool {
+    let mut saw_completed_test = false;
+    for line in stdout.lines() {
+        let Some(summary) = line.trim_start().strip_prefix("test result: ") else {
+            continue;
+        };
+        let Some(counts) = summary.strip_prefix("ok. ") else {
+            return false;
+        };
+        let Some((passed, remainder)) = counts.split_once(" passed; ") else {
+            return false;
+        };
+        let Ok(passed) = passed.parse::<u64>() else {
+            return false;
+        };
+        if !remainder.starts_with("0 failed;") {
+            return false;
+        }
+        saw_completed_test |= passed > 0;
+    }
+    saw_completed_test
 }
 
 // ---------------------------------------------------------------------------
@@ -923,28 +1261,6 @@ fn record_quote(r: &MemoryRecord) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn hunk_old_side(hunk: &DiffHunk) -> Vec<&str> {
-    hunk.lines
-        .iter()
-        .filter_map(|line| match line {
-            DiffLine::Context(s) | DiffLine::Removed(s) => Some(s.as_str()),
-            DiffLine::Added(_) => None,
-        })
-        .collect()
-}
-
-fn has_added_and_removed(hunk: &DiffHunk) -> bool {
-    let has_added = hunk
-        .lines
-        .iter()
-        .any(|line| matches!(line, DiffLine::Added(_)));
-    let has_removed = hunk
-        .lines
-        .iter()
-        .any(|line| matches!(line, DiffLine::Removed(_)));
-    has_added && has_removed
-}
-
 fn package_json_has_test_script(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
@@ -958,28 +1274,6 @@ fn package_json_has_test_script(path: &Path) -> bool {
         .and_then(|script| script.as_str())
         .map(|script| !script.trim().is_empty())
         .unwrap_or(false)
-}
-
-fn old_line_matches(actual: &str, expected: &str) -> bool {
-    if actual == expected {
-        return true;
-    }
-    let actual_trimmed = actual.trim_start();
-    let expected_trimmed = expected.trim_start();
-    actual_trimmed
-        .strip_prefix("export ")
-        .map(|rest| rest == expected_trimmed)
-        .unwrap_or(false)
-}
-
-fn truncate_for_diagnostic(text: &str) -> String {
-    const MAX: usize = 96;
-    if text.chars().count() <= MAX {
-        return text.into();
-    }
-    let mut out: String = text.chars().take(MAX).collect();
-    out.push_str("...");
-    out
 }
 
 fn reconstruct_new_side(hunk: &DiffHunk) -> String {
@@ -1037,56 +1331,49 @@ fn first_syntax_error_detail(tree: &tree_sitter::Tree, source: &str) -> String {
     walk(tree.root_node(), source).unwrap_or_else(|| "parse tree contains errors".into())
 }
 
-/// Infer the cargo package name for a path inside the workspace.
-/// Extract a crate name from a relative path component.
-///
-/// Tries two strategies in order:
-/// 1. Any path component starting with `phonton-` (workspace convention).
-/// 2. Walk up the path looking for a `Cargo.toml` and read its `[package] name`.
-fn crate_name_for(path: &Path) -> Option<String> {
-    // Fast path: phonton workspace layout.
-    for component in path.components() {
-        let s = component.as_os_str().to_string_lossy();
-        if s.starts_with("phonton-") {
-            return Some(s.into_owned());
-        }
+/// Resolve the nearest Cargo package from the target workspace, not the
+/// Phonton process's current directory.
+fn crate_name_for(path: &Path, working_dir: &Path) -> Option<String> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(working_dir).ok()?
+    } else {
+        path
+    };
+    if !relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return None;
     }
-    // Slow path: walk up looking for Cargo.toml.
-    let mut dir = path.parent()?;
+
+    let mut dir = working_dir.join(relative).parent()?.to_path_buf();
     loop {
-        let manifest = dir.join("Cargo.toml");
-        if manifest.exists() {
-            if let Ok(text) = std::fs::read_to_string(&manifest) {
-                // Simple line scan — avoids pulling in toml just for this.
-                for line in text.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("name") {
-                        if let Some(val) = rest
-                            .trim_start_matches([' ', '=', '"', '\''].as_ref())
-                            .split('"')
-                            .next()
-                        {
-                            let name = val.trim_matches(['"', '\'', ' '].as_ref()).to_string();
-                            if !name.is_empty() {
-                                return Some(name);
-                            }
-                        }
-                    }
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            if let Ok(manifest) = toml::from_str::<toml::Value>(&text) {
+                if let Some(name) = manifest
+                    .get("package")
+                    .and_then(|package| package.get("name"))
+                    .and_then(toml::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                {
+                    return Some(name.to_string());
                 }
             }
         }
-        match dir.parent() {
-            Some(p) if p != dir => dir = p,
-            _ => break,
+        if dir == working_dir {
+            return None;
+        }
+        dir = dir.parent()?.to_path_buf();
+        if !dir.starts_with(working_dir) {
+            return None;
         }
     }
-    None
 }
 
-fn touched_packages(hunks: &[DiffHunk]) -> Vec<String> {
+fn touched_packages(hunks: &[DiffHunk], working_dir: &Path) -> Vec<String> {
     let mut packages: Vec<String> = Vec::new();
     for hunk in hunks {
-        if let Some(pkg) = crate_name_for(&hunk.file_path) {
+        if let Some(pkg) = crate_name_for(&hunk.file_path, working_dir) {
             if !packages.iter().any(|p| p == &pkg) {
                 packages.push(pkg);
             }
@@ -1144,15 +1431,402 @@ fn last_lines(text: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_test_evidence_requires_completed_nonempty_suite() {
+        assert!(!cargo_tests_completed(""));
+        assert!(!cargo_tests_completed("test result: ok.\n"));
+        assert!(!cargo_tests_completed(
+            "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured\n"
+        ));
+        assert!(cargo_tests_completed(
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+        ));
+        assert!(cargo_tests_completed(
+            "test result: ok. 0 passed; 0 failed; 0 ignored\ntest result: ok. 2 passed; 0 failed; 0 ignored\n"
+        ));
+    }
+
+    #[test]
+    fn an_observed_test_failure_takes_priority_over_later_unavailability() {
+        assert!(matches!(
+            cargo_test_verdict(
+                vec!["assertion failed".into()],
+                vec!["later package timed out".into()],
+                vec!["empty"],
+            ),
+            VerifyResult::Fail {
+                layer: VerifyLayer::Test,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_verification_never_runs_project_scripts_or_writes_browser_helpers() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"scripts":{"test":"node -e \"require('fs').writeFileSync('executed','bad')\""}}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("index.html"), "<h1>fixture</h1>").unwrap();
+        std::fs::write(tmp.path().join("phonton-server.js"), "user-owned content").unwrap();
+        assert!(matches!(
+            verify_node_test(tmp.path()).await.unwrap(),
+            Some(VerifyResult::Unavailable { .. })
+        ));
+        assert!(matches!(
+            verify_browser_check(tmp.path()).await.unwrap(),
+            Some(VerifyResult::Unavailable { .. })
+        ));
+        assert!(!tmp.path().join("executed").exists());
+        assert!(!tmp.path().join("phonton-playwright.js").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("phonton-server.js")).unwrap(),
+            "user-owned content"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_checks_without_executable_evidence_never_pass_a_diff() {
+        let tmp = tempfile::tempdir().unwrap();
+        for policy in [
+            VerificationExecution::RequireIsolation,
+            VerificationExecution::HostApproved,
+        ] {
+            let result = verify_diff_with_execution(
+                &[hunk("note.txt", vec![DiffLine::Added("plain text".into())])],
+                tmp.path(),
+                None,
+                policy,
+            )
+            .await
+            .unwrap();
+            match policy {
+                VerificationExecution::RequireIsolation => {
+                    assert!(matches!(result, VerifyResult::Unavailable { .. }))
+                }
+                VerificationExecution::HostApproved => {
+                    assert!(matches!(result, VerifyResult::NotRun { .. }))
+                }
+            }
+        }
+    }
+
+    /// Node package whose one existing test fails until `f` returns x + 1.
+    fn node_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("test")).unwrap();
+        std::fs::write(root.join("src/m.js"), "module.exports = { f: (x) => x };\n").unwrap();
+        std::fs::write(
+            root.join("test/m.test.js"),
+            "const t = require('node:test');\nconst a = require('node:assert');\nconst { f } = require('../src/m');\nt('f', () => a.strictEqual(f(1), 2));\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn replace_line(path: &str, old: &str, new: &str, line: u32) -> DiffHunk {
+        DiffHunk {
+            file_path: path.into(),
+            old_start: line,
+            old_count: 1,
+            new_start: line,
+            new_count: 1,
+            lines: vec![DiffLine::Removed(old.into()), DiffLine::Added(new.into())],
+        }
+    }
+
+    #[tokio::test]
+    async fn checks_see_installed_dependencies_and_cleanup_spares_them() {
+        let tmp = node_fixture();
+        let dep = tmp.path().join("node_modules/inc");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("index.js"), "module.exports = (x) => x + 1;\n").unwrap();
+        let fix = replace_line(
+            "src/m.js",
+            "module.exports = { f: (x) => x };",
+            "module.exports = { f: require('inc') };",
+            1,
+        );
+        // Twice: the second run clears the cached copy made by the first.
+        for _ in 0..2 {
+            let worktree =
+                patched_verification_worktree(std::slice::from_ref(&fix), tmp.path()).unwrap();
+            assert!(worktree.path().join("node_modules/inc/index.js").is_file());
+            drop(worktree);
+            assert!(
+                dep.join("index.js").is_file(),
+                "cleanup must remove the link, never the user's packages"
+            );
+        }
+
+        let result = verify_diff_with_execution(
+            &[fix],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, VerifyResult::Pass { .. }), "{result:?}");
+        assert!(dep.join("index.js").is_file());
+    }
+
+    #[test]
+    fn check_memo_keys_on_exact_tree_content_and_skips_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn a() {}
+",
+        )
+        .unwrap();
+        let policy = VerificationExecution::HostApproved;
+        let first = tree_fingerprint(dir.path(), &[], policy).unwrap();
+        assert_eq!(first, tree_fingerprint(dir.path(), &[], policy).unwrap());
+        assert_ne!(
+            first,
+            tree_fingerprint(dir.path(), &["p".into()], policy).unwrap()
+        );
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn b() {}
+",
+        )
+        .unwrap();
+        let second = tree_fingerprint(dir.path(), &[], policy).unwrap();
+        assert_ne!(first, second);
+
+        let pass = VerifyResult::Pass {
+            layer: VerifyLayer::Test,
+        };
+        memo_put(second, &pass);
+        assert!(matches!(memo_get(second), Some(VerifyResult::Pass { .. })));
+        memo_put(
+            first,
+            &VerifyResult::Unavailable {
+                reason: "timeout".into(),
+            },
+        );
+        assert!(memo_get(first).is_none());
+    }
+
+    #[test]
+    fn stale_caches_are_pruned_but_current_and_locked_ones_stay() {
+        let parent = tempfile::tempdir().unwrap();
+        let keep = parent.path().join("keep");
+        let old = parent.path().join("old");
+        let locked = parent.path().join("locked");
+        for dir in [&keep, &old, &locked] {
+            fs::create_dir_all(dir.join("target")).unwrap();
+        }
+        fs::write(locked.with_extension("lock"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        prune_stale_caches(parent.path(), &keep, Duration::from_millis(1));
+        assert!(keep.exists());
+        assert!(!old.exists());
+        assert!(locked.exists());
+    }
+
+    #[tokio::test]
+    async fn candidate_may_add_tests_alongside_a_real_fix() {
+        let tmp = node_fixture();
+        let fix = replace_line(
+            "src/m.js",
+            "module.exports = { f: (x) => x };",
+            "module.exports = { f: (x) => x + 1 };",
+            1,
+        );
+        let new_test = DiffHunk {
+            file_path: "test/extra.test.js".into(),
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 3,
+            lines: vec![
+                DiffLine::Added("const t = require('node:test');".into()),
+                DiffLine::Added("const { f } = require('../src/m');".into()),
+                DiffLine::Added(
+                    "t('zero', () => require('node:assert').strictEqual(f(0), 1));".into(),
+                ),
+            ],
+        };
+        let result = verify_diff_with_execution(
+            &[fix, new_test],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, VerifyResult::Pass { .. }), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn candidate_cannot_pass_by_rewriting_an_existing_assertion() {
+        let tmp = node_fixture();
+        let rewrite = replace_line(
+            "test/m.test.js",
+            "t('f', () => a.strictEqual(f(1), 2));",
+            "t('f', () => a.strictEqual(f(1), 1));",
+            4,
+        );
+        let result = verify_diff_with_execution(
+            &[rewrite],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&result, VerifyResult::Unavailable { reason } if reason.contains("edits existing tests")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_cannot_replace_the_script_that_certifies_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = r#"{"scripts":{"test":"node tests.js"}}"#;
+        std::fs::write(tmp.path().join("package.json"), format!("{old}\n")).unwrap();
+        let change = DiffHunk {
+            file_path: "package.json".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed(old.into()),
+                DiffLine::Added(r#"{"scripts":{"test":"node -e process.exit(0)"}}"#.into()),
+            ],
+        };
+        let result = verify_diff_with_execution(
+            &[change],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, VerifyResult::Unavailable { reason } if reason.contains("definition changed"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+            format!("{old}\n")
+        );
+    }
+
+    #[test]
+    fn verification_definitions_cover_case_aliases_and_node_test_names() {
+        for path in [
+            "Package.json",
+            "CARGO.TOML",
+            "package-lock.JSON",
+            "foo_test.js",
+            "foo-test.js",
+            "test-foo.js",
+            "test.js",
+            "src\\Specs\\math.ts",
+        ] {
+            assert!(
+                is_verification_definition_path(Path::new(path)),
+                "missed {path}"
+            );
+        }
+        assert!(!is_verification_definition_path(Path::new("src/math.js")));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn mixed_case_manifest_alias_cannot_certify_its_own_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = r#"{"scripts":{"test":"node --test"}}"#;
+        std::fs::write(tmp.path().join("package.json"), format!("{old}\n")).unwrap();
+        let change = DiffHunk {
+            file_path: "Package.json".into(),
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec![
+                DiffLine::Removed(old.into()),
+                DiffLine::Added(r#"{"scripts":{"test":"node -e process.exit(0)"}}"#.into()),
+            ],
+        };
+        let result = verify_diff_with_execution(
+            &[change],
+            tmp.path(),
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, VerifyResult::Unavailable { reason } if reason.contains("definition changed"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("package.json")).unwrap(),
+            format!("{old}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn cargo_default_fails_closed_and_nonzero_without_json_is_not_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let packages = vec!["missing-package".into()];
+        assert!(matches!(
+            verify_crate_check(&packages, tmp.path()).await.unwrap(),
+            Some(VerifyResult::Unavailable { .. })
+        ));
+        assert!(matches!(
+            verify_workspace_check(tmp.path()).await.unwrap(),
+            Some(VerifyResult::Unavailable { .. })
+        ));
+        assert!(matches!(
+            verify_test(&packages, tmp.path()).await.unwrap(),
+            Some(VerifyResult::Unavailable { .. })
+        ));
+        assert!(matches!(
+            verify_crate_check_with_execution(
+                &packages,
+                tmp.path(),
+                VerificationExecution::HostApproved
+            )
+            .await
+            .unwrap(),
+            Some(VerifyResult::Fail { .. })
+        ));
+    }
     use std::path::PathBuf;
 
     fn hunk(path: &str, lines: Vec<DiffLine>) -> DiffHunk {
+        let old_count = lines
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Added(_)))
+            .count() as u32;
+        let new_count = lines
+            .iter()
+            .filter(|line| !matches!(line, DiffLine::Removed(_)))
+            .count() as u32;
         DiffHunk {
             file_path: PathBuf::from(path),
-            old_start: 1,
-            old_count: 0,
+            old_start: if old_count == 0 { 0 } else { 1 },
+            old_count,
             new_start: 1,
-            new_count: lines.len() as u32,
+            new_count,
             lines,
         }
     }
@@ -1246,9 +1920,8 @@ mod tests {
                 errors,
                 ..
             }) => {
-                assert!(errors
-                    .join("\n")
-                    .contains("expected `function loadSettings"));
+                assert!(errors.join("\n").contains("Exact hunk verification failed"));
+                assert!(errors.join("\n").contains("config.js"));
             }
             other => panic!("expected PatchApply failure, got {other:?}"),
         }
@@ -1277,7 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_apply_accepts_export_prefix_context_mismatch() {
+    fn patch_apply_rejects_export_prefix_context_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
         std::fs::write(
@@ -1295,22 +1968,21 @@ mod tests {
             ],
         );
 
-        assert!(verify_patch_applies(&[h], tmp.path()).is_none());
+        assert!(matches!(
+            verify_patch_applies(&[h], tmp.path()),
+            Some(VerifyResult::Fail {
+                layer: VerifyLayer::PatchApply,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
     async fn node_test_fails_plain_node_package_when_npm_test_fails() {
-        if std::process::Command::new("npm")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("package.json"),
-            r#"{"type":"module","scripts":{"test":"node --test"}}"#,
+            r#"{"type":"module","scripts":{"test":"node --test --test-reporter=tap"}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(tmp.path().join("test")).unwrap();
@@ -1320,20 +1992,24 @@ mod tests {
         )
         .unwrap();
 
-        match verify_node_test(tmp.path()).await.unwrap() {
+        match verify_node_test_with_execution(tmp.path(), VerificationExecution::HostApproved)
+            .await
+            .unwrap()
+        {
             Some(VerifyResult::Fail {
                 layer: VerifyLayer::Test,
                 errors,
                 ..
             }) => {
-                let combined = errors.join("\n");
-                assert!(
-                    combined.contains("fails")
-                        || combined.contains("not equal")
-                        || combined.contains("1 !== 2")
-                        || combined.contains("AssertionError"),
-                    "expected failing test output, got: {combined}"
-                );
+                // Reporter defaults vary by Node version. Verify the retained
+                // TAP failure evidence, not a test name outside the output tail.
+                let diagnostic = errors.join("\n");
+                for evidence in ["ERR_ASSERTION", "expected: 2", "actual: 1", "# fail 1"] {
+                    assert!(
+                        diagnostic.contains(evidence),
+                        "missing {evidence:?} in npm test failure: {diagnostic}"
+                    );
+                }
             }
             other => panic!("expected npm test failure, got {other:?}"),
         }
@@ -1341,13 +2017,6 @@ mod tests {
 
     #[tokio::test]
     async fn node_test_passes_plain_node_package_when_npm_test_passes() {
-        if std::process::Command::new("npm")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("package.json"),
@@ -1362,7 +2031,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            verify_node_test(tmp.path()).await.unwrap(),
+            verify_node_test_with_execution(tmp.path(), VerificationExecution::HostApproved)
+                .await
+                .unwrap(),
             Some(VerifyResult::Pass {
                 layer: VerifyLayer::Test
             })
@@ -1371,13 +2042,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_diff_runs_node_tests_against_candidate_diff() {
-        if std::process::Command::new("npm")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("package.json"),
@@ -1410,7 +2074,9 @@ mod tests {
         };
 
         assert_eq!(
-            verify_diff(&[h], tmp.path()).await.unwrap(),
+            verify_diff_with_execution(&[h], tmp.path(), None, VerificationExecution::HostApproved)
+                .await
+                .unwrap(),
             VerifyResult::Pass {
                 layer: VerifyLayer::Test
             }
@@ -1606,27 +2272,12 @@ mod tests {
         let html_content = "<html><head><title>Test</title></head><body><h1>Hello</h1><button>Click me</button></body></html>";
         std::fs::write(dir.join("index.html"), html_content).unwrap();
 
-        // Set NODE_PATH to the workspace's node_modules so that @playwright/test resolves in the temp dir
-        let mut node_path = None;
-        if let Ok(cwd) = std::env::current_dir() {
-            let mut current = cwd.as_path();
-            loop {
-                let candidate = current.join("node_modules");
-                if candidate.is_dir() {
-                    node_path = Some(candidate);
-                    break;
-                }
-                match current.parent() {
-                    Some(parent) => current = parent,
-                    None => break,
-                }
-            }
-        }
-        if let Some(path) = node_path {
-            std::env::set_var("NODE_PATH", path);
-        }
-
-        let res = super::verify_browser_check(dir).await.unwrap();
+        let res = super::browser::verify_browser_check_with_execution(
+            dir,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .unwrap();
         match res {
             Some(VerifyResult::Pass {
                 layer: VerifyLayer::BrowserCheck,

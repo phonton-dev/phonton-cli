@@ -70,7 +70,7 @@ fn default_version() -> u32 {
 }
 
 fn trust_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".phonton").join(TRUST_FILENAME))
+    phonton_extensions::phonton_home().map(|h| h.join(TRUST_FILENAME))
 }
 
 fn load() -> TrustFile {
@@ -140,22 +140,81 @@ pub fn prompt_if_needed(workspace: &Path) -> Result<bool> {
     }
 
     let abs = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let folder = display_path(&abs);
+    let color =
+        std::io::IsTerminal::is_terminal(&io::stdout()) && std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+    let text = [
+        String::new(),
+        format!(
+            "{}  {}",
+            paint("1;38;2;236;235;230", "phonton"),
+            paint("38;2;163;161;154", "· first run in this folder")
+        ),
+        String::new(),
+        paint("1;38;2;236;235;230", &short(&folder, 64)),
+        String::new(),
+        paint(
+            "38;2;163;161;154",
+            "Phonton reads source here, proposes diffs and runs",
+        ),
+        paint(
+            "38;2;163;161;154",
+            "this project's own checks. Changes land only when",
+        ),
+        paint("38;2;163;161;154", "you accept a review."),
+        String::new(),
+        paint(
+            "38;2;102;100;94",
+            "Local model: nothing leaves this machine.",
+        ),
+        paint(
+            "38;2;102;100;94",
+            "Cloud provider: the source a plan selects is sent.",
+        ),
+        paint(
+            "38;2;102;100;94",
+            "~/.ssh, ~/.aws and similar paths stay blocked.",
+        ),
+        String::new(),
+        paint(
+            "38;2;102;100;94",
+            "Remembered in ~/.phonton/trusted_workspaces.json",
+        ),
+    ];
+    let phi = if color {
+        crate::art::ansi(&crate::art::phi(None))
+    } else {
+        Vec::new()
+    };
     println!();
-    println!("┌──────────────────────────────────────────────────────────────────┐");
-    println!("│  Phonton — workspace trust                                       │");
-    println!("├──────────────────────────────────────────────────────────────────┤");
-    println!("│  Phonton can read files, write changes, run `cargo`, and call    │");
-    println!("│  external LLM APIs in this folder. Tool calls are still gated    │");
-    println!("│  per-action (.ssh/, .aws/, etc. are blocked outright), but you   │");
-    println!("│  should only trust folders whose source you intend to edit.      │");
-    println!("│                                                                  │");
-    println!("│  Folder:                                                         │");
-    println!("│    {:<62}│", short(&abs.display().to_string(), 62));
-    println!("│                                                                  │");
-    println!("│  This decision is remembered in:                                 │");
-    println!("│    ~/.phonton/trusted_workspaces.json                            │");
-    println!("└──────────────────────────────────────────────────────────────────┘");
-    print!("Trust this folder and start Phonton? [y/N]: ");
+    for row in 0..phi.len().max(text.len()) {
+        let left = phi.get(row).cloned().unwrap_or_else(|| {
+            if color {
+                " ".repeat(crate::art::PHI_WIDTH as usize)
+            } else {
+                String::new()
+            }
+        });
+        let right = text.get(row).map(String::as_str).unwrap_or("");
+        let gap = if color { "    " } else { "  " };
+        println!("  {left}{gap}{right}");
+    }
+    println!();
+    print!(
+        "  {} {} ",
+        paint("1;38;2;95;224;232", "›"),
+        paint(
+            "1;38;2;236;235;230",
+            "Trust this folder and start Phonton? [y/N]"
+        )
+    );
     io::stdout().flush().ok();
 
     let mut buf = String::new();
@@ -163,16 +222,22 @@ pub fn prompt_if_needed(workspace: &Path) -> Result<bool> {
     let answer = buf.trim().to_ascii_lowercase();
     if answer == "y" || answer == "yes" {
         match record_trust(workspace) {
-            Ok(()) => println!("Trust recorded — launching Phonton…\n"),
+            Ok(()) => println!("  Trusted. Launching…\n"),
             Err(e) => {
                 println!("Trust accepted (but persistence failed: {e}) — launching Phonton…\n")
             }
         }
         Ok(true)
     } else {
-        println!("Trust declined — exiting. Re-run from a folder you want to work in.");
+        println!("  Not trusted. Nothing was read. Run phonton from a folder you want to work in.");
         Ok(false)
     }
+}
+
+/// Windows canonical paths carry a `\\?\` verbatim prefix; users never type it.
+fn display_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    raw.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(raw)
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -186,6 +251,15 @@ fn short(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_path_drops_the_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\me\repo")),
+            r"C:\Users\me\repo"
+        );
+        assert_eq!(display_path(Path::new("/home/me/repo")), "/home/me/repo");
+    }
 
     #[test]
     fn unknown_workspace_is_not_trusted() {

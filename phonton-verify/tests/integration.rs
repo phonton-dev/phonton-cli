@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use phonton_types::verification::VerificationExecution;
 use phonton_types::{DiffHunk, DiffLine, VerifyLayer, VerifyResult};
 use tempfile::TempDir;
 
@@ -24,7 +25,7 @@ use tempfile::TempDir;
 fn hunk_added(path: &str, lines: Vec<&str>) -> DiffHunk {
     DiffHunk {
         file_path: PathBuf::from(path),
-        old_start: 1,
+        old_start: 0,
         old_count: 0,
         new_start: 1,
         new_count: lines.len() as u32,
@@ -36,9 +37,7 @@ fn hunk_added(path: &str, lines: Vec<&str>) -> DiffHunk {
 }
 
 /// Scaffold a minimal Cargo project inside `dir` and return its root path.
-/// The crate name is always `test_crate` so the verify pipeline can infer
-/// it from the package name in Cargo.toml (not from path-based heuristics
-/// which look for `phonton-*` prefixes).
+/// The crate name is always `test_crate` in Cargo.toml.
 fn scaffold_cargo_project(dir: &TempDir, lib_content: &str) -> PathBuf {
     let root = dir.path().to_path_buf();
 
@@ -55,6 +54,153 @@ edition = "2021"
     std::fs::create_dir_all(root.join("src")).expect("create src dir");
     std::fs::write(root.join("src").join("lib.rs"), lib_content).expect("write lib.rs");
     root
+}
+
+#[tokio::test]
+async fn root_library_candidate_runs_tests_and_reports_test_layer() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = scaffold_cargo_project(
+        &dir,
+        "pub fn add_one(n: i32) -> i32 { n }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds_one() { assert_eq!(super::add_one(1), 2); }\n}\n",
+    );
+
+    let candidate = |replacement: &str| DiffHunk {
+        file_path: PathBuf::from("src/lib.rs"),
+        old_start: 1,
+        old_count: 1,
+        new_start: 1,
+        new_count: 1,
+        lines: vec![
+            DiffLine::Removed("pub fn add_one(n: i32) -> i32 { n }".into()),
+            DiffLine::Added(replacement.into()),
+        ],
+    };
+
+    let passing = phonton_verify::verify_diff_with_execution(
+        &[candidate("pub fn add_one(n: i32) -> i32 { n + 1 }")],
+        &root,
+        None,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("verify passing candidate");
+    assert_eq!(
+        passing,
+        VerifyResult::Pass {
+            layer: VerifyLayer::Test
+        }
+    );
+
+    let failing = phonton_verify::verify_diff_with_execution(
+        &[candidate("pub fn add_one(n: i32) -> i32 { n + 0 }")],
+        &root,
+        None,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("verify failing candidate");
+    assert!(matches!(
+        failing,
+        VerifyResult::Fail {
+            layer: VerifyLayer::Test,
+            ..
+        }
+    ));
+    assert!(std::fs::read_to_string(root.join("src/lib.rs"))
+        .expect("read original")
+        .contains("{ n }"));
+}
+
+#[tokio::test]
+async fn single_quoted_package_name_still_runs_candidate_tests() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = scaffold_cargo_project(
+        &dir,
+        "pub fn add_one(n: i32) -> i32 { n }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds_one() { assert_eq!(super::add_one(1), 2); }\n}\n",
+    );
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'test_crate'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .expect("write valid single-quoted manifest");
+    let candidate = DiffHunk {
+        file_path: PathBuf::from("src/lib.rs"),
+        old_start: 1,
+        old_count: 1,
+        new_start: 1,
+        new_count: 1,
+        lines: vec![
+            DiffLine::Removed("pub fn add_one(n: i32) -> i32 { n }".into()),
+            DiffLine::Added("pub fn add_one(n: i32) -> i32 { n + 1 }".into()),
+        ],
+    };
+
+    assert_eq!(
+        phonton_verify::verify_diff_with_execution(
+            &[candidate],
+            &root,
+            None,
+            VerificationExecution::HostApproved,
+        )
+        .await
+        .expect("verify candidate"),
+        VerifyResult::Pass {
+            layer: VerifyLayer::Test
+        }
+    );
+}
+
+#[tokio::test]
+async fn empty_package_does_not_hide_later_failing_package_tests() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"empty\", \"failing\"]\nresolver = \"2\"\n",
+    )
+    .expect("write workspace manifest");
+    for (name, source) in [
+        ("empty", "pub fn value() -> i32 { 1 }\n"),
+        (
+            "failing",
+            "pub fn value() -> i32 { 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn needs_three() { assert_eq!(super::value(), 3); }\n}\n",
+        ),
+    ] {
+        std::fs::create_dir_all(root.join(name).join("src")).expect("create package");
+        std::fs::write(
+            root.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .expect("write package manifest");
+        std::fs::write(root.join(name).join("src/lib.rs"), source).expect("write source");
+    }
+    let candidate = |name: &str| DiffHunk {
+        file_path: PathBuf::from(name).join("src/lib.rs"),
+        old_start: 1,
+        old_count: 1,
+        new_start: 1,
+        new_count: 1,
+        lines: vec![
+            DiffLine::Removed("pub fn value() -> i32 { 1 }".into()),
+            DiffLine::Added("pub fn value() -> i32 { 2 }".into()),
+        ],
+    };
+
+    let result = phonton_verify::verify_diff_with_execution(
+        &[candidate("empty"), candidate("failing")],
+        root,
+        None,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("verify both packages");
+    assert!(matches!(
+        result,
+        VerifyResult::Fail {
+            layer: VerifyLayer::Test,
+            ..
+        }
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -101,10 +247,8 @@ async fn broken_types_fails_at_layer_2() {
     let dir = TempDir::new().expect("create temp dir");
     let root = scaffold_cargo_project(&dir, "pub fn foo() -> NonExistentType { todo!() }\n");
 
-    // The hunk must have a file_path that the verify pipeline can map to a
-    // package. Since our crate is named `test_crate` (no `phonton-` prefix),
-    // `touched_packages` won't find it via path heuristics. Instead we call
-    // `verify_crate_check` directly with the known package name.
+    // Exercise the crate-check layer directly with a known package name so
+    // this test isolates compiler failure from the rest of the pipeline.
     let hunk = hunk_added(
         "src/lib.rs",
         vec!["pub fn foo() -> NonExistentType { todo!() }"],
@@ -116,9 +260,13 @@ async fn broken_types_fails_at_layer_2() {
 
     // Now run crate check directly.
     let packages = vec!["test_crate".to_string()];
-    let result = phonton_verify::verify_crate_check(&packages, &root)
-        .await
-        .expect("verify_crate_check should not error");
+    let result = phonton_verify::verify_crate_check_with_execution(
+        &packages,
+        &root,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("verify_crate_check should not error");
 
     match result {
         Some(VerifyResult::Fail {
@@ -141,13 +289,13 @@ async fn broken_types_fails_at_layer_2() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: valid code → Pass all layers
+// Test 3: valid code with no tests has no test evidence
 // ---------------------------------------------------------------------------
 
-/// A well-formed Cargo project should sail through syntax, crate check,
-/// workspace check, and tests (the default test suite is empty = passes).
+/// A well-formed Cargo project passes checks, but an empty default test suite
+/// must not count as completed behavioral verification.
 #[tokio::test]
-async fn valid_code_passes_all_layers() {
+async fn valid_code_without_tests_does_not_claim_test_pass() {
     let dir = TempDir::new().expect("create temp dir");
     let root = scaffold_cargo_project(&dir, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n");
 
@@ -162,22 +310,33 @@ async fn valid_code_passes_all_layers() {
 
     // Crate check (Layer 2).
     let packages = vec!["test_crate".to_string()];
-    let l2 = phonton_verify::verify_crate_check(&packages, &root)
-        .await
-        .expect("crate check should not error");
+    let l2 = phonton_verify::verify_crate_check_with_execution(
+        &packages,
+        &root,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("crate check should not error");
     assert!(l2.is_none(), "crate check should pass, got: {l2:?}");
 
     // Workspace check (Layer 3).
-    let l3 = phonton_verify::verify_workspace_check(&root)
-        .await
-        .expect("workspace check should not error");
+    let l3 = phonton_verify::verify_workspace_check_with_execution(
+        &root,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("workspace check should not error");
     assert!(l3.is_none(), "workspace check should pass, got: {l3:?}");
 
-    // Test (Layer 4) — empty test suite passes.
-    let l4 = phonton_verify::verify_test(&packages, &root)
-        .await
-        .expect("test should not error");
-    assert!(l4.is_none(), "test should pass, got: {l4:?}");
+    // Test (Layer 4) — an empty test suite cannot certify behavior.
+    let l4 = phonton_verify::verify_test_with_execution(
+        &packages,
+        &root,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("test should not error");
+    assert!(matches!(l4, Some(VerifyResult::NotRun { .. })));
 }
 
 // ---------------------------------------------------------------------------
@@ -248,15 +407,23 @@ mod tests {
 
     // Crate check should pass (the code compiles).
     let packages = vec!["test_crate".to_string()];
-    let l2 = phonton_verify::verify_crate_check(&packages, &root)
-        .await
-        .expect("crate check should not error");
+    let l2 = phonton_verify::verify_crate_check_with_execution(
+        &packages,
+        &root,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("crate check should not error");
     assert!(l2.is_none(), "crate check should pass, got: {l2:?}");
 
     // Test should fail.
-    let result = phonton_verify::verify_test(&packages, &root)
-        .await
-        .expect("verify_test should not error");
+    let result = phonton_verify::verify_test_with_execution(
+        &packages,
+        &root,
+        VerificationExecution::HostApproved,
+    )
+    .await
+    .expect("verify_test should not error");
 
     match result {
         Some(VerifyResult::Fail {

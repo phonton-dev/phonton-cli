@@ -1,9 +1,10 @@
-//! Isolated command execution and tool guarding.
+//! Explicit command execution authority and tool guarding.
 //!
 //! Canonical home for [`ToolCall`], [`ExecutionGuard`], and [`GuardDecision`]
 //! (previously duplicated in `phonton-worker`, which now re-exports them).
-//! The [`Sandbox`] wraps the guard and adds OS-level isolation: Linux
-//! namespaces via `unshare`, macOS `sandbox-exec`, Windows Job Objects.
+//! The [`Sandbox`] refuses commands without explicit host execution approval
+//! while filesystem/network containment is unavailable. Windows Job Objects
+//! supervise process cleanup; they are not a security boundary.
 //! On every platform, guard decisions are authoritative — `Block` is never
 //! overridden.
 
@@ -15,21 +16,58 @@ use anyhow::{anyhow, Result};
 use tokio::process::Command;
 
 #[cfg(target_os = "windows")]
-struct JobHandle(windows::Win32::Foundation::HANDLE);
+struct OwnedWinHandle(windows::Win32::Foundation::HANDLE);
 
 #[cfg(target_os = "windows")]
-unsafe impl Send for JobHandle {}
+unsafe impl Send for OwnedWinHandle {}
 
 #[cfg(target_os = "windows")]
-unsafe impl Sync for JobHandle {}
+unsafe impl Sync for OwnedWinHandle {}
 
 #[cfg(target_os = "windows")]
-impl Drop for JobHandle {
+impl Drop for OwnedWinHandle {
     fn drop(&mut self) {
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(self.0);
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn resume_suspended_child(pid: u32) -> Result<()> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    // CREATE_SUSPENDED leaves only the initial thread. Find it after the job
+    // assignment, so project code cannot create a child outside the job.
+    let snapshot = OwnedWinHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)? });
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    unsafe { Thread32First(snapshot.0, &mut entry)? };
+    loop {
+        if entry.th32OwnerProcessID == pid {
+            let thread = OwnedWinHandle(unsafe {
+                OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)?
+            });
+            let previous = unsafe { ResumeThread(thread.0) };
+            if previous != 1 {
+                return Err(anyhow!(
+                    "Could not resume supervised process: initial suspend count was {previous}"
+                ));
+            }
+            return Ok(());
+        }
+        if unsafe { Thread32Next(snapshot.0, &mut entry) }.is_err() {
+            break;
+        }
+    }
+    Err(anyhow!(
+        "Could not find initial thread for supervised process"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,12 +222,33 @@ impl ExecutionGuard {
     }
 
     fn is_inside_root(&self, path: &Path) -> bool {
+        if path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return false;
+        }
         let abs = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.project_root.join(path)
         };
-        abs.starts_with(&self.project_root)
+        if !abs.starts_with(&self.project_root) {
+            return false;
+        }
+        // Resolve every existing ancestor, including junctions, before granting
+        // access to a file that might not exist yet.
+        if let Ok(root) = std::fs::canonicalize(&self.project_root) {
+            let mut existing = abs.as_path();
+            while !existing.exists() {
+                let Some(parent) = existing.parent() else {
+                    return false;
+                };
+                existing = parent;
+            }
+            return std::fs::canonicalize(existing).is_ok_and(|p| p.starts_with(root));
+        }
+        false
     }
 }
 
@@ -261,24 +320,29 @@ fn blocked_path(path: &Path) -> Option<String> {
 // Sandbox
 // ---------------------------------------------------------------------------
 
-/// Isolated executor for [`ToolCall::Run`] and [`ToolCall::Bash`].
+/// Fail-closed executor for [`ToolCall::Run`] and [`ToolCall::Bash`].
 ///
-/// Pairs an [`ExecutionGuard`] with platform-specific process isolation
-/// (Linux unshare, macOS sandbox-exec, Windows Job Objects). Commands run
-/// from `project_root` with a scrubbed environment; output is captured and
-/// the process is killed on 30s timeout.
+/// Pairs an [`ExecutionGuard`] with explicit host authority. Approved commands
+/// run from `project_root` with a scrubbed environment, bounded output and a
+/// deadline. This executor does not currently establish required containment.
 pub struct Sandbox {
     guard: ExecutionGuard,
+    #[cfg(target_os = "windows")]
     task_id: String,
+    host_execution_approved: bool,
 }
 
 impl Sandbox {
     /// Create a new sandbox bound to `project_root`. Typically the
     /// orchestrator's working directory.
     pub fn new(project_root: PathBuf, task_id: String) -> Self {
+        #[cfg(not(target_os = "windows"))]
+        let _ = task_id;
         Self {
             guard: ExecutionGuard::new(project_root),
+            #[cfg(target_os = "windows")]
             task_id,
+            host_execution_approved: false,
         }
     }
 
@@ -293,6 +357,93 @@ impl Sandbox {
         self.guard.project_root()
     }
 
+    /// Explicit permission to execute trusted project commands on the host.
+    /// This grants no filesystem or network isolation and must be labeled so.
+    pub fn with_host_execution_approval(mut self) -> Self {
+        self.host_execution_approved = true;
+        self
+    }
+
+    /// Execute an immutable user-approved verification command, never a command
+    /// selected by model output. Required isolation currently fails closed.
+    pub async fn run_approved_check(
+        &self,
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> Result<Output> {
+        if !self.host_execution_approved {
+            return Err(anyhow!("Isolation unavailable: no filesystem/network containment backend is configured. Explicit host execution approval is required."));
+        }
+        let call = ToolCall::Run { program, args };
+        if let GuardDecision::Block { reason } = self.guard.evaluate(&call) {
+            return Err(anyhow!("BLOCKED by sandbox: {reason}"));
+        }
+        self.execute_with_timeout(call, timeout, None, None).await
+    }
+
+    /// Run an approved Node check with V8's coverage output directed to a
+    /// harness-owned folder. Coverage is process evidence, not isolation.
+    pub async fn run_approved_check_with_node_coverage(
+        &self,
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+        coverage_dir: &Path,
+    ) -> Result<Output> {
+        if !self.host_execution_approved {
+            return Err(anyhow!(
+                "Isolation unavailable: explicit host execution approval is required."
+            ));
+        }
+        if !coverage_dir.is_absolute() || !coverage_dir.is_dir() {
+            return Err(anyhow!(
+                "Node coverage folder must be an existing absolute directory"
+            ));
+        }
+        let call = ToolCall::Run { program, args };
+        if let GuardDecision::Block { reason } = self.guard.evaluate(&call) {
+            return Err(anyhow!("BLOCKED by sandbox: {reason}"));
+        }
+        self.execute_with_timeout(call, timeout, Some(coverage_dir), None)
+            .await
+    }
+
+    /// Run an approved Python check with a harness-owned startup hook. The
+    /// original program and arguments remain unchanged. This trace is only
+    /// process-reported source-loading evidence, not isolation or attestation.
+    pub async fn run_approved_check_with_python_trace(
+        &self,
+        program: String,
+        args: Vec<String>,
+        timeout: Duration,
+        hook_dir: &Path,
+        trace_dir: &Path,
+    ) -> Result<Output> {
+        if !self.host_execution_approved {
+            return Err(anyhow!(
+                "Isolation unavailable: explicit host execution approval is required."
+            ));
+        }
+        let hook = hook_dir.join("sitecustomize.py");
+        if !hook_dir.is_absolute()
+            || !trace_dir.is_absolute()
+            || !std::fs::symlink_metadata(hook_dir)?.file_type().is_dir()
+            || !std::fs::symlink_metadata(trace_dir)?.file_type().is_dir()
+            || !std::fs::symlink_metadata(hook)?.file_type().is_file()
+        {
+            return Err(anyhow!(
+                "Python trace hook and output must be regular, existing absolute paths"
+            ));
+        }
+        let call = ToolCall::Run { program, args };
+        if let GuardDecision::Block { reason } = self.guard.evaluate(&call) {
+            return Err(anyhow!("BLOCKED by sandbox: {reason}"));
+        }
+        self.execute_with_timeout(call, timeout, None, Some((hook_dir, trace_dir)))
+            .await
+    }
+
     /// Run a tool call through the sandbox. Evaluates the guard first;
     /// `Block` short-circuits without execution.
     pub async fn run_tool(&self, call: ToolCall) -> Result<Output> {
@@ -304,29 +455,40 @@ impl Sandbox {
     }
 
     async fn execute(&self, call: ToolCall) -> Result<Output> {
-        let mut cmd = self.build_command(call)?;
-
-        #[cfg(target_os = "linux")]
-        {
-            tracing::debug!(task_id = %self.task_id, "linux sandbox: configuring namespaces");
-            unsafe {
-                cmd.pre_exec(|| {
-                    if let Err(e) = nix::sched::unshare(
-                        nix::sched::CloneFlags::CLONE_NEWNET
-                            | nix::sched::CloneFlags::CLONE_NEWUSER,
-                    ) {
-                        tracing::warn!("Failed to unshare namespaces: {}", e);
-                    }
-                    Ok(())
-                });
-            }
+        if !self.host_execution_approved {
+            return Err(anyhow!(
+                "Isolation unavailable: refusing unattended host execution"
+            ));
         }
+        self.execute_with_timeout(call, Duration::from_secs(30), None, None)
+            .await
+    }
 
+    async fn execute_with_timeout(
+        &self,
+        call: ToolCall,
+        timeout: Duration,
+        node_coverage: Option<&Path>,
+        python_trace: Option<(&Path, &Path)>,
+    ) -> Result<Output> {
+        let mut cmd = self.build_command(call)?;
+        if let Some(directory) = node_coverage {
+            cmd.env("NODE_V8_COVERAGE", directory);
+        }
+        if let Some((hook_dir, trace_dir)) = python_trace {
+            cmd.env("PYTHONPATH", hook_dir)
+                .env("PHONTON_PYTHON_TRACE_DIR", trace_dir);
+        }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000 | 0x00000004); // CREATE_NO_WINDOW | CREATE_SUSPENDED
         cmd.kill_on_drop(true);
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
 
         #[cfg(target_os = "windows")]
-        let _job_handle = {
+        let job_handle = {
             use windows::Win32::System::JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
                 SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -338,37 +500,76 @@ impl Sandbox {
 
             tracing::debug!(task_id = %self.task_id, "windows sandbox: attaching job object");
 
-            let mut job_wrapper = None;
             if let Some(pid) = child.id() {
                 unsafe {
-                    if let Ok(job) = CreateJobObjectW(None, None) {
-                        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    let job = CreateJobObjectW(None, None)?;
+                    let wrapper = OwnedWinHandle(job);
+                    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
-                        let _ = SetInformationJobObject(
-                            job,
-                            JobObjectExtendedLimitInformation,
-                            &info as *const _ as *const std::ffi::c_void,
-                            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                        );
+                    SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        &info as *const _ as *const std::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    )?;
 
-                        if let Ok(process_handle) =
-                            OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
-                        {
-                            let _ = AssignProcessToJobObject(job, process_handle);
-                            let _ = windows::Win32::Foundation::CloseHandle(process_handle);
-                        }
-                        job_wrapper = Some(JobHandle(job));
-                    }
+                    let process_handle = OwnedWinHandle(OpenProcess(
+                        PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                        false,
+                        pid,
+                    )?);
+                    AssignProcessToJobObject(job, process_handle.0)?;
+                    resume_suspended_child(pid)?;
+                    Some(wrapper)
                 }
+            } else {
+                return Err(anyhow!("Cannot supervise command process"));
             }
-            job_wrapper
         };
 
-        match tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await {
+        use tokio::io::AsyncReadExt;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Missing command stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Missing command stderr"))?;
+        async fn bounded_read(
+            stream: impl tokio::io::AsyncRead + Unpin,
+        ) -> std::io::Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            stream.take(1024 * 1024).read_to_end(&mut bytes).await?;
+            if bytes.len() == 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "Command output exceeded 1 MiB capture limit",
+                ));
+            }
+            Ok(bytes)
+        }
+        let capture = async {
+            let wait = async move {
+                let status = child.wait().await?;
+                // A direct child can exit while a descendant retains an output
+                // pipe. Close the job at that point, before waiting for EOF.
+                #[cfg(target_os = "windows")]
+                drop(job_handle);
+                Ok::<_, std::io::Error>(status)
+            };
+            let (status, out, err) =
+                tokio::try_join!(wait, bounded_read(stdout), bounded_read(stderr))?;
+            Ok::<Output, std::io::Error>(Output {
+                status,
+                stdout: out,
+                stderr: err,
+            })
+        };
+        match tokio::time::timeout(timeout, capture).await {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(e)) => Err(e.into()),
-            Err(_) => Err(anyhow!("Command timed out after 30s")),
+            Err(_) => Err(anyhow!("Command timed out after {}s", timeout.as_secs())),
         }
     }
 
@@ -422,7 +623,24 @@ impl Sandbox {
 /// the child process while still letting `cargo` find its toolchain.
 fn apply_env_scrub(cmd: &mut Command) {
     cmd.env_clear();
-    for key in ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "SYSTEMROOT"] {
+    for key in [
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+    ] {
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
         }
@@ -530,16 +748,149 @@ mod tests {
     use super::*;
     use std::env;
 
+    #[test]
+    fn environment_scrub_removes_unapproved_values_but_preserves_os_paths() {
+        let mut command = Command::new("unused-test-command");
+        command.env("PHONTON_TEST_SECRET", "must-not-reach-child");
+        apply_env_scrub(&mut command);
+        let values: std::collections::BTreeMap<_, _> = command.as_std().get_envs().collect();
+        assert!(!values.contains_key(std::ffi::OsStr::new("PHONTON_TEST_SECRET")));
+        #[cfg(windows)]
+        assert_eq!(
+            values
+                .get(std::ffi::OsStr::new("SYSTEMDRIVE"))
+                .copied()
+                .flatten(),
+            env::var_os("SYSTEMDRIVE").as_deref()
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_allows_safe_command() {
         let root = env::current_dir().expect("get current dir");
-        let sandbox = Sandbox::new(root, "test-task-1".to_string());
+        let sandbox = Sandbox::new(root, "test-task-1".to_string()).with_host_execution_approval();
         let call = ToolCall::Run {
             program: "cargo".to_string(),
             args: vec!["--version".to_string()],
         };
         let res = sandbox.run_tool(call).await;
         assert!(res.is_ok(), "expected cargo --version to succeed: {res:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::zombie_processes)] // Intentional detached child exercises Job Object cleanup.
+    fn windows_job_child_helper() {
+        if !Path::new("spawn.flag").exists() {
+            return;
+        }
+        if env::var_os("PHONTON_JOB_DESCENDANT").is_some() {
+            std::fs::write("descendant.started", "started").unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            std::fs::write("descendant.marker", "escaped").unwrap();
+            return;
+        }
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new(env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::windows_job_child_helper"])
+            .env("PHONTON_JOB_DESCENDANT", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.creation_flags(0x08000000);
+        command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !Path::new("descendant.started").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Path::new("descendant.started").exists());
+        std::fs::write("spawned.marker", "spawned").unwrap();
+        if Path::new("wait.flag").exists() {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_job_closes_with_a_detached_descendant() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("phonton-job-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("spawn.flag"), "spawn").unwrap();
+        let sandbox =
+            Sandbox::new(root.clone(), "job-child-test".into()).with_host_execution_approval();
+        let started = std::time::Instant::now();
+        let output = sandbox
+            .run_approved_check(
+                env::current_exe().unwrap().to_string_lossy().into_owned(),
+                vec!["--exact".into(), "tests::windows_job_child_helper".into()],
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        let check_elapsed = started.elapsed();
+        assert!(output.status.success(), "{output:?}");
+        assert!(root.join("spawned.marker").exists());
+        assert!(root.join("descendant.started").exists());
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        assert!(
+            !root.join("descendant.marker").exists(),
+            "check returned after {:?}; stdout={} stderr={}",
+            check_elapsed,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_file(root.join("spawned.marker")).unwrap();
+        std::fs::remove_file(root.join("descendant.started")).unwrap();
+        std::fs::remove_file(root.join("spawn.flag")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_job_cancellation_terminates_descendants() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "phonton-job-cancel-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("spawn.flag"), "spawn").unwrap();
+        std::fs::write(root.join("wait.flag"), "wait").unwrap();
+        let sandbox =
+            Sandbox::new(root.clone(), "job-cancel-test".into()).with_host_execution_approval();
+        let executable = env::current_exe().unwrap().to_string_lossy().into_owned();
+        let task = tokio::spawn(async move {
+            sandbox
+                .run_approved_check(
+                    executable,
+                    vec!["--exact".into(), "tests::windows_job_child_helper".into()],
+                    Duration::from_secs(10),
+                )
+                .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !root.join("spawned.marker").exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(root.join("spawned.marker").exists());
+        assert!(root.join("descendant.started").exists());
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        assert!(!root.join("descendant.marker").exists());
+        std::fs::remove_file(root.join("spawned.marker")).unwrap();
+        std::fs::remove_file(root.join("descendant.started")).unwrap();
+        std::fs::remove_file(root.join("spawn.flag")).unwrap();
+        std::fs::remove_file(root.join("wait.flag")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]
@@ -554,13 +905,55 @@ mod tests {
         assert!(res.unwrap_err().to_string().contains("BLOCKED"));
     }
 
+    #[tokio::test]
+    async fn approved_check_does_not_override_a_blocked_path() {
+        let root = env::current_dir().expect("get current dir");
+        let sandbox =
+            Sandbox::new(root, "approved-block-test".into()).with_host_execution_approval();
+        let error = sandbox
+            .run_approved_check(
+                "cargo".into(),
+                vec!["C:\\Users\\fixture\\.ssh\\id_rsa".into()],
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("BLOCKED by sandbox"));
+    }
+
     #[test]
     fn allow_read_inside_root() {
-        let g = ExecutionGuard::new(PathBuf::from("/work/proj"));
+        let root = env::current_dir().unwrap();
+        let g = ExecutionGuard::new(root.clone());
         let d = g.evaluate(&ToolCall::Read {
-            path: PathBuf::from("/work/proj/src/lib.rs"),
+            path: root.join("src/lib.rs"),
         });
         assert_eq!(d, GuardDecision::Allow);
+    }
+
+    #[test]
+    fn traversal_never_gets_implicit_permission() {
+        let g = ExecutionGuard::new(env::current_dir().unwrap());
+        assert!(!matches!(
+            g.evaluate(&ToolCall::Write {
+                path: "../outside".into(),
+                content: "x".into()
+            }),
+            GuardDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn required_isolation_fails_before_command_execution() {
+        let sandbox = Sandbox::new(env::current_dir().unwrap(), "isolation-test".into());
+        let error = sandbox
+            .run_tool(ToolCall::Run {
+                program: "cargo".into(),
+                args: vec!["--version".into()],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Isolation unavailable"));
     }
 
     #[test]
