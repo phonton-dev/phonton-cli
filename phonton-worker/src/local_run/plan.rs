@@ -16,6 +16,15 @@ struct RankedSource {
     names: BTreeMap<String, (String, context::NameMatch)>,
     path_hits: usize,
     content_hits: usize,
+    // Numbers from the goal ("from 120 to 80") found in this file.
+    literal_hits: usize,
+}
+
+/// Standalone numbers of two or more digits.
+fn number_literals(text: &str) -> BTreeSet<&str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 2 && token.bytes().all(|b| b.is_ascii_digit()))
+        .collect()
 }
 
 impl RankedSource {
@@ -81,6 +90,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
     ];
     let query = context::terms(&request.goal.to_lowercase());
     let goal_symbols = context::SymbolQuery::new(&request.goal);
+    let goal_literals = number_literals(&request.goal);
     let mut ranked = Vec::new();
     for path in &paths {
         if !inferred && !request.files.contains(path) {
@@ -133,10 +143,12 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
         let content_hits = query
             .intersection(&context::terms(&source.to_lowercase()))
             .count();
+        let literal_hits = goal_literals.intersection(&number_literals(source)).count();
         ranked.push(RankedSource {
             names,
             path_hits,
             content_hits,
+            literal_hits,
             evidence: ScopeEvidence {
                 path: path.clone(),
                 reason: String::new(),
@@ -165,9 +177,12 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
     for source in &mut ranked {
         source.explain(inferred);
     }
+    // A value the goal changes ("from 120 to 80") marks the file to edit more
+    // reliably than a name match, which can be a local variable like `todo`.
     ranked.sort_by(|a, b| {
-        b.priority()
-            .cmp(&a.priority())
+        b.literal_hits
+            .cmp(&a.literal_hits)
+            .then(b.priority().cmp(&a.priority()))
             .then(b.score().cmp(&a.score()))
             .then(a.evidence.path.cmp(&b.evidence.path))
     });
@@ -192,6 +207,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
                 .unwrap_or(usize::MAX);
             ranked.retain(|r| {
                 !r.names.is_empty()
+                    || r.literal_hits > 0
                     || r.score() >= threshold
                     || (r.content_hits >= 3 && r.content_hits >= named_content)
             });
@@ -1188,10 +1204,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            plan.request
-                .files
-                .contains(&PathBuf::from("src/validate.js")),
+        // First: the goal's `120` lives only there. A 3B model edited the
+        // first-listed store.js and the existing tests still passed.
+        assert_eq!(
+            plan.request.files.first(),
+            Some(&PathBuf::from("src/validate.js")),
             "{:?}",
             plan.request.files
         );

@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Released CLI version to test
-        default: "0.22.1"
+        description: Released CLI version to test, or "source" to build this commit
+        default: "source"
       model:
         description: Ollama model
         default: "qwen2.5-coder:3b"
@@ -21,8 +21,23 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    if: (inputs.version || 'source') == 'source'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release -p phonton-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phonton-bin
+          path: target/release/phonton
+
   smoke:
     name: ${{ matrix.fixture }}
+    needs: build
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -36,7 +51,7 @@ jobs:
           - fixture: shop
             tasks: shop-coupon-expiry,shop-cancel-restock,shop-top-ties,shop-review-duplicate
     env:
-      VERSION: ${{ inputs.version || '0.22.1' }}
+      VERSION: ${{ inputs.version || 'source' }}
       MODEL: ${{ inputs.model || 'qwen2.5-coder:3b' }}
       RUNS: ${{ inputs.runs || '3' }}
       OLLAMA_VERSION: "0.34.2"
@@ -48,11 +63,19 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install the released CLI
+      - if: env.VERSION == 'source'
+        uses: actions/download-artifact@v4
+        with:
+          name: phonton-bin
+          path: ${{ runner.temp }}/cli
+
+      - name: Install the CLI
         run: |
-          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'phonton-x86_64-unknown-linux-gnu.tar.gz' --dir "$RUNNER_TEMP/cli"
-          tar -xzf "$RUNNER_TEMP/cli/phonton-x86_64-unknown-linux-gnu.tar.gz" -C "$RUNNER_TEMP/cli"
+          if [ "$VERSION" != source ]; then
+            gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'phonton-x86_64-unknown-linux-gnu.tar.gz' --dir "$RUNNER_TEMP/cli"
+            tar -xzf "$RUNNER_TEMP/cli/phonton-x86_64-unknown-linux-gnu.tar.gz" -C "$RUNNER_TEMP/cli"
+          fi
           BIN=$(find "$RUNNER_TEMP/cli" -type f -name phonton | head -1)
           chmod +x "$BIN"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
