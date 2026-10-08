@@ -1470,7 +1470,9 @@ fn excerpt_anchors(
         let Some(s) = start.take() else { continue };
         let word = &text[s..i];
         let called = c == '(';
-        let dotted = c == '.' || (s > 0 && bytes[s - 1] == b'.');
+        // `a.b`, not a word ending a sentence.
+        let dotted = (c == '.' && bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric()))
+            || (s > 0 && bytes[s - 1] == b'.');
         let cased = word.chars().skip(1).any(|ch| ch.is_uppercase()) || word.contains('_');
         if called || dotted || cased {
             push(word);
@@ -2561,6 +2563,15 @@ mod tests {
         assert!(rendered.contains("Too large to inline"));
         assert!(!rendered.contains(&big));
         assert!(!rendered.contains("outside.rs"));
+    }
+
+    #[test]
+    fn excerpt_anchors_take_named_code_not_sentence_words() {
+        let subtask = plain_subtask(
+            "When OrderBook.cancel cancels an order, call `release` so it can be sold again.",
+        );
+        let anchors = excerpt_anchors(&subtask, &[], &[], Path::new("."), Path::new("a.js"));
+        assert_eq!(anchors, ["release", "OrderBook", "cancel"]);
     }
 
     #[test]
