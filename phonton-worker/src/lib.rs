@@ -451,7 +451,10 @@ impl Worker {
             }
 
             let hunks = match parse_unified_diff(&response.content) {
-                Ok(h) => h,
+                Ok(mut h) => {
+                    anchor_hunks(&mut h, self.guard.project_root());
+                    h
+                }
                 Err(e) => {
                     warn!(attempt, error = %e, "worker could not parse diff; will retry with feedback");
                     let errors = vec![format!(
@@ -1875,6 +1878,80 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<DiffHunk>> {
     Ok(hunks)
 }
 
+/// Models miscount `@@` ranges far more often than they misquote source.
+/// Recompute each hunk's counts from its body; when its old side is not at
+/// the stated line, move it to where it matches in the current file (the
+/// nearest match if several). Unmatched hunks are left for verify to reject.
+/// Measured on DeepSeek flash: 6 of 13 diffs applied as sent, 13 of 13 after
+/// this.
+fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
+    let mut sources: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    for h in hunks.iter_mut() {
+        let old: Vec<&str> = h
+            .lines
+            .iter()
+            .filter_map(|l| match l {
+                DiffLine::Context(s) | DiffLine::Removed(s) => Some(s.trim_end_matches('\r')),
+                DiffLine::Added(_) => None,
+            })
+            .collect();
+        h.old_count = old.len() as u32;
+        h.new_count = h
+            .lines
+            .iter()
+            .filter(|l| !matches!(l, DiffLine::Removed(_)))
+            .count() as u32;
+        if old.is_empty() {
+            continue;
+        }
+        let Some(file) = sources
+            .entry(h.file_path.clone())
+            .or_insert_with(|| {
+                std::fs::read_to_string(root.join(&h.file_path))
+                    .ok()
+                    .map(|t| {
+                        t.split('\n')
+                            .map(|l| l.trim_end_matches('\r').to_string())
+                            .collect()
+                    })
+            })
+            .as_ref()
+        else {
+            continue;
+        };
+        let matches_at = |at: usize| {
+            file.get(at..at + old.len())
+                .is_some_and(|window| window.iter().zip(&old).all(|(a, b)| a == b))
+        };
+        let stated = h.old_start.saturating_sub(1) as usize;
+        if matches_at(stated) {
+            continue;
+        }
+        if let Some(at) = (0..file.len())
+            .filter(|&at| matches_at(at))
+            .min_by_key(|&at| at.abs_diff(stated))
+        {
+            h.old_start = at as u32 + 1;
+        }
+    }
+    // new_start follows from the old positions and earlier hunks' growth.
+    let mut order: Vec<usize> = (0..hunks.len()).collect();
+    order.sort_by_key(|&i| (hunks[i].file_path.clone(), hunks[i].old_start));
+    let mut delta: i64 = 0;
+    let mut file: Option<PathBuf> = None;
+    for i in order {
+        let h = &mut hunks[i];
+        if file.as_ref() != Some(&h.file_path) {
+            file = Some(h.file_path.clone());
+            delta = 0;
+        }
+        let base = i64::from(h.old_start) + i64::from(h.old_count == 0);
+        h.new_start = (base + delta).max(0) as u32;
+        delta += i64::from(h.new_count) - i64::from(h.old_count);
+    }
+}
+
 /// Strip a single ```/```diff/```patch fenced code block out of `text`,
 /// returning its body. If no fence is present the original text is
 /// returned. If multiple fences are present the *first* one wins —
@@ -2223,6 +2300,49 @@ mod tests {
             token_count: 4,
             origin: SliceOrigin::Semantic,
         }
+    }
+
+    #[test]
+    fn anchor_hunks_fixes_miscounted_and_misplaced_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        let source: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(temp.path().join("src/a.txt"), &source).unwrap();
+        // Both headers are wrong: the first edit is at line 10 with the
+        // counts off by one, the second at 30 but says 25.
+        let mut hunks = parse_unified_diff(
+            "--- a/src/a.txt\n+++ b/src/a.txt\n\
+             @@ -7,3 +7,3 @@\n line 9\n-line 10\n+line ten\n line 11\n\
+             @@ -25,2 +25,3 @@\n line 29\n+inserted\n line 30\n",
+        )
+        .unwrap();
+        anchor_hunks(&mut hunks, temp.path());
+        let applied = phonton_local::edit::materialize_hunks_with_new_files(
+            temp.path(),
+            &[PathBuf::from("src/a.txt")],
+            &hunks,
+        )
+        .unwrap();
+        let text = &applied[&PathBuf::from("src/a.txt")];
+        assert!(text.contains("line 9\nline ten\nline 11\n"));
+        assert!(text.contains("line 29\ninserted\nline 30\n"));
+        assert_eq!(text.lines().count(), 41);
+    }
+
+    #[test]
+    fn anchor_hunks_leaves_unmatched_hunks_for_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let mut hunks =
+            parse_unified_diff("--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-three\n+3\n").unwrap();
+        anchor_hunks(&mut hunks, temp.path());
+        assert_eq!(hunks[0].old_start, 1);
+        assert!(phonton_local::edit::materialize_hunks_with_new_files(
+            temp.path(),
+            &[PathBuf::from("a.txt")],
+            &hunks,
+        )
+        .is_err());
     }
 
     #[test]
