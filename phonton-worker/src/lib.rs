@@ -603,6 +603,7 @@ impl Worker {
                         attempt,
                         ?layer,
                         n = errors.len(),
+                        first = errors.first().map(String::as_str).unwrap_or(""),
                         "verify failed; will retry"
                     );
                     let signature = diagnostic_signature(layer, &errors);
@@ -2092,6 +2093,7 @@ fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
             .filter(|&at| matches_at(at))
             .min_by_key(|&at| at.abs_diff(stated))
         {
+            debug!(file = %h.file_path.display(), from = h.old_start, to = at + 1, "relocated hunk");
             h.old_start = at as u32 + 1;
         }
     }

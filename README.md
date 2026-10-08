@@ -202,6 +202,11 @@ qdrant_url = "http://127.0.0.1:6333"
 qdrant_collection = "phonton-code"
 ```
 
+When a goal misbehaves, `PHONTON_LOG=debug` (or a narrower filter such as
+`phonton_worker=debug`) appends diagnostics to `phonton.log` in the Phonton
+home: each worker attempt, why verification rejected it, and hunks Phonton
+moved to their matching lines.
+
 ---
 
 ## Benchmark Honesty

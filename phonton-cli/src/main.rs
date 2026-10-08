@@ -6468,7 +6468,33 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| std::process::exit(101))
 }
 
+/// `PHONTON_LOG=debug` (or any tracing filter, e.g. `phonton_worker=debug`)
+/// appends diagnostics such as each failed worker attempt to `phonton.log`
+/// in the Phonton home. A file, because the TUI owns the terminal.
+fn init_log() {
+    let Ok(filter) = std::env::var("PHONTON_LOG") else {
+        return;
+    };
+    let Some(dir) = phonton_extensions::phonton_home() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("phonton.log"))
+    else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .try_init();
+}
+
 async fn run_main() -> Result<()> {
+    init_log();
     if handle_cli_args().await? {
         return Ok(());
     }

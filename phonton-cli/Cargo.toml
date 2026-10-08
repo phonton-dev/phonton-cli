@@ -30,6 +30,7 @@ phonton-mcp          = { path = "../phonton-mcp" }
 anyhow               = { workspace = true }
 tokio                = { workspace = true }
 tracing              = { workspace = true }
+tracing-subscriber   = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter"] }
 async-trait          = "0.1"
 base64               = "0.22"
 ratatui              = "0.28"
