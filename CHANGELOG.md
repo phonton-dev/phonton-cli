@@ -79,6 +79,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] OpenAI-compatible and Anthropic requests retry twice on a dropped
+  connection, 429 or 5xx before failing; one network blip used to fail the
+  whole goal.
 - [fixed] Local goals start the installed managed runtime when it is not
   running (after a reboot, for example) instead of falling back to a hosted
   route that failed with "ollama request failed"; Ollama connection errors

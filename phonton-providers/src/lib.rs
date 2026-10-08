@@ -1178,16 +1178,15 @@ impl Provider for AnthropicProvider {
             "messages": [{ "role": "user", "content": anthropic_user_content(user, attachments) }],
         });
 
-        let http_resp = self
-            .http
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(error_chain(&e)))?;
+        let http_resp = send_with_retry(
+            self.http
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body),
+        )
+        .await?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -1390,10 +1389,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .header("X-Title", "Phonton");
         }
 
-        let http_resp = req
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(error_chain(&e)))?;
+        let http_resp = send_with_retry(req).await?;
 
         let status = http_resp.status();
         if !status.is_success() {
@@ -1524,6 +1520,30 @@ impl GeminiProvider {
         }
         unreachable!("retry loop always returns")
     }
+}
+
+/// Send `req`, retrying twice (after 0.5 s and 1 s) on a failed connection or
+/// a transient status (429, 5xx), so one dropped connection or brief overload
+/// does not fail a goal. The final attempt's response or error is returned.
+async fn send_with_retry(
+    req: reqwest::RequestBuilder,
+) -> std::result::Result<reqwest::Response, ProviderError> {
+    let mut delay = std::time::Duration::from_millis(500);
+    for _ in 0..2 {
+        let Some(attempt) = req.try_clone() else {
+            break;
+        };
+        if let Ok(resp) = attempt.send().await {
+            if !is_transient_http_status(resp.status()) {
+                return Ok(resp);
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2);
+    }
+    req.send()
+        .await
+        .map_err(|e| ProviderError::Transport(error_chain(&e)))
 }
 
 fn is_transient_http_status(status: StatusCode) -> bool {
@@ -1842,6 +1862,49 @@ mod tests {
             classify_http(StatusCode::INTERNAL_SERVER_ERROR),
             ProviderError::ServerError(500)
         ));
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried_before_the_goal_sees_them() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // First connection: dropped without a response. Second: 503.
+            // Third: a valid completion.
+            for n in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = match n {
+                    0 => continue,
+                    1 => "HTTP/1.1 503 Service Unavailable
+Content-Length: 0
+
+"
+                    .to_string(),
+                    _ => {
+                        let body = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+                        format!(
+                            "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {}
+
+{}",
+                            body.len(),
+                            body
+                        )
+                    }
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let endpoint = format!("http://{addr}/chat/completions");
+        let p = OpenAiCompatibleProvider::custom("k".into(), "m".into(), &endpoint);
+        let resp = p.call("sys", "u", &[]).await.unwrap();
+        assert_eq!(resp.content, "ok");
     }
 
     #[test]
