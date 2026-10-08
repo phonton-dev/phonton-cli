@@ -5835,6 +5835,9 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
         let cfg = config::load()?;
         let base_url = cfg.provider.base_url.clone().unwrap_or_default();
         let configured = cfg.provider.model.clone().unwrap_or_default();
+        if provider_is_local(&cfg.provider.name, &base_url) {
+            start_managed_runtime_if_needed().await;
+        }
         let calibrated = provider_is_local(&cfg.provider.name, &base_url)
             && match local_goal_cli::current_model_selection().await {
                 Ok(Some(selection)) => {
@@ -6646,12 +6649,31 @@ fn spawn_input_task(tx: mpsc::Sender<LoopEvent>) {
     });
 }
 
+/// Bring up the installed managed runtime before a local goal, telling the
+/// user why the goal pauses. A failure is reported and the goal continues,
+/// so its own error explains what is missing.
+pub(crate) async fn start_managed_runtime_if_needed() {
+    match models_cli::ensure_managed_runtime().await {
+        Ok(true) => eprintln!("Started the local model runtime."),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "Local model runtime is not running and could not be started: {error}. Run `phonton models setup`."
+        ),
+    }
+}
+
 /// Selected local model (from calibration state) and hardware headroom.
 async fn probe_selection() -> Machine {
     let mut machine = Machine {
         probed: true,
         ..Machine::default()
     };
+    if let Ok(cfg) = config::load() {
+        let base_url = cfg.provider.base_url.clone().unwrap_or_default();
+        if provider_is_local(&cfg.provider.name, &base_url) {
+            let _ = models_cli::ensure_managed_runtime().await;
+        }
+    }
     if let Ok(Some(selection)) = local_goal_cli::current_model_selection().await {
         machine.local_model = Some(selection.model);
         machine.context_tokens = Some(selection.context_tokens);

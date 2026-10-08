@@ -1422,6 +1422,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
         }
         return Ok(0);
     }
+    crate::start_managed_runtime_if_needed().await;
     let (request, expected_model_selection): (LocalRunRequest, ReviewedModelSelection) = if args
         .first()
         .is_some_and(|s| s == "--reviewed-plan")

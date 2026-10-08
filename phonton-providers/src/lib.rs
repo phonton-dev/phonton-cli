@@ -1752,7 +1752,7 @@ impl Provider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .context("ollama request failed")?;
+            .map_err(|e| anyhow!("ollama request failed: {}", error_chain(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();

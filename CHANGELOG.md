@@ -79,6 +79,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Local goals start the installed managed runtime when it is not
+  running (after a reboot, for example) instead of falling back to a hosted
+  route that failed with "ollama request failed"; Ollama connection errors
+  now include their cause.
 - [fixed] Memory is scoped to the repository it came from. Previously every
   repository's rejected approaches and decisions (goal text and file paths)
   were added to prompts for any other repository and sent to the provider.

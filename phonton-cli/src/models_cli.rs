@@ -147,6 +147,25 @@ pub fn settings() -> Result<LocalSettings> {
     Ok(storage::load(&state_path()?)?)
 }
 
+/// Start the Phonton-managed runtime when it is installed but not running
+/// (after a reboot, for example), exactly as `phonton models setup` would.
+/// Returns whether it was started; an external endpoint is never touched.
+pub(crate) async fn ensure_managed_runtime() -> Result<bool> {
+    let settings = settings()?;
+    if settings.endpoint != MANAGED_MODEL_ENDPOINT || !settings.managed_runtime_installed {
+        return Ok(false);
+    }
+    if LocalRuntime::new(&settings.endpoint)?
+        .version()
+        .await
+        .is_ok()
+    {
+        return Ok(false);
+    }
+    mutate("setup", "", None, |_| {}).await?;
+    Ok(true)
+}
+
 pub(crate) fn managed_root_at(
     path: &Path,
     settings: &LocalSettings,
