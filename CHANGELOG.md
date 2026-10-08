@@ -16,16 +16,29 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   13 diffs; all 13 apply after this. On the new `ledger` smoke suite (4 tasks,
   3 runs each, same model) acceptance stayed 12/12 while tokens fell 50%, cost
   63% and wall time 55%, because fewer attempts were retries.
+- [fixed] Files over 24 KB reach workers as excerpts around the names the
+  subtask mentions instead of signatures only, so edits deep in a large
+  module no longer have to guess the surrounding lines.
+- [fixed] A goal containing the word "release" (for example "release the
+  stock") was treated as broad, multi-agent work and split into several LLM-
+  planned subtasks. LLM plans now use the fewest subtasks that cover the goal
+  and add test subtasks only when the goal asks for tests.
 - [fixed] `phonton models` progress prints stages without byte counts as plain
   stages instead of `? / ? bytes`.
+
+### Removed
+
+- [removed] Plan preflight special cases for goals mentioning chess and for a
+  `src/receipt.js` file. Both were tuned to old benchmark fixtures.
 
 ### Added
 
 - [added] `phonton models setup MODEL` runs setup, install, calibrate and
   select in one command and stops at the first failure. Plain
   `phonton models setup` prints that next step.
-- [added] `fixtures/ledger` and four `ledger-*` smoke tasks: edits in the
-  middle of a 339-line module, scored by hidden tests.
+- [added] `fixtures/ledger` (a 339-line module) and `fixtures/shop` (a 28 KB
+  module, past the whole-file limit), each with four smoke tasks scored by
+  hidden tests.
 
 ## 0.22.0 - Product Hunt beta
 
