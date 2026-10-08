@@ -6017,7 +6017,7 @@ pub(crate) async fn execute_headless_goal(
         }
     };
     if resume_from.is_none() {
-        contract_preflight::apply_workspace_preflight(&mut plan, &working_dir, &goal_text_for_run);
+        contract_preflight::apply_workspace_preflight(&mut plan, &working_dir);
     }
 
     let initial_state = GlobalState {
@@ -7859,7 +7859,7 @@ async fn spawn_goal(
             return;
         }
     };
-    contract_preflight::apply_workspace_preflight(&mut plan, working_dir, &text);
+    contract_preflight::apply_workspace_preflight(&mut plan, working_dir);
 
     let (state_tx, mut state_rx) = watch::channel(GlobalState {
         task_status: TaskStatus::Planning,
