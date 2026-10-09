@@ -2965,26 +2965,51 @@ fn goal_name_not_added(goal: &str, original: &str, candidate: &str) -> Option<St
             .map(str::to_lowercase)
             .collect()
     };
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    // "without `unsafe`", "instead of foo()": not something to add.
+    let negated = |before: &str| {
+        before
+            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+            .filter(|w| !w.is_empty())
+            .rev()
+            .take(3)
+            .any(|w| {
+                matches!(
+                    w.to_lowercase().as_str(),
+                    "without"
+                        | "not"
+                        | "no"
+                        | "never"
+                        | "avoid"
+                        | "remove"
+                        | "removing"
+                        | "drop"
+                        | "instead"
+                        | "except"
+                        | "don't"
+                        | "dont"
+                        | "stop"
+                )
+            })
+    };
     let mut named: Vec<&str> = Vec::new();
     // Only a span that is one identifier (`duplicate_review`, `count()`):
     // demanding the words of a quoted message made a 3B model paste them
     // somewhere meaningless to pass.
-    for (i, quoted) in goal.split('`').enumerate() {
-        let name = quoted.trim().trim_end_matches("()");
-        if i % 2 == 1 && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    let ticks: Vec<usize> = goal.match_indices('`').map(|(at, _)| at).collect();
+    for &[open, close] in ticks.as_chunks::<2>().0 {
+        let name = goal[open + 1..close].trim().trim_end_matches("()");
+        if name.chars().all(ident) && !negated(&goal[..open]) {
             named.push(name);
         }
     }
-    let calls: Vec<&str> = goal.split('(').collect();
-    named.extend(
-        calls[..calls.len().saturating_sub(1)]
-            .iter()
-            .filter_map(|before| {
-                before
-                    .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
-                    .next()
-            }),
-    );
+    for (at, _) in goal.match_indices('(') {
+        let before = &goal[..at];
+        let name = before.rsplit(|c: char| !ident(c)).next().unwrap_or("");
+        if !negated(&before[..before.len() - name.len()]) {
+            named.push(name);
+        }
+    }
     let (original, candidate) = (words(original), words(candidate));
     named
         .into_iter()
@@ -6070,6 +6095,15 @@ mod tests {
                 "Add an optional second argument to formatAmount: with `{ grouped: true }` it groups thousands.",
                 "function formatAmount(amount) {}",
                 "function formatAmount(amount, opts) { if (opts.grouped) {} }"
+            ),
+            None
+        );
+        // Negative mentions are not demands.
+        assert_eq!(
+            goal_name_not_added(
+                "Implement the parser without `unsafe` and do not call legacyParse() anymore",
+                "fn parse() {}",
+                "fn parse() { 1 }"
             ),
             None
         );
