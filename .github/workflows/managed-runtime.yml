@@ -28,9 +28,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        include:
+          - os: ubuntu-latest
+            model: qwen2.5-coder:3b
+          # 7 GB runner with about 3.7 GB free: the 3B model does not fit
+          # safely, so setup refuses it. A 16 GB Mac runs the 3B model.
+          - os: macos-14
+            model: qwen2.5-coder:1.5b
     env:
-      MODEL: ${{ inputs.model || 'qwen2.5-coder:3b' }}
+      MODEL: ${{ inputs.model || matrix.model }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -54,6 +60,7 @@ jobs:
 
       - name: Managed setup
         run: |
+          set -o pipefail
           mkdir -p "$PHONTON_HOME"
           printf '[provider]\nname = "ollama"\nmodel = "%s"\n' "$MODEL" > "$PHONTON_HOME/config.toml"
           "$BIN" models setup "$MODEL" | tee "$RUNNER_TEMP/setup.txt"
@@ -66,10 +73,18 @@ jobs:
 
       - name: Goal on the managed runtime
         run: |
+          set -o pipefail
           node benchmarks/smoke/run.mjs --arm local --runs 1 \
             --tasks todo-remove,todo-count --bin "$BIN" \
             --out "$RUNNER_TEMP/results"
           cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          # The runtime is under test, not the model: every goal must reach
+          # the model and come back with a verdict.
+          node -e '
+            const rows = require("fs").readFileSync(process.argv[1], "utf8").trim().split(/\r?\n/).map(JSON.parse);
+            const broken = rows.filter((r) => r.tokens == null);
+            if (broken.length) { console.error("goals that never reached the model:", broken); process.exit(1); }
+          ' "$RUNNER_TEMP/results/results.jsonl"
 
       - if: always()
         uses: actions/upload-artifact@v4
