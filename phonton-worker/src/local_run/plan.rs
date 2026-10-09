@@ -16,6 +16,42 @@ struct RankedSource {
     names: BTreeMap<String, (String, context::NameMatch)>,
     path_hits: usize,
     content_hits: usize,
+    // Numbers from the goal ("from 120 to 80") found in this file.
+    literal_hits: usize,
+}
+
+/// Standalone numbers of two or more digits.
+fn number_literals(text: &str) -> BTreeSet<&str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 2 && token.bytes().all(|b| b.is_ascii_digit()))
+        .collect()
+}
+
+/// Numbers the goal replaces: "from 120 to 80", "change 120 to 80",
+/// "replace 120 with 80". A number merely mentioned ("handle HTTP 404")
+/// does not mark the file to edit.
+fn replaced_literals(goal: &str) -> BTreeSet<&str> {
+    let words: Vec<&str> = goal
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let number = |w: &str| w.len() >= 2 && w.bytes().all(|b| b.is_ascii_digit());
+    let mut out = BTreeSet::new();
+    for (i, w) in words.iter().enumerate() {
+        if !number(w) {
+            continue;
+        }
+        let before = i.checked_sub(1).map(|j| words[j].to_ascii_lowercase());
+        let after = words.get(i + 1).map(|a| a.to_ascii_lowercase());
+        let replaced = matches!(before.as_deref(), Some("from" | "change" | "replace"))
+            || (matches!(after.as_deref(), Some("to" | "with"))
+                && words.get(i + 2).is_some_and(|n| number(n)))
+            || (matches!(before.as_deref(), Some("to" | "with")) && i >= 2 && number(words[i - 2]));
+        if replaced {
+            out.insert(*w);
+        }
+    }
+    out
 }
 
 impl RankedSource {
@@ -81,6 +117,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
     ];
     let query = context::terms(&request.goal.to_lowercase());
     let goal_symbols = context::SymbolQuery::new(&request.goal);
+    let goal_literals = replaced_literals(&request.goal);
     let mut ranked = Vec::new();
     for path in &paths {
         if !inferred && !request.files.contains(path) {
@@ -133,10 +170,12 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
         let content_hits = query
             .intersection(&context::terms(&source.to_lowercase()))
             .count();
+        let literal_hits = goal_literals.intersection(&number_literals(source)).count();
         ranked.push(RankedSource {
             names,
             path_hits,
             content_hits,
+            literal_hits,
             evidence: ScopeEvidence {
                 path: path.clone(),
                 reason: String::new(),
@@ -165,9 +204,12 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
     for source in &mut ranked {
         source.explain(inferred);
     }
+    // A value the goal changes ("from 120 to 80") marks the file to edit more
+    // reliably than a name match, which can be a local variable like `todo`.
     ranked.sort_by(|a, b| {
-        b.priority()
-            .cmp(&a.priority())
+        b.literal_hits
+            .cmp(&a.literal_hits)
+            .then(b.priority().cmp(&a.priority()))
             .then(b.score().cmp(&a.score()))
             .then(a.evidence.path.cmp(&b.evidence.path))
     });
@@ -192,9 +234,35 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
                 .unwrap_or(usize::MAX);
             ranked.retain(|r| {
                 !r.names.is_empty()
+                    || r.literal_hits > 0
                     || r.score() >= threshold
                     || (r.content_hits >= 3 && r.content_hits >= named_content)
             });
+            // "From 120 to 80": the value lives where the edit goes. Other
+            // matches only invite a small model to change the wrong file.
+            if ranked.iter().any(|r| r.literal_hits > 0) {
+                let goal = request.goal.to_lowercase();
+                let named = |path: &Path| {
+                    path.file_name()
+                        .is_some_and(|name| goal.contains(&name.to_string_lossy().to_lowercase()))
+                };
+                // A file defining a code-shaped name the goal uses exactly
+                // (`parseResponse`, `max_title`) stays; a plain word such as
+                // a local variable `todo` does not.
+                let defines_named_code = |r: &RankedSource| {
+                    r.names.values().any(|(name, matched)| {
+                        *matched == context::NameMatch::Exact
+                            && (name.contains('_') || name.chars().skip(1).any(char::is_uppercase))
+                    })
+                };
+                let before = ranked.len();
+                ranked.retain(|r| {
+                    r.literal_hits > 0 || named(&r.evidence.path) || defines_named_code(r)
+                });
+                if ranked.len() < before {
+                    warnings.push("Scope narrowed to the files that contain values the goal changes. Name a file to include it.".into());
+                }
+            }
             if ranked.len() > 8 {
                 warnings.push(format!("{} files matched; this bounded preview includes the top eight. Narrow the goal if more context is required.", ranked.len()));
             }
@@ -1188,14 +1256,72 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            plan.request
-                .files
-                .contains(&PathBuf::from("src/validate.js")),
+        // Only validate.js holds the goal's `120`. With store.js in scope a
+        // 3B model edited it and the existing tests still passed.
+        assert_eq!(
+            plan.request.files,
+            vec![PathBuf::from("src/validate.js")],
             "{:?}",
             plan.request.files
         );
     }
+    #[test]
+    fn only_replaced_numbers_scope_an_edit() {
+        let set = |goal| replaced_literals(goal).into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            set("Reduce the limit from 120 to 80 characters"),
+            ["120", "80"]
+        );
+        assert_eq!(set("change 8080 to 9090"), ["8080", "9090"]);
+        assert!(set("Update parseResponse to handle HTTP 404").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_defining_the_named_function_survives_value_scoping() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/client.js"),
+            "function parseResponse(res) {\n  return res.body;\n}\nmodule.exports = { parseResponse };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/config.js"),
+            "module.exports = { timeout: 30 };\n",
+        )
+        .unwrap();
+        let mut request = LocalRunRequest {
+            goal: "Change the parseResponse timeout from 30 to 60 seconds".into(),
+            repository: root.path().into(),
+            files: vec![],
+            new_file: None,
+            editable_existing: vec![],
+            checks: vec![],
+            preparation: None,
+            approve_host_execution: false,
+            allow_unverified_runtime: false,
+            budget: Default::default(),
+            expected_source_hashes: Default::default(),
+            expected_baseline_sha256: None,
+        };
+        request.checks.clear();
+        let plan = preview(request).await.unwrap();
+        for path in ["src/client.js", "src/config.js"] {
+            assert!(
+                plan.request.files.contains(&PathBuf::from(path)),
+                "{:?}",
+                plan.request.files
+            );
+        }
+    }
+
     #[tokio::test]
     async fn inferred_scope_finds_supported_javascript_module_extensions() {
         let root = tempfile::tempdir().unwrap();

@@ -211,7 +211,7 @@ pub fn decompose(goal: &Goal) -> PlannerOutput {
                 status: SubtaskStatus::Queued,
             });
 
-            if !goal.no_tests {
+            if plans_tests(goal) {
                 tests_planned += 1;
                 subtasks.push(Subtask {
                     id: SubtaskId::new(),
@@ -902,12 +902,29 @@ fn estimate_tokens(detections: &[Detection], goal: &Goal) -> u64 {
     let per_impl = 1_500u64;
     let per_test = 800u64;
     let impls = detections.len().max(1) as u64;
-    let tests = if goal.no_tests {
-        0
-    } else {
+    let tests = if plans_tests(goal) {
         detections.len() as u64
+    } else {
+        0
     };
     base + per_impl * impls + per_test * tests
+}
+
+/// Test subtasks only when the goal asks for tests. Unrequested test files
+/// were most of the tokens of a one-method goal, and the project's own tests
+/// still run on every edit.
+fn plans_tests(goal: &Goal) -> bool {
+    !goal.no_tests
+        && goal
+            .description
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| {
+                matches!(
+                    w,
+                    "test" | "tests" | "tested" | "testing" | "spec" | "specs" | "coverage"
+                )
+            })
 }
 
 /// Crude naive baseline estimate. Assumes a stateless agent would load
@@ -918,10 +935,10 @@ fn estimate_naive_tokens(detections: &[Detection], goal: &Goal) -> u64 {
     // rewrites.
     let per_turn = 35_000u64;
     let turns = detections.len().max(1) as u64;
-    let tests = if goal.no_tests {
-        0
-    } else {
+    let tests = if plans_tests(goal) {
         detections.len() as u64
+    } else {
+        0
     };
     (turns + tests) * per_turn
 }
@@ -1094,8 +1111,12 @@ mod tests {
     }
 
     #[test]
-    fn pairs_each_impl_with_a_test_subtask() {
-        let plan = decompose(&Goal::new("add a function parse_callsites"));
+    fn pairs_each_impl_with_a_test_subtask_when_tests_are_asked_for() {
+        let unasked = decompose(&Goal::new("add a function parse_callsites"));
+        assert_eq!(unasked.subtasks.len(), 1);
+        assert_eq!(unasked.coverage_summary.tests_planned, 0);
+
+        let plan = decompose(&Goal::new("add a function parse_callsites with tests"));
         assert_eq!(plan.subtasks.len(), 2);
         assert_eq!(plan.coverage_summary.new_functions, 1);
         assert_eq!(plan.coverage_summary.tests_planned, 1);
@@ -1227,7 +1248,7 @@ Validate maxRetries as an integer from 0 through 10.";
 
     #[test]
     fn coverage_summary_renders_honest_signal() {
-        let plan = decompose(&Goal::new("add function a and add function b"));
+        let plan = decompose(&Goal::new("add function a and add function b, with tests"));
         assert_eq!(
             plan.coverage_summary.render(),
             "Estimated coverage: 2 new functions, 2 tests planned."
@@ -1493,8 +1514,8 @@ Make sure the existing tests pass.";
         )
         .await
         .unwrap();
-        // Regex fallback emits impl + paired test for a single detection.
-        assert_eq!(plan.subtasks.len(), 2);
+        // Regex fallback emits one implementation subtask; no tests asked.
+        assert_eq!(plan.subtasks.len(), 1);
     }
 
     #[tokio::test]
@@ -1514,8 +1535,8 @@ Make sure the existing tests pass.";
         )
         .await
         .unwrap();
-        // Should have fallen back to regex — which emits 2 subtasks for
-        // "add a function foo" (impl + test).
-        assert_eq!(plan.subtasks.len(), 2);
+        // Should have fallen back to regex: one subtask for
+        // "add a function foo" (no tests asked).
+        assert_eq!(plan.subtasks.len(), 1);
     }
 }

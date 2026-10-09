@@ -728,7 +728,7 @@ fn print_text_report(report: &ReviewReport) {
             println!("route:  {}", hops.join(" -> "));
         }
     }
-    println!("status: {}", compact_json(&report.status));
+    println!("status: {}", status_text(&report.status));
     println!("checkpoints: {}", report.checkpoints.len());
     if let Some(handoff) = &report.handoff {
         println!(
@@ -814,10 +814,16 @@ fn render_context(context: &[ContextAttribution]) {
         return;
     }
     println!("   context:");
+    let cwd = std::env::current_dir().unwrap_or_default();
     for slice in context {
+        // Repo-relative when the review runs from the repository.
+        let path = slice
+            .file_path
+            .strip_prefix(&cwd)
+            .unwrap_or(&slice.file_path);
         println!(
             "     - {} :: {} ({:?}, {} tokens)",
-            slice.file_path.display(),
+            path.display(),
             slice.symbol_name,
             slice.origin,
             slice.token_count
@@ -850,13 +856,22 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// "review-ready" or "failed: reason" instead of the serialized enum.
+fn status_text(value: &serde_json::Value) -> String {
+    match serde_json::from_value::<TaskStatus>(value.clone()) {
+        Ok(TaskStatus::Failed { reason, .. }) => format!("failed: {reason}"),
+        Ok(status) => crate::headless_status_label(&status).to_string(),
+        Err(_) => compact_json(value),
+    }
+}
+
 fn print_action_report(report: &ActionReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
     } else {
         println!("Phonton review {}", report.action);
         println!("task:   {}", report.task_id);
-        println!("status: {}", compact_json(&report.status));
+        println!("status: {}", status_text(&report.status));
         println!("{}", report.detail);
     }
     Ok(())

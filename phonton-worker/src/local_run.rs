@@ -1357,6 +1357,27 @@ async fn run_inner(
                             }
                         }
                     }
+                    if candidate.rejection.is_none() {
+                        let original: String = receipt
+                            .request
+                            .files
+                            .iter()
+                            .filter_map(|file| std::fs::read_to_string(baseline.join(file)).ok())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let changed: String = changes
+                            .values()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if let Some(name) =
+                            goal_name_not_added(&receipt.request.goal, &original, &changed)
+                        {
+                            candidate.rejection = Some(format!(
+                                "The goal names `{name}`, but this edit does not add it"
+                            ));
+                        }
+                    }
                     if candidate.rejection.is_some() {
                         // Never run a project check against model-authored test definitions.
                         persist_json(
@@ -2931,6 +2952,80 @@ fn rust_protected_tail_items_intact(original: &str, candidate: &str, tail: &str)
     rust_scope_signatures(original_prefix, &mut original_scope);
     rust_scope_signatures(candidate_prefix, &mut candidate_scope);
     same_crate_attributes && same_tail_items && original_scope == candidate_scope
+}
+
+/// A name the goal asks for (called like `balanceOn(` or quoted in
+/// backticks, four or more characters) that is in neither the original
+/// scoped source nor the candidate. A small model that edits something
+/// else entirely can still pass the existing tests.
+fn goal_name_not_added(goal: &str, original: &str, candidate: &str) -> Option<String> {
+    let words = |text: &str| -> BTreeSet<String> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    // "without `unsafe`", "instead of foo()": not something to add.
+    let negated = |before: &str| {
+        before
+            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+            .filter(|w| !w.is_empty())
+            .rev()
+            .take(3)
+            .any(|w| {
+                matches!(
+                    w.to_lowercase().as_str(),
+                    "without"
+                        | "not"
+                        | "no"
+                        | "never"
+                        | "avoid"
+                        | "remove"
+                        | "removing"
+                        | "drop"
+                        | "instead"
+                        | "except"
+                        | "don't"
+                        | "dont"
+                        | "stop"
+                )
+            })
+    };
+    let mut named: Vec<&str> = Vec::new();
+    // Only a span that is one identifier (`duplicate_review`, `count()`):
+    // demanding the words of a quoted message made a 3B model paste them
+    // somewhere meaningless to pass.
+    let ticks: Vec<usize> = goal.match_indices('`').map(|(at, _)| at).collect();
+    for &[open, close] in ticks.as_chunks::<2>().0 {
+        let name = goal[open + 1..close].trim().trim_end_matches("()");
+        if name.chars().all(ident) && !negated(&goal[..open]) {
+            named.push(name);
+        }
+    }
+    for (at, _) in goal.match_indices('(') {
+        let before = &goal[..at];
+        let name = before.rsplit(|c: char| !ident(c)).next().unwrap_or("");
+        if !negated(&before[..before.len() - name.len()]) {
+            named.push(name);
+        }
+    }
+    let (original, candidate) = (words(original), words(candidate));
+    named
+        .into_iter()
+        .filter(|w| w.len() >= 4 && w.starts_with(|c: char| c.is_alphabetic()))
+        // Literals and keywords a correct edit need not spell out.
+        .filter(|w| {
+            !matches!(
+                w.to_lowercase().as_str(),
+                "true" | "false" | "null" | "none" | "undefined" | "this" | "self" | "void"
+            )
+        })
+        .find(|w| {
+            let w = w.to_lowercase();
+            !original.contains(&w) && !candidate.contains(&w)
+        })
+        .map(str::to_string)
 }
 
 fn candidate_changes_protected_tests(parent: &Path, file: &Path, content: &str) -> Result<bool> {
@@ -5967,6 +6062,56 @@ mod tests {
 
     fn fixed_hardware(snapshot: HardwareSnapshot) -> HardwareOverride {
         Arc::new(move || snapshot.clone())
+    }
+
+    #[test]
+    fn goal_names_must_be_added_by_the_candidate() {
+        let source = "class Ledger {\n  balance(account) { return tx.date; }\n}\n";
+        let goal = "Add a balanceOn(account, date) method to Ledger that works like balance(account) but counts only transactions dated on or before `date` (YYYY-MM-DD).";
+        // A 3B model edited parseDate instead: existing tests passed.
+        assert_eq!(
+            goal_name_not_added(goal, source, "class Ledger {}\nfunction parseDate() {}\n"),
+            Some("balanceOn".into())
+        );
+        assert_eq!(
+            goal_name_not_added(goal, source, "  balanceOn(account, date) { return 1; }"),
+            None
+        );
+        // Existing names and placeholders are not demands; matching ignores case.
+        let coupon = "In applyCoupon, reject a coupon whose `expires` date is before `today` with a ShopError whose message is `coupon <CODE> expired`.";
+        let shop = "function applyCoupon(cart, coupons, code, today) { // expires\n throw new ShopError('x', 'coupon'); }";
+        // A quoted message is not a list of required words.
+        assert_eq!(goal_name_not_added(coupon, shop, shop), None);
+        assert_eq!(
+            goal_name_not_added(
+                "Reject it with code `duplicate_review`.",
+                "class Reviews {}",
+                "class Reviews {}"
+            ),
+            Some("duplicate_review".into())
+        );
+        assert_eq!(
+            goal_name_not_added(
+                "Add an optional second argument to formatAmount: with `{ grouped: true }` it groups thousands.",
+                "function formatAmount(amount) {}",
+                "function formatAmount(amount, opts) { if (opts.grouped) {} }"
+            ),
+            None
+        );
+        // Negative mentions are not demands.
+        assert_eq!(
+            goal_name_not_added(
+                "Implement the parser without `unsafe` and do not call legacyParse() anymore",
+                "fn parse() {}",
+                "fn parse() { 1 }"
+            ),
+            None
+        );
+        // "account" does not satisfy "count".
+        assert_eq!(
+            goal_name_not_added("Add a count() method", "account", "account"),
+            Some("count".into())
+        );
     }
 
     #[test]

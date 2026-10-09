@@ -503,6 +503,164 @@ async fn catalog_snapshot() -> Result<CatalogSnapshot> {
     Ok(CatalogSnapshot { hardware, models })
 }
 
+fn gigabytes(bytes: &Value) -> String {
+    bytes
+        .as_u64()
+        .map(|b| format!("{:.1} GB", b as f64 / 1e9))
+        .unwrap_or_else(|| "?".into())
+}
+
+fn fit_label(fit: &Value) -> String {
+    match fit["status"].as_str() {
+        Some("likely_fits_gpu") => "fits the GPU".into(),
+        Some("cpu_or_offload") => "runs on CPU or partly offloaded (slower)".into(),
+        Some("insufficient_memory") => "needs more memory than is free".into(),
+        Some(other) => other.replace('_', " "),
+        None => "fit unknown".into(),
+    }
+}
+
+/// `phonton models` for a person: runtime, hardware, installed models and
+/// the one next step. `--json` keeps the full machine-readable status.
+fn status_summary(v: &Value) -> String {
+    let mut out = vec!["Local models".to_string()];
+    let endpoint = v["endpoint"].as_str().unwrap_or("?");
+    let runtime = match v["runtime_version"].as_str() {
+        Some(version) => {
+            let origin = if v["model_store"]["status"].as_str() == Some("verified_managed") {
+                "managed by Phonton"
+            } else {
+                "not started by Phonton"
+            };
+            format!("Ollama {version} at {endpoint}, {origin}")
+        }
+        None => format!("not running at {endpoint}"),
+    };
+    out.push(format!("  runtime   {runtime}"));
+    let hw = &v["hardware"];
+    let mut parts: Vec<String> = hw["gpus"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|g| {
+            format!(
+                "{} {} free of {}",
+                g["name"].as_str().unwrap_or("GPU"),
+                gigabytes(&g["available_bytes"]),
+                gigabytes(&g["total_bytes"])
+            )
+        })
+        .collect();
+    if hw["ram_total_bytes"].is_u64() {
+        parts.push(format!(
+            "RAM {} free of {}",
+            gigabytes(&hw["ram_available_bytes"]),
+            gigabytes(&hw["ram_total_bytes"])
+        ));
+    }
+    if !parts.is_empty() {
+        out.push(format!("  hardware  {}", parts.join(" · ")));
+    }
+    let active = v["active_model"].as_str();
+    let models = v["models"].as_array().cloned().unwrap_or_default();
+    if models.is_empty() {
+        out.push("  models    none installed".into());
+    } else {
+        out.push("  models".into());
+        for m in &models {
+            let name = m["model"]["name"].as_str().unwrap_or("?");
+            let state = if let Some(profile) = m["profile"].as_object() {
+                let passed: Vec<&str> = profile
+                    .get("probes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["status"].as_str() == Some("passed"))
+                    .filter_map(|p| p["name"].as_str())
+                    .collect();
+                format!(
+                    "calibrated at {}k context ({})",
+                    profile["context_tokens"].as_u64().unwrap_or(0) / 1024,
+                    passed.join(", ")
+                )
+            } else if let Some(error) = m["profile_error"].as_str() {
+                format!("calibration no longer valid: {error}")
+            } else {
+                "not calibrated".into()
+            };
+            let mark = if active == Some(name) { "*" } else { " " };
+            out.push(format!(
+                "  {mark} {name:<26} {:>7}  {state}; {}",
+                gigabytes(&m["model"]["size_bytes"]),
+                fit_label(&m["fit"])
+            ));
+        }
+    }
+    let next = if v["runtime_version"].is_null() {
+        if v["managed_runtime_supported"].as_bool() == Some(true) {
+            "phonton models setup qwen2.5-coder:3b installs a runtime and a model.".to_string()
+        } else {
+            format!(
+                "install and start Ollama ({}), then phonton models setup qwen2.5-coder:3b.",
+                v["runtime_install_url"]
+                    .as_str()
+                    .unwrap_or("https://ollama.com/download")
+            )
+        }
+    } else if let Some(name) = active {
+        format!("{name} is selected for local goals. Run phonton in a project.")
+    } else if models.is_empty() {
+        "phonton models catalog lists models that fit; phonton models setup MODEL installs one."
+            .into()
+    } else {
+        "phonton models setup MODEL calibrates and selects an installed model.".into()
+    };
+    out.push(format!("next: {next}"));
+    out.join("\n")
+}
+
+/// `phonton models catalog` for a person.
+fn catalog_summary(models: &[CatalogModel]) -> String {
+    let mut out = vec!["Models for this machine (download, fit):".to_string()];
+    for m in models {
+        let size = m
+            .download_bytes
+            .map(|b| format!("{:.1} GB", b as f64 / 1e9))
+            .unwrap_or_else(|| "?".into());
+        let fit = m
+            .fit
+            .as_ref()
+            .and_then(|f| serde_json::to_value(f).ok())
+            .map(|f| fit_label(&f))
+            .or_else(|| m.error.clone())
+            .unwrap_or_else(|| "fit unknown".into());
+        let first = if m.first_try_reason.is_some() {
+            "  <- try first"
+        } else {
+            ""
+        };
+        out.push(format!("  {:<26} {size:>7}  {fit}{first}", m.name));
+    }
+    // One shared reason ("less than 1.5 GiB host RAM is available") says
+    // more than repeating "needs more memory" on every row.
+    let reasons: std::collections::BTreeSet<&str> = models
+        .iter()
+        .filter_map(|m| m.fit.as_ref())
+        .filter(|f| {
+            matches!(
+                f.status,
+                phonton_types::local::FitStatus::InsufficientMemory
+            )
+        })
+        .map(|f| f.explanation.as_str())
+        .collect();
+    if reasons.len() == 1 {
+        out.extend(reasons.iter().map(|r| format!("  why: {r}")));
+    }
+    out.push("next: phonton models setup MODEL (add --json for full details).".into());
+    out.join("\n")
+}
+
 fn catalog_cli_output(snapshot: CatalogSnapshot, include_hardware: bool) -> Result<Value> {
     if include_hardware {
         Ok(serde_json::to_value(snapshot)?)
@@ -1619,7 +1777,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     if matches!(verb, "--help" | "-h" | "help")
         || (verb == "status" && args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
     {
-        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL]|catalog [--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus always prints JSON; --json is accepted for consistency. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise, on Windows x64 setup downloads a hash-checked portable Ollama runtime (about 1.5 GB).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
+        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus and catalog print a summary; --json prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise, on Windows x64 setup downloads a hash-checked portable Ollama runtime (about 1.5 GB).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
         return Ok(0);
     }
     let value = match verb {
@@ -1634,9 +1792,20 @@ pub async fn run(args: &[String]) -> Result<i32> {
             json!({"endpoint": settings.endpoint, "active_model": settings.active_model, "local_only": managed_local_only(&path, &settings), "loopback_only": true})
         }
         "endpoint" if args.len() == 2 => set_endpoint(&args[1])?,
-        "status" => status(parse_status_context(args.get(1..).unwrap_or_default())?).await?,
-        "catalog" if args.len() == 1 || (args.len() == 2 && args[1] == "--snapshot") => {
-            catalog_cli_output(catalog_snapshot().await?, args.len() == 2)?
+        "status" => {
+            let value = status(parse_status_context(args.get(1..).unwrap_or_default())?).await?;
+            if !args.iter().any(|a| a == "--json") {
+                println!("{}", status_summary(&value));
+                return Ok(0);
+            }
+            value
+        }
+        "catalog" if args.len() == 1 => {
+            println!("{}", catalog_summary(&catalog_snapshot().await?.models));
+            return Ok(0);
+        }
+        "catalog" if args.len() == 2 && matches!(args[1].as_str(), "--snapshot" | "--json") => {
+            catalog_cli_output(catalog_snapshot().await?, args[1] == "--snapshot")?
         }
         "setup" if args.len() == 1 => {
             await_model_mutation(
@@ -1731,6 +1900,46 @@ mod tests {
         CalibrationAttempt, EditProtocol, GpuSnapshot, ModelProbe, CREATION_PROBE_NAME,
         DIFF_CREATION_PROBE_NAME,
     };
+
+    #[test]
+    fn status_summary_names_the_runtime_models_and_next_step() {
+        let none = status_summary(&json!({
+            "endpoint": "http://127.0.0.1:11434", "runtime_version": null,
+            "managed_runtime_supported": false, "runtime_install_url": "https://ollama.com/download",
+            "hardware": {"gpus": [], "ram_available_bytes": 8_000_000_000_u64, "ram_total_bytes": 16_000_000_000_u64},
+            "models": [], "active_model": null, "model_store": {}
+        }));
+        assert!(
+            none.contains("not running at http://127.0.0.1:11434"),
+            "{none}"
+        );
+        assert!(none.contains("RAM 8.0 GB free of 16.0 GB"), "{none}");
+        assert!(
+            none.contains("next: install and start Ollama (https://ollama.com/download)"),
+            "{none}"
+        );
+
+        let ready = status_summary(&json!({
+            "endpoint": "http://127.0.0.1:11434", "runtime_version": "0.34.2",
+            "model_store": {"status": "verified_managed"}, "hardware": {"gpus": []},
+            "active_model": "qwen2.5-coder:3b",
+            "models": [{
+                "model": {"name": "qwen2.5-coder:3b", "size_bytes": 1_929_912_626_u64},
+                "fit": {"status": "likely_fits_gpu"},
+                "profile": {"context_tokens": 8192, "probes": [
+                    {"name": "SearchReplace edit", "status": "passed"},
+                    {"name": "UnifiedDiff edit", "status": "failed"}
+                ]}
+            }]
+        }));
+        assert!(ready.contains("managed by Phonton"), "{ready}");
+        assert!(ready.contains("* qwen2.5-coder:3b"), "{ready}");
+        assert!(
+            ready.contains("calibrated at 8k context (SearchReplace edit); fits the GPU"),
+            "{ready}"
+        );
+        assert!(ready.contains("selected for local goals"), "{ready}");
+    }
 
     #[test]
     fn catalog_snapshot_preserves_the_fit_reading_without_changing_default_output() {

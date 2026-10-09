@@ -139,6 +139,15 @@ pub fn prompt_if_needed(workspace: &Path) -> Result<bool> {
         return Ok(true);
     }
 
+    // Nobody can answer a prompt on a pipe; say how to trust instead.
+    if !std::io::IsTerminal::is_terminal(&io::stdin()) {
+        eprintln!(
+            "phonton: this folder is not trusted yet. Run `phonton` here once to approve it, \
+             pass --yes to `phonton goal`, or set PHONTON_TRUST_ALL=1 for CI."
+        );
+        return Ok(false);
+    }
+
     let abs = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let folder = display_path(&abs);
     let color =

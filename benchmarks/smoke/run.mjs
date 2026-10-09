@@ -66,7 +66,9 @@ function cloudRun(dir, goal) {
 }
 
 function localRun(dir, goal) {
-  const r = run(bin, ["goal", "--local", goal, "--yes", "--allow-host-checks"], dir);
+  // `--runtime unverified`: an Ollama Phonton did not start (macOS, Linux, CI).
+  const unverified = args.runtime === "unverified" ? ["--allow-unverified-runtime"] : [];
+  const r = run(bin, ["goal", "--local", goal, "--yes", "--allow-host-checks", ...unverified], dir);
   const id = (r.stdout.match(/--local (?:apply|show) ([0-9a-f-]{36})/) ?? [])[1];
   let status = "failed";
   let tokens = null;

@@ -31,7 +31,10 @@ node benchmarks/smoke/run.mjs --arm cloud --bin path/to/other/phonton.exe --out 
 ```
 
 Set `PHONTON_HOME` to an isolated profile so runs do not touch your own
-memory or settings. Tasks and their hidden tests live in
+memory or settings. `--runtime unverified` runs the local arm against an
+Ollama Phonton did not start (macOS, Linux). The workflow
+`.github/workflows/local-smoke.yml` runs the local arm on a CPU-only GitHub
+runner for a released version or the current commit. Tasks and their hidden tests live in
 `benchmarks/smoke/tasks.mjs`; every hidden test fails on the untouched fixture
 and passes with a reference fix.
 

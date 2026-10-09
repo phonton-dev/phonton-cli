@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI Status" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars&color=ff69b4"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.22.1--beta-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.22.2--beta-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
@@ -75,10 +75,11 @@ receipt you can audit with `phonton review latest` and `phonton why-tokens`.
 - **Local memory.** Decisions, rejected approaches and conventions live in
   local SQLite and steer the next plan.
 - **Designed for context efficiency.** Workers get only the files they edit
-  plus retrieved symbols; finished subtasks are carried forward as one-line
-  notes instead of full transcripts; tests and boilerplate go to your
-  configured model, core logic starts one tier up, and only failures
-  escalate further. We publish
+  plus retrieved symbols (excerpts of large files); finished subtasks are
+  carried forward as one-line notes instead of full transcripts; test
+  subtasks are planned only when a goal asks for tests, while the project's
+  own tests run on every edit; and only failures escalate to a stronger
+  model. We publish
   measurements only with reproducible artifacts; see
   [Benchmark honesty](#benchmark-honesty).
 
@@ -201,6 +202,11 @@ backend = "qdrant"
 qdrant_url = "http://127.0.0.1:6333"
 qdrant_collection = "phonton-code"
 ```
+
+When a goal misbehaves, `PHONTON_LOG=debug` (or a narrower filter such as
+`phonton_worker=debug`) appends diagnostics to `phonton.log` in the Phonton
+home: each worker attempt, why verification rejected it, and hunks Phonton
+moved to their matching lines.
 
 ---
 
