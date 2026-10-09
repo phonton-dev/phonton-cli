@@ -5591,7 +5591,7 @@ pub(crate) struct HeadlessGoalResult {
 
 fn print_goal_help() {
     println!(
-        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nHost checks execute repository code and require explicit --allow-host-checks on each invocation.
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nEvery edit is verified by running this repository's own checks on this machine. In a terminal, phonton goal asks first; in scripts, pass --allow-host-checks.
 With a local provider and a calibrated model, goals run through the local harness; see phonton goal --local --help."
     );
 }
@@ -5831,6 +5831,37 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
             return Ok(2);
         }
     };
+
+    // Every edit is verified by running the project's own checks, and with no
+    // isolation backend that needs explicit host approval. Without it a goal
+    // spent tokens and then failed verification, so ask (or stop) first.
+    let mut opts = opts;
+    if !opts.host_checks_approved {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) && !opts.json {
+            eprint!(
+                "Phonton checks each edit by running this project's own build and tests \
+                 on this machine, against a copy of the repository. Allow for this goal? [Y/n] "
+            );
+            std::io::Write::flush(&mut std::io::stderr()).ok();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).ok();
+            if !matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "" | "y" | "yes"
+            ) {
+                eprintln!("Not allowed. Without checks no edit can be verified; nothing was sent to a model.");
+                return Ok(2);
+            }
+            opts.host_checks_approved = true;
+        } else {
+            eprintln!(
+                "phonton goal: add --allow-host-checks. Phonton verifies each edit by running this \
+                 project's own build and tests on this machine and does not do that without your \
+                 approval. Nothing was sent to a model."
+            );
+            return Ok(2);
+        }
+    }
 
     let provider = config::load()?.provider.name;
     if !config::KNOWN_PROVIDERS.contains(&provider.as_str()) && provider != "grok" {
