@@ -24,6 +24,21 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   workflow sets up a model and runs goals on fresh Linux and macOS runners
   with no Ollama installed. The local smoke workflow uses the managed runtime.
 
+### Fixed
+
+- [fixed] Local models often answer a search/replace edit with only a
+  block's opening line as `search` (`class OrderBook {`) and the whole
+  rewritten block as the replacement. Phonton replaced just that line and
+  duplicated the body; in the CI smoke suite every `shop-cancel-restock`
+  candidate and most `ledger-csv-quote` candidates failed to parse for this
+  reason. When the replacement starts with that line and is itself one
+  complete block, the whole block is replaced (brace-aware for C-family,
+  JS/TS and Rust; indentation-aware for Python). An unclosed replacement is
+  still an insertion.
+- [fixed] A replacement that opens or closes a different number of braces
+  than the text it replaces is rejected before checks run, with a message
+  that says the replacement looks cut off, instead of a parser error.
+
 ## 0.22.3 - Honest receipts
 
 ### Changed
