@@ -700,17 +700,22 @@ fn print_text_report(report: &ReviewReport) {
     println!("goal:   {}", report.goal);
     println!("tokens: {}", report.total_tokens);
     if report.cost_receipt.frontier_equivalent_usd_micros > 0 {
-        let pct = report
-            .cost_receipt
-            .saved_percent()
-            .map(|p| format!("{p}%"))
-            .unwrap_or_else(|| "n/a".into());
-        println!(
-            "cost est.: ${:.4}  frontier est.: ${:.4}  saved est.: {}",
-            report.cost_receipt.actual_usd_micros as f64 / 1_000_000.0,
-            report.cost_receipt.frontier_equivalent_usd_micros as f64 / 1_000_000.0,
-            pct
-        );
+        // An unlisted model's receipt holds tier-reference figures, not its own.
+        if report.cost_receipt.pricing_known {
+            let pct = report
+                .cost_receipt
+                .saved_percent()
+                .map(|p| format!("{p}%"))
+                .unwrap_or_else(|| "n/a".into());
+            println!(
+                "cost est.: ${:.4}  frontier est.: ${:.4}  saved est.: {}",
+                report.cost_receipt.actual_usd_micros as f64 / 1_000_000.0,
+                report.cost_receipt.frontier_equivalent_usd_micros as f64 / 1_000_000.0,
+                pct
+            );
+        } else {
+            println!("cost est.: unknown (no price listed for this model)");
+        }
         if !report.cost_receipt.route.is_empty() {
             let hops: Vec<String> = report
                 .cost_receipt

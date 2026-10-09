@@ -1885,7 +1885,7 @@ pub fn render_savings_line(state: Option<&GlobalState>) -> String {
     let Some(s) = state else {
         return "  est. $—  |  est. saved — vs frontier  |  tokens: —".into();
     };
-    if s.cost_receipt.frontier_equivalent_usd_micros > 0 {
+    if has_price(s) {
         let pct = s
             .cost_receipt
             .saved_percent()
@@ -1899,7 +1899,13 @@ pub fn render_savings_line(state: Option<&GlobalState>) -> String {
         );
     }
     // No price for this model (local or unlisted): report tokens only.
-    format!("  {} tok  |  est. cost unknown", s.tokens_used)
+    format!("  {} tok", s.tokens_used)
+}
+
+/// Cost and savings are shown only when every call had a listed price; an
+/// unlisted model's receipt carries tier-reference figures, not its own.
+fn has_price(s: &GlobalState) -> bool {
+    s.cost_receipt.pricing_known && s.cost_receipt.frontier_equivalent_usd_micros > 0
 }
 
 fn format_usd_micros(micros: u64) -> String {
@@ -1915,7 +1921,7 @@ pub fn render_savings_line_styled(state: Option<&GlobalState>) -> Line<'static> 
             Style::default().fg(MUTED),
         ));
     };
-    if s.cost_receipt.frontier_equivalent_usd_micros > 0 {
+    if has_price(s) {
         let pct = s.cost_receipt.saved_percent();
         let (pct_txt, pct_style) = match pct {
             Some(p) if p > 50 => (
@@ -1943,13 +1949,10 @@ pub fn render_savings_line_styled(state: Option<&GlobalState>) -> Line<'static> 
             Span::styled(format!("{} tok", s.tokens_used), Style::default().fg(MUTED)),
         ]);
     }
-    Line::from(vec![
-        Span::styled(
-            format!("  {} tok", s.tokens_used),
-            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  est. cost unknown", Style::default().fg(MUTED)),
-    ])
+    Line::from(Span::styled(
+        format!("  {} tok", s.tokens_used),
+        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3200,7 +3203,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             )));
             lines.push(Line::raw(""));
         }
-        if state.estimated_naive_tokens > 0 {
+        if state.tokens_used > 0 {
             lines.push(render_savings_line_styled(Some(state)));
         }
         if let Some(label) = execution_mode_label(g) {
@@ -9090,6 +9093,33 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
+    fn savings_line_ignores_tier_reference_figures_for_unlisted_models() {
+        let s = GlobalState {
+            task_status: TaskStatus::Queued,
+            goal_contract: None,
+            plan_graph: None,
+            index_backend: None,
+            handoff_packet: None,
+            active_workers: Vec::new(),
+            tokens_used: 200,
+            tokens_budget: None,
+            estimated_naive_tokens: 0,
+            checkpoints: Vec::new(),
+            resume_checkpoint: None,
+            cost_receipt: CostReceipt {
+                actual_usd_micros: 220,
+                frontier_equivalent_usd_micros: 15_000,
+                saved_usd_micros: 14_780,
+                pricing_known: false,
+                route: Vec::new(),
+            },
+        };
+        let line = render_savings_line(Some(&s));
+        assert!(line.contains("200 tok"));
+        assert!(!line.contains('%') && !line.contains('$'), "{line}");
+    }
+
+    #[test]
     fn subtask_label_drops_the_goal_the_planner_appends() {
         assert_eq!(
             subtask_label("Implement method `remove` for this goal: Add remove(id)."),
@@ -9373,7 +9403,6 @@ more"
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("add function foo"));
         assert!(dump.contains("150 tok"));
-        assert!(dump.contains("est. cost unknown"));
     }
 
     #[test]
