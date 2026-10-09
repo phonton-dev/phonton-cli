@@ -4,6 +4,40 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.22.3 - Honest receipts
+
+### Changed
+
+- [changed] The TUI no longer shows "saved N% vs naive" or a session "best"
+  when no cost is known: at the start of every goal ("0 tok, saved 100%") and
+  throughout runs on local or unpriced models. The baseline was a fixed
+  35,000 tokens per subtask, not a measurement. Priced models still show
+  estimated cost and savings against frontier pricing; unpriced ones show
+  tokens only. A hosted
+  model with no listed price no longer shows tier-reference figures as its
+  cost in the TUI or `phonton review`, and local TUI runs show their token
+  count again.
+- [changed] `phonton plan` prints the token estimate without the naive
+  baseline (still in `--json`), and the no-tests note says the project's own
+  tests run on every edit and how to plan a test subtask.
+- [changed] `plan`, `goal`, `review` and `why-tokens` label subtasks by their
+  headline ("Implement method `remove`") instead of repeating the whole goal,
+  and so does the TUI receipt.
+- [changed] The TUI receipt drops the "No run command inferred yet" block;
+  the same fact is already listed under known gaps. It also drops the
+  "execution: provider" line on ordinary runs and says "history only" for
+  checkpoints instead of "legacy rollback disabled".
+- [changed] Costs print with four decimals everywhere ($0.0007), so the TUI
+  receipt and the cost line agree.
+
+### Fixed
+
+- [fixed] The TUI stage track no longer wraps the elapsed time onto its own
+  line in an 80-column run pane.
+- [fixed] The npm publish workflow waits up to 5 minutes for the registry
+  instead of 60 seconds before reporting failure (0.22.2 published fine but
+  the check timed out).
+
 ## 0.22.2 - Half the cost, fewer false passes
 
 Cloud smoke suite (DeepSeek flash, 12 tasks x 3 runs, hidden tests): 36/36

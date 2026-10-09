@@ -198,10 +198,7 @@ fn print_text_report(report: &PlanReport) {
             "disabled"
         }
     );
-    println!(
-        "tokens: estimated {} / naive baseline {}",
-        report.plan.estimated_total_tokens, report.plan.naive_baseline_tokens
-    );
+    println!("tokens: ~{} estimated", report.plan.estimated_total_tokens);
     println!(
         "coverage: {} new functions, {} tests planned",
         report.plan.coverage_summary.new_functions, report.plan.coverage_summary.tests_planned
@@ -237,7 +234,7 @@ fn print_text_report(report: &PlanReport) {
             "{}. [{:?}] {}",
             idx + 1,
             subtask.model_tier,
-            first_line(&subtask.description)
+            crate::subtask_label(&subtask.description)
         );
         println!("   id: {}", subtask.id);
         println!("   depends_on: {deps}");
@@ -288,7 +285,7 @@ fn coverage_warnings(plan: &PlannerOutput) -> Vec<String> {
     }
     if plan.coverage_summary.new_functions > 0 && plan.coverage_summary.tests_planned == 0 {
         warnings.push(
-            "Tests are disabled or were not planned for detected implementation work.".into(),
+            "No test subtask planned; the project's own tests still run on every edit. Add \"with tests\" to the goal to plan one.".into(),
         );
     }
     warnings
