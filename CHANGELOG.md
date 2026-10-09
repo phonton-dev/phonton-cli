@@ -4,12 +4,13 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
-## 0.22.2 - Fewer false passes on small models
+## 0.22.2 - Half the cost, fewer false passes
 
-Local smoke suite in CI (qwen2.5-coder:3b, CPU-only Linux runner, 12 tasks x
-3 runs, hidden tests): 0.22.1 accepted 11/36 and marked 8 more runs
-review-ready that the hidden tests then failed; 0.22.2 accepts 15/36 with 2
-such runs.
+Cloud smoke suite (DeepSeek flash, 12 tasks x 3 runs, hidden tests): 36/36
+accepted, as in 0.22.1, at $0.096 instead of $0.186. Local smoke suite in CI
+(qwen2.5-coder:3b, CPU-only Linux runner): 0.22.1 accepted 11/36 and marked 8
+more runs review-ready that the hidden tests then failed; 0.22.2 accepts
+15/36 with 2 such runs.
 
 ### Fixed
 
@@ -22,6 +23,20 @@ such runs.
   when they do not exist yet. Asked for `balanceOn(account, date)`, a 3B model
   edited `parseDate` and passed the existing tests 3 of 3 times; those
   candidates are now rejected and the model is told why.
+
+### Changed
+
+- [changed] Phonton plans test-writing subtasks only when a goal asks for
+  tests; the project's own tests still run on every edit. On the cloud smoke
+  suite (DeepSeek flash, 12 tasks x 3) acceptance stayed 36/36 while tokens
+  fell 36% (302,442 to 193,129) and cost 48% ($0.186 to $0.096).
+- [changed] `phonton goal` asks once in a terminal before running the
+  project's checks, and without a terminal stops before any model call unless
+  `--allow-host-checks` is given. It used to spend tokens and then fail
+  verification.
+- [changed] `phonton models` and `phonton models catalog` print a readable
+  summary with the next step; `--json` keeps the full output. `phonton review`
+  shows "review-ready" or "failed: reason" and repository-relative paths.
 
 ### Added
 
