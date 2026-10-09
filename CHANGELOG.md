@@ -4,6 +4,35 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.22.2 - Fewer false passes on small models
+
+Local smoke suite in CI (qwen2.5-coder:3b, CPU-only Linux runner, 12 tasks x
+3 runs, hidden tests): 0.22.1 accepted 11/36 and marked 8 more runs
+review-ready that the hidden tests then failed; 0.22.2 accepts 15/36 with 2
+such runs.
+
+### Fixed
+
+- [fixed] Local goals that change a value ("from 120 to 80") are scoped to
+  the files that contain it, plus files the goal names. A 3B model edited
+  `store.js`, which matched through a local variable named `todo`, instead of
+  `validate.js`, and the existing tests still passed (`todo-title-limit`
+  0/3 -> 3/3).
+- [fixed] A local candidate must add the identifiers the goal calls or quotes
+  when they do not exist yet. Asked for `balanceOn(account, date)`, a 3B model
+  edited `parseDate` and passed the existing tests 3 of 3 times; those
+  candidates are now rejected and the model is told why.
+
+### Added
+
+- [added] `PHONTON_LOG=debug` (any tracing filter) appends diagnostics to
+  `phonton.log` in the Phonton home: each worker attempt and why
+  verification rejected it, plus hunks Phonton recounted or moved.
+- [added] `.github/workflows/local-smoke.yml`: the local-model smoke suite on
+  a CPU-only Linux runner with Ollama, for a released version or the current
+  commit. `benchmarks/smoke/run.mjs --runtime unverified` runs the local arm
+  against an Ollama Phonton did not start.
+
 ## 0.22.1 - Diffs that land
 
 Smoke suite, DeepSeek flash, 12 tasks x 3 runs on three fixtures: 36/36
