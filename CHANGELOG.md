@@ -4,6 +4,26 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased
+
+### Added
+
+- [added] `phonton models setup` installs and starts a verified local runtime
+  on Linux (x64, arm64) and macOS, as it already did on Windows x64. It
+  downloads the pinned official Ollama 0.34.2 archive, checks its published
+  SHA-256, unpacks it in-process (no `zstd` or `tar` needed) into an owned
+  stage, and checks every file and library symlink against a pinned tree
+  digest before use. Phonton then proves the runtime it started owns
+  `127.0.0.1:11434` (`/proc` on Linux, `lsof` on macOS) and records its start
+  time and executable, so local goals run as verified-managed without
+  `--allow-unverified-runtime`. Network and FUSE mounts are refused for
+  managed storage.
+- [added] `scripts/runtime-tree-digest.py` recomputes every platform's pins
+  from the published archives; it reproduces the existing Windows pins.
+- [added] CI runs the local-runtime tests on macOS, and a `managed-runtime`
+  workflow sets up a model and runs goals on fresh Linux and macOS runners
+  with no Ollama installed. The local smoke workflow uses the managed runtime.
+
 ## 0.22.3 - Honest receipts
 
 ### Changed

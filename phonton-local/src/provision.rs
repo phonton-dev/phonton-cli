@@ -5,34 +5,98 @@ use crate::{LocalError, Result};
 use phonton_types::local::DownloadProgress;
 use std::path::Path;
 
-/// Pinned official release. Updating this requires replacing both URL and hash.
+/// Pinned official release. Updating it means replacing every platform's
+/// archive size, URL and hashes below; `scripts/runtime-tree-digest.py`
+/// computes them from each published archive.
 pub const RUNTIME_VERSION: &str = "0.34.2";
-/// Published GitHub asset size, observed on 2026-09-22.
-pub const ARCHIVE_BYTES: u64 = 1_460_928_014;
+/// Published GitHub asset size for this platform's archive.
+pub const ARCHIVE_BYTES: u64 = pinned::ARCHIVE_BYTES;
 /// Minimum free space for a fresh managed runtime install, including extraction reserve.
 pub const MIN_INSTALL_FREE_BYTES: u64 = ARCHIVE_BYTES * 4;
-#[cfg(all(windows, target_arch = "x86_64"))]
-const ARCHIVE_SHA256: &str = "8f3fd071a2a2f9497b562f43502c77c2b701a99d1ee5dfda28da8c786373063b";
-// Independently extracted ollama.exe from the archive with the pinned SHA-256.
-#[cfg(all(windows, target_arch = "x86_64"))]
-const EXECUTABLE_SHA256: &str = "ad41dcf55c5de96d4a0bff7c559a17285c3aa064a6f12d23db3ebf59ad8e4125";
-// Path-and-content digest of the 82 files independently extracted from the
-// pinned ZIP. This covers the executable, CPU/CUDA/Vulkan DLLs and load tree.
-#[cfg(all(windows, target_arch = "x86_64"))]
-const TREE_SHA256: &str = "3367e5c4874bcdced42c85cfac1aa0f8aa68e7b538e7c7d6ea17495323c74397";
-#[cfg(all(windows, target_arch = "x86_64"))]
-const ARCHIVE_URL: &str =
-    "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-windows-amd64.zip";
+#[cfg(managed_runtime)]
+use pinned::{ARCHIVE_SHA256, ARCHIVE_URL, EXECUTABLE, EXECUTABLE_SHA256, TREE_SHA256};
 
+// Each block: the official archive, its published SHA-256, the SHA-256 of the
+// executable inside it, and the path-and-content digest of every file (and,
+// on Unix, every symlink) it extracts to.
 #[cfg(all(windows, target_arch = "x86_64"))]
+mod pinned {
+    pub const ARCHIVE_BYTES: u64 = 1_460_928_014;
+    pub const ARCHIVE_SHA256: &str =
+        "8f3fd071a2a2f9497b562f43502c77c2b701a99d1ee5dfda28da8c786373063b";
+    pub const EXECUTABLE: &str = "ollama.exe";
+    pub const EXECUTABLE_SHA256: &str =
+        "ad41dcf55c5de96d4a0bff7c559a17285c3aa064a6f12d23db3ebf59ad8e4125";
+    // 82 files: the executable, CPU/CUDA/Vulkan DLLs and load tree.
+    pub const TREE_SHA256: &str =
+        "3367e5c4874bcdced42c85cfac1aa0f8aa68e7b538e7c7d6ea17495323c74397";
+    pub const ARCHIVE_URL: &str =
+        "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-windows-amd64.zip";
+    pub const ARCHIVE_EXTENSION: &str = "zip";
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod pinned {
+    pub const ARCHIVE_BYTES: u64 = 1_427_542_079;
+    pub const ARCHIVE_SHA256: &str =
+        "e155b83589986d2c581fdbf1381ea3ebdb16549883679cd5a0627f7cdc05b12b";
+    pub const EXECUTABLE: &str = "bin/ollama";
+    pub const EXECUTABLE_SHA256: &str =
+        "ca9f4d3b7538196fab8bad3842bff3aa1352a80bfaaf95391ef7dda28880928b";
+    // 62 entries (45 files, 17 symlinks): bin/ollama and lib/ollama CPU and
+    // CUDA 12/13 backends with their versioned library symlinks.
+    pub const TREE_SHA256: &str =
+        "fc988354885995f387046226de304e4f475e58905b176c3d6be25dd5cfe0690f";
+    pub const ARCHIVE_URL: &str =
+        "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-linux-amd64.tar.zst";
+    pub const ARCHIVE_EXTENSION: &str = "tar.zst";
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod pinned {
+    pub const ARCHIVE_BYTES: u64 = 1_549_897_885;
+    pub const ARCHIVE_SHA256: &str =
+        "8edcfe99eb7546d9422cfa8297d341dcd50e090e192ce1a8092a6ab6d182867b";
+    pub const EXECUTABLE: &str = "bin/ollama";
+    pub const EXECUTABLE_SHA256: &str = "PENDING_LINUX_ARM64_EXECUTABLE";
+    pub const TREE_SHA256: &str = "PENDING_LINUX_ARM64_TREE";
+    pub const ARCHIVE_URL: &str =
+        "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-linux-arm64.tar.zst";
+    pub const ARCHIVE_EXTENSION: &str = "tar.zst";
+}
+
+// One universal (arm64 + x86_64) archive serves both Mac architectures.
+#[cfg(target_os = "macos")]
+mod pinned {
+    pub const ARCHIVE_BYTES: u64 = 158_526_160;
+    pub const ARCHIVE_SHA256: &str =
+        "f33b2a5aa59bc6c961ed3ec23ba9dc646ca6d99ced8d2a0d46eb3a522167dd3f";
+    pub const EXECUTABLE: &str = "ollama";
+    pub const EXECUTABLE_SHA256: &str =
+        "e57700f3d7cf3a222e0b899bf4f30e171359e18d2c8a9771f3b77420798b00f3";
+    // 57 entries: the executable, Metal/MLX dylibs, CPU backends and symlinks.
+    pub const TREE_SHA256: &str =
+        "d959b5ff57f7bb3a3185c9d72670f1c08ffa8c1acc566a4bfc63877f224ef3dc";
+    pub const ARCHIVE_URL: &str =
+        "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-darwin.tgz";
+    pub const ARCHIVE_EXTENSION: &str = "tgz";
+}
+
+// Size used only to report setup requirements where no managed runtime exists.
+#[cfg(not(managed_runtime))]
+mod pinned {
+    pub const ARCHIVE_BYTES: u64 = 1_460_928_014;
+}
+
+#[cfg(managed_runtime)]
 static ARCHIVE_HASHES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 #[derive(Debug)]
 struct ArchiveHashPermit;
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 impl ArchiveHashPermit {
     fn new() -> Self {
         ARCHIVE_HASHES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -40,22 +104,22 @@ impl ArchiveHashPermit {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 impl Drop for ArchiveHashPermit {
     fn drop(&mut self) {
         ARCHIVE_HASHES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 #[derive(Debug)]
 struct LockedArchive {
-    // Drop the Windows file handle before the permit allows stage cleanup.
+    // Drop the file handle before the permit allows stage cleanup.
     file: std::fs::File,
     _permit: ArchiveHashPermit,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn wait_for_archive_hashes() -> Result<()> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -73,14 +137,20 @@ async fn wait_for_archive_hashes() -> Result<()> {
     })
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// A Windows reparse point (junction, symlink, mount point) or a Unix symlink.
+#[cfg(all(managed_runtime, windows))]
 fn is_reparse_point(path: &Path) -> Result<bool> {
     use std::os::windows::fs::MetadataExt;
     const REPARSE_POINT: u32 = 0x400;
     Ok(std::fs::symlink_metadata(path)?.file_attributes() & REPARSE_POINT != 0)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(managed_runtime, unix))]
+fn is_reparse_point(path: &Path) -> Result<bool> {
+    Ok(std::fs::symlink_metadata(path)?.file_type().is_symlink())
+}
+
+#[cfg(managed_runtime)]
 fn fresh_runtime_root(root: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
@@ -92,15 +162,15 @@ fn fresh_runtime_root(root: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn require_install_reserve(free: u64, credited_download_bytes: u64) -> Result<()> {
     if free.saturating_add(credited_download_bytes) < MIN_INSTALL_FREE_BYTES {
-        return Err(LocalError::Invalid("Managed runtime setup requires about 6 GB of free disk space, less bytes already allocated to its resumable archive, including extraction reserve.".into()));
+        return Err(LocalError::Invalid(format!("Managed runtime setup requires about {} GB of free disk space, less bytes already allocated to its resumable archive, including extraction reserve.", MIN_INSTALL_FREE_BYTES.div_ceil(1_000_000_000))));
     }
     Ok(())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(managed_runtime, windows))]
 fn reject_nonlocal_runtime_root(path: &Path) -> Result<()> {
     use std::path::{Component, Prefix};
     if let Some(Component::Prefix(prefix)) = path.components().next() {
@@ -114,7 +184,24 @@ fn reject_nonlocal_runtime_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+// Network file systems are refused by `disk::require_local_drive_directory`.
+#[cfg(all(managed_runtime, unix))]
+fn reject_nonlocal_runtime_root(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(LocalError::Invalid(
+            "Managed runtime setup requires an absolute local path".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(managed_runtime, unix))]
+fn local_runtime_root(canonical: &Path) -> Result<std::path::PathBuf> {
+    reject_nonlocal_runtime_root(canonical)?;
+    Ok(canonical.to_path_buf())
+}
+
+#[cfg(all(managed_runtime, windows))]
 fn local_runtime_root(canonical: &Path) -> Result<std::path::PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -147,7 +234,7 @@ fn local_runtime_root(canonical: &Path) -> Result<std::path::PathBuf> {
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 pub(crate) fn checked_direct_child(root: &Path, child: &Path) -> Result<()> {
     if is_reparse_point(child)? {
         return Err(LocalError::Invalid(format!(
@@ -166,28 +253,64 @@ pub(crate) fn checked_direct_child(root: &Path, child: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// Refuse links in a staged tree. Unix runtime archives ship relative
+/// library symlinks (`libggml.dylib -> libggml.0.dylib`); those are allowed
+/// when they resolve inside the tree. Anything else is left for inspection.
+#[cfg(managed_runtime)]
 fn reject_tree_reparse_points(path: &Path) -> Result<()> {
-    if is_reparse_point(path)? {
-        return Err(LocalError::Invalid(format!(
-            "Managed runtime staging contains a reparse point; inspect it before retrying: {}",
-            path.display()
-        )));
-    }
-    if std::fs::symlink_metadata(path)?.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            reject_tree_reparse_points(&entry?.path())?;
+    fn walk(root: &Path, path: &Path) -> Result<()> {
+        if is_reparse_point(path)? {
+            if cfg!(unix) && path != root && link_stays_inside(root, path)? {
+                return Ok(());
+            }
+            return Err(LocalError::Invalid(format!(
+                "Managed runtime staging contains a link that leaves it; inspect it before retrying: {}",
+                path.display()
+            )));
         }
+        if std::fs::symlink_metadata(path)?.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                walk(root, &entry?.path())?;
+            }
+        }
+        Ok(())
     }
-    Ok(())
+    walk(path, path)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// Whether a symlink's relative target stays under `root` lexically.
+#[cfg(managed_runtime)]
+fn link_stays_inside(root: &Path, link: &Path) -> Result<bool> {
+    use std::path::Component;
+    let target = std::fs::read_link(link)?;
+    let Some(parent) = link.parent() else {
+        return Ok(false);
+    };
+    let Ok(relative_parent) = parent.strip_prefix(root) else {
+        return Ok(false);
+    };
+    let mut depth: Vec<Component> = relative_parent.components().collect();
+    for part in target.components() {
+        match part {
+            Component::Normal(_) => depth.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth.pop().is_none() {
+                    return Ok(false);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return Ok(false),
+        }
+    }
+    Ok(!depth.is_empty())
+}
+
+#[cfg(managed_runtime)]
 fn stage_marker(archive_hash: &str) -> String {
     format!("phonton-managed-ollama-stage-v1:{archive_hash}\n")
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn cleanup_owned_stages(root: &Path, final_name: &str, archive_hash: &str) -> Result<()> {
     let prefix = format!("{final_name}.staging-");
     for entry in std::fs::read_dir(root)? {
@@ -219,7 +342,7 @@ fn cleanup_owned_stages(root: &Path, final_name: &str, archive_hash: &str) -> Re
     Ok(())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn create_owned_stage(
     root: &Path,
     final_name: &str,
@@ -255,7 +378,7 @@ fn create_owned_stage(
     ))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 #[derive(Debug)]
 struct OwnedDownloadStage {
     path: std::path::PathBuf,
@@ -266,7 +389,21 @@ struct OwnedDownloadStage {
     allocated: u64,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(managed_runtime, unix))]
+fn allocated_file_bytes(file: &std::fs::File) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(LocalError::Invalid(
+            "Managed runtime partial archive is not a unique regular file; Phonton preserved it for inspection".into(),
+        ));
+    }
+    // st_blocks counts 512-byte units actually allocated, so a sparse file
+    // cannot claim credit for bytes it never wrote.
+    Ok(metadata.blocks().saturating_mul(512).min(metadata.len()))
+}
+
+#[cfg(all(managed_runtime, windows))]
 fn allocated_file_bytes(file: &std::fs::File) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -298,7 +435,25 @@ fn allocated_file_bytes(file: &std::fs::File) -> Result<u64> {
     Ok((info.AllocationSize as u64).min(info.EndOfFile as u64))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(managed_runtime, unix))]
+fn open_owned_partial(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW opens the leaf itself, never a link's target.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(LocalError::Invalid(format!(
+            "Managed runtime partial archive is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(all(managed_runtime, windows))]
 fn open_owned_partial(path: &Path) -> Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -319,7 +474,7 @@ fn open_owned_partial(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn find_owned_download_stage(
     root: &Path,
     archive_name: &str,
@@ -396,26 +551,38 @@ fn find_owned_download_stage(
     Ok(selected)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn create_download_stage(
     root: &Path,
     archive_name: &str,
     archive_hash: &str,
 ) -> Result<OwnedDownloadStage> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const REPARSE_POINT: u32 = 0x400;
     let path = create_owned_stage(root, archive_name, archive_hash)?;
     checked_direct_child(root, &path)?;
     let partial = path.join("download.partial");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(0)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .create_new(true)
-        .open(&partial)?;
-    if !file.metadata()?.is_file() || file.metadata()?.file_attributes() & REPARSE_POINT != 0 {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .custom_flags(OPEN_REPARSE_POINT)
+            .create_new(true)
+            .open(&partial)?
+    };
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .create_new(true)
+            .open(&partial)?
+    };
+    if !file.metadata()?.is_file() || is_reparse_point(&partial)? {
         return Err(LocalError::Invalid(
             "Managed runtime partial archive creation did not yield a regular file".into(),
         ));
@@ -429,7 +596,35 @@ fn create_download_stage(
     })
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(managed_runtime, unix))]
+fn move_path_no_replace(from: &Path, to: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| LocalError::Invalid("Managed runtime path contains a NUL byte".into()))
+    };
+    let (from, to) = (c(from)?, c(to)?);
+    // An atomic rename that fails if the destination exists, so an
+    // unexpectedly occupied path is never replaced.
+    #[cfg(target_os = "linux")]
+    let status = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let status = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(all(managed_runtime, windows))]
 fn move_path_no_replace(from: &Path, to: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileW;
@@ -443,24 +638,35 @@ fn move_path_no_replace(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn hash_locked_archive(path: &Path) -> Result<(LockedArchive, String)> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const REPARSE_POINT: u32 = 0x400;
-    // Keep this handle alive through Expand-Archive. Other readers may open it,
-    // but writers and renamers cannot replace the bytes after verification.
-    // Opening the leaf itself makes a link visible instead of following it to
-    // a target whose pathname could change while Expand-Archive reopens ours.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0x1)
-        .custom_flags(OPEN_REPARSE_POINT)
-        .open(path)?;
+    // Keep this handle alive through extraction. On Windows other readers may
+    // open it, but writers and renamers cannot replace the bytes after
+    // verification; Unix extraction reads this same handle, and the pinned
+    // tree digest checks what it produced. Opening the leaf itself makes a
+    // link visible instead of following it to a target that could change.
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1)
+            .custom_flags(OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.file_attributes() & REPARSE_POINT != 0 {
+    if !metadata.is_file() || is_reparse_point(path)? {
         return Err(LocalError::Invalid(format!(
             "Managed runtime archive is not a regular file; inspect it before setup: {}",
             path.display()
@@ -487,7 +693,7 @@ async fn hash_locked_archive(path: &Path) -> Result<(LockedArchive, String)> {
     .map_err(|error| LocalError::Invalid(format!("Runtime archive hash worker failed: {error}")))?
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn verified_archive_for_credit(
     path: &Path,
     expected_bytes: u64,
@@ -504,7 +710,7 @@ async fn verified_archive_for_credit(
     Ok((locked, allocated.min(expected_bytes)))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;
@@ -521,19 +727,36 @@ async fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn tree_sha256(root: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        paths: &mut Vec<(String, std::path::PathBuf)>,
-    ) -> Result<()> {
+    /// A regular file is hashed by content; a Unix symlink by its target.
+    enum Entry {
+        File(std::path::PathBuf),
+        Link(String),
+    }
+    fn relative(root: &Path, path: &Path) -> Result<String> {
+        Ok(path
+            .strip_prefix(root)
+            .map_err(|_| LocalError::Invalid("Runtime file resolved outside staging root".into()))?
+            .to_str()
+            .ok_or_else(|| LocalError::Invalid("Runtime archive contains a non-UTF-8 path".into()))?
+            .replace('\\', "/"))
+    }
+    fn visit(root: &Path, directory: &Path, paths: &mut Vec<(String, Entry)>) -> Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let path = entry?.path();
             if is_reparse_point(&path)? {
+                if cfg!(unix) && link_stays_inside(root, &path)? {
+                    let target = std::fs::read_link(&path)?;
+                    let target = target.to_str().ok_or_else(|| {
+                        LocalError::Invalid("Runtime archive contains a non-UTF-8 link".into())
+                    })?;
+                    paths.push((relative(root, &path)?, Entry::Link(target.to_owned())));
+                    continue;
+                }
                 return Err(LocalError::Invalid(format!(
-                    "Managed runtime tree contains a reparse point: {}",
+                    "Managed runtime tree contains a link that leaves it: {}",
                     path.display()
                 )));
             }
@@ -549,17 +772,7 @@ async fn tree_sha256(root: &Path) -> Result<String> {
                 {
                     continue;
                 }
-                let relative = path
-                    .strip_prefix(root)
-                    .map_err(|_| {
-                        LocalError::Invalid("Runtime file resolved outside staging root".into())
-                    })?
-                    .to_str()
-                    .ok_or_else(|| {
-                        LocalError::Invalid("Runtime archive contains a non-UTF-8 path".into())
-                    })?
-                    .replace('\\', "/");
-                paths.push((relative, path));
+                paths.push((relative(root, &path)?, Entry::File(path)));
             } else {
                 return Err(LocalError::Invalid(format!(
                     "Unexpected runtime tree entry: {}",
@@ -573,16 +786,19 @@ async fn tree_sha256(root: &Path) -> Result<String> {
     visit(root, root, &mut paths)?;
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = Sha256::new();
-    for (relative, path) in paths {
+    for (relative, entry) in paths {
         hasher.update(relative.as_bytes());
         hasher.update([0]);
-        hasher.update(sha256_file(&path).await?.as_bytes());
+        match entry {
+            Entry::File(path) => hasher.update(sha256_file(&path).await?.as_bytes()),
+            Entry::Link(target) => hasher.update(format!("link:{target}").as_bytes()),
+        }
         hasher.update([10]);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn installed_executable(
     root: &Path,
     directory: &Path,
@@ -596,7 +812,7 @@ async fn installed_executable(
         Ok(_) => {}
     }
     checked_direct_child(root, directory)?;
-    let executable = directory.join("ollama.exe");
+    let executable = directory.join(EXECUTABLE);
     let receipt = directory.join(".archive-sha256");
     if !executable.is_file() || !receipt.is_file() {
         return Err(LocalError::Invalid(format!(
@@ -622,7 +838,7 @@ async fn installed_executable(
     Ok(Some(executable))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 async fn publish_verified_archive(
     root: &Path,
     archive: &Path,
@@ -632,7 +848,6 @@ async fn publish_verified_archive(
     tree_hash: &str,
 ) -> Result<std::path::PathBuf> {
     use std::io::Write;
-    use std::time::Duration;
     let final_name = directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -640,27 +855,16 @@ async fn publish_verified_archive(
     cleanup_owned_stages(root, final_name, archive_hash)?;
     let stage = create_owned_stage(root, final_name, archive_hash)?;
     checked_direct_child(root, &stage)?;
-    let mut command = tokio::process::Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $env:PHONTON_RUNTIME_ARCHIVE -DestinationPath $env:PHONTON_RUNTIME_DEST -ErrorAction Stop"])
-        .env("PHONTON_RUNTIME_ARCHIVE", archive).env("PHONTON_RUNTIME_DEST", &stage)
-        .creation_flags(0x08000000).kill_on_drop(true);
-    let result = tokio::time::timeout(Duration::from_secs(600), command.output())
-        .await
-        .map_err(|_| {
-            LocalError::Invalid(
-                "Runtime extraction timed out; retry setup to recover the owned staging directory"
-                    .into(),
-            )
-        })??;
-    let staged_executable = stage.join("ollama.exe");
-    if !result.status.success()
+    let extracted = extract_archive(archive, &stage).await;
+    let staged_executable = stage.join(EXECUTABLE);
+    if extracted.is_err()
         || !staged_executable.is_file()
         || is_reparse_point(&staged_executable)?
         || sha256_file(&staged_executable).await? != executable_hash
     {
         return Err(LocalError::Invalid(format!(
             "Runtime extraction or executable hash verification failed: {}. Retry setup to recover the owned staging directory.",
-            String::from_utf8_lossy(&result.stderr)
+            extracted.err().map_or_else(String::new, |error| error.to_string())
         )));
     }
     if std::fs::read_to_string(stage.join(".phonton-stage"))? != stage_marker(archive_hash) {
@@ -685,10 +889,108 @@ async fn publish_verified_archive(
     }
     checked_direct_child(root, &stage)?;
     move_path_no_replace(&stage, directory)?;
-    Ok(directory.join("ollama.exe"))
+    Ok(directory.join(EXECUTABLE))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(managed_runtime, windows))]
+async fn extract_archive(archive: &Path, stage: &Path) -> Result<()> {
+    use std::time::Duration;
+    let mut command = tokio::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", "Expand-Archive -LiteralPath $env:PHONTON_RUNTIME_ARCHIVE -DestinationPath $env:PHONTON_RUNTIME_DEST -ErrorAction Stop"])
+        .env("PHONTON_RUNTIME_ARCHIVE", archive).env("PHONTON_RUNTIME_DEST", stage)
+        .creation_flags(0x08000000).kill_on_drop(true);
+    let result = tokio::time::timeout(Duration::from_secs(600), command.output())
+        .await
+        .map_err(|_| {
+            LocalError::Invalid(
+                "Runtime extraction timed out; retry setup to recover the owned staging directory"
+                    .into(),
+            )
+        })??;
+    if !result.status.success() {
+        return Err(LocalError::Invalid(
+            String::from_utf8_lossy(&result.stderr).into_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Unpack the tarball in-process: no `zstd` or `tar` binary is needed, entry
+/// paths cannot leave the stage, and the pinned tree digest checks the result.
+#[cfg(all(managed_runtime, unix))]
+async fn extract_archive(archive: &Path, stage: &Path) -> Result<()> {
+    let archive = archive.to_path_buf();
+    let stage = stage.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&archive)?;
+        let reader = std::io::BufReader::new(file);
+        #[cfg(target_os = "linux")]
+        let decoded = ZstdFrames::new(reader)?;
+        #[cfg(target_os = "macos")]
+        let decoded = flate2::read::GzDecoder::new(reader);
+        let mut tarball = tar::Archive::new(decoded);
+        tarball.set_preserve_permissions(true);
+        // The macOS archive signs its Metal libraries through extended attributes.
+        tarball.set_unpack_xattrs(true);
+        tarball.set_overwrite(false);
+        tarball.unpack(&stage)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| LocalError::Invalid(format!("Runtime extraction worker failed: {error}")))?
+}
+
+/// Decodes every zstd frame in a stream; one `StreamingDecoder` stops after
+/// the first.
+#[cfg(all(managed_runtime, target_os = "linux"))]
+struct ZstdFrames<R: std::io::BufRead> {
+    frame: Option<ruzstd::decoding::StreamingDecoder<R, ruzstd::decoding::FrameDecoder>>,
+}
+
+#[cfg(all(managed_runtime, target_os = "linux"))]
+impl<R: std::io::BufRead> ZstdFrames<R> {
+    fn new(reader: R) -> Result<Self> {
+        Ok(Self {
+            frame: Some(
+                ruzstd::decoding::StreamingDecoder::new(reader).map_err(|error| {
+                    LocalError::Invalid(format!("Runtime archive is not valid zstd: {error}"))
+                })?,
+            ),
+        })
+    }
+}
+
+#[cfg(all(managed_runtime, target_os = "linux"))]
+impl<R: std::io::BufRead> std::io::Read for ZstdFrames<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let Some(frame) = self.frame.as_mut() else {
+                return Ok(0);
+            };
+            let count = frame.read(buffer)?;
+            if count > 0 || buffer.is_empty() {
+                return Ok(count);
+            }
+            let Some(finished) = self.frame.take() else {
+                return Ok(0);
+            };
+            let mut rest = finished.into_inner();
+            if rest.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            self.frame = Some(
+                ruzstd::decoding::StreamingDecoder::new(rest)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            );
+        }
+    }
+}
+
+#[cfg(managed_runtime)]
 async fn download_runtime_archive(
     client: &reqwest::Client,
     url: &str,
@@ -862,26 +1164,26 @@ async fn download_runtime_archive(
     Ok(())
 }
 
-/// Install a hash-checked official portable Windows x64 runtime into a managed
-/// directory. A runtime-root lease serializes installations; the caller owns
-/// cancellation.
+/// Install a hash-checked official portable runtime (Windows x64, Linux
+/// x64/arm64, macOS) into a managed directory. A runtime-root lease
+/// serializes installations; the caller owns cancellation.
 pub async fn install(
     root: &Path,
     progress: impl FnMut(DownloadProgress),
 ) -> Result<std::path::PathBuf> {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     {
-        install_windows(root, progress).await
+        install_managed(root, progress).await
     }
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    #[cfg(not(managed_runtime))]
     {
         let _ = (root, progress);
-        Err(LocalError::Invalid("Managed runtime installation supports Windows x64. Install Ollama from https://ollama.com/download on this platform, then connect its loopback endpoint.".into()))
+        Err(LocalError::Invalid("Managed runtime installation supports Windows x64, Linux x64/arm64 and macOS. Install Ollama from https://ollama.com/download on this platform, then connect its loopback endpoint.".into()))
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-async fn install_windows(
+#[cfg(managed_runtime)]
+async fn install_managed(
     root: &Path,
     mut progress: impl FnMut(DownloadProgress),
 ) -> Result<std::path::PathBuf> {
@@ -926,7 +1228,8 @@ async fn install_windows(
         return Ok(executable);
     }
     cleanup_owned_stages(&root, &format!("ollama-{RUNTIME_VERSION}"), ARCHIVE_SHA256)?;
-    let archive = root.join(format!("ollama-{RUNTIME_VERSION}.zip"));
+    let archive_name = format!("ollama-{RUNTIME_VERSION}.{}", pinned::ARCHIVE_EXTENSION);
+    let archive = root.join(&archive_name);
     let archive_present = match std::fs::symlink_metadata(&archive) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
@@ -950,12 +1253,7 @@ async fn install_windows(
     let download_stage = if archive_present {
         None
     } else {
-        find_owned_download_stage(
-            &root,
-            &format!("ollama-{RUNTIME_VERSION}.zip"),
-            ARCHIVE_SHA256,
-            ARCHIVE_BYTES,
-        )?
+        find_owned_download_stage(&root, &archive_name, ARCHIVE_SHA256, ARCHIVE_BYTES)?
     };
     // An existing verified runtime can restart with low disk. The reserve is
     // needed only when downloading or extracting a fresh installation.
@@ -1135,10 +1433,112 @@ pub(crate) fn loopback_listener_owner(port: u16) -> Result<Option<u32>> {
     ))
 }
 
-#[cfg(not(windows))]
+/// The process that owns the IPv4 `127.0.0.1:port` listener, from the
+/// kernel's socket table and each visible process's descriptors. Another
+/// user's process is not visible here; startup then waits and times out.
+#[cfg(target_os = "linux")]
+pub(crate) fn loopback_listener_owner(port: u16) -> Result<Option<u32>> {
+    let table = std::fs::read_to_string("/proc/net/tcp")?;
+    let inodes = loopback_listener_inodes(&table, port);
+    if inodes.is_empty() {
+        return Ok(None);
+    }
+    let mut owner = None;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue; // Exited, or another user's process.
+        };
+        for descriptor in descriptors.flatten() {
+            let Ok(target) = std::fs::read_link(descriptor.path()) else {
+                continue;
+            };
+            let Some(inode) = target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:["))
+                .and_then(|t| t.strip_suffix(']'))
+                .and_then(|t| t.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if inodes.contains(&inode) {
+                if owner.is_some_and(|previous| previous != pid) {
+                    return Err(LocalError::Invalid(
+                        "Multiple processes own the managed runtime listener".into(),
+                    ));
+                }
+                owner = Some(pid);
+            }
+        }
+    }
+    Ok(owner)
+}
+
+/// Socket inodes listening on exactly 127.0.0.1:port in `/proc/net/tcp`
+/// text. Addresses are host-order hex (little-endian on supported targets),
+/// ports big-endian hex; state 0A is LISTEN.
+#[cfg(any(test, target_os = "linux"))]
+fn loopback_listener_inodes(table: &str, port: u16) -> Vec<u64> {
+    let local = format!("0100007F:{port:04X}");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields.get(1) == Some(&local.as_str()) && fields.get(3) == Some(&"0A"))
+                .then(|| fields.get(9)?.parse().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// The process that owns the `127.0.0.1:port` listener, as reported by the
+/// system `lsof`. Another user's process is not visible here.
+#[cfg(target_os = "macos")]
+pub(crate) fn loopback_listener_owner(port: u16) -> Result<Option<u32>> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args([
+            "-nP",
+            "-a",
+            &format!("-iTCP@127.0.0.1:{port}"),
+            "-sTCP:LISTEN",
+            "-Fp",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    // lsof exits 1 with no output when nothing matches.
+    let mut owner = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(pid) = line.strip_prefix('p').and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if owner.is_some_and(|previous| previous != pid) {
+            return Err(LocalError::Invalid(
+                "Multiple processes own the managed runtime listener".into(),
+            ));
+        }
+        owner = Some(pid);
+    }
+    if owner.is_none() && !output.status.success() && !output.stderr.is_empty() {
+        return Err(LocalError::Invalid(format!(
+            "Could not inspect the managed runtime listener: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(owner)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub(crate) fn loopback_listener_owner(_port: u16) -> Result<Option<u32>> {
     Err(LocalError::Invalid(
-        "Managed runtime listener verification currently supports Windows".into(),
+        "Managed runtime listener verification is not supported on this platform".into(),
     ))
 }
 
@@ -1157,7 +1557,7 @@ fn listener_unavailable(port: u16) -> Result<bool> {
     Ok(std::net::TcpListener::bind(("127.0.0.1", port)).is_err())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn managed_start_paths(root: &Path) -> Result<std::fs::File> {
     let models = root.join("models");
     std::fs::create_dir_all(&models)?;
@@ -1190,14 +1590,14 @@ fn managed_start_paths(root: &Path) -> Result<std::fs::File> {
     }
 }
 
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[cfg(not(managed_runtime))]
 fn managed_start_paths(_root: &Path) -> Result<std::fs::File> {
     Err(LocalError::Invalid(
-        "Managed runtime startup currently supports Windows x64".into(),
+        "Managed runtime startup is not supported on this platform".into(),
     ))
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn canonical_start_root(root: &Path) -> Result<std::path::PathBuf> {
     reject_nonlocal_runtime_root(root)?;
     let root = local_runtime_root(&std::fs::canonicalize(root)?)?;
@@ -1205,10 +1605,10 @@ fn canonical_start_root(root: &Path) -> Result<std::path::PathBuf> {
     Ok(root)
 }
 
-#[cfg(not(all(windows, target_arch = "x86_64")))]
+#[cfg(not(managed_runtime))]
 fn canonical_start_root(_root: &Path) -> Result<std::path::PathBuf> {
     Err(LocalError::Invalid(
-        "Managed runtime startup currently supports Windows x64".into(),
+        "Managed runtime startup is not supported on this platform".into(),
     ))
 }
 
@@ -1234,6 +1634,10 @@ pub async fn start(executable: &Path, root: &Path) -> Result<String> {
         .stderr(log);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
+    // Its own process group, so Ctrl+C in the terminal that ran setup does
+    // not stop the runtime it leaves running.
+    #[cfg(unix)]
+    command.process_group(0);
     start_command(command, &root, 11434).await
 }
 
@@ -1317,7 +1721,7 @@ async fn start_command(
                             "Managed runtime listener changed during readiness; managed startup was refused".into(),
                         ));
                     }
-                    #[cfg(all(windows, target_arch = "x86_64"))]
+                    #[cfg(managed_runtime)]
                     crate::managed_store::record_launch(&root, port, child_pid, &version)?;
                     startup.ready = true;
                     return Ok(version);
@@ -1332,6 +1736,196 @@ async fn start_command(
     Err(LocalError::Invalid(
         "Managed runtime did not become ready; inspect runtime.log".into(),
     ))
+}
+
+#[cfg(test)]
+mod listener_table_tests {
+    use super::loopback_listener_inodes;
+
+    #[test]
+    fn finds_only_listeners_bound_to_exact_loopback_on_the_port() {
+        let table = concat!(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n",
+            "   0: 0100007F:2CAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0 100 0 0 10 0\n",
+            "   1: 00000000:2CAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 5151 1\n",
+            "   2: 0100007F:2CAA 0100007F:D431 01 00000000:00000000 00:00000000 00000000  1000        0 6161 1\n",
+            "   3: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 7171 1\n",
+        );
+        assert_eq!(loopback_listener_inodes(table, 11434), vec![4242]);
+        assert!(loopback_listener_inodes(table, 1).is_empty());
+    }
+}
+
+#[cfg(all(test, managed_runtime, unix))]
+mod unix_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn no_replace_move_refuses_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let from = temp.path().join("stage");
+        let to = temp.path().join("final");
+        std::fs::create_dir(&from).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        assert!(move_path_no_replace(&from, &to).is_err());
+        assert!(from.is_dir() && to.is_dir());
+        std::fs::remove_dir(&to).unwrap();
+        move_path_no_replace(&from, &to).unwrap();
+        assert!(!from.exists() && to.is_dir());
+    }
+
+    #[test]
+    fn sparse_partial_downloads_earn_no_disk_credit() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(temp.path().join("download.partial")).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        assert!(allocated_file_bytes(&file).unwrap() < 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn locked_archive_refuses_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.tar.zst");
+        let link = temp.path().join("archive.tar.zst");
+        std::fs::write(&target, b"source bytes").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(hash_locked_archive(&link).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"source bytes");
+    }
+
+    #[tokio::test]
+    async fn tree_digest_hashes_internal_links_and_refuses_escaping_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tree");
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/libx.so.1"), b"library").unwrap();
+        symlink("libx.so.1", root.join("lib/libx.so")).unwrap();
+        // The rule scripts/runtime-tree-digest.py applies to an archive.
+        let file = format!("{:x}", Sha256::digest(b"library"));
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "lib/libx.so\0link:libx.so.1\nlib/libx.so.1\0{file}\n"
+            ))
+        );
+        assert_eq!(tree_sha256(&root).await.unwrap(), expected);
+        reject_tree_reparse_points(&root).unwrap();
+
+        symlink("../../outside", root.join("lib/escape")).unwrap();
+        assert!(reject_tree_reparse_points(&root).is_err());
+        assert!(tree_sha256(&root).await.is_err());
+        std::fs::remove_file(root.join("lib/escape")).unwrap();
+        symlink("/etc/hosts", root.join("lib/absolute")).unwrap();
+        assert!(reject_tree_reparse_points(&root).is_err());
+    }
+
+    // Two zstd frames holding bin/ollama, a library and two relative links.
+    // Digests from scripts/runtime-tree-digest.py on this fixture.
+    #[cfg(target_os = "linux")]
+    const FIXTURE: &[u8] = include_bytes!("../testdata/runtime-fixture.tar.zst");
+    #[cfg(target_os = "linux")]
+    const FIXTURE_EXECUTABLE: &str =
+        "edcd61b59f35ed22d612c8577ca20de9012fda0bce9ba80f70a411f269809f2b";
+    #[cfg(target_os = "linux")]
+    const FIXTURE_TREE: &str = "27a2c1edc7d523bac7b1647dc06e7a83c53f5034fc92641396956f0e4fbbbc49";
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn publishes_a_verified_tar_zst_once_and_refuses_a_different_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("ollama-fixture.tar.zst");
+        std::fs::write(&archive, FIXTURE).unwrap();
+        let final_dir = temp.path().join("ollama-fixture");
+        let executable = publish_verified_archive(
+            temp.path(),
+            &archive,
+            &final_dir,
+            "fixture",
+            FIXTURE_EXECUTABLE,
+            FIXTURE_TREE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(executable, final_dir.join("bin/ollama"));
+        let mode = std::fs::metadata(&executable).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "executable bit lost: {mode:o}");
+        assert_eq!(
+            std::fs::read_link(final_dir.join("lib/ollama/libfixture.so")).unwrap(),
+            Path::new("libfixture.so.1")
+        );
+        assert!(installed_executable(
+            temp.path(),
+            &final_dir,
+            "fixture",
+            FIXTURE_EXECUTABLE,
+            FIXTURE_TREE
+        )
+        .await
+        .unwrap()
+        .is_some());
+
+        let other = temp.path().join("ollama-other");
+        assert!(publish_verified_archive(
+            temp.path(),
+            &archive,
+            &other,
+            "fixture",
+            FIXTURE_EXECUTABLE,
+            &"0".repeat(64)
+        )
+        .await
+        .is_err());
+        assert!(!other.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn publishes_a_verified_tgz() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("ollama-fixture.tgz");
+        {
+            let file = std::fs::File::create(&archive).unwrap();
+            let gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut builder = tar::Builder::new(gzip);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(8);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "ollama", &b"runtime\n"[..])
+                .unwrap();
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o755);
+            builder
+                .append_link(&mut link, "libx.dylib", "ollama")
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let executable_hash = format!("{:x}", Sha256::digest(b"runtime\n"));
+        let tree = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "libx.dylib\0link:ollama\nollama\0{executable_hash}\n"
+            ))
+        );
+        let final_dir = temp.path().join("ollama-fixture");
+        let executable = publish_verified_archive(
+            temp.path(),
+            &archive,
+            &final_dir,
+            "fixture",
+            &executable_hash,
+            &tree,
+        )
+        .await
+        .unwrap();
+        assert_eq!(executable, final_dir.join("ollama"));
+    }
 }
 
 #[cfg(all(test, windows, target_arch = "x86_64"))]
@@ -2217,7 +2811,7 @@ mod tests {
     async fn runtime_root_lease_blocks_a_second_setup_even_with_a_different_model_state() {
         let temp = tempfile::tempdir().unwrap();
         let held = crate::storage::acquire(&temp.path().join("runtime-install-state")).unwrap();
-        let error = install_windows(temp.path(), |_| {}).await.unwrap_err();
+        let error = install_managed(temp.path(), |_| {}).await.unwrap_err();
         assert!(error.to_string().contains("Another Phonton process"));
         drop(held);
     }
@@ -2241,14 +2835,14 @@ mod tests {
             create_owned_stage(&root, &format!("ollama-{RUNTIME_VERSION}"), ARCHIVE_SHA256)
                 .unwrap();
         std::fs::write(staged.join("partial.dll"), b"interrupted extraction").unwrap();
-        let executable = install_windows(&root, |_| {}).await.unwrap();
+        let executable = install_managed(&root, |_| {}).await.unwrap();
         assert!(!staged.exists());
         assert_eq!(sha256_file(&executable).await.unwrap(), EXECUTABLE_SHA256);
         assert_eq!(
             tree_sha256(executable.parent().unwrap()).await.unwrap(),
             TREE_SHA256
         );
-        assert_eq!(install_windows(&root, |_| {}).await.unwrap(), executable);
+        assert_eq!(install_managed(&root, |_| {}).await.unwrap(), executable);
         assert_eq!(sha256_file(&source).await.unwrap(), ARCHIVE_SHA256);
     }
 }

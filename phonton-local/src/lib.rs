@@ -7,7 +7,7 @@
 pub mod disk;
 pub mod edit;
 pub mod hardware;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 pub mod managed_store;
 pub mod provision;
 pub mod runtime;

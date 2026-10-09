@@ -264,10 +264,17 @@ fn validate_managed_root_location(root: &Path) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        if root.components().count() <= 1 {
+            bail!("Choose a dedicated folder, not the file system root");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = root;
-        bail!("Managed runtime storage selection currently supports Windows only")
+        bail!("Managed runtime storage selection is not supported on this platform")
     }
 }
 
@@ -295,10 +302,26 @@ fn validate_managed_root(root: &Path) -> Result<PathBuf> {
         phonton_local::disk::require_local_drive_directory(&canonical)?;
         Ok(canonical)
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        // symlink_metadata reports a linked folder as a link, not a directory.
+        if !std::fs::symlink_metadata(root)?.is_dir() {
+            bail!(
+                "Managed storage must be an ordinary local directory, not a file or linked folder"
+            );
+        }
+        let canonical = std::fs::canonicalize(root)?;
+        if canonical.components().count() <= 1 {
+            bail!("Choose a dedicated folder, not the file system root");
+        }
+        #[cfg(managed_runtime)]
+        phonton_local::disk::require_local_drive_directory(&canonical)?;
+        Ok(canonical)
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = root;
-        bail!("Managed runtime storage selection currently supports Windows only")
+        bail!("Managed runtime storage selection is not supported on this platform")
     }
 }
 
@@ -311,7 +334,7 @@ fn verify_managed_root_identity(root: &Path, settings: &LocalSettings) -> Result
             "Chosen managed folder has no saved identity. Re-select the empty folder before setup"
         )
     })?;
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     {
         let actual = phonton_local::disk::directory_identity(root)?;
         if actual != expected {
@@ -319,10 +342,10 @@ fn verify_managed_root_identity(root: &Path, settings: &LocalSettings) -> Result
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = (root, expected);
-        bail!("Managed runtime storage identity is supported on Windows only");
+        bail!("Managed runtime storage identity is not supported on this platform");
     }
 }
 
@@ -411,7 +434,7 @@ fn storage_status(path: &Path, settings: &LocalSettings) -> Result<Value> {
         && root.exists()
         && (validate_managed_root(&root).map_or(true, |canonical| canonical != root)
             || verify_managed_root_identity(&root, settings).is_err());
-    let changeable = cfg!(all(windows, target_arch = "x86_64"))
+    let changeable = cfg!(managed_runtime)
         && !isolated
         && !settings.managed_root_used
         && !settings.managed_runtime_installed
@@ -425,8 +448,8 @@ fn storage_status(path: &Path, settings: &LocalSettings) -> Result<Value> {
     };
     let reason = if isolated {
         Some("PHONTON_LOCAL_STATE isolates this process; its runtime stays beside that state file.")
-    } else if !cfg!(all(windows, target_arch = "x86_64")) {
-        Some("Managed runtime setup currently supports Windows x64.")
+    } else if !cfg!(managed_runtime) {
+        Some("Managed runtime setup supports Windows x64, Linux x64/arm64 and macOS.")
     } else if missing && (settings.managed_root_used || settings.managed_runtime_installed) {
         Some("This previously used managed folder is unavailable. Reconnect it before setup; Phonton will not abandon its files.")
     } else if missing {
@@ -744,7 +767,7 @@ fn set_managed_storage_guarded(
     set_managed_storage_at(path, requested, isolated_state)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn previous_managed_runtime(root: &Path, installed: bool) -> bool {
     if installed {
         return true;
@@ -763,7 +786,7 @@ fn model_store_status(root: &Path, endpoint: &str, managed_runtime_installed: bo
     if endpoint != MANAGED_MODEL_ENDPOINT {
         return json!({"status":"unverified", "goal_run_blocked":false, "reason":"This explicitly configured loopback endpoint is external to Phonton's managed runtime; its model-store path and free space are unknown."});
     }
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     {
         match phonton_local::managed_store::bind(root, endpoint) {
             Ok(Some(binding)) => match binding.available_bytes() {
@@ -785,14 +808,14 @@ fn model_store_status(root: &Path, endpoint: &str, managed_runtime_installed: bo
             }
         }
     }
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    #[cfg(not(managed_runtime))]
     {
         let _ = (root, endpoint, managed_runtime_installed);
         json!({"status":"unverified", "goal_run_blocked":false, "reason":"Managed model-store verification is not implemented on this platform."})
     }
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn require_setup_recovery_allowed(root: &Path, managed_runtime_installed: bool) -> Result<()> {
     let store = model_store_status(root, MANAGED_MODEL_ENDPOINT, managed_runtime_installed);
     if store["recovery_required"] == true && store["setup_retryable"] != true {
@@ -824,7 +847,7 @@ fn managed_local_only(path: &Path, settings: &LocalSettings) -> bool {
         == "verified_managed"
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 fn existing_runtime_setup_at(
     path: &Path,
     settings: &mut LocalSettings,
@@ -866,7 +889,7 @@ async fn install_model(
     managed_runtime_installed: bool,
     mut progress: impl FnMut(DownloadProgress),
 ) -> Result<Value> {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     if endpoint == MANAGED_MODEL_ENDPOINT {
         let binding = phonton_local::managed_store::bind(root, endpoint)
             .map_err(|error| anyhow!("A previously managed Ollama service can no longer be verified: {error}. Stop that service and rerun models setup, or configure a different loopback endpoint for an external runtime."))?;
@@ -1358,7 +1381,7 @@ pub async fn status(requested_context: Option<u32>) -> Result<Value> {
         "runtime_error": error, "inventory_warnings": inventory_warnings, "active_model": settings.active_model, "models": rows,
         "calibration_attempt": settings.calibration_attempt,
         "install_attempts": install_attempts,
-        "runtime_install_url": "https://ollama.com/download", "managed_runtime_supported": cfg!(all(windows, target_arch = "x86_64")), "local_only": local_only, "loopback_only": true, "model_store":model_store, "managed_storage":managed_storage }),
+        "runtime_install_url": "https://ollama.com/download", "managed_runtime_supported": cfg!(managed_runtime), "local_only": local_only, "loopback_only": true, "model_store":model_store, "managed_storage":managed_storage }),
     )
 }
 
@@ -1524,20 +1547,20 @@ async fn mutate_with_lease(
                 bail!("Managed setup uses 127.0.0.1:11434; connect or repair the custom runtime separately");
             }
             if let Ok(version) = runtime.version().await {
-                #[cfg(all(windows, target_arch = "x86_64"))]
+                #[cfg(managed_runtime)]
                 return existing_runtime_setup_at(&path, &mut settings, &root, &version);
-                #[cfg(not(all(windows, target_arch = "x86_64")))]
+                #[cfg(not(managed_runtime))]
                 return Ok(json!({
                     "runtime_version": version, "existing": true,
                     "managed_origin": "unverified",
                     "detail": "An existing Ollama-compatible service answered on the loopback endpoint. Phonton did not install or start it and has not verified which process owns the listener."
                 }));
             }
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(managed_runtime)]
             if phonton_local::provision::default_listener_unavailable()? {
                 bail!("The default loopback port 127.0.0.1:11434 is unavailable but did not answer the Ollama version check. Stop the process using it or use a different loopback endpoint before managed setup.");
             }
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(managed_runtime)]
             require_setup_recovery_allowed(&root, settings.managed_runtime_installed)?;
             let executable = phonton_local::provision::install(&root, progress).await?;
             if !settings.managed_runtime_installed {
@@ -1777,7 +1800,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     if matches!(verb, "--help" | "-h" | "help")
         || (verb == "status" && args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
     {
-        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus and catalog print a summary; --json prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise, on Windows x64 setup downloads a hash-checked portable Ollama runtime (about 1.5 GB).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
+        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus and catalog print a summary; --json prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise setup downloads a hash-checked portable Ollama runtime (about 1.5 GB on Windows and Linux, 160 MB on macOS).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
         return Ok(0);
     }
     let value = match verb {
@@ -2308,7 +2331,7 @@ mod tests {
         assert!(models.iter().all(|row| row.pre_setup_storage.is_none()));
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn catalog_omits_plans_for_missing_or_replaced_chosen_storage() {
         let temp = tempfile::tempdir().unwrap();
@@ -2626,7 +2649,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn responding_service_with_stale_receipt_is_a_setup_error() {
         let temp = tempfile::tempdir().unwrap();
@@ -2657,7 +2680,7 @@ mod tests {
         assert!(require_setup_recovery_allowed(&root, false).is_ok());
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn managed_setup_refuses_an_unsafe_receipt_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -2673,7 +2696,7 @@ mod tests {
             .contains("cannot safely replace"));
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn responding_external_service_without_receipt_remains_unverified() {
         let temp = tempfile::tempdir().unwrap();
@@ -2703,7 +2726,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn missing_prior_managed_receipt_requires_recovery() {
         let temp = tempfile::tempdir().unwrap();
@@ -2747,7 +2770,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn missing_default_runtime_keeps_its_install_marker() {
         let temp = tempfile::tempdir().unwrap();
@@ -2776,7 +2799,7 @@ mod tests {
         assert!(storage::load(&path).unwrap().managed_runtime_installed);
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[tokio::test]
     async fn stale_managed_receipt_stops_install_before_runtime_request() {
         let temp = tempfile::tempdir().unwrap();
@@ -2797,7 +2820,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[tokio::test]
     async fn missing_installed_managed_runtime_stops_install_before_runtime_request() {
         let temp = tempfile::tempdir().unwrap();
@@ -2816,7 +2839,7 @@ mod tests {
             .contains("previously used managed folder"));
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[tokio::test]
     async fn alternate_external_endpoint_does_not_inherit_old_managed_receipt() {
         let temp = tempfile::tempdir().unwrap();
@@ -2859,7 +2882,7 @@ mod tests {
         assert!(parse_status_context(&args(&["8192", "4096"])).is_err());
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn idle_setup_lock_does_not_strand_an_unused_storage_choice() {
         let temp = tempfile::tempdir().unwrap();
@@ -2906,7 +2929,7 @@ mod tests {
         assert!(!storage::load(&path).unwrap().managed_root_used);
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn managed_storage_choice_persists_and_isolated_state_ignores_it() {
         let temp = tempfile::tempdir().unwrap();
@@ -2968,7 +2991,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn managed_storage_rejects_occupied_and_unsafe_folders_without_changing_state() {
         let temp = tempfile::tempdir().unwrap();
@@ -2999,7 +3022,7 @@ mod tests {
         assert!(storage::load(&path).unwrap().managed_root.is_none());
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn managed_storage_change_waits_for_operation_and_model_state_lease() {
         let temp = tempfile::tempdir().unwrap();
@@ -3023,7 +3046,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn accepted_model_operation_holds_state_lease_before_worker_runs() {
         let temp = tempfile::tempdir().unwrap();
@@ -3135,7 +3158,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), saved);
         assert!(storage::acquire(&path).is_ok());
 
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         let current = {
             assert!(error.to_string().contains("storage changed"));
             OperationExpectation {
@@ -3143,7 +3166,7 @@ mod tests {
                 ..expected
             }
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         let current = {
             assert!(error.to_string().contains("supports Windows only"));
             // Recover by using supported default storage; rejection must not
@@ -3160,7 +3183,7 @@ mod tests {
         assert!(storage::acquire(&path).is_ok());
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn missing_unused_storage_can_change_but_used_storage_cannot_be_abandoned() {
         let temp = tempfile::tempdir().unwrap();
@@ -3201,7 +3224,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn replaced_used_folder_at_same_path_is_not_the_saved_store() {
         let temp = tempfile::tempdir().unwrap();

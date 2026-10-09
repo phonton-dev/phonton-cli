@@ -15,8 +15,8 @@ OpenRouter, Gemini, Groq, Together, xAI):
 export DEEPSEEK_API_KEY=...      # or ANTHROPIC_API_KEY, OPENAI_API_KEY, ...
 ```
 
-or run a local model with no key (managed runtime on Windows x64; elsewhere
-install [Ollama](https://ollama.com/download) first):
+or run a local model with no key (Phonton installs and verifies its own
+runtime on Windows x64, Linux x64/arm64 and macOS):
 
 ```bash
 phonton models catalog                    # models that fit this machine

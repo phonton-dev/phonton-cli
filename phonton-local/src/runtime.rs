@@ -19,10 +19,10 @@ struct CalibrationAdmission {
     required_resident: Option<ResidentModel>,
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 struct CancelBlobScan(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 impl Drop for CancelBlobScan {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Release);
@@ -199,7 +199,7 @@ fn manifest_descriptors(manifest: &Value) -> Result<Vec<crate::disk::ManifestBlo
                     LocalError::Invalid("Registry manifest size overflowed".into())
                 })?;
                 blobs.push(crate::disk::ManifestBlob {
-                    #[cfg(all(windows, target_arch = "x86_64"))]
+                    #[cfg(managed_runtime)]
                     sha256: hash,
                     size_bytes: bytes,
                 });
@@ -599,7 +599,7 @@ impl LocalRuntime {
     /// Admit a pull against the verified managed store. Only when a full-size
     /// estimate does not fit, hash completed blobs in a blocking worker and
     /// remeasure the bound store before crediting those exact bytes.
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     pub async fn managed_download_admission(
         name: &str,
         binding: &crate::managed_store::VerifiedManagedStore,

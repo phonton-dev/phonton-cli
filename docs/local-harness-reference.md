@@ -75,7 +75,7 @@ Each valid calibrated profile row includes `profile_sha256`, the fingerprint
 used by goal plan review. Recalibrating the same model changes that fingerprint
 and requires a fresh goal plan before Run.
 `models storage` reports the planned managed runtime, model, and new coding-run
-evidence folders and current free space on that drive. On Windows x64, `models storage PATH` saves
+evidence folders and current free space on that drive. With the managed runtime, `models storage PATH` saves
 an existing empty dedicated local-drive folder before managed setup. Desktop
 offers the same choice. Phonton leaves existing managed files in place rather
 than silently moving them. The saved choice is tied to that folder and volume;

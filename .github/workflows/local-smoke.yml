@@ -1,7 +1,8 @@
 name: Local model smoke
 
-# Runs benchmarks/smoke against a released Linux binary and a local model in
-# Ollama on a CPU-only runner. No provider key, no network inference.
+# Runs benchmarks/smoke against a Linux binary and a local model on the
+# Phonton-managed runtime, on a CPU-only runner. No provider key, no network
+# inference. Releases before 0.23 had no Linux managed runtime.
 on:
   workflow_dispatch:
     inputs:
@@ -54,7 +55,6 @@ jobs:
       VERSION: ${{ inputs.version || 'source' }}
       MODEL: ${{ inputs.model || 'qwen2.5-coder:3b' }}
       RUNS: ${{ inputs.runs || '3' }}
-      OLLAMA_VERSION: "0.34.2"
       GH_TOKEN: ${{ github.token }}
     steps:
       - run: echo "PHONTON_HOME=$RUNNER_TEMP/phonton-home" >> "$GITHUB_ENV"
@@ -81,15 +81,6 @@ jobs:
           echo "BIN=$BIN" >> "$GITHUB_ENV"
           "$BIN" version
 
-      - name: Start Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          if ! curl -sf http://127.0.0.1:11434/api/version; then
-            (ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &)
-            for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/version && break; sleep 1; done
-          fi
-          ollama pull "$MODEL"
-
       - name: Set up the local model
         run: |
           mkdir -p "$PHONTON_HOME"
@@ -99,7 +90,7 @@ jobs:
 
       - name: Run the smoke tasks
         run: |
-          node benchmarks/smoke/run.mjs --arm local --runtime unverified \
+          node benchmarks/smoke/run.mjs --arm local \
             --runs "$RUNS" --tasks "${{ matrix.tasks }}" --bin "$BIN" \
             --out "$RUNNER_TEMP/results/${{ matrix.fixture }}"
           cat "$RUNNER_TEMP/results/${{ matrix.fixture }}/summary.md" >> "$GITHUB_STEP_SUMMARY"
@@ -111,5 +102,5 @@ jobs:
           path: |
             ${{ runner.temp }}/results
             ${{ runner.temp }}/setup.json
-            ${{ runner.temp }}/ollama.log
+            ${{ runner.temp }}/phonton-home/runtime/runtime.log
           if-no-files-found: warn

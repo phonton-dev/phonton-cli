@@ -49,13 +49,34 @@ pub fn directory_identity(
     })
 }
 
+/// Read the device and inode of an existing directory. The pair changes when
+/// a mount or folder is replaced, even if the canonical path stays the same.
+#[cfg(unix)]
+pub fn directory_identity(
+    directory: &Path,
+) -> Result<phonton_types::local::LocalDirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(directory)?;
+    if !metadata.is_dir() {
+        return Err(LocalError::Invalid(
+            "Managed runtime identity requires a directory".into(),
+        ));
+    }
+    let mut file_id = [0u8; 16];
+    file_id[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+    Ok(phonton_types::local::LocalDirectoryIdentity {
+        volume_serial: metadata.dev(),
+        file_id,
+    })
+}
+
 /// Report that managed directory identity is unavailable on this platform.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 pub fn directory_identity(
     _directory: &Path,
 ) -> Result<phonton_types::local::LocalDirectoryIdentity> {
     Err(LocalError::Invalid(
-        "Managed runtime directory identity is supported on Windows only".into(),
+        "Managed runtime directory identity is not supported on this platform".into(),
     ))
 }
 
@@ -96,6 +117,62 @@ pub fn require_local_drive_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse network file systems for managed runtime files: NFS, SMB/CIFS, 9P
+/// (including WSL drive mounts), AFS and similar. FUSE is refused too, since
+/// it can front a remote store.
+#[cfg(target_os = "linux")]
+pub fn require_local_drive_directory(directory: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    const NETWORK: [i64; 10] = [
+        0x6969,      // NFS
+        0x517B,      // SMB
+        0xFF53_4D42, // CIFS
+        0xFE53_4D42, // SMB2
+        0x0102_1997, // 9P (WSL drvfs, VM shares)
+        0x5346_414F, // AFS
+        0x6B41_4653, // kAFS
+        0x7366_7362, // CEPH
+        0x0000_564C, // NCP
+        0x6573_5546, // FUSE
+    ];
+    let canonical = std::fs::canonicalize(directory)?;
+    let path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+        .map_err(|_| LocalError::Invalid("Managed runtime path contains a NUL byte".into()))?;
+    // SAFETY: statfs is plain data written by the kernel.
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut info) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    if NETWORK.contains(&(info.f_type as i64)) {
+        return Err(LocalError::Invalid(
+            "Managed runtime storage must be on a local file system, not a network or FUSE mount"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse volumes macOS does not mark as local (SMB, NFS, AFP, WebDAV).
+#[cfg(target_os = "macos")]
+pub fn require_local_drive_directory(directory: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let canonical = std::fs::canonicalize(directory)?;
+    let path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+        .map_err(|_| LocalError::Invalid("Managed runtime path contains a NUL byte".into()))?;
+    // SAFETY: statfs is plain data written by the kernel.
+    let mut info: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut info) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if info.f_flags & libc::MNT_LOCAL as u32 == 0 {
+        return Err(LocalError::Invalid(
+            "Managed runtime storage must be on a local volume, not a network share".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Measure free bytes available to this process on the volume containing an
 /// existing directory. The caller must independently establish that a runtime
 /// actually writes to that directory.
@@ -126,7 +203,20 @@ pub fn available_directory_bytes(directory: &Path) -> Result<u64> {
         }
         Ok(free)
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(canonical.as_os_str().as_bytes())
+            .map_err(|_| LocalError::Invalid("Runtime path contains a NUL byte".into()))?;
+        // SAFETY: statvfs is plain data written by the kernel.
+        let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut info) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        #[allow(clippy::unnecessary_cast)]
+        Ok((info.f_bavail as u64).saturating_mul(info.f_frsize as u64))
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         let _ = canonical;
         Err(LocalError::Invalid(
@@ -138,14 +228,14 @@ pub fn available_directory_bytes(directory: &Path) -> Result<u64> {
 /// A unique SHA-256 manifest descriptor. The digest is normalized to lowercase.
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestBlob {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     pub(crate) sha256: String,
     pub(crate) size_bytes: u64,
 }
 
 /// Count only exact, regular, hash-verified Ollama blobs in a verified store.
 /// Sparse `-partial` files and progress checkpoints are deliberately excluded.
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(managed_runtime)]
 pub(crate) fn verified_complete_blob_bytes(
     blobs: &Path,
     manifest: &[ManifestBlob],

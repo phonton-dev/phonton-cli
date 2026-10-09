@@ -45,3 +45,25 @@ jobs:
 
       - name: Build CLI
         run: cargo build --locked --release -p phonton-cli
+
+  macos:
+    name: macOS (local runtime and CLI)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --locked -p phonton-local -p phonton-cli --all-targets -- -D warnings
+
+      - name: Test local runtime
+        run: cargo test --locked -p phonton-local --no-fail-fast

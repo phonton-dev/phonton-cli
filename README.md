@@ -91,7 +91,7 @@ checks on a copy, and lands nothing until you apply the result.
 
 ```bash
 phonton models catalog                      # models that fit this machine
-phonton models setup qwen2.5-coder:3b       # runtime (Windows x64), download,
+phonton models setup qwen2.5-coder:3b       # runtime, download,
                                             # calibrate edit formats, select
 phonton                                     # TUI: goals now run on the local model
 phonton goal "Add a count() method to TodoStore" --yes --allow-host-checks
@@ -104,10 +104,13 @@ With provider `ollama` and a calibrated model selected, both the TUI and
 local runs never fall back to a cloud model, and the receipt says whether the
 runtime was verified as Phonton-managed.
 
-On macOS and Linux, install [Ollama](https://ollama.com/download) yourself.
-Phonton cannot verify a runtime it did not start (an Ollama install can relay
-cloud models), so the TUI plan review says so and your approval is consent
-for that goal; headless runs need `phonton goal --local ... --allow-unverified-runtime`.
+`models setup` installs a pinned, hash-checked Ollama runtime that Phonton
+starts and verifies, on Windows x64, Linux x64/arm64 and macOS (about 1.5 GB
+to download on Windows and Linux, 160 MB on macOS). If an Ollama you
+installed already answers on port 11434, Phonton uses it instead but cannot
+verify it (an Ollama install can relay cloud models): the TUI plan review says
+so and your approval is consent for that goal; headless runs need
+`phonton goal --local ... --allow-unverified-runtime`.
 
 In our smoke runs, qwen2.5-coder:3b on a 6 GB laptop GPU finished small
 single-file edits in a Node repo in 20-30 s. Small models work best on one

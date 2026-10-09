@@ -1,14 +1,18 @@
-//! Point-in-time binding between a Phonton-started Windows Ollama process and
-//! the model store supplied to that process at launch. A loopback HTTP answer
+//! Point-in-time binding between a Phonton-started Ollama process and the
+//! model store supplied to that process at launch. A loopback HTTP answer
 //! alone cannot establish an external service's model-store directory.
 
 use crate::{disk, provision, LocalError, Result};
 use phonton_types::local::LocalDirectoryIdentity;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{FILETIME, HANDLE, WAIT_TIMEOUT};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -16,17 +20,24 @@ use windows_sys::Win32::System::Threading::{
 
 const RECEIPT_NAME: &str = "managed-process.json";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+#[cfg(windows)]
 const SYNCHRONIZE_PROCESS: u32 = 0x0010_0000;
+
+/// A path in the platform's native units: UTF-16 on Windows, bytes on Unix.
+#[cfg(windows)]
+type PathUnits = Vec<u16>;
+#[cfg(unix)]
+type PathUnits = Vec<u8>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LaunchReceipt {
     schema: u32,
     pid: u32,
     created_at: u64,
-    image: Vec<u16>,
-    root: Vec<u16>,
-    store: Vec<u16>,
-    blobs: Vec<u16>,
+    image: PathUnits,
+    root: PathUnits,
+    store: PathUnits,
+    blobs: PathUnits,
     root_identity: LocalDirectoryIdentity,
     store_identity: LocalDirectoryIdentity,
     blobs_identity: LocalDirectoryIdentity,
@@ -34,8 +45,10 @@ struct LaunchReceipt {
     version: String,
 }
 
+#[cfg(windows)]
 struct ProcessHandle(OwnedHandle);
 
+#[cfg(windows)]
 impl ProcessHandle {
     fn open(pid: u32) -> Result<Self> {
         if pid == 0 {
@@ -63,7 +76,7 @@ impl ProcessHandle {
         self.0.as_raw_handle()
     }
 
-    fn identity(&self) -> Result<(u64, Vec<u16>)> {
+    fn identity(&self) -> Result<(u64, PathUnits)> {
         if unsafe { WaitForSingleObject(self.raw(), 0) } != WAIT_TIMEOUT {
             return Err(LocalError::Invalid(
                 "Managed runtime process has exited".into(),
@@ -100,8 +113,107 @@ impl ProcessHandle {
     }
 }
 
-fn path_units(path: &Path) -> Vec<u16> {
+#[cfg(windows)]
+fn path_units(path: &Path) -> PathUnits {
     path.as_os_str().encode_wide().collect()
+}
+
+#[cfg(unix)]
+fn path_units(path: &Path) -> PathUnits {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// A process ID plus the start time read when it was opened. Unix has no
+/// process handle to hold, so every identity check compares the start time:
+/// a reused PID belongs to a process that started later.
+#[cfg(unix)]
+struct ProcessHandle {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl ProcessHandle {
+    fn open(pid: u32) -> Result<Self> {
+        if pid == 0 || i32::try_from(pid).is_err() {
+            return Err(LocalError::Invalid(
+                "Managed runtime receipt has no process ID".into(),
+            ));
+        }
+        process_start_and_image(pid)?;
+        Ok(Self { pid })
+    }
+
+    fn identity(&self) -> Result<(u64, PathUnits)> {
+        let (created_at, image) = process_start_and_image(self.pid)?;
+        Ok((created_at, path_units(&std::fs::canonicalize(image)?)))
+    }
+}
+
+/// Start time (clock ticks since boot) and executable from `/proc`.
+#[cfg(target_os = "linux")]
+fn process_start_and_image(pid: u32) -> Result<(u64, PathBuf)> {
+    let gone = || LocalError::Invalid(format!("Managed runtime process {pid} has exited"));
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| gone())?;
+    // The command name may contain spaces or ')'; fields follow the last ')'.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .unwrap_or_default();
+    if matches!(fields.first(), None | Some(&"Z") | Some(&"X")) {
+        return Err(gone());
+    }
+    let started = fields
+        .get(19)
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(|| {
+            LocalError::Invalid("Managed runtime process status is unreadable".into())
+        })?;
+    let image = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|error| {
+        LocalError::Invalid(format!(
+            "Managed runtime process {pid} is no longer inspectable: {error}"
+        ))
+    })?;
+    Ok((started, image))
+}
+
+/// Start time (microseconds since the epoch) and executable from libproc.
+#[cfg(target_os = "macos")]
+fn process_start_and_image(pid: u32) -> Result<(u64, PathBuf)> {
+    use std::os::unix::ffi::OsStringExt;
+    const SZOMB: u32 = 5;
+    let gone = || LocalError::Invalid(format!("Managed runtime process {pid} has exited"));
+    let pid = i32::try_from(pid).map_err(|_| gone())?;
+    // SAFETY: proc_bsdinfo is plain data; the kernel fills at most `size` bytes.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read != size || info.pbi_status == SZOMB {
+        return Err(gone());
+    }
+    let started = info
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec);
+    let mut image = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is writable for its full length.
+    let length = unsafe { libc::proc_pidpath(pid, image.as_mut_ptr().cast(), image.len() as u32) };
+    if length <= 0 {
+        return Err(LocalError::Invalid(format!(
+            "Managed runtime process {pid} is no longer inspectable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    image.truncate(length as usize);
+    Ok((started, PathBuf::from(std::ffi::OsString::from_vec(image))))
 }
 
 fn receipt_path(root: &Path) -> PathBuf {
@@ -543,6 +655,9 @@ mod tests {
 
     #[test]
     fn redirected_blob_directory_invalidates_a_managed_binding() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink as symlink_dir;
+        #[cfg(windows)]
         use std::os::windows::fs::symlink_dir;
         let root = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
