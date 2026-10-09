@@ -41,7 +41,8 @@ The first launch in a folder asks you to trust it. The first goal asks whether
 Phonton may run the project's own checks (build, tests) on this machine;
 without that, diffs are still written but cannot be marked verified.
 
-Headless, for scripts and CI:
+Without the TUI, `phonton goal "fix the failing test"` asks the same two
+questions in a terminal. In scripts and CI, answer them with flags:
 
 ```bash
 phonton goal "fix the failing test" --yes --allow-host-checks

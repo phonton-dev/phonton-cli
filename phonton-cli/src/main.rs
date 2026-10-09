@@ -5836,6 +5836,11 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
     // isolation backend that needs explicit host approval. Without it a goal
     // spent tokens and then failed verification, so ask (or stop) first.
     let mut opts = opts;
+    // Trust first (reading the folder), then checks (running its code).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if !opts.yes && !trust::prompt_if_needed(&cwd)? {
+        return Ok(1);
+    }
     if !opts.host_checks_approved {
         if std::io::IsTerminal::is_terminal(&std::io::stdin()) && !opts.json {
             eprint!(
