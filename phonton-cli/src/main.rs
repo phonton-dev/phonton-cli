@@ -171,11 +171,6 @@ fn provider_is_local(provider: &str, base_url: &str) -> bool {
     }
 }
 
-/// Flat block bar, `width` cells, filled `filled_frac` of the way.
-fn gradient_bar(filled_frac: f32, width: usize) -> Vec<Span<'static>> {
-    art::gauge(filled_frac, width, ACCENT)
-}
-
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -455,12 +450,6 @@ pub struct App {
     pub prev_mode: Mode,
     /// Caret position (in chars) inside `ask_input`.
     pub ask_cursor: usize,
-    /// Session-best token savings percentage (vs naive baseline). Updated
-    /// whenever a goal completes with a higher savings rate than seen before.
-    pub best_savings_pct: Option<i64>,
-    /// Flash counter — non-zero for a few ticks after a new personal best
-    /// is set, driving the savings line highlight. Decremented each tick.
-    pub new_best_ticks: u8,
     /// True when the help overlay is visible. Toggled by `?`.
     pub help_open: bool,
     /// Flight Log scroll offset. `None` means "tail" — always pinned to
@@ -539,8 +528,6 @@ impl App {
             palette_selected: 0,
             prev_mode: Mode::Goal,
             ask_cursor: 0,
-            best_savings_pct: None,
-            new_best_ticks: 0,
             help_open: false,
             flight_log_scroll: None,
             memory_records: Vec::new(),
@@ -784,17 +771,6 @@ impl App {
     /// Apply a `GlobalState` snapshot to the goal at `index`. Updates both
     /// the per-goal cached state and the task-level status.
     pub fn apply_state(&mut self, index: usize, state: GlobalState) {
-        // Check for a new session-best savings percentage before storing.
-        if state.estimated_naive_tokens > 0 {
-            let pct = savings_pct(&state);
-            if let Some(p) = pct {
-                let is_new_best = self.best_savings_pct.is_none_or(|best| p > best);
-                if is_new_best {
-                    self.best_savings_pct = Some(p);
-                    self.new_best_ticks = 12;
-                }
-            }
-        }
         let tick = self.spinner_frame;
         if let Some(g) = self.goals.get_mut(index) {
             let settled = matches!(
@@ -1922,35 +1898,17 @@ pub fn render_savings_line(state: Option<&GlobalState>) -> String {
             s.tokens_used
         );
     }
-    let pct = savings_pct(s);
-    let pct_txt = pct.map(|p| format!("{p}%")).unwrap_or_else(|| "—".into());
-    format!(
-        "  {} tok  |  saved {} vs naive  |  Σ baseline: {}",
-        s.tokens_used, pct_txt, s.estimated_naive_tokens
-    )
+    // No price for this model (local or unlisted): report tokens only.
+    format!("  {} tok  |  est. cost unknown", s.tokens_used)
 }
 
 fn format_usd_micros(micros: u64) -> String {
     format!("${:.3}", micros as f64 / 1_000_000.0)
 }
 
-fn savings_pct(s: &GlobalState) -> Option<i64> {
-    if s.estimated_naive_tokens == 0 {
-        return None;
-    }
-    let diff = s.estimated_naive_tokens as i64 - s.tokens_used as i64;
-    Some(((diff as f64 / s.estimated_naive_tokens as f64) * 100.0).round() as i64)
-}
-
 /// Styled version of [`render_savings_line`]. Colors the savings percentage
 /// according to how much we saved: SUCCESS when >50%, WARN when 10–50%.
-/// When `new_best_ticks > 0` an amber "★ best!" flash is appended so the
-/// user knows they just beat their session record.
-pub fn render_savings_line_styled(
-    state: Option<&GlobalState>,
-    best_savings_pct: Option<i64>,
-    new_best_ticks: u8,
-) -> Line<'static> {
+pub fn render_savings_line_styled(state: Option<&GlobalState>) -> Line<'static> {
     let Some(s) = state else {
         return Line::from(Span::styled(
             "  est. $—  |  est. saved — vs frontier  |  tokens: —",
@@ -1985,53 +1943,13 @@ pub fn render_savings_line_styled(
             Span::styled(format!("{} tok", s.tokens_used), Style::default().fg(MUTED)),
         ]);
     }
-    let pct = savings_pct(s);
-    let (pct_txt, pct_style) = match pct {
-        Some(p) if p > 50 => (
-            format!("{p}%"),
-            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+    Line::from(vec![
+        Span::styled(
+            format!("  {} tok", s.tokens_used),
+            Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
         ),
-        Some(p) if p >= 10 => (
-            format!("{p}%"),
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-        ),
-        Some(p) => (format!("{p}%"), Style::default().fg(MUTED)),
-        None => ("—".into(), Style::default().fg(MUTED)),
-    };
-    let best_span = match best_savings_pct {
-        Some(b) if new_best_ticks > 0 => Span::styled(
-            format!("  ★ NEW BEST {b}%!"),
-            Style::default()
-                .fg(SUCCESS)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
-        ),
-        Some(b) => Span::styled(format!("  best {b}%"), Style::default().fg(MUTED)),
-        None => Span::raw(""),
-    };
-    // Gradient mini-gauge showing how much of the naive baseline we've
-    // saved (full bar = 100% savings, empty bar = no savings).
-    let frac = pct
-        .map(|p| (p as f32 / 100.0).clamp(0.0, 1.0))
-        .unwrap_or(0.0);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        "  ⚡ ",
-        Style::default().fg(WARN).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        format!("{} tok", s.tokens_used),
-        Style::default().fg(ACCENT_HI).add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled("  saved ", Style::default().fg(MUTED)));
-    spans.push(Span::styled(pct_txt, pct_style));
-    spans.push(Span::raw("  "));
-    spans.extend(gradient_bar(frac, 14));
-    spans.push(Span::styled(
-        format!("  vs Σ {}", s.estimated_naive_tokens),
-        Style::default().fg(MUTED),
-    ));
-    spans.push(best_span);
-    Line::from(spans)
+        Span::styled("  est. cost unknown", Style::default().fg(MUTED)),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -3220,15 +3138,13 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         for w in &state.active_workers {
             // Worker descriptions can carry a "Prior context from memory"
             // preamble for the model; show the user the task itself.
-            let task =
-                phonton_types::task_description_without_prior_context(&w.subtask_description);
             let mut spans = vec![
                 Span::styled(
                     format!("  {} ", art::spinner(app.spinner_frame)),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    short(task.lines().next().unwrap_or(""), 52),
+                    short(subtask_label(&w.subtask_description), 52),
                     Style::default().fg(PAPER),
                 ),
                 Span::styled(
@@ -3284,11 +3200,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::raw(""));
         }
         if state.estimated_naive_tokens > 0 {
-            lines.push(render_savings_line_styled(
-                Some(state),
-                app.best_savings_pct,
-                app.new_best_ticks,
-            ));
+            lines.push(render_savings_line_styled(Some(state)));
         }
         if let Some(label) = execution_mode_label(g) {
             lines.push(Line::from(vec![
@@ -4444,6 +4356,19 @@ fn status_tag_spans(s: &TaskStatus, spinner_frame: usize) -> Vec<Span<'static>> 
             Style::default().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
         )],
     }
+}
+
+/// One-line headline of a subtask description for display: drops a memory
+/// preamble and the goal text the planner appends for the worker
+/// ("Implement method `x` for this goal: ...").
+pub(crate) fn subtask_label(description: &str) -> &str {
+    let line = phonton_types::task_description_without_prior_context(description)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim();
+    line.split_once(" for this goal: ")
+        .map_or(line, |(head, _)| head)
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -6442,7 +6367,7 @@ fn headless_summary_lines(task_id: TaskId, state: &GlobalState) -> Vec<String> {
             ));
         }
         for passed in &p.verification.passed {
-            out.push(format!("  ✓ {passed}"));
+            out.push(format!("  ✓ {}", subtask_label(passed)));
         }
         for finding in p.verification.findings.iter().take(3) {
             out.push(format!("  ! {finding}"));
@@ -6812,9 +6737,6 @@ async fn run_app<B: Backend>(
         match evt {
             LoopEvent::Tick => {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
-                if app.new_best_ticks > 0 {
-                    app.new_best_ticks -= 1;
-                }
             }
             LoopEvent::Key(k) => {
                 if let Some(intent) = app.handle_key(k) {
@@ -9122,7 +9044,7 @@ fn extract_id(line: &str) -> Option<String> {
     }
 
     #[test]
-    fn savings_line_shows_percent_when_baseline_known() {
+    fn savings_line_without_pricing_shows_tokens_and_no_percent() {
         let s = GlobalState {
             task_status: TaskStatus::Queued,
             goal_contract: None,
@@ -9138,9 +9060,8 @@ fn extract_id(line: &str) -> Option<String> {
             cost_receipt: CostReceipt::default(),
         };
         let line = render_savings_line(Some(&s));
-        assert!(line.contains("200"));
-        assert!(line.contains("1000"));
-        assert!(line.contains("80%"));
+        assert!(line.contains("200 tok"));
+        assert!(!line.contains('%'), "{line}");
     }
 
     #[test]
@@ -9168,6 +9089,25 @@ fn extract_id(line: &str) -> Option<String> {
         let line = render_savings_line(Some(&s));
         assert!(line.contains("frontier"));
         assert!(line.contains("99%"));
+    }
+
+    #[test]
+    fn subtask_label_drops_the_goal_the_planner_appends() {
+        assert_eq!(
+            subtask_label("Implement method `remove` for this goal: Add remove(id)."),
+            "Implement method `remove`"
+        );
+        assert_eq!(
+            subtask_label("test passed: Implement method `remove` for this goal: x"),
+            "test passed: Implement method `remove`"
+        );
+        assert_eq!(
+            subtask_label(
+                "Fix the parser
+more"
+            ),
+            "Fix the parser"
+        );
     }
 
     #[test]
@@ -9434,7 +9374,8 @@ fn extract_id(line: &str) -> Option<String> {
         let buf = terminal.backend().buffer().clone();
         let dump: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(dump.contains("add function foo"));
-        assert!(dump.contains("vs Σ 500") || dump.contains("baseline: 500"));
+        assert!(dump.contains("150 tok"));
+        assert!(dump.contains("est. cost unknown"));
     }
 
     #[test]

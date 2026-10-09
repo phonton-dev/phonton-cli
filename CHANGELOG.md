@@ -4,6 +4,26 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased
+
+### Changed
+
+- [changed] The TUI no longer shows "saved N% vs naive" or a session "best"
+  when a model has no price. The baseline was a fixed 35,000 tokens per
+  subtask, not a measurement. Priced models still show estimated cost and
+  savings against frontier pricing; unpriced ones show tokens only.
+- [changed] `phonton plan` prints the token estimate without the naive
+  baseline (still in `--json`), and the no-tests note says the project's own
+  tests run on every edit and how to plan a test subtask.
+- [changed] `plan`, `goal`, `review` and `why-tokens` label subtasks by their
+  headline ("Implement method `remove`") instead of repeating the whole goal.
+
+### Fixed
+
+- [fixed] The npm publish workflow waits up to 5 minutes for the registry
+  instead of 60 seconds before reporting failure (0.22.2 published fine but
+  the check timed out).
+
 ## 0.22.2 - Half the cost, fewer false passes
 
 Cloud smoke suite (DeepSeek flash, 12 tasks x 3 runs, hidden tests): 36/36

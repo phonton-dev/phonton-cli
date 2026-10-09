@@ -89,20 +89,13 @@ impl TokenReport {
 }
 
 fn render(goal_text: &str, report: &TokenReport) -> String {
-    let goal: String = goal_text.chars().take(90).collect();
+    let goal = crate::short(goal_text, 90);
     let mut out = format!("Why tokens: {goal}\n\n");
     if report.rows.is_empty() {
         out.push_str("No verified subtasks recorded provider usage for this goal.\n");
     }
     for row in &report.rows {
-        let summary: String =
-            phonton_types::task_description_without_prior_context(&row.description)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(42)
-                .collect();
+        let summary = crate::short(crate::subtask_label(&row.description), 42);
         out.push_str(&format!(
             "  {:>7} in  {:>6} out  {:>7} cached  {}  [{}]{}\n",
             row.usage.input_tokens,

@@ -757,7 +757,7 @@ fn print_text_report(report: &ReviewReport) {
         println!(
             "{}. {} [{}] verify={} tokens={} context={} slices/{} tokens",
             idx + 1,
-            item.description.lines().next().unwrap_or(&item.description),
+            crate::subtask_label(&item.description),
             item.tier,
             item.verify,
             item.tokens_used,
