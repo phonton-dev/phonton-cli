@@ -72,8 +72,10 @@ function localRun(dir, goal) {
   const id = (r.stdout.match(/--local (?:apply|show) ([0-9a-f-]{36})/) ?? [])[1];
   let status = "failed";
   let tokens = null;
+  let evidence = "";
   if (id) {
     const shown = run(bin, ["goal", "--local", "show", id], dir);
+    evidence = shown.stdout;
     try {
       const ev = JSON.parse(shown.stdout).evidence ?? {};
       status = ev.state ?? status;
@@ -85,7 +87,7 @@ function localRun(dir, goal) {
       r.stderr += `\n--- apply ---\n${applied.stderr}`;
     }
   }
-  return { r, status, tokens, cost_usd: 0 };
+  return { r, status, tokens, cost_usd: 0, evidence };
 }
 
 const rows = [];
@@ -117,6 +119,8 @@ for (const task of TASKS.filter((t) => !only || only.has(t.id))) {
     fs.writeFileSync(path.join(logDir, "stderr.txt"), res.r.stderr);
     fs.writeFileSync(path.join(logDir, "diff.patch"), diff);
     fs.writeFileSync(path.join(logDir, "acceptance.txt"), accept.stdout + accept.stderr);
+    // Local runs: every candidate, its rejection and check output.
+    if (res.evidence) fs.writeFileSync(path.join(logDir, "evidence.json"), res.evidence);
     fs.appendFileSync(path.join(out, "results.jsonl"), JSON.stringify(row) + "\n");
     console.log(JSON.stringify(row));
     try {
