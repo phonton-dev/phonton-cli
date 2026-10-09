@@ -3126,7 +3126,8 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         ),
     ]));
-    let mut track = art::loop_track(goal_track(g), app.tick(), inner_w).spans;
+    // Leave room for the elapsed time so it stays on the track's line.
+    let mut track = art::loop_track(goal_track(g), app.tick(), inner_w.saturating_sub(10)).spans;
     track.push(Span::styled(
         format!("   {}", fmt_elapsed(g)),
         Style::default().fg(DIM),
@@ -3670,7 +3671,10 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
                 Span::styled(" -", Style::default().fg(MUTED)),
                 Span::styled(file.removed_lines.to_string(), Style::default().fg(DANGER)),
                 Span::styled("  ", Style::default()),
-                Span::styled(short(&file.summary, 62), Style::default().fg(MUTED)),
+                Span::styled(
+                    short(subtask_label(&file.summary), 62),
+                    Style::default().fg(MUTED),
+                ),
             ]));
         }
         if handoff.changed_files.len() > 6 {
@@ -3693,7 +3697,7 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
                     "  pass ",
                     Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(short(passed, 86), Style::default().fg(MUTED)),
+                Span::styled(short(subtask_label(passed), 86), Style::default().fg(MUTED)),
             ]));
         }
         for finding in handoff.verification.findings.iter().take(3) {
@@ -3707,17 +3711,13 @@ fn append_handoff_lines(lines: &mut Vec<Line<'static>>, handoff: &HandoffPacket)
         }
     }
 
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Run",
-        Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
-    )));
-    if handoff.run_commands.is_empty() {
+    // No run command is already listed under known gaps.
+    if !handoff.run_commands.is_empty() {
+        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "  No run command inferred yet.",
-            Style::default().fg(MUTED),
+            "Run",
+            Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
         )));
-    } else {
         for command in handoff.run_commands.iter().take(3) {
             lines.push(Line::from(vec![
                 Span::styled(

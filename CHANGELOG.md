@@ -9,17 +9,23 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 ### Changed
 
 - [changed] The TUI no longer shows "saved N% vs naive" or a session "best"
-  when a model has no price. The baseline was a fixed 35,000 tokens per
-  subtask, not a measurement. Priced models still show estimated cost and
+  when no cost is known: at the start of every goal ("0 tok, saved 100%") and
+  throughout runs on local or unpriced models. The baseline was a fixed
+  35,000 tokens per subtask, not a measurement. Priced models still show estimated cost and
   savings against frontier pricing; unpriced ones show tokens only.
 - [changed] `phonton plan` prints the token estimate without the naive
   baseline (still in `--json`), and the no-tests note says the project's own
   tests run on every edit and how to plan a test subtask.
 - [changed] `plan`, `goal`, `review` and `why-tokens` label subtasks by their
-  headline ("Implement method `remove`") instead of repeating the whole goal.
+  headline ("Implement method `remove`") instead of repeating the whole goal,
+  and so does the TUI receipt.
+- [changed] The TUI receipt drops the "No run command inferred yet" block;
+  the same fact is already listed under known gaps.
 
 ### Fixed
 
+- [fixed] The TUI stage track no longer wraps the elapsed time onto its own
+  line in an 80-column run pane.
 - [fixed] The npm publish workflow waits up to 5 minutes for the registry
   instead of 60 seconds before reporting failure (0.22.2 published fine but
   the check timed out).
