@@ -20,7 +20,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   headline ("Implement method `remove`") instead of repeating the whole goal,
   and so does the TUI receipt.
 - [changed] The TUI receipt drops the "No run command inferred yet" block;
-  the same fact is already listed under known gaps.
+  the same fact is already listed under known gaps. It also drops the
+  "execution: provider" line on ordinary runs and says "history only" for
+  checkpoints instead of "legacy rollback disabled".
+- [changed] Costs print with four decimals everywhere ($0.0007), so the TUI
+  receipt and the cost line agree.
 
 ### Fixed
 

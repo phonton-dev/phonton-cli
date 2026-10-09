@@ -1903,7 +1903,7 @@ pub fn render_savings_line(state: Option<&GlobalState>) -> String {
 }
 
 fn format_usd_micros(micros: u64) -> String {
-    format!("${:.3}", micros as f64 / 1_000_000.0)
+    format!("${:.4}", micros as f64 / 1_000_000.0)
 }
 
 /// Styled version of [`render_savings_line`]. Colors the savings percentage
@@ -3215,10 +3215,7 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
         if !state.checkpoints.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                format!(
-                    "Checkpoints ({} — history only; legacy rollback disabled):",
-                    state.checkpoints.len()
-                ),
+                format!("Checkpoints ({}, history only):", state.checkpoints.len()),
                 Style::default().fg(PAPER).add_modifier(Modifier::BOLD),
             )));
             let cursor = g.checkpoint_cursor;
@@ -3647,7 +3644,8 @@ fn execution_mode_label(goal: &GoalEntry) -> Option<&'static str> {
     match (local, provider) {
         (true, true) => Some("mixed (stub + provider)"),
         (true, false) => Some("stub — not a provider token-efficiency claim"),
-        (false, true) => Some("provider"),
+        // A plain provider run needs no label.
+        (false, true) => None,
         (false, false) => None,
     }
 }
