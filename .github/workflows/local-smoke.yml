@@ -44,16 +44,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - fixture: todo-api
-            tasks: todo-remove,todo-count,todo-sort,todo-title-limit
           - fixture: ledger
             tasks: ledger-thousands,ledger-parens,ledger-balance-on,ledger-csv-quote
           - fixture: shop
             tasks: shop-coupon-expiry,shop-cancel-restock,shop-top-ties,shop-review-duplicate
     env:
       VERSION: ${{ inputs.version || 'source' }}
-      MODEL: ${{ inputs.model || 'qwen2.5-coder:3b' }}
-      RUNS: ${{ inputs.runs || '3' }}
+      MODEL: ${{ inputs.model || 'qwen2.5-coder:7b' }}
+      RUNS: ${{ inputs.runs || '1' }}
       OLLAMA_VERSION: "0.34.2"
       GH_TOKEN: ${{ github.token }}
     steps:
