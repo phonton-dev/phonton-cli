@@ -58,8 +58,12 @@ mod pinned {
     pub const ARCHIVE_SHA256: &str =
         "8edcfe99eb7546d9422cfa8297d341dcd50e090e192ce1a8092a6ab6d182867b";
     pub const EXECUTABLE: &str = "bin/ollama";
-    pub const EXECUTABLE_SHA256: &str = "PENDING_LINUX_ARM64_EXECUTABLE";
-    pub const TREE_SHA256: &str = "PENDING_LINUX_ARM64_TREE";
+    pub const EXECUTABLE_SHA256: &str =
+        "e5b6c340875587839c10e88645a1fca66c0618cd2796ece748859f4efd940a65";
+    // 49 entries: bin/ollama and lib/ollama CPU and CUDA backends with their
+    // versioned library symlinks.
+    pub const TREE_SHA256: &str =
+        "b7208d2458274842055aa6273c95a03b119d26d2c66eb7c67d8df50c1530d141";
     pub const ARCHIVE_URL: &str =
         "https://github.com/ollama/ollama/releases/download/v0.34.2/ollama-linux-arm64.tar.zst";
     pub const ARCHIVE_EXTENSION: &str = "tar.zst";
