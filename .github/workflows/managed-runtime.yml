@@ -31,10 +31,13 @@ jobs:
         include:
           - os: ubuntu-latest
             model: qwen2.5-coder:3b
-          # 7 GB runner with about 3.7 GB free: the 3B model does not fit
-          # safely, so setup refuses it. A 16 GB Mac runs the 3B model.
+          # Apple Silicon, 7 GB with about 3.7 GB free: no model passes the
+          # fit check (2 GiB host reserve), so this checks the runtime only.
           - os: macos-14
-            model: qwen2.5-coder:1.5b
+            model: ""
+          # Intel Mac, 14 GB: the universal runtime's x86_64 half, end to end.
+          - os: macos-15-intel
+            model: qwen2.5-coder:3b
     env:
       MODEL: ${{ inputs.model || matrix.model }}
     steps:
@@ -62,8 +65,12 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$PHONTON_HOME"
-          printf '[provider]\nname = "ollama"\nmodel = "%s"\n' "$MODEL" > "$PHONTON_HOME/config.toml"
-          "$BIN" models setup "$MODEL" | tee "$RUNNER_TEMP/setup.txt"
+          if [ -n "$MODEL" ]; then
+            printf '[provider]\nname = "ollama"\nmodel = "%s"\n' "$MODEL" > "$PHONTON_HOME/config.toml"
+            "$BIN" models setup "$MODEL" | tee "$RUNNER_TEMP/setup.txt"
+          else
+            "$BIN" models setup | tee "$RUNNER_TEMP/setup.txt"
+          fi
           "$BIN" models status --json > "$RUNNER_TEMP/status.json"
           node -e '
             const s = require(process.argv[1]);
@@ -72,6 +79,7 @@ jobs:
           ' "$RUNNER_TEMP/status.json"
 
       - name: Goal on the managed runtime
+        if: env.MODEL != ''
         run: |
           set -o pipefail
           node benchmarks/smoke/run.mjs --arm local --runs 1 \
