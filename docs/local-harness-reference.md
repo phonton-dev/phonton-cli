@@ -66,8 +66,11 @@ calibration changes, the saved plan refuses before creating an attempt. A direct
 `--yes` invocation accepts a newly generated plan at that moment. `--plan`
 remains available without a selected model and reports a null selection.
 
-`models status` prints JSON. It also accepts `--json`, with or without an
-explicit context (for example, `models status 8192 --json`).
+`models status` prints a summary: runtime, hardware, installed models, and
+the next step. `--json` prints the full status described here, with or
+without an explicit context (for example, `models status 8192 --json`).
+`models catalog` likewise prints a summary unless given `--json` or
+`--snapshot`.
 Each valid calibrated profile row includes `profile_sha256`, the fingerprint
 used by goal plan review. Recalibrating the same model changes that fingerprint
 and requires a fresh goal plan before Run.
