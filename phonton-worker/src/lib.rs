@@ -2057,12 +2057,16 @@ fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
                 DiffLine::Added(_) => None,
             })
             .collect();
-        h.old_count = old.len() as u32;
-        h.new_count = h
+        let new_count = h
             .lines
             .iter()
             .filter(|l| !matches!(l, DiffLine::Removed(_)))
             .count() as u32;
+        if (h.old_count, h.new_count) != (old.len() as u32, new_count) {
+            debug!(file = %h.file_path.display(), stated = ?(h.old_count, h.new_count), counted = ?(old.len(), new_count), "recounted hunk");
+        }
+        h.old_count = old.len() as u32;
+        h.new_count = new_count;
         if old.is_empty() {
             continue;
         }
@@ -2095,6 +2099,8 @@ fn anchor_hunks(hunks: &mut [DiffHunk], root: &Path) {
         {
             debug!(file = %h.file_path.display(), from = h.old_start, to = at + 1, "relocated hunk");
             h.old_start = at as u32 + 1;
+        } else {
+            debug!(file = %h.file_path.display(), at = h.old_start, "hunk matches no lines in the file");
         }
     }
     // new_start follows from the old positions and earlier hunks' growth,

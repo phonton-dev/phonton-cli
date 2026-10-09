@@ -211,6 +211,20 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
                     || r.score() >= threshold
                     || (r.content_hits >= 3 && r.content_hits >= named_content)
             });
+            // "From 120 to 80": the value lives where the edit goes. Other
+            // matches only invite a small model to change the wrong file.
+            if ranked.iter().any(|r| r.literal_hits > 0) {
+                let goal = request.goal.to_lowercase();
+                let named = |path: &Path| {
+                    path.file_name()
+                        .is_some_and(|name| goal.contains(&name.to_string_lossy().to_lowercase()))
+                };
+                let before = ranked.len();
+                ranked.retain(|r| r.literal_hits > 0 || named(&r.evidence.path));
+                if ranked.len() < before {
+                    warnings.push("Scope narrowed to the files that contain values the goal changes. Name a file to include it.".into());
+                }
+            }
             if ranked.len() > 8 {
                 warnings.push(format!("{} files matched; this bounded preview includes the top eight. Narrow the goal if more context is required.", ranked.len()));
             }
@@ -1204,11 +1218,11 @@ mod tests {
         })
         .await
         .unwrap();
-        // First: the goal's `120` lives only there. A 3B model edited the
-        // first-listed store.js and the existing tests still passed.
+        // Only validate.js holds the goal's `120`. With store.js in scope a
+        // 3B model edited it and the existing tests still passed.
         assert_eq!(
-            plan.request.files.first(),
-            Some(&PathBuf::from("src/validate.js")),
+            plan.request.files,
+            vec![PathBuf::from("src/validate.js")],
             "{:?}",
             plan.request.files
         );
