@@ -2966,9 +2966,13 @@ fn goal_name_not_added(goal: &str, original: &str, candidate: &str) -> Option<St
             .collect()
     };
     let mut named: Vec<&str> = Vec::new();
+    // Only a span that is one identifier (`duplicate_review`, `count()`):
+    // demanding the words of a quoted message made a 3B model paste them
+    // somewhere meaningless to pass.
     for (i, quoted) in goal.split('`').enumerate() {
-        if i % 2 == 1 {
-            named.extend(quoted.split(|c: char| !(c.is_alphanumeric() || c == '_')));
+        let name = quoted.trim().trim_end_matches("()");
+        if i % 2 == 1 && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            named.push(name);
         }
     }
     let calls: Vec<&str> = goal.split('(').collect();
@@ -6051,13 +6055,15 @@ mod tests {
         // Existing names and placeholders are not demands; matching ignores case.
         let coupon = "In applyCoupon, reject a coupon whose `expires` date is before `today` with a ShopError whose message is `coupon <CODE> expired`.";
         let shop = "function applyCoupon(cart, coupons, code, today) { // expires\n throw new ShopError('x', 'coupon'); }";
+        // A quoted message is not a list of required words.
+        assert_eq!(goal_name_not_added(coupon, shop, shop), None);
         assert_eq!(
-            goal_name_not_added(coupon, shop, shop),
-            Some("expired".into())
-        );
-        assert_eq!(
-            goal_name_not_added(coupon, shop, "`coupon ${coupon.code} expired`"),
-            None
+            goal_name_not_added(
+                "Reject it with code `duplicate_review`.",
+                "class Reviews {}",
+                "class Reviews {}"
+            ),
+            Some("duplicate_review".into())
         );
         assert_eq!(
             goal_name_not_added(
