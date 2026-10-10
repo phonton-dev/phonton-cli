@@ -112,7 +112,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
         } else if request.new_file.is_some() {
             "Creation path and read-only source context are explicit. Review the selected check; it does not establish general implementation quality or test coverage.".into()
         } else {
-            "Scope uses source and symbol matches. Review the files and checks; this does not establish an implementation strategy or test coverage.".into()
+            "Files were chosen by matching names in the goal. Check they are the right ones.".into()
         },
     ];
     let query = context::terms(&request.goal.to_lowercase());
@@ -311,7 +311,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
             warnings.push(caution.into());
         }
         if !request.checks.is_empty() {
-            warnings.push("Verification commands were inferred from repository files. They have not run and require separate host approval.".into());
+            warnings.push("These checks were inferred from the repository and have not run yet. Phonton asks before running them on this machine.".into());
         }
     }
     let root_npm_check = LocalCheck {
@@ -414,7 +414,7 @@ fn node_inclusion_warning(request: &LocalRunRequest, root: &Path) -> Option<&'st
     if !direct_tap {
         return Some("JS/TS edits need a reviewed direct node --test --test-reporter=tap check that loads every edited source file. The selected checks cannot prove this inclusion; passing unrelated or opaque commands will leave the candidate unverified.");
     }
-    Some("JS/TS edit verification also requires V8 coverage showing each exact edited source loaded by the selected direct Node test. A transpiler that reports only generated files will leave the candidate unverified; loading source alone does not prove its behavior was asserted.")
+    Some("A JS/TS edit counts as verified only when Node's coverage shows the test run loaded every edited file. Loading a file does not prove a test asserted its behavior.")
 }
 
 fn python_inclusion_warning(request: &LocalRunRequest, root: &Path) -> Option<&'static str> {
@@ -964,7 +964,7 @@ fn suggested_checks(
                         };
                         let Some(runner) = super::node_test_invocation(&check, root) else {
                             if let Some(tap) = super::node_spec_test_script_as_tap(root) {
-                                return Ok((vec![tap], Some("The root test script runs Node's test runner with its default reporter; the plan runs the same files directly with --test-reporter=tap so completed cases are counted.")));
+                                return Ok((vec![tap], Some("npm test uses Node's default reporter; Phonton runs the same test files with --test-reporter=tap so each passing case is counted.")));
                             }
                             return Ok((vec![], Some("The inferred root npm test was withheld: its script has no supported test runner with an explicit TAP reporter, so a successful exit would not prove a completed test. Choose a check that reports named completed cases.")));
                         };

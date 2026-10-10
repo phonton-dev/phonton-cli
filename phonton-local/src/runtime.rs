@@ -1466,7 +1466,15 @@ fn calibration_context(
     let context = match requested_context {
         Some(context) => context,
         None => crate::recommend_context(weights_bytes, hardware, model_ceiling).ok_or_else(
-            || LocalError::Invalid("No safe automatic context is available from current memory and model metadata. Free resources or choose an explicit supported context.".into()),
+            || {
+                // Name the cause: memory (with the reading) or missing metadata.
+                let smallest = crate::estimate_fit_for_context(weights_bytes, hardware, 2048);
+                LocalError::Invalid(if model_ceiling.is_some() {
+                    format!("No context fits in memory right now, not even 2048 tokens. {} Then run the same command again.", smallest.explanation)
+                } else {
+                    "The runtime did not report this model's context limit, so no automatic context is safe. Pass one explicitly, for example `phonton models calibrate MODEL 4096`.".into()
+                })
+            },
         )?,
     };
     let fit = crate::estimate_fit_for_context(weights_bytes, hardware, context);
