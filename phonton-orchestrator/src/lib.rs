@@ -1386,9 +1386,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         let mut reached_test_layer = false;
 
         for rt in runtimes.values() {
+            // A failed attempt reports progress but no usage split; count it
+            // as estimated input so the receipt never shows fewer tokens than
+            // the run used.
+            let unsplit = rt
+                .tokens_used
+                .saturating_sub(rt.token_usage.budget_tokens());
             usage.input_tokens = usage
                 .input_tokens
-                .saturating_add(rt.token_usage.input_tokens);
+                .saturating_add(rt.token_usage.input_tokens)
+                .saturating_add(unsplit);
             usage.output_tokens = usage
                 .output_tokens
                 .saturating_add(rt.token_usage.output_tokens);
@@ -1398,7 +1405,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             usage.cache_creation_tokens = usage
                 .cache_creation_tokens
                 .saturating_add(rt.token_usage.cache_creation_tokens);
-            usage.estimated |= rt.token_usage.estimated;
+            usage.estimated |= rt.token_usage.estimated || unsplit > 0;
 
             let clean_desc = compact_description(&rt.subtask.description);
             match &rt.verify_result {
@@ -1511,12 +1518,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         if changed_files.is_empty() {
             known_gaps.push("No changed files were recorded for this run.".into());
         }
-        if run_commands.is_empty() {
-            known_gaps.push(
-                "No application launch command was inferred; verification checks are reported separately."
-                    .into(),
-            );
-        }
+        // A missing launch command is not a gap: libraries have none, and
+        // receipts list run commands only when there are some.
         if !reached_test_layer {
             known_gaps.push("No explicit test layer was recorded by this run.".into());
         }
@@ -2243,6 +2246,36 @@ mod tests {
             assert!(joins.is_empty());
             assert!(dispatcher.calls.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn handoff_counts_tokens_from_a_failed_attempt() {
+        let ok = subtask("first", vec![]);
+        let failed = subtask("second", vec![]);
+        let mut done = SubtaskRuntime::new(ok.clone(), NodeIndex::new(0));
+        done.tokens_used = 300;
+        done.token_usage = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 100,
+            ..TokenUsage::default()
+        };
+        // Progress was reported, then dispatch returned Err: no usage split.
+        let mut lost = SubtaskRuntime::new(failed.clone(), NodeIndex::new(1));
+        lost.tokens_used = 50;
+        let runtimes = HashMap::from([(ok.id, done), (failed.id, lost)]);
+        let plan = PlannerOutput {
+            subtasks: vec![ok, failed],
+            estimated_total_tokens: 0,
+            naive_baseline_tokens: 0,
+            coverage_summary: CoverageSummary::default(),
+            goal_contract: None,
+            plan_graph: Default::default(),
+        };
+        let orch = Orchestrator::new(Arc::new(TrivialDispatcher::new()));
+        let packet = orch.build_handoff_packet(&plan, &runtimes, &TaskStatus::Queued, 350, &[]);
+        assert_eq!(packet.token_usage.input_tokens, 250);
+        assert_eq!(packet.token_usage.output_tokens, 100);
+        assert!(packet.token_usage.estimated);
     }
 
     #[tokio::test]

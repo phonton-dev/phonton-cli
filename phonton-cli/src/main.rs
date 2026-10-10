@@ -3184,7 +3184,6 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             lines.extend(receipt_lines(app, g, state, handoff, width));
             append_local_review(&mut lines, g);
             append_handoff_lines(&mut lines, handoff);
-            lines.push(Line::raw(""));
         } else if let TaskStatus::Failed { reason, .. } = &g.status {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -3203,7 +3202,8 @@ fn render_centre(frame: &mut Frame, area: Rect, app: &App) {
             )));
             lines.push(Line::raw(""));
         }
-        if state.tokens_used > 0 {
+        // Once the receipt is up it carries tokens and cost; one source only.
+        if state.tokens_used > 0 && state.handoff_packet.is_none() {
             lines.push(render_savings_line_styled(Some(state)));
         }
         if let Some(label) = execution_mode_label(g) {
@@ -3604,6 +3604,19 @@ fn receipt_lines(
         vec![num(receipt_cost(g, &h.cost_receipt))],
         inner,
     ));
+    if let Some(pct) = has_price(state)
+        .then(|| state.cost_receipt.saved_percent())
+        .flatten()
+    {
+        body.push(art::leader(
+            "vs frontier",
+            vec![Span::styled(
+                format!("est. {pct}% less"),
+                Style::default().fg(MUTED),
+            )],
+            inner,
+        ));
+    }
     if g.recorded {
         let streak = app.record.streak;
         body.push(art::leader(
@@ -9336,6 +9349,9 @@ more"
         assert!(dump.contains("Changed files"));
         assert!(dump.contains("chess.py"));
         assert!(dump.contains("Known gaps"));
+        // The receipt alone carries tokens; an unpriced run gets no estimate.
+        assert!(!dump.contains("240 tok"));
+        assert!(!dump.contains("vs frontier"));
         // Syntax passed but no test ran: the receipt must not claim VERIFIED,
         // and the run does not extend the streak.
         assert!(!dump.contains("✓ VERIFIED"));

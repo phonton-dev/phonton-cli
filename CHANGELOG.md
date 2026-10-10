@@ -4,6 +4,22 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.23.1 - Receipts that agree
+
+### Changed
+
+- [changed] The TUI receipt is the one place a finished run shows tokens and
+  cost. The line under it repeated the cost and counted tokens from a
+  different source (2,362 under a receipt of 803 in + 1,558 out); the
+  "vs frontier" estimate now sits in the receipt, for priced models only.
+- [fixed] Tokens from a worker call that failed after reporting progress
+  were missing from the receipt. They now count as estimated input.
+- [changed] "No application launch command was inferred" is no longer
+  listed as a known gap; libraries have none, and run commands are listed
+  when there are some.
+- [changed] README hero and demo GIF re-recorded on 0.23.0; the old ones
+  showed the removed "saved 100% vs Σ 35000" line.
+
 ## 0.23.0 - Local models on Linux and macOS
 
 ### Added
