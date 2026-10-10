@@ -1,0 +1,78 @@
+name: Demo desktop walk
+
+# Drives the Desktop local workbench (browser build) against a real
+# `phonton serve` and qwen2.5-coder:3b on a fresh runner. Records video and
+# screenshots for review and the launch demo. Lives only on demo/** branches.
+on:
+  push:
+    branches: ["demo/**"]
+    paths: ["demo/desktop-walk.mjs", ".github/workflows/demo-desktop.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  walk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: phonton-dev/phonton-desktop
+          ref: mbcz/local-workbench
+          path: desktop
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the engine
+        run: cargo build --locked --release -p phonton-cli
+
+      - name: Managed runtime and model
+        run: |
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+          export PATH="$PWD/target/release:$PATH"
+          echo "PHONTON_HOME=$RUNNER_TEMP/phonton-home" >> "$GITHUB_ENV"
+          export PHONTON_HOME="$RUNNER_TEMP/phonton-home"
+          mkdir -p "$PHONTON_HOME"
+          printf '[provider]\nname = "ollama"\nmodel = "qwen2.5-coder:3b"\n' > "$PHONTON_HOME/config.toml"
+          phonton models setup qwen2.5-coder:3b > "$RUNNER_TEMP/setup.json"
+
+      - name: Fixture repository
+        run: |
+          cp -r demo/port-config "$RUNNER_TEMP/port-config"
+          git -C "$RUNNER_TEMP/port-config" init -q
+          git -C "$RUNNER_TEMP/port-config" add -A
+          git -C "$RUNNER_TEMP/port-config" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
+
+      - name: Engine and Desktop UI
+        run: |
+          (phonton serve > "$RUNNER_TEMP/serve.log" 2>&1 &)
+          cd desktop && npm ci
+          (npm run dev > "$RUNNER_TEMP/vite.log" 2>&1 &)
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:47831/health && curl -sf http://localhost:1420 >/dev/null && break; sleep 2; done
+
+      - name: Walk
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" out
+          cd "$RUNNER_TEMP/pw" && npm init -y >/dev/null && npm i --no-audit --no-fund playwright@1.64.0 >/dev/null
+          npx playwright install --with-deps chromium >/dev/null
+          cd "$GITHUB_WORKSPACE"
+          OUT="$GITHUB_WORKSPACE/out" REPO="$RUNNER_TEMP/port-config" PW="$RUNNER_TEMP/pw/node_modules/playwright" \
+            GOAL="Make parsePort in src/port.js reject ports outside 1-65535 and trailing garbage so npm test passes" \
+            node demo/desktop-walk.mjs
+          git -C "$RUNNER_TEMP/port-config" status --short > out/repo-status.txt || true
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-desktop
+          path: |
+            out
+            ${{ runner.temp }}/serve.log
+            ${{ runner.temp }}/vite.log
+            ${{ runner.temp }}/setup.json
+          if-no-files-found: warn
