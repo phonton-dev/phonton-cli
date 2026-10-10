@@ -1185,7 +1185,7 @@ mod tests {
         });
         assert!(node_inclusion_warning(&request, root.path())
             .unwrap()
-            .contains("each exact edited source"));
+            .contains("loaded every edited file"));
         request.files = vec!["src/app.py".into()];
         assert!(node_inclusion_warning(&request, root.path()).is_none());
         request.files = vec!["src/context.js".into()];
