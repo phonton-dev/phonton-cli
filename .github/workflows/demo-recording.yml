@@ -48,15 +48,17 @@ jobs:
           VHS=$(command -v vhs || find /opt/hostedtoolcache "$RUNNER_TOOL_CACHE" -type f -name vhs 2>/dev/null | head -1)
           test -x "$VHS" || { echo "vhs not found" >&2; exit 1; }
           for take in 1 2 3 4; do
-            rm -rf "$DEMO_WORK/port-config"
-            cp -r demo/port-config "$DEMO_WORK/port-config"
-            git -C "$DEMO_WORK/port-config" init -q
-            git -C "$DEMO_WORK/port-config" add -A
-            git -C "$DEMO_WORK/port-config" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
-            sed "s/TAKE/$take/g" demo/goal.tape > "$RUNNER_TEMP/goal-$take.tape"
+            # A fresh folder per take: each one asks for trust like a first run.
+            repo="$DEMO_WORK/take$take/port-config"
+            mkdir -p "$DEMO_WORK/take$take"
+            cp -r demo/port-config "$repo"
+            git -C "$repo" init -q
+            git -C "$repo" add -A
+            git -C "$repo" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
+            sed -e "s/TAKE/$take/g" -e "s#DEMO_REPO#$repo#g" demo/goal.tape > "$RUNNER_TEMP/goal-$take.tape"
             "$VHS" "$RUNNER_TEMP/goal-$take.tape" || echo "take $take failed"
-            git -C "$DEMO_WORK/port-config" diff --cached > "out/goal-$take.diff" || true
-            (cd "$DEMO_WORK/port-config" && node --test test/ > "$GITHUB_WORKSPACE/out/goal-$take-tests.txt" 2>&1) || true
+            git -C "$repo" diff --cached > "out/goal-$take.diff" || true
+            (cd "$repo" && npm test > "$GITHUB_WORKSPACE/out/goal-$take-tests.txt" 2>&1) || true
           done
           phonton models status > out/models-status.txt 2>&1 || true
 

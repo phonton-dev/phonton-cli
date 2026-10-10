@@ -6,7 +6,7 @@ name: Demo desktop walk
 on:
   push:
     branches: ["demo/**"]
-    paths: ["demo/desktop-walk.mjs", ".github/workflows/demo-desktop.yml"]
+    paths: ["demo/desktop-walk.mjs", "demo/port-config/**", ".github/workflows/demo-desktop.yml"]
 
 permissions:
   contents: read
@@ -75,4 +75,5 @@ jobs:
             ${{ runner.temp }}/serve.log
             ${{ runner.temp }}/vite.log
             ${{ runner.temp }}/setup.json
+            ${{ runner.temp }}/phonton-home/runs
           if-no-files-found: warn
