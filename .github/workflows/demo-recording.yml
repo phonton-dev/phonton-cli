@@ -1,0 +1,71 @@
+name: Demo recording
+
+# Records the launch demo footage on a fresh runner with no Ollama and no
+# GPU: managed setup of qwen2.5-coder:3b, then several takes of one local
+# goal in the TUI. Lives only on demo/** branches.
+on:
+  push:
+    branches: ["demo/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        run: cargo build --locked --release -p phonton-cli
+
+      - name: Prepare a clean Phonton home
+        run: |
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+          echo "PHONTON_HOME=$RUNNER_TEMP/phonton-home" >> "$GITHUB_ENV"
+          echo "DEMO_WORK=$RUNNER_TEMP/demo" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/phonton-home" "$RUNNER_TEMP/demo" out
+          printf '[provider]\nname = "ollama"\nmodel = "qwen2.5-coder:3b"\n' > "$RUNNER_TEMP/phonton-home/config.toml"
+          sudo apt-get update -q && sudo apt-get install -yq fonts-jetbrains-mono
+          if command -v ollama || curl -sf http://127.0.0.1:11434/api/version; then
+            echo "an Ollama install or listener is already present" >&2; exit 1
+          fi
+          free -h; nproc
+
+      - name: Record managed setup
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: demo/setup.tape
+
+      - name: Record goal takes
+        run: |
+          VHS=$(command -v vhs || find /opt/hostedtoolcache "$RUNNER_TOOL_CACHE" -type f -name vhs 2>/dev/null | head -1)
+          test -x "$VHS" || { echo "vhs not found" >&2; exit 1; }
+          for take in 1 2 3 4; do
+            rm -rf "$DEMO_WORK/port-config"
+            cp -r demo/port-config "$DEMO_WORK/port-config"
+            git -C "$DEMO_WORK/port-config" init -q
+            git -C "$DEMO_WORK/port-config" add -A
+            git -C "$DEMO_WORK/port-config" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
+            sed "s/TAKE/$take/g" demo/goal.tape > "$RUNNER_TEMP/goal-$take.tape"
+            "$VHS" "$RUNNER_TEMP/goal-$take.tape" || echo "take $take failed"
+            git -C "$DEMO_WORK/port-config" diff --cached > "out/goal-$take.diff" || true
+            (cd "$DEMO_WORK/port-config" && node --test test/ > "$GITHUB_WORKSPACE/out/goal-$take-tests.txt" 2>&1) || true
+          done
+          phonton models status > out/models-status.txt 2>&1 || true
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-recording
+          path: |
+            out
+            ${{ runner.temp }}/phonton-home/runs
+            ${{ runner.temp }}/phonton-home/runtime/runtime.log
+          if-no-files-found: warn
