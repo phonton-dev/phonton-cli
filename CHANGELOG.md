@@ -34,7 +34,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   reason. When the replacement starts with that line and is itself one
   complete block, the whole block is replaced (brace-aware for C-family,
   JS/TS and Rust; indentation-aware for Python). An unclosed replacement is
-  still an insertion.
+  still an insertion. Acceptance on the local smoke suite is unchanged (3B:
+  14/36 before and after); the rewrites now parse and fail, when they fail,
+  on the project's tests.
 - [fixed] A local model that writes `'\n'` with a single JSON escape produced
   a real line break inside a one-line string literal, a syntax error. Such
   breaks in a search/replace edit are turned back into `\n` (JS/TS, Python,
