@@ -39,7 +39,8 @@ jobs:
           - os: macos-15-intel
             model: qwen2.5-coder:3b
     env:
-      MODEL: ${{ inputs.model || matrix.model }}
+      # An input model never overrides a runtime-only (empty) entry.
+      MODEL: ${{ matrix.model && (inputs.model || matrix.model) || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

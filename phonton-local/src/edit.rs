@@ -219,15 +219,15 @@ fn block_anchor_search<'a>(
     let end = match brace_language(path) {
         None if is_python => python_block_end(original, start, replace)?,
         None => return None,
-        Some(rust) => {
+        Some(lang) => {
             // The anchor must open a block and the replacement must open and
             // close exactly one.
-            if brace_balance(anchor, rust).is_none_or(|(depth, _)| depth == 0)
-                || brace_balance(replace, rust) != Some((0, true))
+            if brace_balance(anchor, lang).is_none_or(|(depth, _)| depth == 0)
+                || brace_balance(replace, lang) != Some((0, true))
             {
                 return None;
             }
-            let close = start + block_close(&original[start..], rust)?;
+            let close = start + block_close(&original[start..], lang)?;
             // Keep `);` after the closing brace unless the replacement wrote it.
             let line_end = original[close..]
                 .find('\n')
@@ -243,9 +243,8 @@ fn block_anchor_search<'a>(
     (end > start + search.len()).then(|| &original[start..end])
 }
 
-/// Brace-delimited source by extension; `Some(true)` for Rust, whose `'` is
-/// a lifetime as often as a quote.
-fn brace_language(path: &Path) -> Option<bool> {
+/// Brace-delimited source by extension, with the scanner rules it needs.
+fn brace_language(path: &Path) -> Option<Braces> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     matches!(
         extension.as_str(),
@@ -270,7 +269,11 @@ fn brace_language(path: &Path) -> Option<bool> {
             | "php"
             | "scala"
     )
-    .then_some(extension == "rs")
+    .then(|| match extension.as_str() {
+        "rs" => Braces::Rust,
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => Braces::Js,
+        _ => Braces::Other,
+    })
 }
 
 /// Small models write `'\n'` inside JSON with a single escape, so the decoded
@@ -368,15 +371,29 @@ fn string_line_breaks(text: &str, python: bool) -> Vec<usize> {
     found
 }
 
-/// Visit each brace outside strings and comments with its byte offset and the
-/// depth after it, until `visit` returns false.
-fn walk_braces(text: &str, rust: bool, mut visit: impl FnMut(usize, i64) -> bool) {
+/// Lexical rules the brace scanner needs beyond strings and comments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Braces {
+    /// `'` is a lifetime as often as a quote.
+    Rust,
+    /// `/.../` can be a regex literal holding `{` or `}`.
+    Js,
+    Other,
+}
+
+/// Visit each brace outside strings, comments and (JS/TS) regex literals with
+/// its byte offset and the depth after it, until `visit` returns false.
+fn walk_braces(text: &str, lang: Braces, mut visit: impl FnMut(usize, i64) -> bool) {
     let mut depth = 0i64;
+    // Last significant character outside strings and comments: a `/` after
+    // an operand is division, after an operator or opening it starts a regex.
+    let mut previous: Option<char> = None;
     let mut chars = text.char_indices().peekable();
     while let Some((offset, c)) = chars.next() {
         let quote = match c {
             '{' | '}' => {
                 depth += if c == '{' { 1 } else { -1 };
+                previous = Some(c);
                 if !visit(offset, depth) {
                     return;
                 }
@@ -401,10 +418,32 @@ fn walk_braces(text: &str, rust: bool, mut visit: impl FnMut(usize, i64) -> bool
                 }
                 continue;
             }
-            // Rust uses ' for lifetimes, so only " strings are skipped there.
+            '/' if lang == Braces::Js
+                && previous.is_none_or(|p| "(,=:[!&|?{};+-*%<>~^".contains(p)) =>
+            {
+                let (mut escaped, mut class) = (false, false);
+                for (_, n) in chars.by_ref() {
+                    match n {
+                        _ if escaped => escaped = false,
+                        '\\' => escaped = true,
+                        '[' => class = true,
+                        ']' => class = false,
+                        '/' if !class => break,
+                        '\n' => break,
+                        _ => {}
+                    }
+                }
+                previous = Some('a');
+                continue;
+            }
             '"' | '`' => c,
-            '\'' if !rust => c,
-            _ => continue,
+            '\'' if lang != Braces::Rust => c,
+            _ => {
+                if !c.is_whitespace() {
+                    previous = Some(c);
+                }
+                continue;
+            }
         };
         let mut escaped = false;
         for (_, n) in chars.by_ref() {
@@ -416,14 +455,15 @@ fn walk_braces(text: &str, rust: bool, mut visit: impl FnMut(usize, i64) -> bool
                 break;
             }
         }
+        previous = Some('a');
     }
 }
 
 /// Net brace depth of `text` and whether it opened one; `None` if a brace
 /// closes one it never opened.
-fn brace_balance(text: &str, rust: bool) -> Option<(i64, bool)> {
+fn brace_balance(text: &str, lang: Braces) -> Option<(i64, bool)> {
     let (mut depth, mut opened, mut valid) = (0, false, true);
-    walk_braces(text, rust, |_, after| {
+    walk_braces(text, lang, |_, after| {
         opened |= after > depth;
         depth = after;
         valid = after >= 0;
@@ -433,9 +473,9 @@ fn brace_balance(text: &str, rust: bool) -> Option<(i64, bool)> {
 }
 
 /// Byte offset just past the brace that closes the first one `text` opens.
-fn block_close(text: &str, rust: bool) -> Option<usize> {
+fn block_close(text: &str, lang: Braces) -> Option<usize> {
     let mut close = None;
-    walk_braces(text, rust, |offset, after| {
+    walk_braces(text, lang, |offset, after| {
         if after == 0 {
             close = Some(offset + 1);
         }
@@ -891,6 +931,21 @@ mod tests {
     }
 
     #[test]
+    fn regex_braces_do_not_end_a_js_block() {
+        let original = "function f(s) {\n  return s.split(/[{}]/);\n}\nconst x = a / b / c;\n";
+        let updated = apply(
+            "f.ts",
+            original,
+            "function f(s) {",
+            "function f(s) {\n  return s.replace(/\\}/g, '').split(/[{}]/);\n}",
+        );
+        assert_eq!(
+            updated,
+            "function f(s) {\n  return s.replace(/\\}/g, '').split(/[{}]/);\n}\nconst x = a / b / c;\n"
+        );
+    }
+
+    #[test]
     fn rust_lifetimes_do_not_hide_braces() {
         let original = "fn f<'a>(x: &'a str) -> &'a str {\n    x\n}\nfn g() {}\n";
         let updated = apply(
@@ -980,7 +1035,7 @@ mod tests {
         let updated = &materialize_hunks(dir.path(), &scope, &hunks).unwrap()[&path];
         assert_eq!(updated.matches("class OrderBook {").count(), 1);
         assert_eq!(updated.matches("  constructor(stock) {").count(), 1);
-        assert_eq!(brace_balance(updated, false), Some((0, true)));
+        assert_eq!(brace_balance(updated, Braces::Js), Some((0, true)));
         // Everything around the class is untouched.
         assert!(updated.starts_with(&original[..original.find("class OrderBook {").unwrap()]));
         assert!(updated.contains("function dailySales(orders) {"));
