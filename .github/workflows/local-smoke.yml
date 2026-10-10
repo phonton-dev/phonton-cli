@@ -1,7 +1,9 @@
 name: Local model smoke
 
-# Runs benchmarks/smoke against a released Linux binary and a local model in
-# Ollama on a CPU-only runner. No provider key, no network inference.
+# Runs benchmarks/smoke against a Linux binary and a local model on the
+# Phonton-managed runtime, on a CPU-only runner. No provider key, no network
+# inference. Releases before 0.23 (no Linux managed runtime) run on an
+# Ollama this workflow installs, with --runtime unverified.
 on:
   workflow_dispatch:
     inputs:
@@ -54,7 +56,6 @@ jobs:
       VERSION: ${{ inputs.version || 'source' }}
       MODEL: ${{ inputs.model || 'qwen2.5-coder:3b' }}
       RUNS: ${{ inputs.runs || '3' }}
-      OLLAMA_VERSION: "0.34.2"
       GH_TOKEN: ${{ github.token }}
     steps:
       - run: echo "PHONTON_HOME=$RUNNER_TEMP/phonton-home" >> "$GITHUB_ENV"
@@ -80,8 +81,14 @@ jobs:
           chmod +x "$BIN"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
           "$BIN" version
+          # Releases before 0.23 had no Linux managed runtime: run them on an
+          # Ollama this workflow installs, with per-goal consent.
+          if [ "$VERSION" != source ] && [ "$(printf '%s\n' "$VERSION" 0.23.0 | sort -V | head -1)" != 0.23.0 ]; then
+            echo "LEGACY_RUNTIME=1" >> "$GITHUB_ENV"
+          fi
 
-      - name: Start Ollama
+      - name: Start Ollama (releases before 0.23)
+        if: env.LEGACY_RUNTIME == '1'
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           if ! curl -sf http://127.0.0.1:11434/api/version; then
@@ -99,7 +106,8 @@ jobs:
 
       - name: Run the smoke tasks
         run: |
-          node benchmarks/smoke/run.mjs --arm local --runtime unverified \
+          node benchmarks/smoke/run.mjs --arm local \
+            ${LEGACY_RUNTIME:+--runtime unverified} \
             --runs "$RUNS" --tasks "${{ matrix.tasks }}" --bin "$BIN" \
             --out "$RUNNER_TEMP/results/${{ matrix.fixture }}"
           cat "$RUNNER_TEMP/results/${{ matrix.fixture }}/summary.md" >> "$GITHUB_STEP_SUMMARY"
@@ -111,5 +119,6 @@ jobs:
           path: |
             ${{ runner.temp }}/results
             ${{ runner.temp }}/setup.json
+            ${{ runner.temp }}/phonton-home/runtime/runtime.log
             ${{ runner.temp }}/ollama.log
           if-no-files-found: warn

@@ -1,0 +1,107 @@
+name: Managed runtime
+
+# End to end on a fresh Linux and macOS runner with no Ollama installed:
+# `phonton models setup MODEL` downloads the pinned runtime, verifies its
+# archive and file tree, starts it, proves it owns the loopback listener,
+# then a smoke goal runs on it with no --allow-unverified-runtime.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Ollama model
+        default: "qwen2.5-coder:3b"
+  pull_request:
+    paths:
+      - "phonton-local/**"
+      - ".github/workflows/managed-runtime.yml"
+  push:
+    branches: ["bench/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  setup-and-goal:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            model: qwen2.5-coder:3b
+          # Apple Silicon, 7 GB with about 3.7 GB free: no model passes the
+          # fit check (2 GiB host reserve), so this checks the runtime only.
+          - os: macos-14
+            model: ""
+          # Intel Mac, 14 GB: the universal runtime's x86_64 half, end to end.
+          - os: macos-15-intel
+            model: qwen2.5-coder:3b
+    env:
+      # An input model never overrides a runtime-only (empty) entry.
+      MODEL: ${{ matrix.model && (inputs.model || matrix.model) || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        run: |
+          cargo build --locked --release -p phonton-cli
+          echo "BIN=$PWD/target/release/phonton" >> "$GITHUB_ENV"
+          echo "PHONTON_HOME=$RUNNER_TEMP/phonton-home" >> "$GITHUB_ENV"
+
+      - name: No Ollama on this runner
+        run: |
+          if command -v ollama || curl -sf http://127.0.0.1:11434/api/version; then
+            echo "an Ollama install or listener is already present" >&2
+            exit 1
+          fi
+
+      - name: Managed setup
+        run: |
+          set -o pipefail
+          mkdir -p "$PHONTON_HOME"
+          if [ -n "$MODEL" ]; then
+            printf '[provider]\nname = "ollama"\nmodel = "%s"\n' "$MODEL" > "$PHONTON_HOME/config.toml"
+            "$BIN" models setup "$MODEL" | tee "$RUNNER_TEMP/setup.txt"
+          else
+            "$BIN" models setup | tee "$RUNNER_TEMP/setup.txt"
+          fi
+          "$BIN" models status --json > "$RUNNER_TEMP/status.json"
+          node -e '
+            const s = require(process.argv[1]);
+            console.log(JSON.stringify(s.model_store));
+            if (s.model_store?.status !== "verified_managed") process.exit(1);
+          ' "$RUNNER_TEMP/status.json"
+
+      - name: Goal on the managed runtime
+        if: env.MODEL != ''
+        run: |
+          set -o pipefail
+          node benchmarks/smoke/run.mjs --arm local --runs 1 \
+            --tasks todo-remove,todo-count --bin "$BIN" \
+            --out "$RUNNER_TEMP/results"
+          cat "$RUNNER_TEMP/results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          # The runtime is under test, not the model: every goal must reach
+          # the model and come back with a verdict.
+          node -e '
+            const rows = require("fs").readFileSync(process.argv[1], "utf8").trim().split(/\r?\n/).map(JSON.parse);
+            const broken = rows.filter((r) => r.tokens == null);
+            if (broken.length) { console.error("goals that never reached the model:", broken); process.exit(1); }
+          ' "$RUNNER_TEMP/results/results.jsonl"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-runtime-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/results
+            ${{ runner.temp }}/setup.txt
+            ${{ runner.temp }}/status.json
+            ${{ runner.temp }}/phonton-home/runtime/runtime.log
+          if-no-files-found: warn

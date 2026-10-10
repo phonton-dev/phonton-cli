@@ -46,9 +46,12 @@ remains visible with a context warning. Select and goal execution fetch current
 metadata and validate the calibrated context before inference.
 
 `models setup` downloads a pinned, SHA-256 checked portable Ollama runtime on
-Windows x64. Model status reports `managed_runtime_supported` so clients can
-offer setup only where the shared engine implements it. Setup needs approximately
-1.5 GB of download and 6 GB of free disk. `models status` reports the exact
+Windows x64, Linux x64/arm64 and macOS, then checks every extracted file (and,
+on Linux and macOS, every library symlink) against a pinned tree digest. Model
+status reports `managed_runtime_supported` so clients can offer setup only
+where the shared engine implements it. Setup needs approximately 1.5 GB of
+download and 6 GB of free disk on Windows and Linux, 160 MB and 650 MB on
+macOS. `models status` reports the exact
 current install reserve as `managed_storage.runtime_setup_min_free_bytes`
 alongside measured `available_bytes` and the saved runtime-install marker, so
 Desktop can flag a shortfall before a new or unfinished download. The backend
@@ -122,9 +125,12 @@ When NAME omits a tag, install, calibrate, select, and remove resolve it to the
 explicit `:latest` name reported by Ollama's installed inventory. The default
 `library/` namespace is omitted in that inventory name. Operation results and
 saved profiles use the resolved tag and still require the current digest.
-On Windows x64, a Phonton-started managed runtime records its process creation
-time, executable image, exact loopback port, canonical `models/blobs` path, and
-volume and directory IDs for the runtime, model, and blob folders.
+A Phonton-started managed runtime records its process start time, executable
+image, exact loopback port, canonical `models/blobs` path, and volume and
+directory IDs (device and inode on Linux and macOS) for the runtime, model,
+and blob folders. Listener ownership comes from the IP Helper table on
+Windows, `/proc` on Linux and `lsof` on macOS; network file systems are
+refused for managed storage.
 `models status` reports `model_store.status` as `verified_managed` only while
 the same live process still owns that listener and the unredirected blob path
 matches the receipt; it reports current `available_bytes` for that volume.

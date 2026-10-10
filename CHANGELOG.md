@@ -4,6 +4,45 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.23.0 - Local models on Linux and macOS
+
+### Added
+
+- [added] `phonton models setup` installs and starts a verified local runtime
+  on Linux (x64, arm64) and macOS, as it already did on Windows x64. It
+  downloads the pinned official Ollama 0.34.2 archive, checks its published
+  SHA-256, unpacks it in-process (no `zstd` or `tar` needed) into an owned
+  stage, and checks every file and library symlink against a pinned tree
+  digest before use. Phonton then proves the runtime it started owns
+  `127.0.0.1:11434` (`/proc` on Linux, `lsof` on macOS) and records its start
+  time and executable, so local goals run as verified-managed without
+  `--allow-unverified-runtime`. Network and FUSE mounts are refused for
+  managed storage.
+- [added] `scripts/runtime-tree-digest.py` recomputes every platform's pins
+  from the published archives; it reproduces the existing Windows pins.
+- [added] CI runs the local-runtime tests on macOS, and a `managed-runtime`
+  workflow sets up a model and runs goals on fresh Linux and macOS runners
+  with no Ollama installed. The local smoke workflow uses the managed runtime.
+
+### Fixed
+
+- [fixed] Local models often answer a search/replace edit with only a
+  block's opening line as `search` (`class OrderBook {`) and the whole
+  rewritten block as the replacement. Phonton replaced just that line and
+  duplicated the body; in the CI smoke suite every `shop-cancel-restock`
+  candidate and most `ledger-csv-quote` candidates failed to parse for this
+  reason. When the replacement starts with that line and is itself one
+  complete block, the whole block is replaced (brace-aware for C-family,
+  JS/TS and Rust; indentation-aware for Python). An unclosed replacement is
+  still an insertion. Acceptance on the local smoke suite is unchanged (3B:
+  14/36 before and after); the rewrites now parse and fail, when they fail,
+  on the project's tests.
+- [fixed] A local model that writes `'\n'` with a single JSON escape produced
+  a real line break inside a one-line string literal, a syntax error. Such
+  breaks in a search/replace edit are turned back into `\n` (JS/TS, Python,
+  Go, Java, C-family; not Rust, whose strings may span lines), only when the
+  text being replaced reads clean to the same scanner.
+
 ## 0.22.3 - Honest receipts
 
 ### Changed

@@ -551,10 +551,10 @@ fn runtime_guard_at(
         settings,
         std::env::var_os("PHONTON_LOCAL_STATE").is_some(),
     )?;
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    #[cfg(not(managed_runtime))]
     let _ = &root;
     if settings.endpoint == crate::models_cli::MANAGED_MODEL_ENDPOINT {
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(managed_runtime)]
         match phonton_local::managed_store::bind(&root, &settings.endpoint) {
             Ok(Some(binding)) => {
                 return Ok(phonton_worker::local_run::RuntimeGuard::managed_verified(
@@ -2788,7 +2788,7 @@ mod tests {
         assert!(!attempt_path(&directory).exists());
         drop(lease);
 
-        #[cfg(windows)]
+        #[cfg(any(windows, unix))]
         {
             let chosen = fixture.path().join("chosen");
             std::fs::create_dir(&chosen).unwrap();
@@ -3010,7 +3010,7 @@ mod tests {
         server.abort();
     }
 
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(managed_runtime)]
     #[test]
     fn stale_managed_launch_cannot_be_overridden_by_runtime_consent() {
         let fixture = tempfile::tempdir().unwrap();
