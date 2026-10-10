@@ -1511,12 +1511,8 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         if changed_files.is_empty() {
             known_gaps.push("No changed files were recorded for this run.".into());
         }
-        if run_commands.is_empty() {
-            known_gaps.push(
-                "No application launch command was inferred; verification checks are reported separately."
-                    .into(),
-            );
-        }
+        // A missing launch command is not a gap: libraries have none, and
+        // receipts list run commands only when there are some.
         if !reached_test_layer {
             known_gaps.push("No explicit test layer was recorded by this run.".into());
         }

@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI Status" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars&color=ff69b4"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.23.0--beta-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.23.1--beta-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
@@ -54,7 +54,7 @@ goal     Make parsePort reject ports outside 1-65535 and trailing garbage
 plan     1 subtask, verify with the repo's own `node --test`
 edit     unified diff against the exact current src/port.js
 verify   patch applies · syntax · tests: 3 pass, 0 fail (was 1 pass, 2 fail)
-review   receipt: 1 file (+6/-2) · 8.8k tokens · est. $0.003 · checkpoint #1
+review   receipt: 1 file (+7/-1) · 803 in / 439 out tokens · $0.0008 · 8.2 s · checkpoint #1
 remember completion stored locally for the next goal
 ```
 
