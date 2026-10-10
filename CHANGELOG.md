@@ -12,6 +12,8 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   cost. The line under it repeated the cost and counted tokens from a
   different source (2,362 under a receipt of 803 in + 1,558 out); the
   "vs frontier" estimate now sits in the receipt, for priced models only.
+- [fixed] Tokens from a worker call that failed after reporting progress
+  were missing from the receipt. They now count as estimated input.
 - [changed] "No application launch command was inferred" is no longer
   listed as a known gap; libraries have none, and run commands are listed
   when there are some.
