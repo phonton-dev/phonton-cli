@@ -136,7 +136,7 @@ pub fn search_replace_hunks(
     if response.len() > 1024 * 1024 {
         return Err(LocalError::Invalid("Edit output exceeds 1 MiB".into()));
     }
-    let edit: Edit = serde_json::from_str(&preserve_code_escapes(response))?;
+    let mut edit: Edit = serde_json::from_str(&preserve_code_escapes(response))?;
     let relative = safe_relative_path(&edit.path)?;
     if !allowed.iter().any(|path| path == &relative) {
         return Err(LocalError::Invalid(format!(
@@ -174,14 +174,14 @@ pub fn search_replace_hunks(
                 .into(),
         ));
     }
+    if let Some(repaired) = escape_string_line_breaks(&edit.search, &edit.replace, &relative) {
+        edit.replace = repaired;
+    }
     if edit.search == edit.replace {
         return Err(LocalError::Invalid("Edit makes no change".into()));
     }
     let search = block_anchor_search(&original, &edit.search, &edit.replace, &relative)
         .unwrap_or(&edit.search);
-    if let Some(problem) = unbalanced_replacement(search, &edit.replace, &relative) {
-        return Err(LocalError::Invalid(problem));
-    }
     let updated = original.replacen(search, &edit.replace, 1);
     if updated.len() > 1024 * 1024 || original.contains('\0') || updated.contains('\0') {
         return Err(LocalError::Invalid(
@@ -273,40 +273,99 @@ fn brace_language(path: &Path) -> Option<bool> {
     .then_some(extension == "rs")
 }
 
-/// Replacing text with text that opens or closes a different number of
-/// braces always leaves the file unbalanced, usually because the model cut
-/// its replacement off. Name that instead of waiting for a parser error.
-fn unbalanced_replacement(search: &str, replace: &str, path: &Path) -> Option<String> {
-    let rust = brace_language(path)?;
-    // A regex like /\{/ is outside what this scanner understands.
-    if [search, replace]
-        .iter()
-        .any(|text| text.contains("\\{") || text.contains("\\}"))
-    {
+/// Small models write `'\n'` inside JSON with a single escape, so the decoded
+/// replacement holds a real line break inside a one-line string literal: a
+/// syntax error in JS, Python, Go, Java and C. Turn those breaks back into
+/// `\n`. Applied only when the scanner reads the replaced text as clean, so a
+/// regex or comment it misreads leaves the edit untouched.
+fn escape_string_line_breaks(search: &str, replace: &str, path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let python = extension == "py";
+    let c_family = matches!(
+        extension.as_str(),
+        "js" | "mjs"
+            | "cjs"
+            | "jsx"
+            | "ts"
+            | "mts"
+            | "cts"
+            | "tsx"
+            | "go"
+            | "java"
+            | "kt"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "hpp"
+            | "cs"
+            | "php"
+    );
+    if !python && !c_family {
         return None;
     }
-    let net = |text: &str| {
-        let mut depth = 0;
-        walk_braces(text, rust, |_, after| {
-            depth = after;
-            true
-        });
-        depth
-    };
-    let (before, after) = (net(search), net(replace));
-    (before != after).then(|| {
-        if after > before {
-            format!(
-                "The replacement text leaves {} more brace(s) open than the text it replaces; it looks cut off. Return the complete function or block as text.",
-                after - before
-            )
+    if !string_line_breaks(search, python).is_empty() {
+        return None;
+    }
+    let breaks = string_line_breaks(replace, python);
+    if breaks.is_empty() || breaks.len() > 4 {
+        return None;
+    }
+    let mut repaired = String::with_capacity(replace.len() + breaks.len());
+    let mut last = 0;
+    for offset in breaks {
+        // Drop a CR before the break too; `\n` stands for the whole break.
+        let end = if replace[..offset].ends_with('\r') {
+            offset - 1
         } else {
-            format!(
-                "The replacement text closes {} more brace(s) than the text it replaces. Replace a complete function or block.",
-                before - after
-            )
+            offset
+        };
+        repaired.push_str(&replace[last..end]);
+        repaired.push_str("\\n");
+        last = offset + 1;
+    }
+    repaired.push_str(&replace[last..]);
+    Some(repaired)
+}
+
+/// Byte offsets of line breaks inside one-line `'` or `"` string literals,
+/// outside comments, template literals and Python triple-quoted strings.
+fn string_line_breaks(text: &str, python: bool) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        if (python && rest.starts_with('#')) || (!python && rest.starts_with("//")) {
+            i += rest.find('\n').unwrap_or(rest.len());
+        } else if !python && rest.starts_with("/*") {
+            i += rest[2..].find("*/").map_or(rest.len(), |end| end + 4);
+        } else if python && (rest.starts_with("\"\"\"") || rest.starts_with("'''")) {
+            let quote = &rest[..3];
+            i += rest[3..].find(quote).map_or(rest.len(), |end| end + 6);
+        } else if !python && rest.starts_with('`') {
+            let mut j = 1;
+            while j < rest.len() && rest.as_bytes()[j] != b'`' {
+                j += if rest.as_bytes()[j] == b'\\' { 2 } else { 1 };
+            }
+            i += (j + 1).min(rest.len());
+        } else if rest.starts_with('"') || rest.starts_with('\'') {
+            let quote = bytes[i];
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != quote {
+                match bytes[j] {
+                    b'\\' => j += 1,
+                    b'\n' => found.push(j),
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j + 1;
+        } else {
+            i += rest.chars().next().map_or(1, char::len_utf8);
         }
-    })
+    }
+    found
 }
 
 /// Visit each brace outside strings and comments with its byte offset and the
@@ -863,22 +922,46 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_off_replacement_is_named_before_any_check_runs() {
-        // qwen2.5-coder:3b on shop-top-ties stopped mid-function; the parser
-        // error ("Unexpected end of input") pointed nowhere useful.
-        let original = include_str!("../../fixtures/shop/src/shop.js");
-        let start = original.find("function topProducts").unwrap();
-        let end = start + original[start..].find("\n}\n").unwrap() + 2;
-        let search = &original[start..end];
-        let cut = &search[..search.find("    .map(").unwrap()];
+    fn a_line_break_decoded_inside_a_string_literal_becomes_an_escape() {
+        // qwen2.5-coder:3b on todo-sort wrote `join('\n')` with one JSON
+        // escape; strict JSON decodes it to a real line break in the string.
+        let original =
+            "function formatList(todos) {\n  return todos.map(formatTodo).join('\\n');\n}\n";
+        let raw = r#"{"path":"format.js","search":"  return todos.map(formatTodo).join('\\n');","text":"  const sorted = [...todos];\n  return sorted.map(formatTodo).join('\n');"}"#;
         let dir = tempfile::tempdir().unwrap();
-        let path = PathBuf::from("shop.js");
+        let path = PathBuf::from("format.js");
         std::fs::write(dir.path().join(&path), original).unwrap();
-        let raw = serde_json::json!({"path": "shop.js", "search": search, "text": cut}).to_string();
-        let error = search_replace_hunks(dir.path(), &[path], &raw)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("leaves 1 more brace(s) open"), "{error}");
+        let scope = [path.clone()];
+        let hunks = search_replace_hunks(dir.path(), &scope, raw).unwrap();
+        assert_eq!(
+            materialize_hunks(dir.path(), &scope, &hunks).unwrap()[&path],
+            "function formatList(todos) {\n  const sorted = [...todos];\n  return sorted.map(formatTodo).join('\\n');\n}\n"
+        );
+    }
+
+    #[test]
+    fn line_breaks_outside_one_line_strings_are_left_alone() {
+        let js = |text: &str| string_line_breaks(text, false);
+        assert!(js("// don't\nconst a = 1;\n").is_empty());
+        assert!(js("/* it's\n */ const a = `x\ny`;\n").is_empty());
+        assert_eq!(js("f('a\n');\n"), vec![4]);
+        let py = |text: &str| string_line_breaks(text, true);
+        assert!(py("# don't\ndoc = '''a\nb'''\n").is_empty());
+        assert_eq!(py("print('a\n')\n"), vec![8]);
+        // A misread original (a regex with a quote) disables the repair.
+        assert_eq!(
+            escape_string_line_breaks(
+                "x = /'/;\ny('a');",
+                "x = /'/;\ny('a\n');",
+                Path::new("a.js")
+            ),
+            None
+        );
+        // Rust strings may span lines.
+        assert_eq!(
+            escape_string_line_breaks("f(\"a\");", "f(\"a\nb\");", Path::new("a.rs")),
+            None
+        );
     }
 
     #[test]

@@ -35,9 +35,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   complete block, the whole block is replaced (brace-aware for C-family,
   JS/TS and Rust; indentation-aware for Python). An unclosed replacement is
   still an insertion.
-- [fixed] A replacement that opens or closes a different number of braces
-  than the text it replaces is rejected before checks run, with a message
-  that says the replacement looks cut off, instead of a parser error.
+- [fixed] A local model that writes `'\n'` with a single JSON escape produced
+  a real line break inside a one-line string literal, a syntax error. Such
+  breaks in a search/replace edit are turned back into `\n` (JS/TS, Python,
+  Go, Java, C-family; not Rust, whose strings may span lines), only when the
+  text being replaced reads clean to the same scanner.
 
 ## 0.22.3 - Honest receipts
 
