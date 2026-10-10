@@ -4,6 +4,24 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.24.0 - A first local run that reads well
+
+### Changed
+
+- [changed] `phonton models setup MODEL` prints a summary in a terminal: the
+  runtime, the model, and each calibration probe as pass or FAIL with its
+  time, then the edit format Phonton will ask for. The full JSON record is
+  still printed with `--json` or when the output is piped. Download progress
+  rewrites one line on a terminal instead of printing a line every 250 ms,
+  and a layer's digest is no longer repeated after Ollama's own label.
+- [changed] The TUI's local plan review is shorter: Goal, Repo, Edits,
+  Checks as a command line (arguments with spaces or quotes are quoted, so
+  boundaries stay exact), Model, Budget, then short notes. The notes
+  themselves were rewritten in plain language.
+- [changed] When calibration finds no context that fits in memory, the error
+  says which memory is short and what to do, instead of "no safe automatic
+  context".
+
 ## 0.23.1 - Receipts that agree
 
 ### Changed
