@@ -42,10 +42,13 @@ impl ProgressPrinter {
     /// line in place; finished stages and piped output get a line each.
     fn print(&mut self, event: DownloadProgress, elapsed: Duration) {
         use std::io::IsTerminal;
-        let partial = event
-            .completed
-            .zip(event.total)
-            .is_some_and(|(done, total)| done < total);
+        // A byte line is unfinished until completed reaches a known total;
+        // "? / total" (nothing received yet) is unfinished too.
+        let partial = match (event.completed, event.total) {
+            (Some(done), Some(total)) => done < total,
+            (None, Some(_)) => true,
+            _ => false,
+        };
         let Some(line) = self.line(event, elapsed) else {
             return;
         };
@@ -981,7 +984,8 @@ async fn install_model(
             let reserve = admission.reserve_bytes;
             progress(DownloadProgress {
                 status: format!(
-                    "Model store verified: {} of {} bytes to download{}, {} bytes kept free",
+                    "Model store verified: {} to download ({} of {} bytes){}, {} bytes kept free",
+                    gigabytes(&json!(admission.remaining_bytes)),
                     admission.remaining_bytes,
                     admission.manifest_bytes,
                     if admission.credited_existing_bytes > 0 {
