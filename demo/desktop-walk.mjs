@@ -61,13 +61,13 @@ await page.waitForTimeout(1500);
 await click(page.locator('#local-goal'));
 await page.locator('#local-goal').pressSequentially(GOAL, { delay: 28 });
 await page.waitForTimeout(800);
-await click(page.locator('summary', { hasText: 'Verification & permissions' }));
-await click(page.locator('label.lw-approval input').first());
 await shot('composed');
 
 await click(page.getByRole('button', { name: /Review plan/ }));
-await page.getByRole('button', { name: /Run local goal/ }).waitFor({ timeout: 180000 });
+await page.getByRole('button', { name: /Run (local goal|without checks)/ }).waitFor({ timeout: 180000 });
 await page.waitForTimeout(2500);
+await click(page.locator('.lw-plan label.lw-approval input').first());
+await page.waitForTimeout(800);
 await shot('plan', true);
 
 await click(page.getByRole('button', { name: /Run local goal/ }));
