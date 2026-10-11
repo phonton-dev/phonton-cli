@@ -33,9 +33,38 @@ pub(crate) fn profile_sha256(profile: &ModelProfile) -> Result<String> {
 struct ProgressPrinter {
     last: Option<DownloadProgress>,
     at: Duration,
+    /// Width of an unfinished byte line rewritten in place on a terminal.
+    open: usize,
 }
 
 impl ProgressPrinter {
+    /// Print to stderr. On a terminal an unfinished download rewrites one
+    /// line in place; finished stages and piped output get a line each.
+    fn print(&mut self, event: DownloadProgress, elapsed: Duration) {
+        use std::io::IsTerminal;
+        // A byte line is unfinished until completed reaches a known total;
+        // "? / total" (nothing received yet) is unfinished too.
+        let partial = match (event.completed, event.total) {
+            (Some(done), Some(total)) => done < total,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let Some(line) = self.line(event, elapsed) else {
+            return;
+        };
+        let width = self.open;
+        if partial && std::io::stderr().is_terminal() {
+            eprint!("\r{line:<width$}");
+            self.open = line.chars().count();
+        } else {
+            if width > 0 {
+                eprint!("\r{:<width$}\r", "");
+                self.open = 0;
+            }
+            eprintln!("{line}");
+        }
+    }
+
     fn line(&mut self, event: DownloadProgress, elapsed: Duration) -> Option<String> {
         if let Some(previous) = &self.last {
             let metadata_changed = previous.status != event.status
@@ -61,9 +90,14 @@ impl ProgressPrinter {
             }
         }
         let count = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+        // Ollama's status already names the layer ("pulling 4a188102020e").
         let digest = event
             .digest
             .as_ref()
+            .filter(|digest| {
+                let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+                !event.status.contains(hex.get(..12).unwrap_or(hex))
+            })
             .map(|digest| format!(" {digest}"))
             .unwrap_or_default();
         // A stage with no byte counts ("verifying digest") prints as a stage.
@@ -642,6 +676,58 @@ fn status_summary(v: &Value) -> String {
     out.join("\n")
 }
 
+/// `phonton models setup MODEL` for a person: what was installed and what
+/// calibration measured, probe by probe.
+fn setup_summary(model: &str, steps: &serde_json::Map<String, Value>) -> String {
+    let mut out = vec![String::new()];
+    let setup = &steps["setup"];
+    if let Some(version) = setup["runtime_version"].as_str() {
+        let origin = match setup["managed_origin"].as_str() {
+            Some("started_by_phonton") => "started and verified by Phonton",
+            Some(other) => other,
+            None => "not started by Phonton",
+        };
+        out.push(format!("  runtime   Ollama {version}, {origin}"));
+    }
+    let install = &steps["install"];
+    if install.is_object() {
+        out.push(format!(
+            "  model     {model}, {} on disk, digest checked",
+            gigabytes(&install["size_bytes"])
+        ));
+    }
+    let cal = &steps["calibrate"];
+    if let Some(probes) = cal["probes"].as_array() {
+        let gpu = cal["hardware"]["gpus"][0]["name"].as_str().unwrap_or("CPU");
+        out.push(format!(
+            "  measured  on {gpu}, {}k context",
+            cal["context_tokens"].as_u64().unwrap_or(0) / 1024
+        ));
+        for p in probes {
+            let mark = match p["status"].as_str() {
+                Some("passed") => "pass",
+                Some("failed") => "FAIL",
+                _ => "  - ",
+            };
+            let secs = p["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
+            out.push(format!(
+                "            {mark}  {:<20} {secs:>5.1} s",
+                p["name"].as_str().unwrap_or("?")
+            ));
+        }
+        let protocol = match cal["protocol"].as_str() {
+            Some("search_replace") => Some("search/replace"),
+            Some("unified_diff") => Some("unified diff"),
+            Some(other) => Some(other),
+            None => None,
+        };
+        if let Some(protocol) = protocol {
+            out.push(format!("  Phonton asks {model} for {protocol} edits only."));
+        }
+    }
+    out.join("\n")
+}
+
 /// `phonton models catalog` for a person.
 fn catalog_summary(models: &[CatalogModel]) -> String {
     let mut out = vec!["Models for this machine (download, fit):".to_string()];
@@ -898,9 +984,16 @@ async fn install_model(
             let reserve = admission.reserve_bytes;
             progress(DownloadProgress {
                 status: format!(
-                    "Managed store verified; {} manifest bytes, {} verified complete blob bytes credited, {} remaining bytes and {} reserve bytes",
-                    admission.manifest_bytes, admission.credited_existing_bytes,
-                    admission.remaining_bytes, reserve
+                    "Model store verified: {} to download ({} of {} bytes){}, {} bytes kept free",
+                    gigabytes(&json!(admission.remaining_bytes)),
+                    admission.remaining_bytes,
+                    admission.manifest_bytes,
+                    if admission.credited_existing_bytes > 0 {
+                        format!(" ({} already verified)", admission.credited_existing_bytes)
+                    } else {
+                        String::new()
+                    },
+                    reserve
                 ),
                 ..Default::default()
             });
@@ -1800,7 +1893,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
     if matches!(verb, "--help" | "-h" | "help")
         || (verb == "status" && args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
     {
-        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus and catalog print a summary; --json prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise setup downloads a hash-checked portable Ollama runtime (about 1.5 GB on Windows and Linux, 160 MB on macOS).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved and printed but the command exits 2; the model cannot be selected.");
+        println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL [--json]]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus, catalog and setup MODEL print a summary in a terminal; --json (or a pipe, for setup MODEL) prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise setup downloads a hash-checked portable Ollama runtime (about 1.5 GB on Windows and Linux, 160 MB on macOS).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved but the command exits 2; the model cannot be selected.");
         return Ok(0);
     }
     let value = match verb {
@@ -1834,9 +1927,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
             await_model_mutation(
                 "setup",
                 mutate("setup", "", None, |event| {
-                    if let Some(line) = printer.line(event, started.elapsed()) {
-                        eprintln!("{line}");
-                    }
+                    printer.print(event, started.elapsed())
                 }),
                 ctrl_c_requested(),
             )
@@ -1844,8 +1935,19 @@ pub async fn run(args: &[String]) -> Result<i32> {
         }
         // One command from nothing to a selected model: runtime, weights,
         // calibration, selection. Stops at the first step that fails.
-        "setup" if args.len() == 2 => {
+        "setup" if args.len() == 2 || (args.len() == 3 && args[2] == "--json") => {
+            use std::io::IsTerminal;
             let model = args[1].as_str();
+            // People get a summary; scripts and --json get the full record.
+            let summary = args.len() == 2 && std::io::stdout().is_terminal();
+            let report = |steps: &serde_json::Map<String, Value>| -> Result<()> {
+                if summary {
+                    println!("{}", setup_summary(model, steps));
+                } else {
+                    println!("{}", serde_json::to_string_pretty(steps)?);
+                }
+                Ok(())
+            };
             let mut steps = serde_json::Map::new();
             for step in ["setup", "install", "calibrate", "select"] {
                 let target = if step == "setup" { "" } else { model };
@@ -1853,9 +1955,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 let value = await_model_mutation(
                     step,
                     mutate(step, target, None, |event| {
-                        if let Some(line) = printer.line(event, started.elapsed()) {
-                            eprintln!("{line}");
-                        }
+                        printer.print(event, started.elapsed())
                     }),
                     ctrl_c_requested(),
                 )
@@ -1863,12 +1963,12 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 let failed = calibration_exit_code(step, &value) != 0;
                 steps.insert(step.into(), value);
                 if failed {
-                    println!("{}", serde_json::to_string_pretty(&steps)?);
-                    eprintln!("Calibration evidence was saved, but no edit format passed. Inspect the probe outputs above; {model} cannot be selected. Try another model from `phonton models catalog`.");
+                    report(&steps)?;
+                    eprintln!("Calibration evidence was saved, but no edit format passed; {model} cannot be selected. `phonton models setup {model} --json` prints the probe outputs. Try another model from `phonton models catalog`.");
                     return Ok(2);
                 }
             }
-            println!("{}", serde_json::to_string_pretty(&steps)?);
+            report(&steps)?;
             eprintln!("Ready: {model} is calibrated and selected. Run `phonton` and type a goal, or `phonton goal \"<goal>\" --yes --allow-host-checks`.");
             return Ok(0);
         }
@@ -1895,9 +1995,7 @@ pub async fn run(args: &[String]) -> Result<i32> {
             await_model_mutation(
                 verb,
                 mutate(verb, &args[1], context, |event| {
-                    if let Some(line) = printer.line(event, started.elapsed()) {
-                        eprintln!("{line}");
-                    }
+                    printer.print(event, started.elapsed())
                 }),
                 ctrl_c_requested(),
             )
@@ -3838,6 +3936,48 @@ mod tests {
         assert!(printer
             .line(progress(1000), Duration::from_secs(1))
             .is_none());
+    }
+    #[test]
+    fn setup_summary_lists_each_probe_and_the_chosen_format() {
+        let steps = json!({
+            "setup": {"runtime_version": "0.34.2", "managed_origin": "started_by_phonton"},
+            "install": {"size_bytes": 1_929_912_626u64},
+            "calibrate": {
+                "context_tokens": 8192,
+                "protocol": "search_replace",
+                "hardware": {"gpus": [{"name": "RTX 4050"}]},
+                "probes": [
+                    {"name": "SearchReplace edit", "status": "passed", "elapsed_ms": 7140},
+                    {"name": "UnifiedDiff edit", "status": "failed", "elapsed_ms": 775}
+                ]
+            }
+        });
+        let text = setup_summary("qwen2.5-coder:3b", steps.as_object().unwrap());
+        assert!(
+            text.contains("Ollama 0.34.2, started and verified by Phonton"),
+            "{text}"
+        );
+        assert!(text.contains("1.9 GB on disk"), "{text}");
+        assert!(text.contains("on RTX 4050, 8k context"), "{text}");
+        assert!(text.contains("pass  SearchReplace edit"), "{text}");
+        assert!(text.contains("FAIL  UnifiedDiff edit"), "{text}");
+        assert!(text.contains("for search/replace edits only"), "{text}");
+    }
+    #[test]
+    fn layer_digest_is_not_repeated_after_ollamas_own_label() {
+        let mut printer = ProgressPrinter::default();
+        let line = printer
+            .line(
+                DownloadProgress {
+                    status: "pulling 4a188102020e".into(),
+                    digest: Some("sha256:4a188102020e9c95".into()),
+                    completed: Some(1),
+                    total: Some(2),
+                },
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert_eq!(line, "pulling 4a188102020e: 1 / 2 bytes");
     }
     #[test]
     fn progress_never_hides_backwards_bytes_layer_changes_or_unknown_sizes() {

@@ -18,64 +18,67 @@ impl PendingLocalPlan {
         let r = &p.request;
         let repository = r.repository.display().to_string();
         let mut lines = vec![
-            format!("Goal: {}", r.goal),
+            format!("Goal     {}", r.goal),
             format!(
-                "Repository: {}",
+                "Repo     {}",
                 repository.strip_prefix(r"\\?\").unwrap_or(&repository)
             ),
             String::new(),
-            "WILL EDIT".into(),
         ];
-        for f in &p.files {
-            lines.push(format!("  {}  ({})", f.path.display(), f.reason));
-        }
+        let mut edits: Vec<String> = p
+            .files
+            .iter()
+            .map(|f| format!("{}  ({})", f.path.display(), f.reason))
+            .collect();
         if let Some(c) = &p.creation {
-            lines.push(format!("  {}  (new file)", c.path.display()));
+            edits.push(format!("{}  (new file)", c.path.display()));
         }
-        lines.extend([String::new(), "CHECKS (exact arguments)".into()]);
-        if let Some(c) = &r.preparation {
-            lines.push(format!("  setup {}", command(c)));
-        }
-        for c in &r.checks {
-            lines.push(format!("  {}", command(c)));
-        }
-        lines.push(
+        labeled(&mut lines, "Edits", edits);
+        // Arguments print exactly; any that could read ambiguously are quoted.
+        let mut checks: Vec<String> = r
+            .preparation
+            .iter()
+            .map(|c| format!("setup: {}", command(c)))
+            .chain(r.checks.iter().map(command))
+            .collect();
+        checks.push(
             if r.approve_host_execution {
-                "  Allowed by your session choice; project code runs without isolation."
+                "Allowed for this session; project code runs without isolation."
             } else {
-                "  Not allowed: the candidate will stay unverified."
+                "Not allowed yet; without it the result stays unverified."
             }
             .into(),
         );
-        lines.push(String::new());
+        labeled(&mut lines, "Checks", checks);
         if let Some(m) = &reviewed.model_selection {
-            lines.push(format!(
-                "MODEL {} · {} context tokens",
-                m.model, m.context_tokens
-            ));
+            let mut model = vec![format!("{} · {} context tokens", m.model, m.context_tokens)];
             if r.allow_unverified_runtime {
-                lines.push(format!(
-                    "  Runtime at {} was not started by Phonton; it may relay repository context off this machine. Y runs this plan on it.",
+                model.push(format!(
+                    "Runtime at {} was not started by Phonton; it may relay repository context off this machine. Y runs this plan on it.",
                     m.endpoint
                 ));
             }
+            labeled(&mut lines, "Model", model);
         }
         lines.extend([
             format!(
-                "BUDGET {} model calls · {} output tokens · {} s",
+                "Budget   {} model calls · {} output tokens · {} s",
                 r.budget.generations, r.budget.generated_tokens, r.budget.wall_seconds
             ),
+            String::new(),
             "Edits stay in a copy until you apply the reviewed result.".into(),
         ]);
         // The pending-approval note is stale once the session allowed checks.
         let notes: Vec<&String> = p
             .warnings
             .iter()
-            .filter(|w| !(r.approve_host_execution && w.contains("require separate host approval")))
+            .filter(|w| {
+                !(r.approve_host_execution && w.contains("Phonton asks before running them"))
+            })
             .collect();
         if !notes.is_empty() {
-            lines.extend([String::new(), "NOTES".into()]);
-            lines.extend(notes.into_iter().cloned());
+            lines.extend([String::new(), "Notes".into()]);
+            lines.extend(notes.into_iter().map(|n| format!("- {n}")));
         }
         Self {
             task_id,
@@ -160,12 +163,35 @@ impl PendingLocalPlan {
     }
 }
 
+/// First line under a label, the rest aligned beneath it.
+fn labeled(lines: &mut Vec<String>, label: &str, items: Vec<String>) {
+    for (i, item) in items.into_iter().enumerate() {
+        let head = if i == 0 { label } else { "" };
+        lines.push(format!("{head:<9}{item}"));
+    }
+}
+
+/// A shell-like line that keeps argument boundaries: an argument with
+/// spaces, quotes, escapes or control characters is JSON-quoted.
 fn command(c: &phonton_types::local_run::LocalCheck) -> String {
-    let args: Vec<&str> = std::iter::once(c.program.as_str())
-        .chain(c.args.iter().map(String::as_str))
-        .collect();
-    // Serializing strings cannot fail; preserve argument boundaries in the UI.
-    serde_json::to_string(&args).unwrap_or_else(|_| "[unavailable]".into())
+    std::iter::once(&c.program)
+        .chain(&c.args)
+        .map(|arg| {
+            let plain = !arg.is_empty()
+                && arg.chars().all(|ch| {
+                    !ch.is_whitespace()
+                        && !ch.is_control()
+                        && !matches!(ch, '"' | '\'' | '\\' | '`' | '$')
+                });
+            if plain {
+                arg.clone()
+            } else {
+                // Serializing a string cannot fail.
+                serde_json::to_string(arg).unwrap_or_else(|_| "\"?\"".into())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -243,8 +269,13 @@ mod tests {
     fn commands_preserve_argument_boundaries_and_control_characters() {
         let c = phonton_types::local_run::LocalCheck {
             program: "python".into(),
-            args: vec!["test suite.py".into(), "a\nb".into()],
+            args: vec![
+                "test suite.py".into(),
+                "a\nb".into(),
+                "".into(),
+                "--x=1".into(),
+            ],
         };
-        assert_eq!(command(&c), r#"["python","test suite.py","a\nb"]"#);
+        assert_eq!(command(&c), r#"python "test suite.py" "a\nb" "" --x=1"#);
     }
 }
