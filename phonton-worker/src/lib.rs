@@ -1427,6 +1427,9 @@ fn render_target_sources(
         if included >= MAX_TARGET_SOURCE_FILES {
             break;
         }
+        if !inside_root(root, &rel) {
+            continue;
+        }
         let Ok(bytes) = std::fs::read(root.join(&rel)) else {
             continue;
         };
@@ -1581,9 +1584,21 @@ fn parse_file_request(content: &str) -> Option<Vec<String>> {
         .lines()
         .map(|line| line.trim().trim_matches('`').trim())
         .find(|line| line.starts_with("NEED_FILES:"))?;
+    let is_quote = |c: char| matches!(c, '`' | '"' | '\'');
+    // Comma-separated; a quoted entry keeps its spaces, an unquoted one is
+    // also split on whitespace.
     let paths: Vec<String> = line["NEED_FILES:".len()..]
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .map(|p| p.trim_matches(|c: char| matches!(c, '`' | '"' | '\'')))
+        .split(',')
+        .flat_map(|part| {
+            let part = part.trim();
+            let quoted = part.len() > 1 && part.starts_with(is_quote) && part.ends_with(is_quote);
+            if quoted {
+                vec![&part[1..part.len() - 1]]
+            } else {
+                part.split_whitespace().collect()
+            }
+        })
+        .map(|p| p.trim_matches(is_quote))
         .filter(|p| !p.is_empty())
         .map(|p| p.replace('\\', "/"))
         .take(MAX_REQUESTED_FILES)
@@ -1597,11 +1612,23 @@ fn existing_requested_files(requested: Vec<String>, root: &Path) -> (Vec<PathBuf
     let (mut found, mut missing) = (Vec::new(), Vec::new());
     for raw in requested {
         match safe_relative_path(Path::new(&raw)) {
-            Some(rel) if root.join(rel).is_file() => found.push(rel.to_path_buf()),
+            Some(rel) if inside_root(root, rel) => found.push(rel.to_path_buf()),
             _ => missing.push(raw),
         }
     }
     (found, missing)
+}
+
+/// True when `rel` is a file that resolves inside `root`. A symlink can point
+/// anywhere on disk; what it targets outside the repository must never be
+/// sent to a model.
+fn inside_root(root: &Path, rel: &Path) -> bool {
+    let path = root.join(rel);
+    path.is_file()
+        && match (root.canonicalize(), path.canonicalize()) {
+            (Ok(root), Ok(path)) => path.starts_with(root),
+            _ => false,
+        }
 }
 
 /// Names to look for in a large file, most specific first: identifiers the
@@ -1772,11 +1799,16 @@ fn missing_required_touch_files(
 fn missing_requested_test(subtask: &Subtask, hunks: &[DiffHunk]) -> Option<String> {
     let task = phonton_types::task_description_without_prior_context(&subtask.description)
         .to_ascii_lowercase();
-    if !asks_for_tests(&task)
-        || hunks
-            .iter()
-            .any(|hunk| is_verification_definition_path(&hunk.file_path))
-    {
+    // A manifest or lockfile does not count; a Rust test may live in the
+    // source file it tests.
+    let adds_a_test = hunks.iter().any(|hunk| {
+        is_test_path(&hunk.file_path)
+            || hunk.lines.iter().any(|line| {
+                matches!(line, DiffLine::Added(text)
+                    if text.contains("#[test]") || text.contains("::test]") || text.contains("#[cfg(test)]"))
+            })
+    });
+    if !asks_for_tests(&task) || adds_a_test {
         return None;
     }
     Some(
@@ -1809,7 +1841,7 @@ fn asks_for_tests(task: &str) -> bool {
                 words.get(i + 1).copied(),
                 Some("pass" | "passes" | "passing" | "green" | "still")
             )
-            && words[i.saturating_sub(3)..i].iter().any(|before| {
+            && words[i.saturating_sub(5)..i].iter().any(|before| {
                 matches!(
                     *before,
                     "add" | "adds" | "adding" | "write" | "writes" | "writing" | "with" | "new"
@@ -1819,6 +1851,18 @@ fn asks_for_tests(task: &str) -> bool {
 }
 
 fn is_verification_definition_path(path: &Path) -> bool {
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    is_test_path(path)
+        || matches!(
+            file.as_str(),
+            "package.json" | "package-lock.json" | "cargo.toml" | "cargo.lock"
+        )
+}
+
+fn is_test_path(path: &Path) -> bool {
     let normalized = path
         .to_string_lossy()
         .replace('\\', "/")
@@ -1834,10 +1878,6 @@ fn is_verification_definition_path(path: &Path) -> bool {
         || file.contains(".spec.")
         || file.contains("_test.")
         || file.contains("-test.")
-        || matches!(
-            file,
-            "package.json" | "package-lock.json" | "cargo.toml" | "cargo.lock"
-        )
 }
 
 fn required_path_is_enforceable(required_path: &Path, project_root: &Path) -> bool {
@@ -2918,6 +2958,14 @@ mod tests {
             None
         );
         assert_eq!(parse_file_request("I need to see the CLI first."), None);
+        assert_eq!(
+            parse_file_request("NEED_FILES: \"docs/User Guide.md\", a.js b.js"),
+            Some(vec![
+                "docs/User Guide.md".to_string(),
+                "a.js".to_string(),
+                "b.js".to_string()
+            ])
+        );
 
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("a.js"), "a\n").unwrap();
@@ -2994,6 +3042,46 @@ mod tests {
             ..readme_only[0].clone()
         }];
         assert!(missing_requested_test(&subtask, &with_test).is_none());
+
+        assert!(asks_for_tests(
+            "please add a thorough unit test for parsing"
+        ));
+        let manifest_only = vec![DiffHunk {
+            file_path: PathBuf::from("package.json"),
+            ..readme_only[0].clone()
+        }];
+        assert!(missing_requested_test(&subtask, &manifest_only).is_some());
+        let rust_inline = vec![DiffHunk {
+            file_path: PathBuf::from("src/lib.rs"),
+            lines: vec![DiffLine::Added("    #[test]".into())],
+            ..readme_only[0].clone()
+        }];
+        assert!(missing_requested_test(&subtask, &rust_inline).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_out_of_the_repo_are_never_read() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOKEN=hunter2\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            repo.path().join("notes.md"),
+        )
+        .unwrap();
+
+        let (found, missing) = existing_requested_files(vec!["notes.md".into()], repo.path());
+        assert!(found.is_empty());
+        assert_eq!(missing, ["notes.md"]);
+        let rendered = render_target_sources(
+            &plain_subtask("Update notes.md"),
+            &[],
+            &[],
+            repo.path(),
+            &[PathBuf::from("notes.md")],
+        );
+        assert!(!rendered.contains("hunter2"));
     }
 
     #[test]
