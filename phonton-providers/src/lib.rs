@@ -1404,10 +1404,18 @@ impl Provider for OpenAiCompatibleProvider {
             ));
         }
 
-        let resp: Value = http_resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::ParseFail(e.to_string()))?;
+        // DeepSeek sends the 200 status at once and the answer only when the
+        // model is done, so a client timeout fires mid-body. Report that as
+        // a timeout, not as malformed JSON.
+        let text = http_resp.text().await.map_err(|e| {
+            ProviderError::Transport(if e.is_timeout() {
+                "timed out waiting for the model's answer".into()
+            } else {
+                error_chain(&e)
+            })
+        })?;
+        let resp: Value =
+            serde_json::from_str(&text).map_err(|e| ProviderError::ParseFail(e.to_string()))?;
 
         let content = resp
             .pointer("/choices/0/message/content")
