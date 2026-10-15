@@ -18,7 +18,11 @@ saw either, and the run passed without adding the test.
   capitals such as README. Before, only Rust and a few web extensions counted,
   and only after verbs like "edit" or "update".
 - [fixed] A goal that asks to add or write a test no longer passes when the
-  diff changes no test file. The model is told to add the test and retries.
+  diff changes no test file. A manifest or lockfile does not count; a Rust
+  `#[test]` added in the source file does. The model is told to add the test
+  and retries.
+- [fixed] Source is only shown to the model for files that resolve inside the
+  repository; a symlink that points elsewhere is skipped.
 - [fixed] A model that is still thinking when the 600 s request timeout fires
   is reported as "timed out waiting for the model's answer", not "provider
   response parse failed: error decoding response body".
