@@ -88,6 +88,19 @@ node benchmarks/polyglot/run.mjs --polyglot ../polyglot-benchmark --model refere
   --endpoint http://127.0.0.1:11999/v1 --arms bare --per-lang 3
 ```
 
+### On a free Kaggle GPU
+
+`kaggle_job.py` runs the whole slice on a Kaggle notebook session (GPU T4 x2,
+internet on, 12 h limit): it builds Phonton, installs Ollama 0.34.2, Node and
+OpenCode at pinned versions, calibrates the model at 16384 tokens and runs one
+runner process per language. Upload the source as a private dataset with
+`phonton-src.tar.gz` (`git archive --format=tar.gz HEAD`) and `commit.txt`,
+then push the job as a private script kernel with that dataset as a source,
+`"enable_gpu": "true"`, `"enable_internet": "true"` and
+`"machine_shape": "NvidiaTeslaT4"`. Set `PER_LANG` at the top of the script.
+`kaggle kernels output` downloads `out/`, `setup.log` and `env.txt`; attaching
+a finished run as a kernel source reuses its `prebuilt/phonton`.
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--polyglot DIR` | required | polyglot-benchmark checkout |
