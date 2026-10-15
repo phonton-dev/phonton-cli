@@ -19,14 +19,17 @@ available-RAM estimate. Inactive pages may require paging to reclaim. The
 estimate is not a reservation, and missing or invalid counters leave fit
 unknown rather than creating a recommendation.
 Catalog fit is a 4096-token cold-load estimate because a registry manifest does
-not report the installed model's context ceiling. When current memory readings
-and a manifest support it, one entry has `first_try_reason`: the largest likely
-GPU fit, or the smallest CPU/offload fit if none fits a GPU. This is a
-resource-based starting point, not a model-quality, speed, compatibility, or
-context-limit measurement. Missing readings or insufficient memory produce no
-first-try suggestion; an entry whose manifest lookup failed cannot be selected
-as the first try, though another valid entry can be. Downloading remains
-explicit; calibrate the installed model before selecting it.
+not report the installed model's context ceiling. One entry has
+`first_try_reason`: the model recommended for the machine's memory tier. The
+tier uses total memory, the largest GPU's VRAM or half of RAM when that is
+larger, so a busy machine still gets the model it can run once other apps
+close; the fit column says what is free now. Tiers: under 6 GB
+`qwen3.5:4b`, 6 GB `qwen3.5:9b`, 16 GB `gpt-oss:20b`, 24 GB `qwen3.6:35b-a3b`;
+`gemma4:12b` and `qwen3.6:27b` are listed as alternatives. This is a size-based
+starting point, not a model-quality, speed, compatibility, or context-limit
+measurement. Missing memory readings produce no suggestion, and an entry whose
+manifest lookup failed is never suggested. Downloading remains explicit;
+calibrate the installed model before selecting it.
 Before managed setup, catalog entries with a usable manifest may include
 `pre_setup_storage`. The shared engine adds runtime setup headroom, the model's
 manifest bytes and the same pull reserve used by live admission. It reports

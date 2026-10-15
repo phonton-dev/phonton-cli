@@ -17,12 +17,12 @@ phonton models storage  # inspect runtime, model, and coding-run storage
 phonton models endpoint  # inspect the selected local Ollama origin
 phonton models catalog --snapshot  # see hardware behind fit and pre_setup_storage
 phonton models setup
-phonton models install qwen2.5-coder:1.5b
-phonton models calibrate qwen2.5-coder:1.5b
-phonton models select qwen2.5-coder:1.5b
+phonton models install qwen3.5:9b
+phonton models calibrate qwen3.5:9b
+phonton models select qwen3.5:9b
 # Later, deselect before removing the active model:
 # phonton models deselect
-# phonton models remove qwen2.5-coder:1.5b
+# phonton models remove qwen3.5:9b
 phonton goal --local --plan "Fix parsePort validation" --repo C:/projects/example
 $planPath = Join-Path $env:TEMP 'phonton-reviewed-plan.json'
 phonton goal --local --plan "Fix parsePort validation" --repo C:/projects/example | Set-Content -Encoding utf8NoBOM $planPath

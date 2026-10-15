@@ -577,6 +577,18 @@ fn fit_label(fit: &Value) -> String {
     }
 }
 
+/// `phonton models setup MODEL` for the model recommended for this machine's
+/// memory tier.
+pub(crate) fn setup_command_for(hardware: &HardwareSnapshot) -> String {
+    let model = phonton_local::recommended_model(hardware).unwrap_or("qwen3.5:9b");
+    format!("phonton models setup {model}")
+}
+
+/// [`setup_command_for`] a serialized [`HardwareSnapshot`].
+fn setup_command(hardware: &Value) -> String {
+    setup_command_for(&serde_json::from_value(hardware.clone()).unwrap_or_default())
+}
+
 /// `phonton models` for a person: runtime, hardware, installed models and
 /// the one next step. `--json` keeps the full machine-readable status.
 fn status_summary(v: &Value) -> String {
@@ -653,12 +665,13 @@ fn status_summary(v: &Value) -> String {
             ));
         }
     }
+    let setup = setup_command(&v["hardware"]);
     let next = if v["runtime_version"].is_null() {
         if v["managed_runtime_supported"].as_bool() == Some(true) {
-            "phonton models setup qwen2.5-coder:3b installs a runtime and a model.".to_string()
+            format!("{setup} installs a runtime and the model for this machine.")
         } else {
             format!(
-                "install and start Ollama ({}), then phonton models setup qwen2.5-coder:3b.",
+                "install and start Ollama ({}), then {setup}.",
                 v["runtime_install_url"]
                     .as_str()
                     .unwrap_or("https://ollama.com/download")
@@ -667,8 +680,9 @@ fn status_summary(v: &Value) -> String {
     } else if let Some(name) = active {
         format!("{name} is selected for local goals. Run phonton in a project.")
     } else if models.is_empty() {
-        "phonton models catalog lists models that fit; phonton models setup MODEL installs one."
-            .into()
+        format!(
+            "{setup} installs the model for this machine; phonton models catalog lists the others."
+        )
     } else {
         "phonton models setup MODEL calibrates and selects an installed model.".into()
     };
@@ -766,7 +780,13 @@ fn catalog_summary(models: &[CatalogModel]) -> String {
     if reasons.len() == 1 {
         out.extend(reasons.iter().map(|r| format!("  why: {r}")));
     }
-    out.push("next: phonton models setup MODEL (add --json for full details).".into());
+    let first = models
+        .iter()
+        .find(|m| m.first_try_reason.is_some())
+        .map_or("MODEL", |m| m.name.as_str());
+    out.push(format!(
+        "next: phonton models setup {first} (add --json for full details)."
+    ));
     out.join("\n")
 }
 
@@ -2036,16 +2056,25 @@ mod tests {
         );
         assert!(none.contains("RAM 8.0 GB free of 16.0 GB"), "{none}");
         assert!(
-            none.contains("next: install and start Ollama (https://ollama.com/download)"),
+            none.contains("next: install and start Ollama (https://ollama.com/download), then phonton models setup qwen3.5:9b."),
             "{none}"
+        );
+        let workstation = serde_json::to_value(HardwareSnapshot {
+            ram_total_bytes: Some(64_000_000_000),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            setup_command(&workstation),
+            "phonton models setup qwen3.6:35b-a3b"
         );
 
         let ready = status_summary(&json!({
             "endpoint": "http://127.0.0.1:11434", "runtime_version": "0.34.2",
             "model_store": {"status": "verified_managed"}, "hardware": {"gpus": []},
-            "active_model": "qwen2.5-coder:3b",
+            "active_model": "qwen3.5:9b",
             "models": [{
-                "model": {"name": "qwen2.5-coder:3b", "size_bytes": 1_929_912_626_u64},
+                "model": {"name": "qwen3.5:9b", "size_bytes": 6_591_455_232_u64},
                 "fit": {"status": "likely_fits_gpu"},
                 "profile": {"context_tokens": 8192, "probes": [
                     {"name": "SearchReplace edit", "status": "passed"},
@@ -2054,7 +2083,7 @@ mod tests {
             }]
         }));
         assert!(ready.contains("managed by Phonton"), "{ready}");
-        assert!(ready.contains("* qwen2.5-coder:3b"), "{ready}");
+        assert!(ready.contains("* qwen3.5:9b"), "{ready}");
         assert!(
             ready.contains("calibrated at 8k context (SearchReplace edit); fits the GPU"),
             "{ready}"

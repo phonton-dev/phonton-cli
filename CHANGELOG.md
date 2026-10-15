@@ -4,6 +4,36 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased - Current local models, local first, comparable proof
+
+### Changed
+
+- [changed] `phonton models catalog` lists 2026 local coding models and
+  marks one by the machine's total memory (the largest GPU, or half of RAM
+  when that is larger): `qwen3.5:4b` under 6 GB, `qwen3.5:9b` from 6 GB,
+  `gpt-oss:20b` from 16 GB, `qwen3.6:35b-a3b` from 24 GB, with `gemma4:12b`
+  and `qwen3.6:27b` as alternatives. The 2024 `qwen2.5-coder` entries are
+  gone. Free memory no longer decides the suggestion; the fit column still
+  reports it.
+- [changed] With no provider key anywhere, Phonton defaults to a local model
+  instead of Anthropic. `phonton doctor` and `phonton models` name the
+  `phonton models setup MODEL` command for this machine first, then the
+  provider keys.
+
+### Fixed
+
+- [fixed] `phonton review` and `phonton why-tokens` listed only the retrieved
+  snippets (often five unrelated ones, ~500 tokens) as model context. They now
+  list the files each prompt inlined whole or as excerpts, then the retrieved
+  snippets, with a per-prompt token estimate next to the provider-reported
+  input for all calls.
+
+### Added
+
+- [added] `benchmarks/polyglot`: an Aider Polyglot slice runner that scores
+  Phonton, the bare model and OpenCode on the same exercises, prompt and
+  local model, reporting pass rate, false-pass rate, tokens and wall time.
+
 ## 0.24.1 - Goals that name files get those files
 
 Found by running `phonton goal` on a real JavaScript repository with a cloud

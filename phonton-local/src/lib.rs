@@ -35,6 +35,58 @@ pub enum LocalError {
 /// Result for local model operations.
 pub type Result<T> = std::result::Result<T, LocalError>;
 
+/// One curated catalog model and the memory tier it is recommended for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogEntry {
+    /// Exact Ollama library tag.
+    pub name: &'static str,
+    /// Smallest [`model_memory_budget`], in decimal GB, this model is
+    /// recommended for.
+    pub tier_gb: u64,
+    /// Listed as an alternative; never the tier's recommendation.
+    pub alternative: bool,
+}
+
+const fn entry(name: &'static str, tier_gb: u64, alternative: bool) -> CatalogEntry {
+    CatalogEntry {
+        name,
+        tier_gb,
+        alternative,
+    }
+}
+
+/// Curated local coding models, smallest tier first. Tags checked against
+/// registry.ollama.ai on 2026-10-15 (downloads 3.3, 6.6, 8.0, 13.8, 17.8
+/// and 22.6 GB).
+pub const CATALOG: [CatalogEntry; 6] = [
+    entry("qwen3.5:4b", 0, false),
+    entry("qwen3.5:9b", 6, false),
+    entry("gemma4:12b", 10, true),
+    entry("gpt-oss:20b", 16, false),
+    entry("qwen3.6:27b", 24, true),
+    entry("qwen3.6:35b-a3b", 24, false),
+];
+
+/// Memory a local model can use on this machine: the largest GPU's total
+/// VRAM, or half of system RAM when that is larger (unified memory, CPU
+/// offload). Total, not free: closing apps frees RAM, nothing grows a GPU.
+pub fn model_memory_budget(hardware: &HardwareSnapshot) -> Option<u64> {
+    let gpu = hardware.gpus.iter().map(|gpu| gpu.total_bytes).max();
+    gpu.max(hardware.ram_total_bytes.map(|bytes| bytes / 2))
+}
+
+/// The catalog model recommended for this machine's memory tier, or `None`
+/// without a memory reading. A size-based starting point, not a
+/// coding-quality result; calibration still decides whether it is usable.
+pub fn recommended_model(hardware: &HardwareSnapshot) -> Option<&'static str> {
+    let budget = model_memory_budget(hardware)?;
+    CATALOG
+        .iter()
+        .rev()
+        .find(|entry| !entry.alternative && budget >= entry.tier_gb * 1_000_000_000)
+        .map(|entry| entry.name)
+}
+
 /// Estimate a conservative 4K-context cold-load working set. The model's
 /// context ceiling is unknown here, so this is not an automatic recommendation.
 /// Host RAM a GPU-resident model needs free: the runtime process only. Matches
@@ -236,5 +288,41 @@ mod tests {
         };
         assert_eq!(recommend_context(1 << 30, &h, Some(32768)), Some(4096));
         assert_eq!(recommend_context(0, &h, Some(32768)), None);
+    }
+
+    #[test]
+    fn recommendation_follows_total_memory_tiers() {
+        const GB: u64 = 1_000_000_000;
+        let machine = |gpu_gb: Option<u64>, ram_gb: u64| HardwareSnapshot {
+            ram_total_bytes: Some(ram_gb * GB),
+            // Free memory never changes the tier.
+            ram_available_bytes: Some(GB),
+            gpus: gpu_gb
+                .map(|gb| GpuSnapshot {
+                    name: "GPU".into(),
+                    total_bytes: gb * GB,
+                    available_bytes: 0,
+                })
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(recommended_model(&HardwareSnapshot::default()), None);
+        // RTX 4050 laptop: 6 GB VRAM, 16 GB RAM.
+        assert_eq!(recommended_model(&machine(Some(6), 16)), Some("qwen3.5:9b"));
+        assert_eq!(recommended_model(&machine(None, 8)), Some("qwen3.5:4b"));
+        assert_eq!(
+            recommended_model(&machine(Some(16), 32)),
+            Some("gpt-oss:20b")
+        );
+        assert_eq!(recommended_model(&machine(None, 36)), Some("gpt-oss:20b"));
+        assert_eq!(
+            recommended_model(&machine(Some(24), 32)),
+            Some("qwen3.6:35b-a3b")
+        );
+        assert_eq!(
+            recommended_model(&machine(None, 64)),
+            Some("qwen3.6:35b-a3b")
+        );
     }
 }

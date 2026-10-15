@@ -688,19 +688,18 @@ pub(crate) fn plan_focus_text(goal: &GoalEntry) -> String {
 
 pub(crate) fn context_focus_text(goal: &GoalEntry) -> String {
     let mut out = String::from("Context\n");
-    let mut selected = 0usize;
-    let mut selected_tokens = 0usize;
+    // Latest report per subtask: a worker reports again after NEED_FILES.
+    let mut context = std::collections::HashMap::new();
     let mut prompt_count = 0usize;
     let mut buckets = phonton_types::ContextBucketSummary::default();
     for record in &goal.flight_log {
         match &record.event {
             OrchestratorEvent::ContextSelected {
+                subtask_id,
                 slices,
                 total_token_count,
-                ..
             } => {
-                selected = selected.saturating_add(slices.len());
-                selected_tokens = selected_tokens.saturating_add(*total_token_count);
+                context.insert(*subtask_id, (slices.len(), *total_token_count));
             }
             OrchestratorEvent::PromptManifest { manifest, .. } => {
                 prompt_count = prompt_count.saturating_add(1);
@@ -709,8 +708,10 @@ pub(crate) fn context_focus_text(goal: &GoalEntry) -> String {
             _ => {}
         }
     }
+    let selected: usize = context.values().map(|(slices, _)| slices).sum();
+    let selected_tokens: usize = context.values().map(|(_, tokens)| tokens).sum();
     out.push_str(&format!(
-        "selected slices: {}  indexed tokens: {}  prompt manifests: {}\n",
+        "files and slices per prompt: {}  context tokens: {}  prompt manifests: {}\n",
         selected, selected_tokens, prompt_count
     ));
     out.push_str(&format!(

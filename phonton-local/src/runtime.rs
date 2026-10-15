@@ -90,44 +90,26 @@ fn parse_installed_inventory(value: &Value) -> Result<InstalledInventory> {
     Ok(inventory)
 }
 
-fn mark_first_try(models: &mut [CatalogModel]) {
-    // The catalog has only manifest sizes and a 4K cold-load estimate. This
-    // chooses a resource starting point, never a quality or speed winner.
-    let eligible = |model: &CatalogModel, status: FitStatus| -> Option<u64> {
-        if model.error.is_some() {
-            return None;
-        }
-        let bytes = model.download_bytes.filter(|bytes| *bytes > 0)?;
-        let fit = model.fit.as_ref()?;
-        (fit.status == status && fit.context_tokens == 4096).then_some(bytes)
-    };
+fn mark_first_try(models: &mut [CatalogModel], hardware: &HardwareSnapshot) {
+    // The tier follows total memory, so a busy machine still gets the model
+    // it can run once other apps close; the fit column says what is free now.
     for model in models.iter_mut() {
         model.first_try_reason = None;
     }
-    let gpu = models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, model)| {
-            eligible(model, FitStatus::LikelyFitsGpu)
-                .map(|bytes| (index, bytes, model.name.as_str()))
-        })
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(a.2)))
-        .map(|(index, _, _)| index);
-    if let Some(index) = gpu {
-        models[index].first_try_reason = Some("Largest manifest-backed catalog entry with a likely 4K cold-load fit on one observed GPU at browse time. This is a memory-based starting point, not a coding-quality or speed result. Calibrate after download before selecting.".into());
+    let (Some(name), Some(budget)) = (
+        crate::recommended_model(hardware),
+        crate::model_memory_budget(hardware),
+    ) else {
         return;
-    }
-    let cpu = models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, model)| {
-            eligible(model, FitStatus::CpuOrOffload)
-                .map(|bytes| (index, bytes, model.name.as_str()))
-        })
-        .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(b.2)))
-        .map(|(index, _, _)| index);
-    if let Some(index) = cpu {
-        models[index].first_try_reason = Some("Smallest manifest-backed catalog entry with a 4K CPU/offload cold-load fit. CPU/offload speed and coding quality are unmeasured. Calibrate after download before selecting.".into());
+    };
+    if let Some(model) = models
+        .iter_mut()
+        .find(|model| model.name == name && model.error.is_none())
+    {
+        model.first_try_reason = Some(format!(
+            "Recommended for {:.0} GB of model memory (the largest GPU, or half of RAM when that is larger). A size-based starting point, not a coding-quality or speed result. Calibrate after download before selecting.",
+            budget as f64 / 1e9
+        ));
     }
 }
 
@@ -255,15 +237,16 @@ fn official_manifest_url(name: &str) -> Result<String> {
 async fn catalog_entries(
     http: &Client,
     hardware: &HardwareSnapshot,
-    entries: [(String, String); 5],
+    entries: [(String, String); 6],
 ) -> Vec<CatalogModel> {
-    let [first, second, third, fourth, fifth] =
+    let [first, second, third, fourth, fifth, sixth] =
         entries.map(|(name, source)| catalog_entry(http, hardware, name, source));
-    // The curated set is fixed at five. Poll every independent registry read
+    // The curated set is fixed at six. Poll every independent registry read
     // together, then keep display order regardless of response order.
-    let (first, second, third, fourth, fifth) = tokio::join!(first, second, third, fourth, fifth);
-    let mut models = vec![first, second, third, fourth, fifth];
-    mark_first_try(&mut models);
+    let (first, second, third, fourth, fifth, sixth) =
+        tokio::join!(first, second, third, fourth, fifth, sixth);
+    let mut models = vec![first, second, third, fourth, fifth, sixth];
+    mark_first_try(&mut models, hardware);
     models
 }
 
@@ -402,7 +385,7 @@ pub fn validate_model(name: &str) -> Result<()> {
         || name.to_ascii_lowercase().contains("cloud")
     {
         return Err(LocalError::Invalid(
-            "Use a local model tag such as qwen2.5-coder:1.5b; cloud models are disabled.".into(),
+            "Use a local model tag such as qwen3.5:9b; cloud models are disabled.".into(),
         ));
     }
     Ok(())
@@ -555,16 +538,10 @@ impl LocalRuntime {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(15))
             .build()?;
-        let entries = [
-            ("qwen2.5-coder", "0.5b"),
-            ("qwen2.5-coder", "1.5b"),
-            ("qwen2.5-coder", "3b"),
-            ("qwen2.5-coder", "7b"),
-            ("qwen3.5", "4b"),
-        ]
-        .map(|(family, tag)| {
+        let entries = crate::CATALOG.map(|entry| {
+            let (family, tag) = entry.name.split_once(':').unwrap_or((entry.name, "latest"));
             (
-                format!("{family}:{tag}"),
+                entry.name.to_string(),
                 format!("https://registry.ollama.ai/v2/library/{family}/manifests/{tag}"),
             )
         });
@@ -2302,64 +2279,51 @@ mod tests {
     }
 
     #[test]
-    fn first_try_prefers_largest_manifest_backed_gpu_fit() {
+    fn first_try_follows_the_memory_tier_not_free_memory() {
+        let hardware = HardwareSnapshot {
+            ram_total_bytes: Some(16_000_000_000),
+            ram_available_bytes: Some(1_000_000_000),
+            gpus: vec![GpuSnapshot {
+                name: "RTX 4050".into(),
+                total_bytes: 6_400_000_000,
+                available_bytes: 6_000_000_000,
+            }],
+            ..Default::default()
+        };
         let mut models = vec![
-            catalog_fixture("cpu:large", Some(8), FitStatus::CpuOrOffload),
-            catalog_fixture("gpu:small", Some(2), FitStatus::LikelyFitsGpu),
-            catalog_fixture("gpu:large", Some(4), FitStatus::LikelyFitsGpu),
-            catalog_fixture("memory:large", Some(12), FitStatus::InsufficientMemory),
-            catalog_fixture("unknown:large", Some(16), FitStatus::Unknown),
+            catalog_fixture("qwen3.5:4b", Some(3), FitStatus::LikelyFitsGpu),
+            catalog_fixture("qwen3.5:9b", Some(6), FitStatus::InsufficientMemory),
+            catalog_fixture("gpt-oss:20b", Some(13), FitStatus::InsufficientMemory),
         ];
-        mark_first_try(&mut models);
-        assert_eq!(
-            models
-                .iter()
-                .filter(|m| m.first_try_reason.is_some())
-                .count(),
-            1
-        );
-        assert!(models[2]
+        mark_first_try(&mut models, &hardware);
+        let marked: Vec<&str> = models
+            .iter()
+            .filter(|m| m.first_try_reason.is_some())
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(marked, ["qwen3.5:9b"]);
+        assert!(models[1]
             .first_try_reason
             .as_deref()
             .unwrap()
-            .contains("4K"));
-        assert!(models[2]
-            .first_try_reason
-            .as_deref()
-            .unwrap()
-            .contains("memory-based"));
-        assert!(models[0].first_try_reason.is_none());
-    }
-
-    #[test]
-    fn first_try_cpu_fallback_chooses_smallest_and_ties_by_name() {
-        let mut models = vec![
-            catalog_fixture("z:small", Some(2), FitStatus::CpuOrOffload),
-            catalog_fixture("large", Some(8), FitStatus::CpuOrOffload),
-            catalog_fixture("a:small", Some(2), FitStatus::CpuOrOffload),
-        ];
-        mark_first_try(&mut models);
-        assert!(models[2]
-            .first_try_reason
-            .as_deref()
-            .unwrap()
-            .contains("CPU/offload"));
-        assert!(models[0].first_try_reason.is_none());
-        assert!(models[1].first_try_reason.is_none());
+            .contains("8 GB of model memory"));
     }
 
     #[test]
     fn first_try_withholds_on_unknown_memory_and_failed_manifest() {
-        let mut models = vec![
-            catalog_fixture("memory", Some(2), FitStatus::InsufficientMemory),
-            catalog_fixture("unknown", Some(3), FitStatus::Unknown),
-            CatalogModel {
-                error: Some("manifest unavailable".into()),
-                ..catalog_fixture("failed", Some(4), FitStatus::LikelyFitsGpu)
-            },
-        ];
-        mark_first_try(&mut models);
-        assert!(models.iter().all(|m| m.first_try_reason.is_none()));
+        let laptop = HardwareSnapshot {
+            ram_total_bytes: Some(16_000_000_000),
+            ..Default::default()
+        };
+        let mut models = vec![CatalogModel {
+            error: Some("manifest unavailable".into()),
+            ..catalog_fixture("qwen3.5:9b", Some(6), FitStatus::LikelyFitsGpu)
+        }];
+        mark_first_try(&mut models, &laptop);
+        assert!(models[0].first_try_reason.is_none());
+        let mut models = vec![catalog_fixture("qwen3.5:9b", Some(6), FitStatus::Unknown)];
+        mark_first_try(&mut models, &HardwareSnapshot::default());
+        assert!(models[0].first_try_reason.is_none());
         assert!(serde_json::to_value(&models)
             .unwrap()
             .as_array()
@@ -2378,10 +2342,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            // Hold every response until all five requests arrive. A serial
+            // Hold every response until all six requests arrive. A serial
             // catalog cannot finish this fixture before the test timeout.
             let mut requests = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut buffer = [0; 2048];
                 let mut request = Vec::new();
@@ -2426,7 +2390,7 @@ mod tests {
         });
         let entries = std::array::from_fn(|index| {
             (
-                format!("model-{index}"),
+                crate::CATALOG[index].name.to_string(),
                 format!("{endpoint}/manifests/{index}"),
             )
         });
@@ -2452,13 +2416,13 @@ mod tests {
         )
         .await
         .expect("Catalog waited for one manifest before requesting the others");
-        assert_eq!(server.await.unwrap(), [4, 3, 2, 1, 0]);
+        assert_eq!(server.await.unwrap(), [5, 4, 3, 2, 1, 0]);
         assert_eq!(
             models
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
-            ["model-0", "model-1", "model-2", "model-3", "model-4"]
+            crate::CATALOG.map(|entry| entry.name)
         );
         assert!(models[0]
             .error
@@ -2470,7 +2434,15 @@ mod tests {
             assert_eq!(model.download_bytes, Some(index as u64 * 100_000_000 + 10));
             assert!(model.error.is_none());
         }
-        assert!(models[4].first_try_reason.is_some());
+        // 8 GiB GPU and 16 GiB RAM: the 6 GB tier.
+        assert!(models[1].first_try_reason.is_some());
+        assert_eq!(
+            models
+                .iter()
+                .filter(|m| m.first_try_reason.is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]

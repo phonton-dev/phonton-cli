@@ -230,7 +230,7 @@ pub fn load() -> Result<Config> {
 
     if !path.exists() {
         let mut cfg = Config::default();
-        autodetect_provider(&mut cfg.provider, local_model_selected());
+        autodetect_provider(&mut cfg.provider);
         return Ok(cfg);
     }
 
@@ -244,7 +244,7 @@ pub fn load() -> Result<Config> {
         .and_then(|v| v.get("provider")?.get("name").cloned())
         .is_some();
     if !provider_chosen {
-        autodetect_provider(&mut cfg.provider, local_model_selected());
+        autodetect_provider(&mut cfg.provider);
     }
 
     Ok(cfg)
@@ -263,15 +263,10 @@ const AUTODETECT_ORDER: &[&str] = &[
     "together",
 ];
 
-fn local_model_selected() -> bool {
-    crate::models_cli::settings().is_ok_and(|s| s.active_model.is_some())
-}
-
 /// With no provider named in the config, use the first one that has a key
-/// (config `[provider.keys]` or environment). With no key anywhere, a
-/// calibrated local model wins. Otherwise the default stays and doctor
-/// reports the missing key.
-fn autodetect_provider(provider: &mut ProviderConfig, local_model: bool) {
+/// (config `[provider.keys]` or environment). With no key anywhere, run
+/// locally: doctor and the TUI then point at `phonton models setup`.
+fn autodetect_provider(provider: &mut ProviderConfig) {
     if resolve_api_key(provider).is_some() {
         return;
     }
@@ -286,9 +281,7 @@ fn autodetect_provider(provider: &mut ProviderConfig, local_model: bool) {
             return;
         }
     }
-    if local_model {
-        provider.name = "ollama".to_string();
-    }
+    provider.name = "ollama".to_string();
 }
 
 /// Save configuration to the resolved config path.
@@ -379,21 +372,29 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     #[test]
-    fn autodetect_uses_configured_keys_then_local_model() {
+    fn autodetect_uses_configured_keys_then_local() {
         let mut p = ProviderConfig::default();
         p.keys.insert("deepseek".into(), "sk-test".into());
         // Env may hold real keys on a dev machine; only assert when it does not.
-        if super::resolve_api_key(&ProviderConfig::default()).is_none()
-            && std::env::var_os("OPENAI_API_KEY").is_none()
-        {
-            super::autodetect_provider(&mut p, false);
+        let no_env_keys = AUTODETECT_ORDER.iter().all(|name| {
+            super::resolve_api_key(&ProviderConfig {
+                name: (*name).into(),
+                ..ProviderConfig::default()
+            })
+            .is_none()
+        });
+        if no_env_keys {
+            super::autodetect_provider(&mut p);
             assert_eq!(p.name, "deepseek");
+            let mut fresh = ProviderConfig::default();
+            super::autodetect_provider(&mut fresh);
+            assert_eq!(fresh.name, "ollama");
         }
         let mut chosen = ProviderConfig {
             api_key: Some("sk-ant-x".into()),
             ..ProviderConfig::default()
         };
-        super::autodetect_provider(&mut chosen, true);
+        super::autodetect_provider(&mut chosen);
         assert_eq!(chosen.name, "anthropic");
     }
 

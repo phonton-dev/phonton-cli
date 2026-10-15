@@ -90,8 +90,8 @@ asks it only for edits in a format it handled during calibration, runs your
 checks on a copy, and lands nothing until you apply the result.
 
 ```bash
-phonton models catalog                      # models that fit this machine
-phonton models setup qwen2.5-coder:3b       # runtime, download,
+phonton models catalog                      # marks the model for this machine
+phonton models setup qwen3.5:9b             # runtime, download,
                                             # calibrate edit formats, select
 phonton                                     # TUI: goals now run on the local model
 phonton goal "Add a count() method to TodoStore" --yes --allow-host-checks
@@ -111,6 +111,19 @@ installed already answers on port 11434, Phonton uses it instead but cannot
 verify it (an Ollama install can relay cloud models): the TUI plan review says
 so and your approval is consent for that goal; headless runs need
 `phonton goal --local ... --allow-unverified-runtime`.
+
+`models catalog` recommends one model by total memory (the largest GPU, or
+half of RAM when that is larger):
+
+| Memory | Recommended | Alternative |
+| --- | --- | --- |
+| under 6 GB | `qwen3.5:4b` | |
+| 6-16 GB | `qwen3.5:9b` | `gemma4:12b` (10 GB and up) |
+| 16-24 GB | `gpt-oss:20b` | |
+| 24 GB and up | `qwen3.6:35b-a3b` | `qwen3.6:27b` |
+
+The recommendation is a size-based starting point; calibration decides
+whether a model is usable. Any other Ollama tag works with `models setup`.
 
 In our smoke runs, qwen2.5-coder:3b on a 6 GB laptop GPU finished small
 single-file edits in a Node repo in 20-30 s. Small models work best on one
