@@ -4,6 +4,49 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.24.1 - Goals that name files get those files
+
+Found by running `phonton goal` on a real JavaScript repository with a cloud
+model: the goal named `tests/cli.test.mjs` and the README, the model never
+saw either, and the run passed without adding the test.
+
+### Fixed
+
+- [fixed] Files a goal names are shown to the model whatever the wording or
+  language: paths ending in common source, config and doc extensions (`.mjs`,
+  `.ts`, `.py`, `.go`, `.md`, `.toml` and more), plus root documents named in
+  capitals such as README. Before, only Rust and a few web extensions counted,
+  and only after verbs like "edit" or "update".
+- [fixed] A goal that asks to add or write a test no longer passes when the
+  diff changes no test file. A manifest or lockfile does not count; a Rust
+  `#[test]` added in the source file does. The model is told to add the test
+  and retries.
+- [fixed] Source is only shown to the model for files that resolve inside the
+  repository; a symlink that points elsewhere is skipped.
+- [fixed] A model that is still thinking when the 600 s request timeout fires
+  is reported as "timed out waiting for the model's answer", not "provider
+  response parse failed: error decoding response body".
+- [fixed] An empty model reply (the output limit spent on reasoning) gets a
+  retry that says so, instead of a diff-format lecture.
+
+### Added
+
+- [added] Workers see a list of the repository's files (git-tracked and
+  untracked, minus ignored, shallowest first, about 6 KB) and may reply
+  `NEED_FILES: path, path` once per subtask to get up to four files' current
+  source before writing the diff. A requested file is sent whole when it fits
+  the prompt's source budget.
+
+### Changed
+
+- [changed] Install: the curl and PowerShell install scripts are gone (they
+  pinned v0.1.0). Install with npm, a binary from GitHub Releases, or cargo.
+- [changed] There is no nightly or dev channel: the nightly workflow is
+  removed, CI runs on pushes to `main` and on pull requests, and
+  `docs/RELEASE_CHANNELS.md` lists Stable and Main only.
+- [changed] Long subtask descriptions in the `phonton goal` summary are cut
+  at 100 characters.
+
 ## 0.24.0 - A first local run that reads well
 
 ### Changed

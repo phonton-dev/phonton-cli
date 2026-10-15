@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml"><img alt="CI Status" src="https://github.com/phonton-dev/phonton-cli/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/phonton-dev/phonton-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/phonton-dev/phonton-cli?style=flat&label=stars&color=ff69b4"></a>
-  <img alt="release" src="https://img.shields.io/badge/release-v0.24.0--beta-6c63ff">
+  <img alt="release" src="https://img.shields.io/badge/release-v0.24.1--beta-6c63ff">
   <img alt="license" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
@@ -125,20 +125,15 @@ focused change at a time. Details and limits:
 npm install -g phonton-cli
 ```
 
-From source:
+Without Node: download the binary for your platform (Linux x64, macOS
+Apple Silicon, Windows x64) from
+[GitHub Releases](https://github.com/phonton-dev/phonton-cli/releases/latest)
+and put it on your `PATH`.
+
+From source (needs stable Rust and a C/C++ toolchain):
 
 ```bash
 cargo install --git https://github.com/phonton-dev/phonton-cli phonton-cli --locked --force
-```
-
-Script installers:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.sh | sh
-```
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/phonton-dev/phonton-cli/main/scripts/install.ps1)))
 ```
 
 ---

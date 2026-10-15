@@ -6381,7 +6381,7 @@ fn headless_summary_lines(task_id: TaskId, state: &GlobalState) -> Vec<String> {
             ));
         }
         for passed in &p.verification.passed {
-            out.push(format!("  ✓ {}", subtask_label(passed)));
+            out.push(format!("  ✓ {}", short(subtask_label(passed), 100)));
         }
         for finding in p.verification.findings.iter().take(3) {
             out.push(format!("  ! {finding}"));
