@@ -1,5 +1,6 @@
-//! Conservative, reviewed offline preparation for a root npm test script.
-//! This is dependency setup, never evidence that the task passed verification.
+//! Conservative, reviewed offline preparation for a root npm test script or a
+//! direct jest check. This is dependency setup, never evidence that the task
+//! passed verification.
 
 use super::{invalid, Result};
 use phonton_types::local_run::LocalCheck;
@@ -7,8 +8,10 @@ use serde_json::Value;
 use std::path::Path;
 
 const MAX_PACKAGE_JSON: u64 = 1024 * 1024;
+// The lockfile byte cap bounds the whole install description; the entry cap
+// admits an ordinary jest + babel toolchain (about 580 entries), not app trees.
 const MAX_LOCKFILE: u64 = 2 * 1024 * 1024;
-const MAX_LOCKED_PACKAGES: usize = 512;
+const MAX_LOCKED_PACKAGES: usize = 2048;
 
 pub(super) fn command() -> LocalCheck {
     LocalCheck {
@@ -109,7 +112,7 @@ pub(super) fn validated_command(root: &Path) -> Result<Option<LocalCheck>> {
         .ok_or_else(|| invalid("package-lock.json has no packages object"))?;
     if packages.is_empty() || packages.len() > MAX_LOCKED_PACKAGES || !packages.contains_key("") {
         return Err(invalid(
-            "Offline npm lockfile has no root package or exceeds 512 package entries",
+            "Offline npm lockfile has no root package or exceeds 2048 package entries",
         ));
     }
     for (path, entry) in packages {
@@ -171,6 +174,17 @@ mod tests {
             lock.replace("node_modules/fixture", r"node_modules/..\\fixture"),
         )
         .unwrap();
+        assert!(validated_command(root.path()).is_err());
+        let mut sized: serde_json::Value = serde_json::from_str(lock).unwrap();
+        let entry = sized["packages"]["node_modules/fixture"].clone();
+        // The root and fixture entries plus these fill the cap exactly.
+        for index in 2..MAX_LOCKED_PACKAGES {
+            sized["packages"][format!("node_modules/fixture-{index}")] = entry.clone();
+        }
+        std::fs::write(root.path().join("package-lock.json"), sized.to_string()).unwrap();
+        assert!(validated_command(root.path()).unwrap().is_some());
+        sized["packages"]["node_modules/fixture-over"] = entry;
+        std::fs::write(root.path().join("package-lock.json"), sized.to_string()).unwrap();
         assert!(validated_command(root.path()).is_err());
         std::fs::write(root.path().join("package-lock.json"), lock).unwrap();
         std::fs::write(

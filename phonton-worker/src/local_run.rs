@@ -4,6 +4,7 @@ mod cargo_source;
 mod context;
 mod integrity;
 mod node_deps;
+mod node_jest;
 mod node_source;
 pub mod plan;
 mod python_source;
@@ -3226,7 +3227,10 @@ fn validate_request(request: &LocalRunRequest) -> Result<()> {
             args: vec!["test".into()],
         };
         let direct_runner = node_test_invocation(&root_npm_check, &request.repository);
-        let root_script_check_selected = request.checks.iter().any(node_deps::is_root_npm_test)
+        let root_script_check_selected = request
+            .checks
+            .iter()
+            .any(|check| node_deps::is_root_npm_test(check) || node_jest::is_supported(check))
             || direct_runner.as_ref().is_some_and(|runner| {
                 request
                     .checks
@@ -3237,7 +3241,7 @@ fn validate_request(request: &LocalRunRequest) -> Result<()> {
             || preparation.args != exact.args
             || !root_script_check_selected
         {
-            return Err(invalid("Dependency preparation must be the reviewed offline npm ci command for a root npm script check or its exact direct Node TAP command"));
+            return Err(invalid("Dependency preparation must be the reviewed offline npm ci command for a root npm script check, its exact direct Node TAP command, or a direct jest check"));
         }
         if node_deps::validated_command(&request.repository)?.is_none() {
             return Err(invalid("This root package has no dependencies to prepare"));
@@ -3360,7 +3364,9 @@ fn validate_request(request: &LocalRunRequest) -> Result<()> {
                     | "rust-toolchain.toml"
                     | "tsconfig.json"
             )
+            || basename.starts_with(".babelrc")
             || [
+                "babel.config.",
                 "jest.config.",
                 "vitest.config.",
                 "vite.config.",
@@ -4535,7 +4541,8 @@ async fn checks_for_sources(
             let capture_node = purpose == CheckPurpose::Verification
                 && !node_source_paths.is_empty()
                 && is_node_command(check)
-                && node_test_invocation(check, directory).is_some();
+                && (node_test_invocation(check, directory).is_some()
+                    || node_jest::is_supported(check));
             let coverage = if capture_node {
                 tempfile::tempdir().ok()
             } else {
@@ -4616,9 +4623,14 @@ async fn checks_for_sources(
                     let cargo_no_tests = purpose == CheckPurpose::Verification
                         && output.status.success()
                         && reports_no_cargo_tests(check, &stdout);
+                    let jest_report = (purpose == CheckPurpose::Verification
+                        && output.status.success()
+                        && node_jest::names_entry(check))
+                    .then(|| node_jest::report(check, directory, &stdout));
                     let node_no_tests = purpose == CheckPurpose::Verification
                         && output.status.success()
-                        && reports_no_node_tests(check, directory, &stdout);
+                        && (matches!(jest_report, Some(Err(_)))
+                            || reports_no_node_tests(check, directory, &stdout));
                     let diagnostic_only = purpose == CheckPurpose::Verification
                         && output.status.success()
                         && !check_executes_candidate_verifier(check, directory);
@@ -4663,7 +4675,11 @@ async fn checks_for_sources(
                     } else if cargo_no_tests {
                         evidence.detail.push_str(". Cargo exited successfully, but no test behavior was exercised. Select a command that runs the tests.");
                     } else if node_no_tests {
-                        if node_deps::is_root_npm_test(check) {
+                        if let Some(Err(reason)) = &jest_report {
+                            evidence
+                                .detail
+                                .push_str(&format!(". {reason}; this run is Not run, not a pass."));
+                        } else if node_deps::is_root_npm_test(check) {
                             evidence.detail.push_str(". npm test exited successfully, but npm script shell and executable resolution can differ from package.json. This command is diagnostic only; choose a reviewed direct node --test --test-reporter=tap check for verification.");
                         } else if is_node_command(check)
                             && node_test_invocation(check, directory).is_none()
@@ -4674,6 +4690,8 @@ async fn checks_for_sources(
                         }
                     } else if diagnostic_only {
                         evidence.detail.push_str(". This command did not run a supported candidate test or a reviewed candidate-local script. Its successful exit is diagnostic only; select a check that exercises the candidate.");
+                    } else if let Some(Ok(summary)) = &jest_report {
+                        evidence.detail.push_str(&format!(". {summary}. This is process-reported evidence, not tamper-proof attestation"));
                     }
                     if evidence.status == CheckStatus::Passed
                         && cargo_test_subcommand_index(check).is_some()
@@ -4877,7 +4895,7 @@ async fn checks_for_sources(
                 stdout: String::new(),
                 stderr: String::new(),
                 detail: format!(
-                    "Node test coverage did not show the edited source loaded: {}. Select a direct node --test --test-reporter=tap check that imports each edited module; passing unrelated tests are insufficient. Coverage is process-reported evidence, not independent correctness attestation.{}",
+                    "Node test coverage did not show the edited source loaded: {}. Select a direct node --test --test-reporter=tap or jest --json check that imports each edited module; passing unrelated tests are insufficient. Coverage is process-reported evidence, not independent correctness attestation.{}",
                     missing.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", "),
                     node_coverage_issue.as_ref().map(|issue| format!(" Coverage unavailable: {issue}.")).unwrap_or_default(),
                 ),
@@ -9647,6 +9665,117 @@ mod tests {
         assert_eq!(unavailable[0].status, CheckStatus::Unavailable);
         assert_eq!(unavailable[1].status, CheckStatus::NotRun);
         assert_eq!(used, 5);
+    }
+    fn jest_sum_fixture() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("app");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/jest-sum");
+        for file in [
+            "package.json",
+            "package-lock.json",
+            "src/sum.js",
+            "test/sum.test.js",
+        ] {
+            std::fs::create_dir_all(app.join(file).parent().unwrap()).unwrap();
+            std::fs::copy(fixture.join(file), app.join(file)).unwrap();
+        }
+        (root, app)
+    }
+    fn jest_check(args: &[&str]) -> LocalCheck {
+        LocalCheck {
+            program: "node".into(),
+            args: std::iter::once("node_modules/jest/bin/jest.js")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+    #[test]
+    fn direct_jest_check_may_use_reviewed_offline_preparation() {
+        let (_root, app) = jest_sum_fixture();
+        let mut request = request();
+        request.repository = app;
+        request.files = vec!["src/sum.js".into()];
+        request.checks = vec![jest_check(&["--ci", "--json"])];
+        request.preparation = Some(node_deps::command());
+        assert!(validate_request(&request).is_ok());
+        request.checks = vec![jest_check(&["--ci"])];
+        assert!(validate_request(&request).is_err());
+        request.checks = vec![jest_check(&["--ci", "--json"])];
+        request.files = vec!["babel.config.js".into()];
+        std::fs::write(request.repository.join("babel.config.js"), "").unwrap();
+        assert!(validate_request(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("protected"));
+    }
+    #[tokio::test]
+    #[ignore = "requires npm with jest 29.7.0 in its cache (npm ci once in fixtures/jest-sum) and approved host commands"]
+    async fn offline_npm_setup_lets_the_candidate_run_its_own_jest() {
+        let (_root, app) = jest_sum_fixture();
+        let mut request = request();
+        request.repository = app.clone();
+        request.files = vec!["src/sum.js".into()];
+        request.checks = vec![jest_check(&["--ci", "--json"])];
+        request.preparation = Some(node_deps::command());
+        request.approve_host_execution = true;
+        let edited = [PathBuf::from("src/sum.js")];
+        let sources = || SourceInclusion {
+            rust: &[],
+            go: &[],
+            node: &edited,
+            python: &[],
+        };
+        let mut used = 0;
+        std::fs::write(app.join("src/sum.js"), "exports.sum = (a, b) => a - b;\n").unwrap();
+        let broken = checks_for_sources(&request, &app, &mut used, Instant::now(), None, sources())
+            .await
+            .unwrap();
+        assert_eq!(broken[0].purpose, CheckPurpose::Preparation);
+        assert_eq!(
+            broken[0].status,
+            CheckStatus::Passed,
+            "{}",
+            broken[0].stderr
+        );
+        assert_eq!(
+            broken[1].status,
+            CheckStatus::Failed,
+            "{}",
+            broken[1].detail
+        );
+
+        std::fs::write(app.join("src/sum.js"), "exports.sum = (a, b) => a + b;\n").unwrap();
+        let repaired =
+            checks_for_sources(&request, &app, &mut used, Instant::now(), None, sources())
+                .await
+                .unwrap();
+        assert_eq!(repaired.len(), 2, "{repaired:#?}");
+        assert_eq!(
+            repaired[1].status,
+            CheckStatus::Passed,
+            "{}",
+            repaired[1].detail
+        );
+        assert!(
+            repaired[1].detail.contains("1 passed and 1 skipped")
+                && repaired[1]
+                    .detail
+                    .contains("loaded edited candidate sources: src"),
+            "{}",
+            repaired[1].detail
+        );
+
+        let skipped = std::fs::read_to_string(app.join("test/sum.test.js"))
+            .unwrap()
+            .replace("test(\"adds", "test.skip(\"adds");
+        std::fs::write(app.join("test/sum.test.js"), skipped).unwrap();
+        let none = checks_for_sources(&request, &app, &mut used, Instant::now(), None, sources())
+            .await
+            .unwrap();
+        assert_eq!(none[1].status, CheckStatus::NotRun, "{}", none[1].detail);
+        assert!(none[1].detail.contains("no completed passing test"));
+        assert_eq!(used, 6);
     }
     #[tokio::test]
     async fn creation_target_requires_absence_safe_parent_and_git_visibility() {

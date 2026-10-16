@@ -326,7 +326,8 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
             .iter()
             .any(|check| check.program == runner.program && check.args == runner.args)
     });
-    if root_npm_selected || script_node_selected {
+    let jest_selected = request.checks.iter().any(super::node_jest::is_supported);
+    if root_npm_selected || script_node_selected || jest_selected {
         if root_npm_selected {
             warnings.push("The selected root npm test is diagnostic only: npm may replace its script shell or resolve a different node executable. A successful exit remains Not run; select a direct Node TAP check for verification.".into());
         }
@@ -409,10 +410,11 @@ fn node_inclusion_warning(request: &LocalRunRequest, root: &Path) -> Option<&'st
         return None;
     }
     let direct_tap = request.checks.iter().any(|check| {
-        super::is_node_command(check) && super::node_test_invocation(check, root).is_some()
+        (super::is_node_command(check) && super::node_test_invocation(check, root).is_some())
+            || super::node_jest::is_supported(check)
     });
     if !direct_tap {
-        return Some("JS/TS edits need a reviewed direct node --test --test-reporter=tap check that loads every edited source file. The selected checks cannot prove this inclusion; passing unrelated or opaque commands will leave the candidate unverified.");
+        return Some("JS/TS edits need a reviewed direct node --test --test-reporter=tap or node node_modules/jest/bin/jest.js --json check that loads every edited source file. The selected checks cannot prove this inclusion; passing unrelated or opaque commands will leave the candidate unverified.");
     }
     Some("A JS/TS edit counts as verified only when Node's coverage shows the test run loaded every edited file. Loading a file does not prove a test asserted its behavior.")
 }

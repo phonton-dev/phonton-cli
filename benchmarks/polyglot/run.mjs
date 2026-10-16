@@ -141,6 +141,9 @@ function workspace(ex) {
   if (ex.lang === "javascript") {
     ensureJsDeps(ex.src);
     fs.symlinkSync(path.join(jsDeps, "node_modules"), path.join(dir, "node_modules"), "junction");
+    // Phonton leaves node_modules out of its candidate copy and rebuilds it
+    // with offline `npm ci` from a committed lockfile.
+    fs.copyFileSync(path.join(jsDeps, "package-lock.json"), path.join(dir, "package-lock.json"));
   }
   git(dir, "init", "-q");
   git(dir, "add", "-A");
@@ -156,6 +159,8 @@ function testCommand(ex, root) {
       // --pattern, not -p: Phonton's check guard reads a bare -p as inline code.
       return ["python", ["-m", "unittest", "discover", "-s", ".", "--pattern", "*_test.py"], {}];
     case "javascript":
+      // Phonton recognizes only the candidate's own jest with a JSON report.
+      if (root === ".") return [process.execPath, ["node_modules/jest/bin/jest.js", "--ci", "--json"], {}];
       return [process.execPath, [path.join(jsDeps, "node_modules", "jest", "bin", "jest.js"), "--ci", "--rootDir", root], {}];
     case "rust":
       return ["cargo", ["test", "--quiet", "--", "--include-ignored"], { env: { ...process.env, CARGO_TARGET_DIR: cargoTarget } }];
@@ -175,12 +180,9 @@ function phontonArm(ex, dir, logDir) {
   const promptFile = path.join(logDir, "prompt.md");
   const unverified = args.runtime === "unverified" ? ["--allow-unverified-runtime"] : [];
   // The same files and test command the other arms get from the prompt and
-  // the scorer; with hidden tests Phonton gets no check either. Nor does it
-  // for JavaScript: its isolated candidate copy leaves out node_modules and
-  // its offline `npm ci` takes at most 512 locked packages (jest + babel lock
-  // 580), so it cannot run jest yet. Those runs end unverified and never claim.
+  // the scorer; with hidden tests Phonton gets no check either.
   const [cmd, argv] = testCommand(ex, ".");
-  const check = testsMode === "visible" && ex.lang !== "javascript" ? ["--check", JSON.stringify([cmd, ...argv])] : [];
+  const check = testsMode === "visible" ? ["--check", JSON.stringify([cmd, ...argv])] : [];
   const scope = ["--files", ex.solution.join(",")];
   const r = run(bin, ["goal", "--local", ex.prompt, ...scope, ...check, "--yes", "--allow-host-checks", ...unverified], { cwd: dir });
   fs.writeFileSync(promptFile, ex.prompt);
