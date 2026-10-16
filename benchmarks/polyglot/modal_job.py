@@ -1,6 +1,6 @@
-"""Run the Aider Polyglot slice on a Modal A10G (24 GB) with a hard dollar cap.
+"""Run the Aider Polyglot slice on a 24 GB Modal GPU with a hard dollar cap.
 
-  modal run benchmarks/polyglot/modal_job.py --model qwen3.5:9b --per-lang 1 --max-dollars 1.5
+  modal run benchmarks/polyglot/modal_job.py --model qwen3.5:9b --per-lang 1 --max-dollars 1.5 [--gpu L4]
   modal volume get phonton-polyglot runs/<tag> ./polyglot-<tag>
 
 The image bakes in `gpu_job.py setup` (tools and the Phonton release build) from
@@ -19,9 +19,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2] if modal.is_local() else path
 GPU = "A10G"
 CPU = 4.0
 MEMORY_GIB = 32
-# Modal list prices in USD per second (modal.com/pricing, 2026-10-16): A10G,
-# physical CPU cores, memory GiB.
-PER_SECOND = 0.000306 + CPU * 0.0000131 + MEMORY_GIB * 0.00000222
+# Modal list prices in USD per second (modal.com/pricing, 2026-10-16): 24 GB
+# GPUs, plus physical CPU cores and memory GiB.
+GPU_RATE = {"A10G": 0.000306, "L4": 0.000222}
+HOST_RATE = CPU * 0.0000131 + MEMORY_GIB * 0.00000222
 KILL_AFTER_S = 600
 
 image = (
@@ -56,7 +57,7 @@ def run_slice(model: str, per_lang: int, langs: str, tag: str, commit: str, budg
 
 @app.local_entrypoint()
 def main(model: str = "qwen3.5:9b", per_lang: int = 1, langs: str = "python,javascript,rust",
-         max_dollars: float = 0.0, tag: str = ""):
+         max_dollars: float = 0.0, gpu: str = GPU, tag: str = ""):
     def git(*args):
         return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True).stdout.strip()
 
@@ -64,11 +65,14 @@ def main(model: str = "qwen3.5:9b", per_lang: int = 1, langs: str = "python,java
         raise SystemExit("Commit local changes first: the run must match a commit.")
     if max_dollars <= 0:
         raise SystemExit("Pass --max-dollars: the most this run may spend.")
-    budget_s = int(max_dollars / PER_SECOND) - KILL_AFTER_S - 120
+    if gpu not in GPU_RATE:
+        raise SystemExit(f"--gpu must be one of {', '.join(GPU_RATE)}")
+    per_s = GPU_RATE[gpu] + HOST_RATE
+    budget_s = int(max_dollars / per_s) - KILL_AFTER_S - 120
     if budget_s < 900:
-        raise SystemExit(f"${max_dollars} buys {max_dollars / PER_SECOND / 60:.0f} min on {GPU}; too little.")
+        raise SystemExit(f"${max_dollars} buys {max_dollars / per_s / 60:.0f} min on {gpu}; too little.")
     commit = git("rev-parse", "HEAD")
-    tag = tag or f"{model.replace(':', '-')}-x{per_lang}-{commit[:7]}"
-    print(f"{GPU} at ${PER_SECOND * 3600:.2f}/h: runner capped at {budget_s / 3600:.2f} h, hard kill"
+    tag = tag or f"{model.replace(':', '-')}-x{per_lang}-{gpu.lower()}-{commit[:7]}"
+    print(f"{gpu} at ${per_s * 3600:.2f}/h: runner capped at {budget_s / 3600:.2f} h, hard kill"
           f" {KILL_AFTER_S // 60} min later; at most ${max_dollars:.2f}. Artifacts: runs/{tag}")
-    run_slice.remote(model, per_lang, langs, tag, commit, budget_s)
+    run_slice.with_options(gpu=gpu).remote(model, per_lang, langs, tag, commit, budget_s)
