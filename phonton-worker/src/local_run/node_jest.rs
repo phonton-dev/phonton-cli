@@ -43,6 +43,44 @@ pub(super) fn is_supported(check: &LocalCheck) -> bool {
     json
 }
 
+/// A root `"test": "jest [paths]"` script with jest declared as a dependency,
+/// no pre/post hooks and only literal candidate paths: propose the same tests
+/// through the candidate's own jest with a JSON report instead of npm's shell.
+pub(super) fn from_test_script(directory: &Path) -> Option<LocalCheck> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("package.json")).ok()?).ok()?;
+    if !["dependencies", "devDependencies"]
+        .iter()
+        .any(|group| manifest[group]["jest"].is_string())
+    {
+        return None;
+    }
+    let scripts = manifest["scripts"].as_object()?;
+    if scripts.contains_key("pretest") || scripts.contains_key("posttest") {
+        return None;
+    }
+    let words = super::simple_script_words(super::single_literal_script_command(
+        scripts.get("test")?.as_str()?,
+    )?)?;
+    let (program, paths) = words.split_first()?;
+    if program != "jest"
+        || paths
+            .iter()
+            .any(|path| path.starts_with('-') || super::check_path_escapes_candidate(path, false))
+    {
+        return None;
+    }
+    let check = LocalCheck {
+        program: "node".into(),
+        args: [ENTRY, "--ci", "--json"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(paths.iter().cloned())
+            .collect(),
+    };
+    is_supported(&check).then_some(check)
+}
+
 /// Read jest's `--json` report from stdout. `Ok` describes the completed passing
 /// tests in candidate files; `Err` says why the run is not verification.
 pub(super) fn report(check: &LocalCheck, directory: &Path, stdout: &str) -> Result<String, String> {

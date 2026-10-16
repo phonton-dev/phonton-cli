@@ -437,8 +437,12 @@ Jest is supported only as the candidate's own copy run directly by node:
 `--passWithNoTests`), or a missing `--json`, leave the run **Not run**. Exit 0
 passes only when stdout is exactly jest's JSON report, it shows no failed or
 interrupted test, every reported test file resolves inside the candidate, and
-at least one test passed; skipped-only runs are **Not run**. A selected jest
-check gets the same reviewed offline `npm ci` preparation as a root npm script,
+at least one test passed; skipped-only runs are **Not run**. A root
+`"test": "jest"` script, optionally with literal candidate test paths, jest
+declared as a dependency and no `pretest`/`posttest`, proposes this check
+(`--ci --json` plus those paths); scripts with flags, globs or shell operators
+are withheld. A jest check gets the same reviewed offline `npm ci` preparation
+as a root npm script,
 so the candidate's `node_modules/jest` is installed from the captured lockfile,
 never linked or copied from the original repository. Babel configuration
 (`babel.config.*`, `.babelrc*`) is protected from model edits alongside

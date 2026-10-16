@@ -519,9 +519,11 @@ test binary, toolchain execution, or candidate source bytes.
 For a supported root npm script that declares registry dependencies, the
 read-only plan proposes a direct Node TAP check and adds an exact `preparation`
 command before verification: `npm ci --offline
---ignore-scripts --no-audit --no-fund --no-update-notifier`. A selected direct
-jest check (`node node_modules/jest/bin/jest.js --json`) gets the same
-preparation, so the candidate runs its own installed jest. It requires a
+--ignore-scripts --no-audit --no-fund --no-update-notifier`. A root
+`"test": "jest"` script proposes a direct jest check
+(`node node_modules/jest/bin/jest.js --ci --json`) instead, and a selected
+direct jest check gets the same preparation, so the candidate runs its own
+installed jest. It requires a
 captured root `package.json` and v2/v3 `package-lock.json` of at most 2 MiB and
 2,048 locked package entries (a jest and babel toolchain locks about 580), and
 registry tarballs with integrity hashes. Workspaces,

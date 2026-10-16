@@ -44,7 +44,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   report to show at least one passing test in candidate files, no failure, and
   V8 coverage of every edited source. Unsupported jest flags, a missing
   `--json`, or skipped-only runs stay Not run. Babel configuration is now
-  protected from model edits like `jest.config.*`.
+  protected from model edits like `jest.config.*`. A root `"test": "jest"`
+  script (literal test paths only, jest declared as a dependency) now
+  proposes this check and its preparation without `--check`.
 
 ## 0.24.1 - Goals that name files get those files
 

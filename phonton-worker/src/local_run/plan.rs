@@ -968,6 +968,9 @@ fn suggested_checks(
                             if let Some(tap) = super::node_spec_test_script_as_tap(root) {
                                 return Ok((vec![tap], Some("npm test uses Node's default reporter; Phonton runs the same test files with --test-reporter=tap so each passing case is counted.")));
                             }
+                            if let Some(jest) = super::node_jest::from_test_script(root) {
+                                return Ok((vec![jest], Some("npm test runs jest through npm's script shell; Phonton runs the candidate's own node_modules/jest/bin/jest.js with --json so each passing test is counted.")));
+                            }
                             return Ok((vec![], Some("The inferred root npm test was withheld: its script has no supported test runner with an explicit TAP reporter, so a successful exit would not prove a completed test. Choose a check that reports named completed cases.")));
                         };
                         return Ok((vec![runner], Some("The root npm script was used to propose a direct Node TAP check. The plan runs Node directly so npm script-shell and node_modules/.bin cannot change the verifier executable; review whether the project needs npm-specific setup.")));
@@ -1458,6 +1461,67 @@ mod tests {
         }];
         explicit.preparation = Some(node_deps::command());
         assert!(preview(explicit).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn root_jest_script_proposes_the_candidates_own_jest_with_offline_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/jest-sum");
+        for file in [
+            "package.json",
+            "package-lock.json",
+            "src/sum.js",
+            "test/sum.test.js",
+        ] {
+            std::fs::create_dir_all(root.path().join(file).parent().unwrap()).unwrap();
+            std::fs::copy(fixture.join(file), root.path().join(file)).unwrap();
+        }
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success())
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        let plan = preview(request_for(root.path(), &["src/sum.js"]))
+            .await
+            .unwrap();
+        assert_eq!(plan.request.checks.len(), 1);
+        assert_eq!(plan.request.checks[0].program, "node");
+        assert_eq!(
+            plan.request.checks[0].args,
+            ["node_modules/jest/bin/jest.js", "--ci", "--json"]
+        );
+        assert_eq!(
+            plan.request.preparation.as_ref().unwrap().args,
+            node_deps::command().args
+        );
+
+        let package = std::fs::read_to_string(root.path().join("package.json")).unwrap();
+        for script in [r#""test": "jest --watch""#, r#""test": "jest && echo ok""#] {
+            std::fs::write(
+                root.path().join("package.json"),
+                package.replace(r#""test": "jest""#, script),
+            )
+            .unwrap();
+            let withheld = preview(request_for(root.path(), &["src/sum.js"]))
+                .await
+                .unwrap();
+            assert!(withheld.request.checks.is_empty(), "{script}");
+        }
+        std::fs::write(
+            root.path().join("package.json"),
+            package.replace(r#""test": "jest""#, r#""test": "jest test""#),
+        )
+        .unwrap();
+        let scoped = preview(request_for(root.path(), &["src/sum.js"]))
+            .await
+            .unwrap();
+        assert_eq!(scoped.request.checks[0].args.last().unwrap(), "test");
     }
 
     #[tokio::test]
