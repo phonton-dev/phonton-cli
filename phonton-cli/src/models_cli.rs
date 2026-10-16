@@ -1230,17 +1230,28 @@ fn context_param(params: &Value) -> Result<Option<u32>> {
 
 fn fit_for_status(
     model: &LocalModel,
+    kv_bytes_per_token: Option<u64>,
     hardware: &HardwareSnapshot,
     profile: Option<&ModelProfile>,
     requested_context: Option<u32>,
     model_ceiling: Option<u32>,
 ) -> ModelFit {
-    let recommended = phonton_local::recommend_context(model.size_bytes, hardware, model_ceiling);
+    let recommended = phonton_local::recommend_context(
+        model.size_bytes,
+        kv_bytes_per_token,
+        hardware,
+        model_ceiling,
+    );
     let context = requested_context
         .or_else(|| profile.map(|p| p.context_tokens))
         .or(recommended)
         .unwrap_or_else(|| model_ceiling.unwrap_or(4096).clamp(2048, 4096));
-    let mut fit = phonton_local::estimate_fit_for_context(model.size_bytes, hardware, context);
+    let mut fit = phonton_local::estimate_fit_for_context(
+        model.size_bytes,
+        kv_bytes_per_token,
+        hardware,
+        context,
+    );
     fit.suggested_context = recommended;
     fit
 }
@@ -1454,6 +1465,10 @@ pub async fn status(requested_context: Option<u32>) -> Result<Value> {
         let profile_sha256 = profile.map(profile_sha256).transpose()?;
         let mut fit = fit_for_status(
             model,
+            metadata
+                .as_ref()
+                .ok()
+                .and_then(phonton_local::runtime::model_kv_bytes_per_token),
             &hardware,
             profile,
             requested_context,
@@ -3838,18 +3853,22 @@ mod tests {
             hardware: hardware.clone(),
             measured_at_unix: 0,
         };
-        let fit = fit_for_status(&model, &hardware, Some(&profile), None, Some(32768));
+        let fit = fit_for_status(&model, None, &hardware, Some(&profile), None, Some(32768));
         assert_eq!(fit.context_tokens, 8192);
         assert_eq!(fit.suggested_context, Some(4096));
-        assert_eq!(
-            fit.status,
-            phonton_types::local::FitStatus::InsufficientMemory
+        // 8192 tokens fit only with the GPU plus RAM: offload.
+        assert_eq!(fit.status, phonton_types::local::FitStatus::CpuOrOffload);
+        let override_fit = fit_for_status(
+            &model,
+            None,
+            &hardware,
+            Some(&profile),
+            Some(2048),
+            Some(32768),
         );
-        let override_fit =
-            fit_for_status(&model, &hardware, Some(&profile), Some(2048), Some(32768));
         assert_eq!(override_fit.context_tokens, 2048);
         assert_eq!(override_fit.suggested_context, Some(4096));
-        let unmeasured = fit_for_status(&model, &hardware, None, None, None);
+        let unmeasured = fit_for_status(&model, None, &hardware, None, None, None);
         assert_eq!(unmeasured.context_tokens, 4096);
         assert_eq!(unmeasured.suggested_context, None);
     }

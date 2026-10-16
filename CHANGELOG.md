@@ -26,6 +26,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] Local fit estimates reserved 1 GiB per 4096 context tokens plus 25%
+  of the weights, so `qwen3.5:4b` could not be calibrated above 4096 tokens on
+  a 6 GB GPU that serves it at 16384. Estimates now read the KV cache size from
+  the installed model's attention metadata (32 KiB per token for `qwen3.5`),
+  add a fixed 1 GiB runtime reserve, and accept a model that fits the largest
+  GPU plus available RAM as partly offloaded, so the 6 GB tier's `qwen3.5:9b`
+  is admitted once about 4 GiB of RAM is free. A copy of the same model already
+  loaded at another context no longer hides its own memory from calibration
+  or goal admission.
 - [fixed] `phonton review` and `phonton why-tokens` listed only the retrieved
   snippets (often five unrelated ones, ~500 tokens) as model context. They now
   list the files each prompt inlined whole or as excerpts, then the retrieved

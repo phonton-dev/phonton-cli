@@ -137,6 +137,14 @@ memory and the installed model's reported limit. `models status` labels each
 cold-load estimate with its context; `models status 8192` previews an explicit
 override. Unknown readings do not become a recommendation. You can still pass
 an explicit 2048–32768 context to `models calibrate`.
+The estimate sizes the KV cache from Ollama's reported attention shape: per-layer
+KV head counts, so hybrid models such as `qwen3.5` pay only for their
+full-attention layers (32 KiB per token for 4b and 9b). Sliding-window layers
+count as full attention, so gemma and gpt-oss estimates run high. A copy of the
+same model (name and digest) already loaded at another context counts as free
+memory, because Ollama unloads it before reloading at the new context. An
+automatic calibration keeps a larger context such a copy already holds
+entirely in VRAM instead of reloading it smaller.
 If cold loading does not fit, calibration may retry with the exact installed
 model already loaded in Ollama. The model must have enough context and at least
 30 seconds before unload, while at least 1.5 GiB host RAM remains available.
