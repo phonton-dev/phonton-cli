@@ -16,7 +16,7 @@ import modal
 
 # Inside the container this file sits at /root, and the checkout is at /src.
 ROOT = pathlib.Path(__file__).resolve().parents[2] if modal.is_local() else pathlib.Path("/src")
-GPU = "A10G"
+GPU = "L4"
 CPU = 4.0
 MEMORY_GIB = 32
 # Modal list prices in USD per second (modal.com/pricing, 2026-10-16): 24 GB
