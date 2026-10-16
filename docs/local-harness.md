@@ -13,7 +13,11 @@ and actual sizes. Its default JSON output remains a model array;
 `models catalog --snapshot` wraps the same entries in `models` alongside the
 point-in-time `hardware` reading used for their fit and first-try guidance.
 Later `models status` readings may differ as free memory changes.
-Fit estimates reserve runtime/context memory and never pool GPU memory with RAM.
+Fit estimates add the model's KV cache for the context, read from the
+installed model's attention metadata (256 KiB per token when it is missing), and
+a 1 GiB runtime reserve to the weights. A model that does not fit the largest
+GPU is reported as running partly offloaded when that GPU plus available RAM,
+less a 2 GiB host reserve, holds it. Independent GPUs are never summed.
 On macOS, `vm_stat` free, inactive and speculative pages give a bounded
 available-RAM estimate. Inactive pages may require paging to reclaim. The
 estimate is not a reservation, and missing or invalid counters leave fit

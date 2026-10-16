@@ -13,7 +13,7 @@ use phonton_local::{
     runtime::{validate_profile, validate_profile_context, LocalRuntime},
 };
 use phonton_types::local::{
-    CheckStatus, EditProtocol, FitStatus, HardwareSnapshot, ModelProfile, ResidentModel,
+    CheckStatus, EditProtocol, FitStatus, HardwareSnapshot, LocalModel, ModelProfile, ResidentModel,
 };
 use phonton_types::local_run::*;
 use quote::ToTokens;
@@ -174,7 +174,8 @@ async fn confirm_model_identity(
 async fn admitted_resident_for_generation(
     runtime: &LocalRuntime,
     profile: &ModelProfile,
-    model_size_bytes: u64,
+    installed: &LocalModel,
+    kv_bytes_per_token: Option<u64>,
     hardware: &HardwareSnapshot,
     initial_resident: Option<&ResidentModel>,
 ) -> std::result::Result<Option<ResidentModel>, GenerationAdmissionError> {
@@ -186,9 +187,15 @@ async fn admitted_resident_for_generation(
             "Available host RAM fell below the 1.5 GiB generation reserve".into(),
         ));
     }
-    confirm_model_identity(runtime, profile, model_size_bytes).await?;
-    let fit =
-        phonton_local::estimate_fit_for_context(model_size_bytes, hardware, profile.context_tokens);
+    confirm_model_identity(runtime, profile, installed.size_bytes).await?;
+    let fit = runtime
+        .estimate_cold_load(
+            installed,
+            kv_bytes_per_token,
+            hardware,
+            profile.context_tokens,
+        )
+        .await;
     if fit.status == FitStatus::Unknown {
         return Err(GenerationAdmissionError::ResourcePressure(fit.explanation));
     }
@@ -382,12 +389,16 @@ async fn run_inner(
     )?;
     let metadata = runtime.show_local(&profile.model).await?;
     validate_profile_context(&profile, &metadata)?;
+    let kv_bytes_per_token = phonton_local::runtime::model_kv_bytes_per_token(&metadata);
     let machine = observed_hardware(hardware_override.as_ref()).await;
-    let fit = phonton_local::estimate_fit_for_context(
-        installed.size_bytes,
-        &machine,
-        profile.context_tokens,
-    );
+    let fit = runtime
+        .estimate_cold_load(
+            installed,
+            kv_bytes_per_token,
+            &machine,
+            profile.context_tokens,
+        )
+        .await;
     if fit.status == FitStatus::Unknown {
         return Err(invalid(fit.explanation));
     }
@@ -804,7 +815,8 @@ async fn run_inner(
             let required_resident = match admitted_resident_for_generation(
                 &runtime,
                 &receipt.profile,
-                installed.size_bytes,
+                installed,
+                kv_bytes_per_token,
                 &machine,
                 receipt.resident_reuse.as_ref(),
             )
@@ -1183,7 +1195,8 @@ async fn run_inner(
         let required_resident = match admitted_resident_for_generation(
             &runtime,
             &receipt.profile,
-            installed.size_bytes,
+            installed,
+            kv_bytes_per_token,
             &machine,
             receipt.resident_reuse.as_ref(),
         )
