@@ -428,16 +428,33 @@ Direct `node --test` checks need an explicit TAP reporter and output showing a
 completed named test; empty, skipped-only and spec-reporter runs remain
 **Not run** even when Node exits 0. A supported root npm script is used to
 propose that direct Node command. Explicit `npm test` stays diagnostic-only on
-exit 0 because npm may change the executable or shell. Other Node runners need
-separate review.
-When a candidate edits JS/TS source, a passing direct Node TAP check also needs
-V8 coverage output showing every edited source file loaded from the complete
-candidate, including edits retained through a repair or mixed-file creation.
-An unrelated passing test adds separate **Not run** source-inclusion evidence.
-Phonton records only the inspected inclusion result; the test process can still
-forge coverage, and loading a file does not prove the changed behavior was
-asserted. Transpilers that report only generated files leave original source
-inclusion unproven and the candidate unverified.
+exit 0 because npm may change the executable or shell.
+Jest is supported only as the candidate's own copy run directly by node:
+`node node_modules/jest/bin/jest.js --json`, optionally with `--ci`,
+`--runInBand`/`-i`, `--silent`, `--verbose`, `--no-cache`, `--no-watchman`,
+`--rootDir`, `--testNamePattern`/`-t` and test path patterns. Other jest flags
+(such as `--config`, `--reporters`, `--testRunner`, `--setupFiles` or
+`--passWithNoTests`), or a missing `--json`, leave the run **Not run**. Exit 0
+passes only when stdout is exactly jest's JSON report, it shows no failed or
+interrupted test, every reported test file resolves inside the candidate, and
+at least one test passed; skipped-only runs are **Not run**. A root
+`"test": "jest"` script, optionally with literal candidate test paths, jest
+declared as a dependency and no `pretest`/`posttest`, proposes this check
+(`--ci --json` plus those paths); scripts with flags, globs or shell operators
+are withheld. A jest check gets the same reviewed offline `npm ci` preparation
+as a root npm script,
+so the candidate's `node_modules/jest` is installed from the captured lockfile,
+never linked or copied from the original repository. Babel configuration
+(`babel.config.*`, `.babelrc*`) is protected from model edits alongside
+`jest.config.*`. Other Node runners need separate review.
+When a candidate edits JS/TS source, a passing direct Node TAP or jest check
+also needs V8 coverage output showing every edited source file loaded from the
+complete candidate, including edits retained through a repair or mixed-file
+creation. An unrelated passing test adds separate **Not run** source-inclusion
+evidence. Phonton records only the inspected inclusion result; the test process
+can still forge coverage, and loading a file does not prove the changed
+behavior was asserted. Transpilers that report only generated files leave
+original source inclusion unproven and the candidate unverified.
 The reviewed plan warns before execution when its selected checks cannot
 establish this inclusion, or when transformed source may hide exact file identity.
 Passing checks retain the candidate-relative paths matched by their V8 report

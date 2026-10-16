@@ -8,6 +8,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Changed
 
+- [changed] Offline npm preparation accepts lockfiles of up to 2,048 package
+  entries (was 512) within the existing 2 MiB lockfile bound, enough for a
+  jest and babel toolchain.
+
 - [changed] `phonton models catalog` lists 2026 local coding models and
   marks one by the machine's total memory (the largest GPU, or half of RAM
   when that is larger): `qwen3.5:4b` under 6 GB, `qwen3.5:9b` from 6 GB,
@@ -33,6 +37,16 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 - [added] `benchmarks/polyglot`: an Aider Polyglot slice runner that scores
   Phonton, the bare model and OpenCode on the same exercises, prompt and
   local model, reporting pass rate, false-pass rate, tokens and wall time.
+- [added] Local goal runs can verify jest projects. Select
+  `node node_modules/jest/bin/jest.js --ci --json` as the check: each check
+  copy installs the project's own jest with the reviewed offline `npm ci`
+  (lockfile integrity, no lifecycle scripts), and a pass needs jest's JSON
+  report to show at least one passing test in candidate files, no failure, and
+  V8 coverage of every edited source. Unsupported jest flags, a missing
+  `--json`, or skipped-only runs stay Not run. Babel configuration is now
+  protected from model edits like `jest.config.*`. A root `"test": "jest"`
+  script (literal test paths only, jest declared as a dependency) now
+  proposes this check and its preparation without `--check`.
 
 ## 0.24.1 - Goals that name files get those files
 

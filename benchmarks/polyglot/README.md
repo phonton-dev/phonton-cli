@@ -24,7 +24,10 @@ runs where the arm said it succeeded, how many fail the pristine tests.
 - **Workspace.** Each run gets a fresh temporary git copy of the exercise
   without `.meta/` (it holds the reference solution). JavaScript copies share
   one `node_modules` junction with jest and babel from the exercise's
-  `package.json`.
+  `package.json`, plus that install's `package-lock.json`. Phonton leaves the
+  junction out of its candidate copy and rebuilds `node_modules` from the
+  lockfile with offline `npm ci` (no lifecycle scripts) before each check;
+  it runs `node node_modules/jest/bin/jest.js --ci --json`.
 - **Prompt.** `.docs/instructions.md` plus `instructions.append.md`, then
   Aider's benchmark addendum naming the solution files. Every arm gets the
   same text.
@@ -130,10 +133,9 @@ copy a run's folder next to its write-up.
   Phonton sets its calibrated context per request, which its memory estimate
   can hold well below the runtime's (4096 tokens for `qwen3.5:4b` on a 6 GB
   GPU). Record both in the write-up.
-- Phonton cannot run jest in its isolated candidate yet (`node_modules` is not
-  copied, and its offline `npm ci` preparation allows 512 locked packages;
-  jest with babel locks 580). Its JavaScript runs get no `--check`, end
-  unverified and never claim success, so their false-pass rate says nothing.
+- Phonton's JavaScript checks need jest's packages in the local npm cache:
+  its preparation runs `npm ci --offline`. The runner's first `npm install`
+  fills the cache; a cache miss ends the run unverified, not failed.
 - OpenCode reports no verdict, so finishing is its claim; that favours neither
   side on pass rate but makes its false-pass rate an upper bound.
 - Python is scored with `unittest`, not pytest as in Aider's harness; the
