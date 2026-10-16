@@ -91,18 +91,29 @@ node benchmarks/polyglot/run.mjs --polyglot ../polyglot-benchmark --model refere
   --endpoint http://127.0.0.1:11999/v1 --arms bare --per-lang 3
 ```
 
-### On a free Kaggle GPU
+### On a rented or free GPU
 
-`kaggle_job.py` runs the whole slice on a Kaggle notebook session (GPU T4 x2,
-internet on, 12 h limit): it builds Phonton, installs Ollama 0.34.2, Node and
-OpenCode at pinned versions, calibrates the model at 16384 tokens and runs one
-runner process per language. Upload the source as a private dataset with
-`phonton-src.tar.gz` (`git archive --format=tar.gz HEAD`) and `commit.txt`,
-then push the job as a private script kernel with that dataset as a source,
-`"enable_gpu": "true"`, `"enable_internet": "true"` and
-`"machine_shape": "NvidiaTeslaT4"`. Set `PER_LANG` at the top of the script.
-`kaggle kernels output` downloads `out/`, `setup.log` and `env.txt`; attaching
-a finished run as a kernel source reuses its `prebuilt/phonton`.
+`gpu_job.py` runs the whole slice on a Linux GPU host: it builds Phonton,
+installs Ollama 0.34.2, Node and OpenCode at pinned versions, calibrates the
+model at 16384 tokens and runs one runner process per language within a time
+budget. It writes `out/<lang>/`, `setup.log`, `env.txt` and `ollama.log`.
+
+- **Modal** (24 GB A10G): `modal_job.py` bakes the setup into an image from a
+  clean, committed checkout and converts a dollar cap into the time budget,
+  with a hard kill shortly after:
+
+  ```bash
+  modal run --detach benchmarks/polyglot/modal_job.py --model qwen3.5:9b --per-lang 17 --max-dollars 9
+  modal volume get phonton-polyglot runs/<tag> ./polyglot-<tag>
+  ```
+
+- **Kaggle** (GPU T4 x2, 12 h sessions): upload `phonton-src.tar.gz`
+  (`git archive --format=tar.gz HEAD`) and `commit.txt` as a private dataset,
+  then push `gpu_job.py` as a private script kernel with that dataset as a
+  source, `"enable_gpu": "true"`, `"enable_internet": "true"` and
+  `"machine_shape": "NvidiaTeslaT4"`. Edit `MODEL` and `PER_LANG` defaults in
+  the script, since kernels take no environment. Attaching a finished run as a
+  kernel source reuses its `prebuilt/phonton`.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
