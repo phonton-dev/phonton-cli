@@ -4665,14 +4665,25 @@ fn provider_probe_base_url(
     }
 }
 
+/// The key a run sends: the resolved key, or an empty one for keyless
+/// providers. `None` means nothing can run yet: a hosted provider without a
+/// key, or Ollama with no configured or selected model.
 fn provider_key_for_run(cfg: &config::ProviderConfig) -> Option<String> {
     config::resolve_api_key(cfg).or_else(|| {
-        if provider_requires_key(&cfg.name) {
+        if provider_requires_key(&cfg.name) || !local_model_known(cfg) {
             None
         } else {
             Some(String::new())
         }
     })
+}
+
+/// Ollama needs a model to send work to; other keyless endpoints serve
+/// whatever the user configured.
+fn local_model_known(cfg: &config::ProviderConfig) -> bool {
+    cfg.name != "ollama"
+        || cfg.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+        || models_cli::settings().is_ok_and(|s| s.active_model.is_some())
 }
 
 /// Build an [`ApiProviderConfig`] from the provider name, resolved key,
@@ -5122,7 +5133,7 @@ fn default_model_for(provider: &str) -> String {
         "ollama" => models_cli::settings()
             .ok()
             .and_then(|settings| settings.active_model)
-            .unwrap_or_else(|| "llama3.2:3b".into()),
+            .unwrap_or_else(|| "qwen3.5:9b".into()),
         "deepseek" => "deepseek-flash".into(),
         "xai" | "grok" => "grok-build-0.1".into(),
         "groq" => "openai/gpt-oss-120b".into(),
@@ -5162,7 +5173,8 @@ fn print_help() {
          QUICK START:\n  \
          phonton doctor           check provider key, git, and local tools\n  \
          phonton                  open the TUI and type a goal\n  \
-         phonton models setup qwen2.5-coder:3b\n                           \
+         phonton models           pick a local model sized for this machine\n  \
+         phonton models setup qwen3.5:9b\n                           \
          run on a local model instead of a cloud key\n  \
          phonton why-tokens       see where the last goal spent tokens\n\
          \n\
@@ -5469,8 +5481,8 @@ async fn handle_cli_args() -> Result<bool> {
             let cfg = config::load()?;
             let provider = load_ask_provider(&cfg).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no provider configured — set an API key (e.g. ANTHROPIC_API_KEY) \
-                     or run `phonton` and configure one in Settings"
+                    "no model yet — run `phonton models` to set up a local model, \
+                     or set an API key (e.g. ANTHROPIC_API_KEY)"
                 )
             })?;
             match provider

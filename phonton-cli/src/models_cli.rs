@@ -577,6 +577,22 @@ fn fit_label(fit: &Value) -> String {
     }
 }
 
+/// `phonton models setup MODEL` for the model recommended for this machine's
+/// memory tier; `None` when memory is unknown or below the smallest tier, so
+/// nobody is sent to a download that cannot run.
+pub(crate) fn setup_command_for(hardware: &HardwareSnapshot) -> Option<String> {
+    phonton_local::recommended_model(hardware).map(|model| format!("phonton models setup {model}"))
+}
+
+/// [`setup_command_for`] a serialized [`HardwareSnapshot`].
+fn setup_command(hardware: &Value) -> Option<String> {
+    setup_command_for(&serde_json::from_value(hardware.clone()).unwrap_or_default())
+}
+
+/// Next step when no model is recommended for this machine.
+pub(crate) const NO_RECOMMENDATION: &str =
+    "phonton models catalog shows which models fit this machine; phonton models setup MODEL installs one.";
+
 /// `phonton models` for a person: runtime, hardware, installed models and
 /// the one next step. `--json` keeps the full machine-readable status.
 fn status_summary(v: &Value) -> String {
@@ -653,22 +669,35 @@ fn status_summary(v: &Value) -> String {
             ));
         }
     }
+    let setup = setup_command(&v["hardware"]);
     let next = if v["runtime_version"].is_null() {
-        if v["managed_runtime_supported"].as_bool() == Some(true) {
-            "phonton models setup qwen2.5-coder:3b installs a runtime and a model.".to_string()
-        } else {
-            format!(
-                "install and start Ollama ({}), then phonton models setup qwen2.5-coder:3b.",
+        match (
+            &setup,
+            v["managed_runtime_supported"].as_bool() == Some(true),
+        ) {
+            (Some(setup), true) => {
+                format!("{setup} installs a runtime and the model for this machine.")
+            }
+            (None, true) => NO_RECOMMENDATION.into(),
+            (setup, false) => format!(
+                "install and start Ollama ({}), then {}.",
                 v["runtime_install_url"]
                     .as_str()
-                    .unwrap_or("https://ollama.com/download")
-            )
+                    .unwrap_or("https://ollama.com/download"),
+                setup.as_deref().unwrap_or(
+                    "phonton models setup MODEL with a model from phonton models catalog"
+                )
+            ),
         }
     } else if let Some(name) = active {
         format!("{name} is selected for local goals. Run phonton in a project.")
     } else if models.is_empty() {
-        "phonton models catalog lists models that fit; phonton models setup MODEL installs one."
-            .into()
+        match &setup {
+            Some(setup) => format!(
+                "{setup} installs the model for this machine; phonton models catalog lists the others."
+            ),
+            None => NO_RECOMMENDATION.into(),
+        }
     } else {
         "phonton models setup MODEL calibrates and selects an installed model.".into()
     };
@@ -766,7 +795,13 @@ fn catalog_summary(models: &[CatalogModel]) -> String {
     if reasons.len() == 1 {
         out.extend(reasons.iter().map(|r| format!("  why: {r}")));
     }
-    out.push("next: phonton models setup MODEL (add --json for full details).".into());
+    let first = models
+        .iter()
+        .find(|m| m.first_try_reason.is_some())
+        .map_or("MODEL", |m| m.name.as_str());
+    out.push(format!(
+        "next: phonton models setup {first} (add --json for full details)."
+    ));
     out.join("\n")
 }
 
@@ -1210,17 +1245,28 @@ fn context_param(params: &Value) -> Result<Option<u32>> {
 
 fn fit_for_status(
     model: &LocalModel,
+    kv_bytes_per_token: Option<u64>,
     hardware: &HardwareSnapshot,
     profile: Option<&ModelProfile>,
     requested_context: Option<u32>,
     model_ceiling: Option<u32>,
 ) -> ModelFit {
-    let recommended = phonton_local::recommend_context(model.size_bytes, hardware, model_ceiling);
+    let recommended = phonton_local::recommend_context(
+        model.size_bytes,
+        kv_bytes_per_token,
+        hardware,
+        model_ceiling,
+    );
     let context = requested_context
         .or_else(|| profile.map(|p| p.context_tokens))
         .or(recommended)
         .unwrap_or_else(|| model_ceiling.unwrap_or(4096).clamp(2048, 4096));
-    let mut fit = phonton_local::estimate_fit_for_context(model.size_bytes, hardware, context);
+    let mut fit = phonton_local::estimate_fit_for_context(
+        model.size_bytes,
+        kv_bytes_per_token,
+        hardware,
+        context,
+    );
     fit.suggested_context = recommended;
     fit
 }
@@ -1434,6 +1480,10 @@ pub async fn status(requested_context: Option<u32>) -> Result<Value> {
         let profile_sha256 = profile.map(profile_sha256).transpose()?;
         let mut fit = fit_for_status(
             model,
+            metadata
+                .as_ref()
+                .ok()
+                .and_then(phonton_local::runtime::model_kv_bytes_per_token),
             &hardware,
             profile,
             requested_context,
@@ -1890,8 +1940,13 @@ pub async fn run(args: &[String]) -> Result<i32> {
     let started = Instant::now();
     let mut printer = ProgressPrinter::default();
     let verb = args.first().map(String::as_str).unwrap_or("status");
+    // `--help` after any verb prints usage; `setup --help` used to treat it as
+    // a model name and download the runtime first.
     if matches!(verb, "--help" | "-h" | "help")
-        || (verb == "status" && args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
+        || args
+            .iter()
+            .skip(1)
+            .any(|a| matches!(a.as_str(), "--help" | "-h"))
     {
         println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL [--json]]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus, catalog and setup MODEL print a summary in a terminal; --json (or a pipe, for setup MODEL) prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise setup downloads a hash-checked portable Ollama runtime (about 1.5 GB on Windows and Linux, 160 MB on macOS).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved but the command exits 2; the model cannot be selected.");
         return Ok(0);
@@ -2024,10 +2079,20 @@ mod tests {
 
     #[test]
     fn status_summary_names_the_runtime_models_and_next_step() {
+        // Status carries a serialized snapshot; a hand-written partial one
+        // would not deserialize and would read as unknown memory.
+        let ram = |available: u64, total: u64| {
+            serde_json::to_value(HardwareSnapshot {
+                ram_available_bytes: Some(available),
+                ram_total_bytes: Some(total),
+                ..Default::default()
+            })
+            .unwrap()
+        };
         let none = status_summary(&json!({
             "endpoint": "http://127.0.0.1:11434", "runtime_version": null,
             "managed_runtime_supported": false, "runtime_install_url": "https://ollama.com/download",
-            "hardware": {"gpus": [], "ram_available_bytes": 8_000_000_000_u64, "ram_total_bytes": 16_000_000_000_u64},
+            "hardware": ram(8_000_000_000, 16_000_000_000),
             "models": [], "active_model": null, "model_store": {}
         }));
         assert!(
@@ -2036,16 +2101,41 @@ mod tests {
         );
         assert!(none.contains("RAM 8.0 GB free of 16.0 GB"), "{none}");
         assert!(
-            none.contains("next: install and start Ollama (https://ollama.com/download)"),
+            none.contains("next: install and start Ollama (https://ollama.com/download), then phonton models setup qwen3.5:9b."),
             "{none}"
         );
+        let workstation = serde_json::to_value(HardwareSnapshot {
+            ram_total_bytes: Some(64_000_000_000),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            setup_command(&workstation).as_deref(),
+            Some("phonton models setup qwen3.6:35b-a3b")
+        );
+        // Unknown or undersized memory gets no model to download.
+        assert_eq!(
+            setup_command(&serde_json::to_value(HardwareSnapshot::default()).unwrap()),
+            None
+        );
+        let tiny = status_summary(&json!({
+            "endpoint": "http://127.0.0.1:11434", "runtime_version": null,
+            "managed_runtime_supported": true,
+            "hardware": ram(1_000_000_000, 4_000_000_000),
+            "models": [], "active_model": null, "model_store": {}
+        }));
+        assert!(
+            tiny.contains(&format!("next: {NO_RECOMMENDATION}")),
+            "{tiny}"
+        );
+        assert!(!tiny.contains("phonton models setup qwen"), "{tiny}");
 
         let ready = status_summary(&json!({
             "endpoint": "http://127.0.0.1:11434", "runtime_version": "0.34.2",
             "model_store": {"status": "verified_managed"}, "hardware": {"gpus": []},
-            "active_model": "qwen2.5-coder:3b",
+            "active_model": "qwen3.5:9b",
             "models": [{
-                "model": {"name": "qwen2.5-coder:3b", "size_bytes": 1_929_912_626_u64},
+                "model": {"name": "qwen3.5:9b", "size_bytes": 6_591_455_232_u64},
                 "fit": {"status": "likely_fits_gpu"},
                 "profile": {"context_tokens": 8192, "probes": [
                     {"name": "SearchReplace edit", "status": "passed"},
@@ -2054,7 +2144,7 @@ mod tests {
             }]
         }));
         assert!(ready.contains("managed by Phonton"), "{ready}");
-        assert!(ready.contains("* qwen2.5-coder:3b"), "{ready}");
+        assert!(ready.contains("* qwen3.5:9b"), "{ready}");
         assert!(
             ready.contains("calibrated at 8k context (SearchReplace edit); fits the GPU"),
             "{ready}"
@@ -3809,18 +3899,22 @@ mod tests {
             hardware: hardware.clone(),
             measured_at_unix: 0,
         };
-        let fit = fit_for_status(&model, &hardware, Some(&profile), None, Some(32768));
+        let fit = fit_for_status(&model, None, &hardware, Some(&profile), None, Some(32768));
         assert_eq!(fit.context_tokens, 8192);
         assert_eq!(fit.suggested_context, Some(4096));
-        assert_eq!(
-            fit.status,
-            phonton_types::local::FitStatus::InsufficientMemory
+        // 8192 tokens fit only with the GPU plus RAM: offload.
+        assert_eq!(fit.status, phonton_types::local::FitStatus::CpuOrOffload);
+        let override_fit = fit_for_status(
+            &model,
+            None,
+            &hardware,
+            Some(&profile),
+            Some(2048),
+            Some(32768),
         );
-        let override_fit =
-            fit_for_status(&model, &hardware, Some(&profile), Some(2048), Some(32768));
         assert_eq!(override_fit.context_tokens, 2048);
         assert_eq!(override_fit.suggested_context, Some(4096));
-        let unmeasured = fit_for_status(&model, &hardware, None, None, None);
+        let unmeasured = fit_for_status(&model, None, &hardware, None, None, None);
         assert_eq!(unmeasured.context_tokens, 4096);
         assert_eq!(unmeasured.suggested_context, None);
     }

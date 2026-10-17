@@ -16,6 +16,7 @@ const MAX_SAVED_ATTEMPT_OUTPUT_CHARS: usize = 16 * 1024;
 
 struct CalibrationAdmission {
     context_tokens: u32,
+    kv_bytes_per_token: Option<u64>,
     required_resident: Option<ResidentModel>,
 }
 
@@ -90,44 +91,26 @@ fn parse_installed_inventory(value: &Value) -> Result<InstalledInventory> {
     Ok(inventory)
 }
 
-fn mark_first_try(models: &mut [CatalogModel]) {
-    // The catalog has only manifest sizes and a 4K cold-load estimate. This
-    // chooses a resource starting point, never a quality or speed winner.
-    let eligible = |model: &CatalogModel, status: FitStatus| -> Option<u64> {
-        if model.error.is_some() {
-            return None;
-        }
-        let bytes = model.download_bytes.filter(|bytes| *bytes > 0)?;
-        let fit = model.fit.as_ref()?;
-        (fit.status == status && fit.context_tokens == 4096).then_some(bytes)
-    };
+fn mark_first_try(models: &mut [CatalogModel], hardware: &HardwareSnapshot) {
+    // The tier follows total memory, so a busy machine still gets the model
+    // it can run once other apps close; the fit column says what is free now.
     for model in models.iter_mut() {
         model.first_try_reason = None;
     }
-    let gpu = models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, model)| {
-            eligible(model, FitStatus::LikelyFitsGpu)
-                .map(|bytes| (index, bytes, model.name.as_str()))
-        })
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(a.2)))
-        .map(|(index, _, _)| index);
-    if let Some(index) = gpu {
-        models[index].first_try_reason = Some("Largest manifest-backed catalog entry with a likely 4K cold-load fit on one observed GPU at browse time. This is a memory-based starting point, not a coding-quality or speed result. Calibrate after download before selecting.".into());
+    let (Some(name), Some(budget)) = (
+        crate::recommended_model(hardware),
+        crate::model_memory_budget(hardware),
+    ) else {
         return;
-    }
-    let cpu = models
-        .iter()
-        .enumerate()
-        .filter_map(|(index, model)| {
-            eligible(model, FitStatus::CpuOrOffload)
-                .map(|bytes| (index, bytes, model.name.as_str()))
-        })
-        .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(b.2)))
-        .map(|(index, _, _)| index);
-    if let Some(index) = cpu {
-        models[index].first_try_reason = Some("Smallest manifest-backed catalog entry with a 4K CPU/offload cold-load fit. CPU/offload speed and coding quality are unmeasured. Calibrate after download before selecting.".into());
+    };
+    if let Some(model) = models
+        .iter_mut()
+        .find(|model| model.name == name && model.error.is_none())
+    {
+        model.first_try_reason = Some(format!(
+            "Recommended for {:.0} GB of model memory (the largest GPU, or half of RAM when that is larger). A size-based starting point, not a coding-quality or speed result. Calibrate after download before selecting.",
+            budget as f64 / 1e9
+        ));
     }
 }
 
@@ -255,15 +238,16 @@ fn official_manifest_url(name: &str) -> Result<String> {
 async fn catalog_entries(
     http: &Client,
     hardware: &HardwareSnapshot,
-    entries: [(String, String); 5],
+    entries: [(String, String); 6],
 ) -> Vec<CatalogModel> {
-    let [first, second, third, fourth, fifth] =
+    let [first, second, third, fourth, fifth, sixth] =
         entries.map(|(name, source)| catalog_entry(http, hardware, name, source));
-    // The curated set is fixed at five. Poll every independent registry read
+    // The curated set is fixed at six. Poll every independent registry read
     // together, then keep display order regardless of response order.
-    let (first, second, third, fourth, fifth) = tokio::join!(first, second, third, fourth, fifth);
-    let mut models = vec![first, second, third, fourth, fifth];
-    mark_first_try(&mut models);
+    let (first, second, third, fourth, fifth, sixth) =
+        tokio::join!(first, second, third, fourth, fifth, sixth);
+    let mut models = vec![first, second, third, fourth, fifth, sixth];
+    mark_first_try(&mut models, hardware);
     models
 }
 
@@ -402,7 +386,7 @@ pub fn validate_model(name: &str) -> Result<()> {
         || name.to_ascii_lowercase().contains("cloud")
     {
         return Err(LocalError::Invalid(
-            "Use a local model tag such as qwen2.5-coder:1.5b; cloud models are disabled.".into(),
+            "Use a local model tag such as qwen3.5:9b; cloud models are disabled.".into(),
         ));
     }
     Ok(())
@@ -539,6 +523,46 @@ impl LocalRuntime {
         resident_from_ps(&value, &name, digest, required_context)
     }
 
+    /// `hardware` as a cold load of this exact model sees it: memory held by
+    /// a loaded copy at any context counts as free, because the runtime
+    /// unloads that copy before reloading the model. Without such evidence
+    /// the observation is returned unchanged.
+    pub async fn cold_load_hardware(
+        &self,
+        name: &str,
+        digest: &str,
+        hardware: &HardwareSnapshot,
+    ) -> HardwareSnapshot {
+        match self.resident(name, digest, 0).await {
+            Ok(Some(loaded)) => crate::credit_resident(hardware, &loaded),
+            _ => hardware.clone(),
+        }
+    }
+
+    /// [`crate::estimate_fit_for_context`], asking the runtime for a loaded
+    /// copy of the same model only when the observation alone does not fit.
+    pub async fn estimate_cold_load(
+        &self,
+        model: &LocalModel,
+        kv_bytes_per_token: Option<u64>,
+        hardware: &HardwareSnapshot,
+        context: u32,
+    ) -> ModelFit {
+        let fit = crate::estimate_fit_for_context(
+            model.size_bytes,
+            kv_bytes_per_token,
+            hardware,
+            context,
+        );
+        if fit.status != FitStatus::InsufficientMemory {
+            return fit;
+        }
+        let credited = self
+            .cold_load_hardware(&model.name, &model.digest, hardware)
+            .await;
+        crate::estimate_fit_for_context(model.size_bytes, kv_bytes_per_token, &credited, context)
+    }
+
     /// Fetch metadata and reject daemon-side cloud aliases before sending code.
     pub async fn show_local(&self, name: &str) -> Result<Value> {
         let name = canonical_model_name(name)?;
@@ -555,16 +579,10 @@ impl LocalRuntime {
             .redirect(Policy::none())
             .timeout(Duration::from_secs(15))
             .build()?;
-        let entries = [
-            ("qwen2.5-coder", "0.5b"),
-            ("qwen2.5-coder", "1.5b"),
-            ("qwen2.5-coder", "3b"),
-            ("qwen2.5-coder", "7b"),
-            ("qwen3.5", "4b"),
-        ]
-        .map(|(family, tag)| {
+        let entries = crate::CATALOG.map(|entry| {
+            let (family, tag) = entry.name.split_once(':').unwrap_or((entry.name, "latest"));
             (
-                format!("{family}:{tag}"),
+                entry.name.to_string(),
                 format!("https://registry.ollama.ai/v2/library/{family}/manifests/{tag}"),
             )
         });
@@ -884,13 +902,54 @@ impl LocalRuntime {
         &self,
         model: &LocalModel,
         hardware: &HardwareSnapshot,
-        model_ceiling: Option<u32>,
+        metadata: &Value,
         requested_context: Option<u32>,
     ) -> Result<CalibrationAdmission> {
+        let model_ceiling = model_context_ceiling(metadata);
+        let kv_bytes_per_token = model_kv_bytes_per_token(metadata);
         validate_calibration_context_request(requested_context, model_ceiling)?;
-        match calibration_context(model.size_bytes, hardware, model_ceiling, requested_context) {
+        // A copy of this exact model loaded at any context: its memory is free
+        // to a cold reload, and a fully GPU-resident copy proves its context.
+        let loaded = self
+            .resident(&model.name, &model.digest, 0)
+            .await
+            .ok()
+            .flatten();
+        let cold = loaded.as_ref().map_or_else(
+            || hardware.clone(),
+            |loaded| crate::credit_resident(hardware, loaded),
+        );
+        let cold_context = calibration_context(
+            model.size_bytes,
+            kv_bytes_per_token,
+            &cold,
+            model_ceiling,
+            requested_context,
+        );
+        // An automatic choice keeps a larger context the loaded copy holds
+        // entirely in VRAM rather than reloading it smaller.
+        if let (Ok(cold_tokens), None, Some(loaded)) = (&cold_context, requested_context, loaded) {
+            let context_tokens = loaded
+                .context_length
+                .min(model_ceiling.unwrap_or(0))
+                .min(32768);
+            if context_tokens > *cold_tokens
+                && loaded.size_vram_bytes >= loaded.size_bytes
+                && hardware
+                    .ram_available_bytes
+                    .is_some_and(|bytes| bytes >= CALIBRATION_HOST_RESERVE_BYTES)
+            {
+                return Ok(CalibrationAdmission {
+                    context_tokens,
+                    kv_bytes_per_token,
+                    required_resident: Some(loaded),
+                });
+            }
+        }
+        match cold_context {
             Ok(context_tokens) => Ok(CalibrationAdmission {
                 context_tokens,
+                kv_bytes_per_token,
                 required_resident: None,
             }),
             Err(cold_error) => {
@@ -931,6 +990,7 @@ impl LocalRuntime {
                 }
                 Ok(CalibrationAdmission {
                     context_tokens,
+                    kv_bytes_per_token,
                     required_resident: Some(resident),
                 })
             }
@@ -957,8 +1017,14 @@ impl LocalRuntime {
                     .into(),
             ));
         }
-        let fit =
-            crate::estimate_fit_for_context(model.size_bytes, &hardware, admission.context_tokens);
+        let fit = self
+            .estimate_cold_load(
+                model,
+                admission.kv_bytes_per_token,
+                &hardware,
+                admission.context_tokens,
+            )
+            .await;
         if fit.status == FitStatus::Unknown {
             return Err(LocalError::Invalid(fit.explanation));
         }
@@ -1244,12 +1310,7 @@ impl LocalRuntime {
         let name = model.name.as_str();
         let metadata = self.show_local(name).await?;
         let admission = self
-            .calibration_admission(
-                model,
-                &hardware,
-                model_context_ceiling(&metadata),
-                requested_context,
-            )
+            .calibration_admission(model, &hardware, &metadata, requested_context)
             .await?;
         let context = admission.context_tokens;
         let version = self.version().await?;
@@ -1329,7 +1390,7 @@ impl LocalRuntime {
         let mut probes = std::mem::take(&mut selected.probes);
         if admission.required_resident.is_some() {
             if let Some(first) = probes.first_mut() {
-                first.detail.push_str(" Calibration started from an exact resident-model observation because cold loading did not fit. Residency was rechecked before each probe and was not reserved.");
+                first.detail.push_str(" Calibration started from an exact resident-model observation because cold loading did not fit, or fit only a smaller context. Residency was rechecked before each probe and was not reserved.");
             }
         }
         let required_resident = self
@@ -1424,6 +1485,30 @@ pub fn model_context_ceiling(metadata: &Value) -> Option<u32> {
     u32::try_from(limit).ok().filter(|limit| *limit >= 2048)
 }
 
+/// KV cache bytes per context token at f16, from the attention shape in
+/// Ollama's model metadata. Per-layer KV head counts are summed, so the
+/// linear-attention layers of hybrid models (qwen3.5: 8 of 32 layers keep a
+/// KV cache) cost nothing. Sliding-window layers count as full attention, so
+/// gemma and gpt-oss estimates run high. Missing or malformed shape metadata
+/// returns `None` and the caller's conservative fallback.
+pub fn model_kv_bytes_per_token(metadata: &Value) -> Option<u64> {
+    let info = metadata.get("model_info")?.as_object()?;
+    let architecture = info.get("general.architecture")?.as_str()?;
+    let field = |name: &str| info.get(&format!("{architecture}.{name}"));
+    let number = |name: &str| field(name).and_then(Value::as_u64);
+    let kv_heads = match field("attention.head_count_kv")? {
+        Value::Array(layers) => layers.iter().map(Value::as_u64).sum::<Option<u64>>()?,
+        heads => heads.as_u64()?.checked_mul(number("block_count")?)?,
+    };
+    let head_dim = || number("embedding_length")?.checked_div(number("attention.head_count")?);
+    let key = number("attention.key_length").or_else(head_dim)?;
+    let value = number("attention.value_length").or_else(head_dim)?;
+    kv_heads
+        .checked_mul(key.checked_add(value)?)?
+        .checked_mul(2)
+        .filter(|bytes| *bytes > 0)
+}
+
 /// Refuse a calibrated context above the installed model's current reported
 /// ceiling. Missing ceiling metadata leaves an explicit older profile usable;
 /// it does not authorize a new automatic calibration choice.
@@ -1458,6 +1543,7 @@ fn validate_calibration_context_request(
 
 fn calibration_context(
     weights_bytes: u64,
+    kv_bytes_per_token: Option<u64>,
     hardware: &HardwareSnapshot,
     model_ceiling: Option<u32>,
     requested_context: Option<u32>,
@@ -1465,10 +1551,16 @@ fn calibration_context(
     validate_calibration_context_request(requested_context, model_ceiling)?;
     let context = match requested_context {
         Some(context) => context,
-        None => crate::recommend_context(weights_bytes, hardware, model_ceiling).ok_or_else(
-            || {
-                // Name the cause: memory (with the reading) or missing metadata.
-                let smallest = crate::estimate_fit_for_context(weights_bytes, hardware, 2048);
+        None => crate::recommend_context(
+            weights_bytes,
+            kv_bytes_per_token,
+            hardware,
+            model_ceiling,
+        )
+        .ok_or_else(|| {
+            // Name the cause: memory (with the reading) or missing metadata.
+            let smallest =
+                crate::estimate_fit_for_context(weights_bytes, kv_bytes_per_token, hardware, 2048);
                 LocalError::Invalid(if model_ceiling.is_some() {
                     format!("No context fits in memory right now, not even 2048 tokens. {} Then run the same command again.", smallest.explanation)
                 } else {
@@ -1477,7 +1569,7 @@ fn calibration_context(
             },
         )?,
     };
-    let fit = crate::estimate_fit_for_context(weights_bytes, hardware, context);
+    let fit = crate::estimate_fit_for_context(weights_bytes, kv_bytes_per_token, hardware, context);
     if matches!(
         fit.status,
         FitStatus::InsufficientMemory | FitStatus::Unknown
@@ -1751,7 +1843,7 @@ mod tests {
                         if current_mode == 4 && server_chats.load(Ordering::SeqCst) > 0 {
                             json!({"models":[]})
                         } else {
-                            json!({"models":[{"name":"fixture:latest","digest":if current_mode == 1 {"digest-b"} else {"digest-a"},"size":1073741824,"size_vram":if current_mode == 5 && server_chats.load(Ordering::SeqCst) > 0 {1024} else {0},"context_length":if current_mode == 2 {2048} else {4096},"expires_at":expires}]})
+                            json!({"models":[{"name":"fixture:latest","digest":if current_mode == 1 {"digest-b"} else {"digest-a"},"size":1073741824,"size_vram":if current_mode == 10 {1073741824} else if current_mode == 5 && server_chats.load(Ordering::SeqCst) > 0 {1024} else {0},"context_length":match current_mode {2 => 2048, 10 => 8192, _ => 4096},"expires_at":expires}]})
                         }
                     }
                     "/api/chat" => {
@@ -1766,6 +1858,36 @@ mod tests {
             }
         });
         (runtime, mode, chats, server)
+    }
+
+    #[tokio::test]
+    async fn automatic_calibration_keeps_a_larger_gpu_resident_context() {
+        let (runtime, mode, _chats, server) = resident_calibration_fixture().await;
+        // The fixture model is loaded entirely in VRAM at 8192 tokens.
+        mode.store(10, std::sync::atomic::Ordering::SeqCst);
+        // Crediting the loaded copy, a cold reload fits the GPU only at 2048.
+        let hardware = HardwareSnapshot {
+            ram_available_bytes: Some(1800 << 20),
+            gpus: vec![GpuSnapshot {
+                name: "GPU".into(),
+                total_bytes: 4 << 30,
+                available_bytes: 1638 << 20,
+            }],
+            ..Default::default()
+        };
+        let observe = fixed_hardware(hardware.clone());
+        let automatic = runtime
+            .calibrate_with_observer("fixture", None, hardware.clone(), &observe)
+            .await
+            .unwrap();
+        assert_eq!(automatic.context_tokens, 8192);
+        assert!(automatic.probes[0].detail.contains("exact resident-model"));
+        let explicit = runtime
+            .calibrate_with_observer("fixture", Some(2048), hardware, &observe)
+            .await
+            .unwrap();
+        assert_eq!(explicit.context_tokens, 2048);
+        server.abort();
     }
 
     #[test]
@@ -2176,7 +2298,7 @@ mod tests {
             ram_available_bytes: Some(1800 * 1024 * 1024),
             ..Default::default()
         };
-        assert!(calibration_context(1 << 30, &low_memory, Some(8192), Some(4096)).is_err());
+        assert!(calibration_context(1 << 30, None, &low_memory, Some(8192), Some(4096)).is_err());
         let observe = fixed_hardware(low_memory.clone());
         let profile = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2302,64 +2424,51 @@ mod tests {
     }
 
     #[test]
-    fn first_try_prefers_largest_manifest_backed_gpu_fit() {
+    fn first_try_follows_the_memory_tier_not_free_memory() {
+        let hardware = HardwareSnapshot {
+            ram_total_bytes: Some(16_000_000_000),
+            ram_available_bytes: Some(1_000_000_000),
+            gpus: vec![GpuSnapshot {
+                name: "RTX 4050".into(),
+                total_bytes: 6_400_000_000,
+                available_bytes: 6_000_000_000,
+            }],
+            ..Default::default()
+        };
         let mut models = vec![
-            catalog_fixture("cpu:large", Some(8), FitStatus::CpuOrOffload),
-            catalog_fixture("gpu:small", Some(2), FitStatus::LikelyFitsGpu),
-            catalog_fixture("gpu:large", Some(4), FitStatus::LikelyFitsGpu),
-            catalog_fixture("memory:large", Some(12), FitStatus::InsufficientMemory),
-            catalog_fixture("unknown:large", Some(16), FitStatus::Unknown),
+            catalog_fixture("qwen3.5:4b", Some(3), FitStatus::LikelyFitsGpu),
+            catalog_fixture("qwen3.5:9b", Some(6), FitStatus::InsufficientMemory),
+            catalog_fixture("gpt-oss:20b", Some(13), FitStatus::InsufficientMemory),
         ];
-        mark_first_try(&mut models);
-        assert_eq!(
-            models
-                .iter()
-                .filter(|m| m.first_try_reason.is_some())
-                .count(),
-            1
-        );
-        assert!(models[2]
+        mark_first_try(&mut models, &hardware);
+        let marked: Vec<&str> = models
+            .iter()
+            .filter(|m| m.first_try_reason.is_some())
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(marked, ["qwen3.5:9b"]);
+        assert!(models[1]
             .first_try_reason
             .as_deref()
             .unwrap()
-            .contains("4K"));
-        assert!(models[2]
-            .first_try_reason
-            .as_deref()
-            .unwrap()
-            .contains("memory-based"));
-        assert!(models[0].first_try_reason.is_none());
-    }
-
-    #[test]
-    fn first_try_cpu_fallback_chooses_smallest_and_ties_by_name() {
-        let mut models = vec![
-            catalog_fixture("z:small", Some(2), FitStatus::CpuOrOffload),
-            catalog_fixture("large", Some(8), FitStatus::CpuOrOffload),
-            catalog_fixture("a:small", Some(2), FitStatus::CpuOrOffload),
-        ];
-        mark_first_try(&mut models);
-        assert!(models[2]
-            .first_try_reason
-            .as_deref()
-            .unwrap()
-            .contains("CPU/offload"));
-        assert!(models[0].first_try_reason.is_none());
-        assert!(models[1].first_try_reason.is_none());
+            .contains("8 GB of model memory"));
     }
 
     #[test]
     fn first_try_withholds_on_unknown_memory_and_failed_manifest() {
-        let mut models = vec![
-            catalog_fixture("memory", Some(2), FitStatus::InsufficientMemory),
-            catalog_fixture("unknown", Some(3), FitStatus::Unknown),
-            CatalogModel {
-                error: Some("manifest unavailable".into()),
-                ..catalog_fixture("failed", Some(4), FitStatus::LikelyFitsGpu)
-            },
-        ];
-        mark_first_try(&mut models);
-        assert!(models.iter().all(|m| m.first_try_reason.is_none()));
+        let laptop = HardwareSnapshot {
+            ram_total_bytes: Some(16_000_000_000),
+            ..Default::default()
+        };
+        let mut models = vec![CatalogModel {
+            error: Some("manifest unavailable".into()),
+            ..catalog_fixture("qwen3.5:9b", Some(6), FitStatus::LikelyFitsGpu)
+        }];
+        mark_first_try(&mut models, &laptop);
+        assert!(models[0].first_try_reason.is_none());
+        let mut models = vec![catalog_fixture("qwen3.5:9b", Some(6), FitStatus::Unknown)];
+        mark_first_try(&mut models, &HardwareSnapshot::default());
+        assert!(models[0].first_try_reason.is_none());
         assert!(serde_json::to_value(&models)
             .unwrap()
             .as_array()
@@ -2378,10 +2487,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            // Hold every response until all five requests arrive. A serial
+            // Hold every response until all six requests arrive. A serial
             // catalog cannot finish this fixture before the test timeout.
             let mut requests = Vec::new();
-            for _ in 0..5 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut buffer = [0; 2048];
                 let mut request = Vec::new();
@@ -2426,7 +2535,7 @@ mod tests {
         });
         let entries = std::array::from_fn(|index| {
             (
-                format!("model-{index}"),
+                crate::CATALOG[index].name.to_string(),
                 format!("{endpoint}/manifests/{index}"),
             )
         });
@@ -2452,13 +2561,13 @@ mod tests {
         )
         .await
         .expect("Catalog waited for one manifest before requesting the others");
-        assert_eq!(server.await.unwrap(), [4, 3, 2, 1, 0]);
+        assert_eq!(server.await.unwrap(), [5, 4, 3, 2, 1, 0]);
         assert_eq!(
             models
                 .iter()
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
-            ["model-0", "model-1", "model-2", "model-3", "model-4"]
+            crate::CATALOG.map(|entry| entry.name)
         );
         assert!(models[0]
             .error
@@ -2470,7 +2579,57 @@ mod tests {
             assert_eq!(model.download_bytes, Some(index as u64 * 100_000_000 + 10));
             assert!(model.error.is_none());
         }
-        assert!(models[4].first_try_reason.is_some());
+        // 8 GiB GPU and 16 GiB RAM: the 6 GB tier.
+        assert!(models[1].first_try_reason.is_some());
+        assert_eq!(
+            models
+                .iter()
+                .filter(|m| m.first_try_reason.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn kv_cache_size_follows_reported_attention_shape() {
+        // qwen3.5:4b as Ollama 0.34.2 reports it: 8 of 32 layers keep KV.
+        let mut kv_heads = vec![0; 32];
+        for layer in (3..32).step_by(4) {
+            kv_heads[layer] = 4;
+        }
+        let qwen35 = json!({"model_info":{
+            "general.architecture":"qwen35",
+            "qwen35.block_count":32,
+            "qwen35.attention.head_count":16,
+            "qwen35.attention.head_count_kv":kv_heads,
+            "qwen35.attention.key_length":256,
+            "qwen35.attention.value_length":256,
+            "qwen35.embedding_length":2560
+        }});
+        // 512 MiB at 16384 tokens; llama-server reported 562 MiB of context
+        // including the fixed linear-attention state.
+        assert_eq!(model_kv_bytes_per_token(&qwen35), Some(32 * 1024));
+        // qwen2.5-coder 1.5B: head size from embedding width; llama-server
+        // logged a 448 MiB KV buffer at 16384 tokens.
+        let qwen2 = json!({"model_info":{
+            "general.architecture":"qwen2",
+            "qwen2.block_count":28,
+            "qwen2.attention.head_count":12,
+            "qwen2.attention.head_count_kv":2,
+            "qwen2.embedding_length":1536
+        }});
+        assert_eq!(
+            model_kv_bytes_per_token(&qwen2).map(|bytes| bytes * 16384),
+            Some(448 << 20)
+        );
+        for broken in [
+            json!({"model_info":{"general.architecture":"qwen2","qwen2.block_count":28}}),
+            json!({"model_info":{"general.architecture":"qwen2","qwen2.block_count":28,"qwen2.attention.head_count_kv":2,"qwen2.attention.head_count":0,"qwen2.embedding_length":1536}}),
+            json!({"model_info":{"general.architecture":"x","x.attention.head_count_kv":[0,0],"x.attention.key_length":64,"x.attention.value_length":64}}),
+            json!({"details":{"format":"gguf"}}),
+        ] {
+            assert_eq!(model_kv_bytes_per_token(&broken), None, "{broken}");
+        }
     }
 
     #[test]
@@ -2508,28 +2667,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            calibration_context(1 << 30, &hardware, Some(32768), None).unwrap(),
+            calibration_context(1 << 30, None, &hardware, Some(32768), None).unwrap(),
             4096
         );
         assert_eq!(
-            calibration_context(1 << 30, &hardware, Some(32768), Some(2048)).unwrap(),
+            calibration_context(1 << 30, None, &hardware, Some(32768), Some(2048)).unwrap(),
             2048
         );
-        assert!(calibration_context(1 << 30, &hardware, None, None).is_err());
+        assert!(calibration_context(1 << 30, None, &hardware, None, None).is_err());
         assert!(
-            calibration_context(1 << 30, &hardware, Some(4096), Some(8192))
+            calibration_context(1 << 30, None, &hardware, Some(4096), Some(8192))
                 .unwrap_err()
                 .to_string()
                 .contains("reported limit")
         );
         assert!(
-            calibration_context(1 << 30, &hardware, Some(32768), Some(8192))
+            calibration_context(1 << 30, None, &hardware, Some(32768), Some(16384))
                 .unwrap_err()
                 .to_string()
                 .contains("exceeds available memory")
         );
         assert!(calibration_context(
             1 << 30,
+            None,
             &HardwareSnapshot::default(),
             Some(32768),
             Some(4096)

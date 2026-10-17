@@ -48,15 +48,17 @@ struct Row {
 impl TokenReport {
     fn from_events(events: &[EventRecord]) -> Self {
         let mut report = Self::default();
+        // A worker reports again after inlining files it asked for; the
+        // latest report per subtask is what its prompts carried.
+        let mut context = std::collections::HashMap::new();
         for record in events {
             match &record.event {
                 OrchestratorEvent::ContextSelected {
+                    subtask_id,
                     slices,
                     total_token_count,
-                    ..
                 } => {
-                    report.context_tokens += *total_token_count as u64;
-                    report.context_slices += slices.len();
+                    context.insert(*subtask_id, (*total_token_count as u64, slices.len()));
                 }
                 OrchestratorEvent::SubtaskReviewReady {
                     description,
@@ -71,6 +73,8 @@ impl TokenReport {
                 _ => {}
             }
         }
+        report.context_tokens = context.values().map(|(tokens, _)| tokens).sum();
+        report.context_slices = context.values().map(|(_, slices)| slices).sum();
         report
     }
 
@@ -123,7 +127,7 @@ fn render(goal_text: &str, report: &TokenReport) -> String {
         }
     ));
     out.push_str(&format!(
-        "code context selected: {} slices, ~{} tokens (local estimate)\n",
+        "code context per prompt: {} files and slices, ~{} tokens (local estimate)\n",
         report.context_slices, report.context_tokens
     ));
     out

@@ -123,6 +123,22 @@ fn local_goal_help_exits_cleanly() {
 }
 
 #[test]
+fn models_verb_help_prints_usage_without_running_the_verb() {
+    let home = tempfile::tempdir().unwrap();
+    for verb in ["setup", "install", "calibrate"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_phonton"))
+            .args(["models", verb, "--help"])
+            .env("PHONTON_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "models {verb} --help failed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("phonton models status"), "{stdout}");
+        assert!(!stdout.contains("Downloading"), "{stdout}");
+    }
+}
+
+#[test]
 fn incomplete_local_plan_reports_usage_without_crashing() {
     let output = Command::new(env!("CARGO_BIN_EXE_phonton"))
         .args(["goal", "--local", "--plan"])

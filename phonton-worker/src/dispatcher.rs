@@ -25,7 +25,7 @@ use phonton_mcp::McpRuntime;
 use phonton_orchestrator::WorkerDispatcher;
 use phonton_sandbox::{ExecutionGuard, Sandbox};
 use phonton_types::verification::VerificationExecution;
-use phonton_types::{CodeSlice, ContextAttribution, ModelTier, Subtask, SubtaskResult, TaskId};
+use phonton_types::{CodeSlice, ModelTier, Subtask, SubtaskResult, TaskId};
 
 use crate::Worker;
 
@@ -140,23 +140,9 @@ impl WorkerDispatcher for RealDispatcher {
         msg_tx: Option<tokio::sync::mpsc::Sender<phonton_types::messages::OrchestratorMessage>>,
     ) -> Result<SubtaskResult> {
         let provider = (self.provider_factory)(subtask.model_tier);
+        // The worker reports context once its prompt is built: retrieved
+        // slices alone miss the files it inlines whole.
         let context_slices = self.select_context(&subtask, &prior_errors).await;
-        if let Some(tx) = &msg_tx {
-            let slices: Vec<ContextAttribution> = context_slices
-                .iter()
-                .map(ContextAttribution::from)
-                .collect();
-            let total_token_count = slices.iter().map(|s| s.token_count).sum();
-            let _ = tx
-                .send(
-                    phonton_types::messages::OrchestratorMessage::ContextSelected {
-                        id: subtask.id,
-                        slices,
-                        total_token_count,
-                    },
-                )
-                .await;
-        }
         let mut worker = Worker::new(provider, self.guard.clone())
             .with_sandbox(Arc::clone(&self.sandbox))
             .with_context_manager(Arc::clone(&self.context))

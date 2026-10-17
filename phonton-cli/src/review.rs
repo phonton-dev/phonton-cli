@@ -760,14 +760,12 @@ fn print_text_report(report: &ReviewReport) {
 
     for (idx, item) in report.review_items.iter().enumerate() {
         println!(
-            "{}. {} [{}] verify={} tokens={} context={} slices/{} tokens",
+            "{}. {} [{}] verify={} tokens={}",
             idx + 1,
             crate::subtask_label(&item.description),
             item.tier,
             item.verify,
             item.tokens_used,
-            item.context.len(),
-            item.context_token_count
         );
         let price = if item.cost.pricing_known {
             format!("{} micros estimated", item.cost.total_usd_micros)
@@ -786,7 +784,7 @@ fn print_text_report(report: &ReviewReport) {
             price
         );
         println!(
-            "   usage: input={} output={} cached={} cache_creation={}{}",
+            "   model usage, all calls: input={} output={} cached={} cache_creation={}{}",
             item.token_usage.input_tokens,
             item.token_usage.output_tokens,
             item.token_usage.cached_tokens,
@@ -797,7 +795,7 @@ fn print_text_report(report: &ReviewReport) {
                 ""
             }
         );
-        render_context(&item.context);
+        render_context(&item.context, item.context_token_count);
         render_hunks(&item.diff_hunks);
         println!();
     }
@@ -813,12 +811,14 @@ fn print_text_report(report: &ReviewReport) {
     }
 }
 
-fn render_context(context: &[ContextAttribution]) {
+fn render_context(context: &[ContextAttribution], total_tokens: usize) {
     if context.is_empty() {
-        println!("   context: (none selected)");
+        println!("   context: (none recorded)");
         return;
     }
-    println!("   context:");
+    // Inlined files come first; each prompt repeats them, so the model's
+    // input above is several times this estimate on a multi-call subtask.
+    println!("   context per prompt, ~{total_tokens} tokens (estimate):");
     let cwd = std::env::current_dir().unwrap_or_default();
     for slice in context {
         // Repo-relative when the review runs from the repository.
@@ -826,11 +826,13 @@ fn render_context(context: &[ContextAttribution]) {
             .file_path
             .strip_prefix(&cwd)
             .unwrap_or(&slice.file_path);
+        let what = match slice.symbol_name.as_str() {
+            "whole file" | "excerpts" => slice.symbol_name.clone(),
+            symbol => format!("retrieved {symbol}"),
+        };
         println!(
-            "     - {} :: {} ({:?}, {} tokens)",
+            "     - {} ({what}, ~{} tokens)",
             path.display(),
-            slice.symbol_name,
-            slice.origin,
             slice.token_count
         );
     }

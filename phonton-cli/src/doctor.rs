@@ -275,6 +275,26 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
         );
     }
 
+    // No key anywhere resolves to local (config autodetect). Point at the
+    // model sized for this machine before any cloud key.
+    if !crate::local_model_known(&cfg.provider) {
+        let hardware = phonton_local::hardware::detect().await;
+        push(
+            checks,
+            "provider.model",
+            Severity::Fail,
+            "No model yet",
+            "no provider key found and no local model selected",
+            Some(match crate::models_cli::setup_command_for(&hardware) {
+                Some(setup) => format!(
+                    "Run `{setup}` to run on this machine with no key, or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ...)."
+                ),
+                None => "Run `phonton models catalog` to see which local models fit this machine, or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ...).".into(),
+            }),
+        );
+        return;
+    }
+
     if matches!(provider, "custom" | "openai-compatible") && cfg.provider.base_url.is_none() {
         push(
             checks,

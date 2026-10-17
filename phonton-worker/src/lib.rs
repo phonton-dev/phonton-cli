@@ -35,9 +35,9 @@ use phonton_sandbox::Sandbox;
 use phonton_store::Store;
 use phonton_types::verification::VerificationExecution;
 use phonton_types::{
-    CodeSlice, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord, ModelTier, Permission,
-    SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId, TokenUsage, VerifyLayer,
-    VerifyResult,
+    CodeSlice, ContextAttribution, ContextFrame, DiffHunk, DiffLine, ExtensionId, MemoryRecord,
+    ModelTier, Permission, SliceOrigin, Subtask, SubtaskId, SubtaskResult, SubtaskStatus, TaskId,
+    TokenUsage, VerifyLayer, VerifyResult,
 };
 use regex::Regex;
 use serde_json::{json, Value};
@@ -155,6 +155,35 @@ impl Worker {
     ) -> Self {
         self.msg_tx = Some(tx);
         self
+    }
+
+    /// Report what the prompt carries: inlined files first, then retrieved
+    /// slices. Sent again when `NEED_FILES` changes the inlined set; the
+    /// latest report per subtask is the one that counts.
+    async fn report_context(
+        &self,
+        subtask: &Subtask,
+        inlined: Vec<ContextAttribution>,
+        slices: &[CodeSlice],
+        relevant: &[CodeSlice],
+    ) {
+        let Some(tx) = &self.msg_tx else {
+            return;
+        };
+        let slices: Vec<ContextAttribution> = inlined
+            .into_iter()
+            .chain(slices.iter().chain(relevant).map(ContextAttribution::from))
+            .collect();
+        let total_token_count = slices.iter().map(|s| s.token_count).sum();
+        let _ = tx
+            .send(
+                phonton_types::messages::OrchestratorMessage::ContextSelected {
+                    id: subtask.id,
+                    slices,
+                    total_token_count,
+                },
+            )
+            .await;
     }
 
     /// Replace the worker's sandbox with a caller-supplied one. Typically
@@ -307,13 +336,16 @@ impl Worker {
         let file_list = render_file_list(&repository_file_list(self.guard.project_root()).await);
         let mut requested_files: Vec<PathBuf> = Vec::new();
         let mut file_requests = 0usize;
-        let mut target_sources = render_target_sources(
+        let (sources, inlined) = inline_target_sources(
             &subtask,
             &context_slices,
             &relevant_slices,
             self.guard.project_root(),
             &requested_files,
-        ) + &file_list;
+        );
+        let mut target_sources = sources + &file_list;
+        self.report_context(&subtask, inlined, &context_slices, &relevant_slices)
+            .await;
 
         let mut last_errors: Vec<String> = prior_errors;
         let mut last_layer = VerifyLayer::Syntax;
@@ -474,13 +506,16 @@ impl Worker {
                 file_requests += 1;
                 debug!(attempt, files = ?found, "worker requested files");
                 requested_files.extend(found);
-                target_sources = render_target_sources(
+                let (sources, inlined) = inline_target_sources(
                     &subtask,
                     &context_slices,
                     &relevant_slices,
                     root,
                     &requested_files,
-                ) + &file_list;
+                );
+                target_sources = sources + &file_list;
+                self.report_context(&subtask, inlined, &context_slices, &relevant_slices)
+                    .await;
                 last_errors.clear();
                 continue;
             }
@@ -1389,10 +1424,7 @@ fn relative_to_root(path: &Path, root: &Path) -> Option<PathBuf> {
     safe_relative_path(&rel).map(Path::to_path_buf)
 }
 
-/// Render the current contents of the files this subtask most likely edits:
-/// files the model asked for (`requested`), then paths named in the
-/// description, then files of retrieved slices. Files already attached to
-/// the subtask are skipped. Returns an empty string when nothing qualifies.
+#[cfg(test)]
 fn render_target_sources(
     subtask: &Subtask,
     slices: &[CodeSlice],
@@ -1400,6 +1432,22 @@ fn render_target_sources(
     root: &Path,
     requested: &[PathBuf],
 ) -> String {
+    inline_target_sources(subtask, slices, relevant, root, requested).0
+}
+
+/// Render the current contents of the files this subtask most likely edits:
+/// files the model asked for (`requested`), then paths named in the
+/// description, then files of retrieved slices. Files already attached to
+/// the subtask are skipped. Returns an empty string when nothing qualifies,
+/// plus one attribution per inlined file (`whole file` or `excerpts`, with a
+/// bytes/4 token estimate) so the review shows what the model read.
+fn inline_target_sources(
+    subtask: &Subtask,
+    slices: &[CodeSlice],
+    relevant: &[CodeSlice],
+    root: &Path,
+    requested: &[PathBuf],
+) -> (String, Vec<ContextAttribution>) {
     let mut candidates: Vec<PathBuf> = Vec::new();
     let task = phonton_types::task_description_without_prior_context(&subtask.description);
     let named = named_source_paths(task)
@@ -1421,6 +1469,7 @@ fn render_target_sources(
 
     let mut out = String::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut inlined: Vec<ContextAttribution> = Vec::new();
     let mut total = 0usize;
     let mut included = 0usize;
     for rel in candidates {
@@ -1453,6 +1502,7 @@ fn render_target_sources(
                 Some(excerpt) => {
                     total += excerpt.len();
                     included += 1;
+                    inlined.push(inlined_attribution(&rel, "excerpts", excerpt.len()));
                     out.push_str(&format!(
                         "## {display} (excerpts of a {} byte file; edit only lines shown)\n{excerpt}",
                         bytes.len()
@@ -1467,6 +1517,7 @@ fn render_target_sources(
         };
         total += text.len();
         included += 1;
+        inlined.push(inlined_attribution(&rel, "whole file", text.len()));
         out.push_str(&format!("## {display}\n```{lang}\n{text}"));
         if !text.ends_with('\n') {
             out.push('\n');
@@ -1474,7 +1525,7 @@ fn render_target_sources(
         out.push_str("```\n");
     }
     if out.is_empty() && skipped.is_empty() {
-        return String::new();
+        return (String::new(), inlined);
     }
     let mut section = String::from(
         "# Current source\nEdit against these exact lines. Context and removed lines must match byte-for-byte.\n",
@@ -1487,7 +1538,16 @@ fn render_target_sources(
         ));
     }
     section.push('\n');
-    section
+    (section, inlined)
+}
+
+fn inlined_attribution(path: &Path, what: &str, bytes: usize) -> ContextAttribution {
+    ContextAttribution {
+        file_path: path.to_path_buf(),
+        symbol_name: what.into(),
+        origin: SliceOrigin::Semantic,
+        token_count: bytes.div_ceil(4),
+    }
 }
 
 /// Root Markdown documents named without their extension, such as "the
@@ -2849,6 +2909,24 @@ mod tests {
         let rendered = render_target_sources(&subtask, &slices, &[], temp.path(), &[]);
         assert!(rendered.starts_with("# Current source"));
         assert_eq!(rendered.matches("## src/math.js").count(), 1);
+        let (_, inlined) = inline_target_sources(&subtask, &slices, &[], temp.path(), &[]);
+        let inlined: Vec<(String, &str, usize)> = inlined
+            .iter()
+            .map(|a| {
+                (
+                    a.file_path.to_string_lossy().replace('\\', "/"),
+                    a.symbol_name.as_str(),
+                    a.token_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            inlined,
+            [
+                ("src/math.js".to_string(), "whole file", 5),
+                ("src/util.js".to_string(), "whole file", 5)
+            ]
+        );
         assert!(rendered.contains("export const a = 1;"));
         assert!(rendered.contains("## src/util.js"));
 
@@ -3479,11 +3557,14 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let worker = Worker::new(Box::new(provider), ExecutionGuard::new(tmp.clone()));
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/App.tsx"), "export const App = 1;\n").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let worker =
+            Worker::new(Box::new(provider), ExecutionGuard::new(tmp.clone())).with_msg_tx(tx);
         let subtask = Subtask {
             id: SubtaskId::new(),
-            description: "Fix the failing generated app test".into(),
+            description: "Fix the failing generated app test in src/App.tsx".into(),
             model_tier: ModelTier::Cheap,
             dependencies: Vec::new(),
             attachments: Vec::new(),
@@ -3500,6 +3581,20 @@ mod tests {
             .await
             .unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
+
+        // The review reports the file the prompt inlined, not only retrieval.
+        let mut reported = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let phonton_types::messages::OrchestratorMessage::ContextSelected {
+                slices, ..
+            } = message
+            {
+                reported = slices;
+            }
+        }
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(reported[0].symbol_name, "whole file");
+        assert!(reported[0].file_path.ends_with("App.tsx"));
 
         let captured = prompts.lock().unwrap();
         assert_eq!(captured.len(), 1);

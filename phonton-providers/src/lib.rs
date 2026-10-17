@@ -92,7 +92,7 @@ pub fn model_for_tier(provider: &str, tier: ModelTier) -> String {
             ModelTier::Standard => "zai-org/GLM-5.3".into(),
             ModelTier::Frontier => "moonshotai/Kimi-K3".into(),
         },
-        "ollama" => "llama3.2:3b".into(),
+        "ollama" => "qwen3.5:9b".into(),
         _ => "unknown".into(),
     }
 }

@@ -241,8 +241,10 @@ mod tests {
             ram_available_bytes: available,
             ..Default::default()
         };
+        // 4.9 GiB free holds a 512 MiB model, its fallback KV cache, the
+        // runtime reserve and the 2 GiB host reserve.
         assert_eq!(
-            crate::estimate_fit(1u64 << 30, &hardware).status,
+            crate::estimate_fit(1u64 << 29, &hardware).status,
             FitStatus::CpuOrOffload
         );
     }

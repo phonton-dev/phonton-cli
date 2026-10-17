@@ -4,6 +4,64 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.25.0 - Current local models, local first, comparable proof
+
+### Changed
+
+- [changed] Offline npm preparation accepts lockfiles of up to 2,048 package
+  entries (was 512) within the existing 2 MiB lockfile bound, enough for a
+  jest and babel toolchain.
+
+- [changed] `phonton models catalog` lists 2026 local coding models and
+  marks one by the machine's total memory (the largest GPU, or half of RAM
+  when that is larger): `qwen3.5:4b` from 4 GB, `qwen3.5:9b` from 6 GB,
+  `gpt-oss:20b` from 16 GB, `qwen3.6:35b-a3b` from 24 GB, with `gemma4:12b`
+  and `qwen3.6:27b` as alternatives. Under 4 GB or without a memory reading
+  nothing is suggested, and `doctor` and `models` point to the catalog
+  instead of a download. The 2024 `qwen2.5-coder` entries are
+  gone. Free memory no longer decides the suggestion; the fit column still
+  reports it.
+- [changed] With no provider key anywhere, Phonton defaults to a local model
+  instead of Anthropic. `phonton doctor` and `phonton models` name the
+  `phonton models setup MODEL` command for this machine first, then the
+  provider keys.
+
+### Fixed
+
+- [fixed] `phonton models setup --help` (and `--help` after any other models
+  command) printed nothing useful and started downloading the 1.5 GB runtime,
+  taking `--help` as a model name. It now prints the models usage.
+- [fixed] Local fit estimates reserved 1 GiB per 4096 context tokens plus 25%
+  of the weights, so `qwen3.5:4b` could not be calibrated above 4096 tokens on
+  a 6 GB GPU that serves it at 16384. Estimates now read the KV cache size from
+  the installed model's attention metadata (32 KiB per token for `qwen3.5`),
+  add a fixed 1 GiB runtime reserve, and accept a model that fits the largest
+  GPU plus available RAM as partly offloaded, so the 6 GB tier's `qwen3.5:9b`
+  is admitted once about 4 GiB of RAM is free. A copy of the same model already
+  loaded at another context no longer hides its own memory from calibration
+  or goal admission.
+- [fixed] `phonton review` and `phonton why-tokens` listed only the retrieved
+  snippets (often five unrelated ones, ~500 tokens) as model context. They now
+  list the files each prompt inlined whole or as excerpts, then the retrieved
+  snippets, with a per-prompt token estimate next to the provider-reported
+  input for all calls.
+
+### Added
+
+- [added] `benchmarks/polyglot`: an Aider Polyglot slice runner that scores
+  Phonton, the bare model and OpenCode on the same exercises, prompt and
+  local model, reporting pass rate, false-pass rate, tokens and wall time.
+- [added] Local goal runs can verify jest projects. Select
+  `node node_modules/jest/bin/jest.js --ci --json` as the check: each check
+  copy installs the project's own jest with the reviewed offline `npm ci`
+  (lockfile integrity, no lifecycle scripts), and a pass needs jest's JSON
+  report to show at least one passing test in candidate files, no failure, and
+  V8 coverage of every edited source. Unsupported jest flags, a missing
+  `--json`, or skipped-only runs stay Not run. Babel configuration is now
+  protected from model edits like `jest.config.*`. A root `"test": "jest"`
+  script (literal test paths only, jest declared as a dependency) now
+  proposes this check and its preparation without `--check`.
+
 ## 0.24.1 - Goals that name files get those files
 
 Found by running `phonton goal` on a real JavaScript repository with a cloud
