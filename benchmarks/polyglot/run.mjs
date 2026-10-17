@@ -183,7 +183,10 @@ function phontonArm(ex, dir, logDir) {
   // the scorer; with hidden tests Phonton gets no check either.
   const [cmd, argv] = testCommand(ex, ".");
   const check = testsMode === "visible" ? ["--check", JSON.stringify([cmd, ...argv])] : [];
-  const scope = ["--files", ex.solution.join(",")];
+  // Phonton protects files its check depends on (Cargo.toml for cargo test)
+  // and refuses a scope that names one; the prompt allows standard libraries
+  // only, so the manifest needs no edit.
+  const scope = ["--files", ex.solution.filter((f) => path.basename(f) !== "Cargo.toml").join(",")];
   const r = run(bin, ["goal", "--local", ex.prompt, ...scope, ...check, "--yes", "--allow-host-checks", ...unverified], { cwd: dir });
   fs.writeFileSync(promptFile, ex.prompt);
   const id = (r.stdout.match(/--local (?:apply|show) ([0-9a-f-]{36})/) ?? [])[1];

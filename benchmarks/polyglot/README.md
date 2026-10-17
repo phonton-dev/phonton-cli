@@ -31,6 +31,10 @@ runs where the arm said it succeeded, how many fail the pristine tests.
 - **Prompt.** `.docs/instructions.md` plus `instructions.append.md`, then
   Aider's benchmark addendum naming the solution files. Every arm gets the
   same text.
+- **Scope.** Phonton gets the exercise's solution files as `--files`, except
+  `Cargo.toml`: it protects files its check depends on and refuses a scope
+  that names one. The prompt allows standard libraries only, so the manifest
+  needs no edit. The other arms may still edit it.
 - **Tests.** `--tests visible` (default, as in Aider's benchmark) leaves the
   test files in the workspace with every skipped JavaScript test enabled.
   `--tests hidden` removes them, so no arm can run them.
