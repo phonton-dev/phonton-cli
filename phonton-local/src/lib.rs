@@ -59,7 +59,8 @@ const fn entry(name: &'static str, tier_gb: u64, alternative: bool) -> CatalogEn
 /// registry.ollama.ai on 2026-10-15 (downloads 3.3, 6.6, 8.0, 13.8, 17.8
 /// and 22.6 GB).
 pub const CATALOG: [CatalogEntry; 6] = [
-    entry("qwen3.5:4b", 0, false),
+    // 3.3 GB of weights plus KV cache and the runtime: below 4 GB, nothing.
+    entry("qwen3.5:4b", 4, false),
     entry("qwen3.5:9b", 6, false),
     entry("gemma4:12b", 10, true),
     entry("gpt-oss:20b", 16, false),
@@ -368,6 +369,10 @@ mod tests {
         // RTX 4050 laptop: 6 GB VRAM, 16 GB RAM.
         assert_eq!(recommended_model(&machine(Some(6), 16)), Some("qwen3.5:9b"));
         assert_eq!(recommended_model(&machine(None, 8)), Some("qwen3.5:4b"));
+        assert_eq!(recommended_model(&machine(Some(4), 6)), Some("qwen3.5:4b"));
+        // Under the smallest tier: no download that cannot run.
+        assert_eq!(recommended_model(&machine(Some(2), 6)), None);
+        assert_eq!(recommended_model(&machine(None, 4)), None);
         assert_eq!(
             recommended_model(&machine(Some(16), 32)),
             Some("gpt-oss:20b")

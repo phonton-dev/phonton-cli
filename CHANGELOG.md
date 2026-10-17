@@ -14,9 +14,11 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 - [changed] `phonton models catalog` lists 2026 local coding models and
   marks one by the machine's total memory (the largest GPU, or half of RAM
-  when that is larger): `qwen3.5:4b` under 6 GB, `qwen3.5:9b` from 6 GB,
+  when that is larger): `qwen3.5:4b` from 4 GB, `qwen3.5:9b` from 6 GB,
   `gpt-oss:20b` from 16 GB, `qwen3.6:35b-a3b` from 24 GB, with `gemma4:12b`
-  and `qwen3.6:27b` as alternatives. The 2024 `qwen2.5-coder` entries are
+  and `qwen3.6:27b` as alternatives. Under 4 GB or without a memory reading
+  nothing is suggested, and `doctor` and `models` point to the catalog
+  instead of a download. The 2024 `qwen2.5-coder` entries are
   gone. Free memory no longer decides the suggestion; the fit column still
   reports it.
 - [changed] With no provider key anywhere, Phonton defaults to a local model

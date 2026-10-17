@@ -117,12 +117,13 @@ half of RAM when that is larger):
 
 | Memory | Recommended | Alternative |
 | --- | --- | --- |
-| under 6 GB | `qwen3.5:4b` | |
+| 4-6 GB | `qwen3.5:4b` | |
 | 6-16 GB | `qwen3.5:9b` | `gemma4:12b` (10 GB and up) |
 | 16-24 GB | `gpt-oss:20b` | |
 | 24 GB and up | `qwen3.6:35b-a3b` | `qwen3.6:27b` |
 
-The recommendation is a size-based starting point; calibration decides
+Under 4 GB, or without a memory reading, nothing is recommended. The
+recommendation is a size-based starting point; calibration decides
 whether a model is usable. Any other Ollama tag works with `models setup`.
 
 In our smoke runs, qwen2.5-coder:3b on a 6 GB laptop GPU finished small

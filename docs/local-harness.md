@@ -27,11 +27,11 @@ not report the installed model's context ceiling. One entry has
 `first_try_reason`: the model recommended for the machine's memory tier. The
 tier uses total memory, the largest GPU's VRAM or half of RAM when that is
 larger, so a busy machine still gets the model it can run once other apps
-close; the fit column says what is free now. Tiers: under 6 GB
+close; the fit column says what is free now. Tiers: 4 GB
 `qwen3.5:4b`, 6 GB `qwen3.5:9b`, 16 GB `gpt-oss:20b`, 24 GB `qwen3.6:35b-a3b`;
 `gemma4:12b` and `qwen3.6:27b` are listed as alternatives. This is a size-based
 starting point, not a model-quality, speed, compatibility, or context-limit
-measurement. Missing memory readings produce no suggestion, and an entry whose
+measurement. Missing memory readings, or under 4 GB, produce no suggestion, and an entry whose
 manifest lookup failed is never suggested. Downloading remains explicit;
 calibrate the installed model before selecting it.
 Before managed setup, catalog entries with a usable manifest may include

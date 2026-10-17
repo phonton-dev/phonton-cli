@@ -578,16 +578,20 @@ fn fit_label(fit: &Value) -> String {
 }
 
 /// `phonton models setup MODEL` for the model recommended for this machine's
-/// memory tier.
-pub(crate) fn setup_command_for(hardware: &HardwareSnapshot) -> String {
-    let model = phonton_local::recommended_model(hardware).unwrap_or("qwen3.5:9b");
-    format!("phonton models setup {model}")
+/// memory tier; `None` when memory is unknown or below the smallest tier, so
+/// nobody is sent to a download that cannot run.
+pub(crate) fn setup_command_for(hardware: &HardwareSnapshot) -> Option<String> {
+    phonton_local::recommended_model(hardware).map(|model| format!("phonton models setup {model}"))
 }
 
 /// [`setup_command_for`] a serialized [`HardwareSnapshot`].
-fn setup_command(hardware: &Value) -> String {
+fn setup_command(hardware: &Value) -> Option<String> {
     setup_command_for(&serde_json::from_value(hardware.clone()).unwrap_or_default())
 }
+
+/// Next step when no model is recommended for this machine.
+pub(crate) const NO_RECOMMENDATION: &str =
+    "phonton models catalog shows which models fit this machine; phonton models setup MODEL installs one.";
 
 /// `phonton models` for a person: runtime, hardware, installed models and
 /// the one next step. `--json` keeps the full machine-readable status.
@@ -667,22 +671,33 @@ fn status_summary(v: &Value) -> String {
     }
     let setup = setup_command(&v["hardware"]);
     let next = if v["runtime_version"].is_null() {
-        if v["managed_runtime_supported"].as_bool() == Some(true) {
-            format!("{setup} installs a runtime and the model for this machine.")
-        } else {
-            format!(
-                "install and start Ollama ({}), then {setup}.",
+        match (
+            &setup,
+            v["managed_runtime_supported"].as_bool() == Some(true),
+        ) {
+            (Some(setup), true) => {
+                format!("{setup} installs a runtime and the model for this machine.")
+            }
+            (None, true) => NO_RECOMMENDATION.into(),
+            (setup, false) => format!(
+                "install and start Ollama ({}), then {}.",
                 v["runtime_install_url"]
                     .as_str()
-                    .unwrap_or("https://ollama.com/download")
-            )
+                    .unwrap_or("https://ollama.com/download"),
+                setup.as_deref().unwrap_or(
+                    "phonton models setup MODEL with a model from phonton models catalog"
+                )
+            ),
         }
     } else if let Some(name) = active {
         format!("{name} is selected for local goals. Run phonton in a project.")
     } else if models.is_empty() {
-        format!(
-            "{setup} installs the model for this machine; phonton models catalog lists the others."
-        )
+        match &setup {
+            Some(setup) => format!(
+                "{setup} installs the model for this machine; phonton models catalog lists the others."
+            ),
+            None => NO_RECOMMENDATION.into(),
+        }
     } else {
         "phonton models setup MODEL calibrates and selects an installed model.".into()
     };
@@ -2085,9 +2100,22 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            setup_command(&workstation),
-            "phonton models setup qwen3.6:35b-a3b"
+            setup_command(&workstation).as_deref(),
+            Some("phonton models setup qwen3.6:35b-a3b")
         );
+        // Unknown or undersized memory gets no model to download.
+        assert_eq!(setup_command(&json!({"gpus": []})), None);
+        let tiny = status_summary(&json!({
+            "endpoint": "http://127.0.0.1:11434", "runtime_version": null,
+            "managed_runtime_supported": true,
+            "hardware": {"gpus": [], "ram_available_bytes": 1_000_000_000_u64, "ram_total_bytes": 4_000_000_000_u64},
+            "models": [], "active_model": null, "model_store": {}
+        }));
+        assert!(
+            tiny.contains(&format!("next: {NO_RECOMMENDATION}")),
+            "{tiny}"
+        );
+        assert!(!tiny.contains("phonton models setup qwen"), "{tiny}");
 
         let ready = status_summary(&json!({
             "endpoint": "http://127.0.0.1:11434", "runtime_version": "0.34.2",

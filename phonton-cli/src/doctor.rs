@@ -285,10 +285,12 @@ async fn check_config(checks: &mut Vec<DoctorCheck>, opts: DoctorOptions) {
             Severity::Fail,
             "No model yet",
             "no provider key found and no local model selected",
-            Some(format!(
-                "Run `{}` to run on this machine with no key, or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ...).",
-                crate::models_cli::setup_command_for(&hardware)
-            )),
+            Some(match crate::models_cli::setup_command_for(&hardware) {
+                Some(setup) => format!(
+                    "Run `{setup}` to run on this machine with no key, or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ...)."
+                ),
+                None => "Run `phonton models catalog` to see which local models fit this machine, or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ...).".into(),
+            }),
         );
         return;
     }
