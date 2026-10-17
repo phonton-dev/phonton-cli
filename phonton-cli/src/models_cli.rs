@@ -1925,8 +1925,13 @@ pub async fn run(args: &[String]) -> Result<i32> {
     let started = Instant::now();
     let mut printer = ProgressPrinter::default();
     let verb = args.first().map(String::as_str).unwrap_or("status");
+    // `--help` after any verb prints usage; `setup --help` used to treat it as
+    // a model name and download the runtime first.
     if matches!(verb, "--help" | "-h" | "help")
-        || (verb == "status" && args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h"))
+        || args
+            .iter()
+            .skip(1)
+            .any(|a| matches!(a.as_str(), "--help" | "-h"))
     {
         println!("phonton models status [CONTEXT] [--json]|storage [EMPTY_FOLDER]|endpoint [ORIGIN]|setup [MODEL [--json]]|catalog [--json|--snapshot]|install MODEL|calibrate MODEL [CONTEXT]|select MODEL|deselect|remove MODEL\n\nSetup MODEL runs setup, install, calibrate and select in order and stops at the first failure.\nStatus, catalog and setup MODEL print a summary in a terminal; --json (or a pipe, for setup MODEL) prints the full JSON. Other commands print JSON. Storage chooses an existing, empty dedicated local-drive folder for managed runtime and model files before setup; the choice is saved for CLI and Desktop. The PHONTON_LOCAL_STATE override keeps its own isolated runtime beside that state file. Existing managed files are never moved by this command. Endpoint accepts only a loopback HTTP(S) origin. Changing it clears the selected model; it can be saved before that runtime starts. Managed setup uses the default 127.0.0.1:11434 origin.\nSetup labels a responding service unverified only when no conflicting saved managed launch exists. A stale receipt requires stopping the port owner and retrying. Otherwise setup downloads a hash-checked portable Ollama runtime (about 1.5 GB on Windows and Linux, 160 MB on macOS).\nCatalog and install access the public registry. Catalog --snapshot also prints the exact hardware reading used for model fit and first-try guidance; default catalog output remains an array. A model without a tag resolves to the installed :latest identity for calibration and selection. Deselect keeps installed weights and calibration so the model can be selected again or explicitly removed later. Phonton sends inference requests to loopback; an existing service's cloud settings are not verified.\nOmitted calibration context uses observed memory and the installed model limit; an explicit context overrides that choice. Calibration records measured edit, creation and tool-call formats, not general coding quality. If no edit format passes, the probe JSON is saved but the command exits 2; the model cannot be selected.");
         return Ok(0);

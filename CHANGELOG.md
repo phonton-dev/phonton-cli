@@ -26,6 +26,9 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] `phonton models setup --help` (and `--help` after any other models
+  command) printed nothing useful and started downloading the 1.5 GB runtime,
+  taking `--help` as a model name. It now prints the models usage.
 - [fixed] Local fit estimates reserved 1 GiB per 4096 context tokens plus 25%
   of the weights, so `qwen3.5:4b` could not be calibrated above 4096 tokens on
   a 6 GB GPU that serves it at 16384. Estimates now read the KV cache size from
