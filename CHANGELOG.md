@@ -4,6 +4,20 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased
+
+### Fixed
+
+- [fixed] `phonton goal --local` stopped with `resource_pressure` whenever
+  available host RAM fell below 1.5 GiB between model calls, even when the
+  exact calibrated model was still loaded at the calibrated context entirely
+  in VRAM. That reserve covers starting the runtime, and a loaded copy
+  already holds its host memory. A chat with a copy entirely in VRAM now
+  needs 512 MiB free. Cold loads and partly offloaded copies keep their
+  reserves, and an unknown memory reading still stops the run. In the 0.25.0
+  Aider Polyglot run on a 16 GB RAM, 6 GB RTX 4050 laptop, this ended 18 of
+  51 Phonton runs, 13 of 17 in JavaScript, after jest checks.
+
 ## 0.25.0 - Current local models, local first, comparable proof
 
 ### Changed
