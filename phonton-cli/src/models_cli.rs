@@ -2079,10 +2079,20 @@ mod tests {
 
     #[test]
     fn status_summary_names_the_runtime_models_and_next_step() {
+        // Status carries a serialized snapshot; a hand-written partial one
+        // would not deserialize and would read as unknown memory.
+        let ram = |available: u64, total: u64| {
+            serde_json::to_value(HardwareSnapshot {
+                ram_available_bytes: Some(available),
+                ram_total_bytes: Some(total),
+                ..Default::default()
+            })
+            .unwrap()
+        };
         let none = status_summary(&json!({
             "endpoint": "http://127.0.0.1:11434", "runtime_version": null,
             "managed_runtime_supported": false, "runtime_install_url": "https://ollama.com/download",
-            "hardware": {"gpus": [], "ram_available_bytes": 8_000_000_000_u64, "ram_total_bytes": 16_000_000_000_u64},
+            "hardware": ram(8_000_000_000, 16_000_000_000),
             "models": [], "active_model": null, "model_store": {}
         }));
         assert!(
@@ -2104,11 +2114,14 @@ mod tests {
             Some("phonton models setup qwen3.6:35b-a3b")
         );
         // Unknown or undersized memory gets no model to download.
-        assert_eq!(setup_command(&json!({"gpus": []})), None);
+        assert_eq!(
+            setup_command(&serde_json::to_value(HardwareSnapshot::default()).unwrap()),
+            None
+        );
         let tiny = status_summary(&json!({
             "endpoint": "http://127.0.0.1:11434", "runtime_version": null,
             "managed_runtime_supported": true,
-            "hardware": {"gpus": [], "ram_available_bytes": 1_000_000_000_u64, "ram_total_bytes": 4_000_000_000_u64},
+            "hardware": ram(1_000_000_000, 4_000_000_000),
             "models": [], "active_model": null, "model_store": {}
         }));
         assert!(
