@@ -192,7 +192,8 @@ that its own child owns the loopback listener before reporting success.
 Before each strategy or edit request, the runner refreshes the runtime version,
 installed model digest and size, and cold-load fit from current hardware. If
 cold loading no longer fits, the exact calibrated model must be resident at the
-required context with at least 1.5 GiB available host RAM. Ollama must report
+required context with at least 512 MiB available host RAM when the copy is
+entirely in VRAM, or 1.5 GiB when part of it is in RAM. Ollama must report
 at least 30 seconds before unload; residency is checked again immediately
 before chat. These are point-in-time checks, not a memory reservation.
 CLI download output coalesces byte updates while immediately showing stage

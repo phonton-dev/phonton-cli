@@ -133,11 +133,28 @@ fn creation_system_instruction(path: &Path, protocol: EditProtocol) -> String {
     }
 }
 
+/// Host RAM a chat with an exact resident model needs free when that copy is
+/// entirely in VRAM. Its runtime allocation was made at load time and is
+/// already outside the available reading, so the 1.5 GiB cold-load reserve
+/// would count it twice; this leaves headroom for the request and the OS. On
+/// Ollama 0.34.2 (2026-10-17, RTX 4050) loading qwen3.5:4b at 16384 tokens
+/// took about 700 MiB of host RAM; a later 7000-token chat loaded nothing.
+// ponytail: fixed floor, measure per-chat host use if a runtime allocates per request.
+const VRAM_RESIDENT_HOST_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Whether `resident` may serve the next chat. A copy partly in RAM keeps the
+/// full reserve, because paging its weights out would stall generation.
 fn resident_headroom(hardware: &HardwareSnapshot, resident: Option<&ResidentModel>) -> bool {
-    resident.is_some()
-        && hardware
+    resident.is_some_and(|model| {
+        let reserve = if model.size_vram_bytes >= model.size_bytes {
+            VRAM_RESIDENT_HOST_RESERVE_BYTES
+        } else {
+            phonton_local::GPU_HOST_RESERVE_BYTES
+        };
+        hardware
             .ram_available_bytes
-            .is_some_and(|bytes| bytes >= 1536 * 1024 * 1024)
+            .is_some_and(|bytes| bytes >= reserve)
+    })
 }
 
 async fn confirm_model_identity(
@@ -180,14 +197,8 @@ async fn admitted_resident_for_generation(
     hardware: &HardwareSnapshot,
     initial_resident: Option<&ResidentModel>,
 ) -> std::result::Result<Option<ResidentModel>, GenerationAdmissionError> {
-    if hardware
-        .ram_available_bytes
-        .is_none_or(|bytes| bytes < 1536 * 1024 * 1024)
-    {
-        return Err(GenerationAdmissionError::ResourcePressure(
-            "Available host RAM fell below the 1.5 GiB generation reserve".into(),
-        ));
-    }
+    // Host reserves live in the cold-load estimate (unknown memory fails
+    // there) and in `resident_headroom`; no flat reserve may run first.
     confirm_model_identity(runtime, profile, installed.size_bytes).await?;
     let fit = runtime
         .estimate_cold_load(
@@ -680,14 +691,8 @@ async fn run_inner(
             receipt.state = "budget_exhausted".into();
             break;
         }
-        let current = observed_hardware(hardware_override.as_ref()).await;
-        if current
-            .ram_available_bytes
-            .is_none_or(|n| n < 1536 * 1024 * 1024)
-        {
-            receipt.state = "resource_pressure".into();
-            break;
-        }
+        // Host memory is admitted immediately before each chat, where the
+        // exact resident copy can be seen.
         if receipt.resident_reuse.is_some()
             && !matches!(
                 runtime
@@ -988,15 +993,6 @@ async fn run_inner(
             {
                 receipt.state = "baseline_changed_or_unavailable".into();
                 receipt.known_gaps.push("Captured baseline changed during strategy inference; no edit inference started.".into());
-                break;
-            }
-            if observed_hardware(hardware_override.as_ref())
-                .await
-                .ram_available_bytes
-                .is_none_or(|bytes| bytes < 1536 * 1024 * 1024)
-            {
-                receipt.state = "resource_pressure".into();
-                receipt.known_gaps.push("Host RAM fell below the generation reserve after strategy inference; no edit inference started.".into());
                 break;
             }
         }
@@ -8719,6 +8715,7 @@ mod tests {
             "malicious_repair",
             "pressure_after_baseline",
             "pressure_with_resident",
+            "pressure_with_vram_resident",
             "model_replaced_after_baseline",
             "alias_from_start",
             "alias_after_baseline",
@@ -8745,6 +8742,9 @@ mod tests {
             let malicious_repair = scenario == "malicious_repair";
             let pressure_after_baseline = scenario == "pressure_after_baseline";
             let pressure_with_resident = scenario == "pressure_with_resident";
+            // After the first load, host RAM falls below the cold-load reserve
+            // while the exact model stays entirely in VRAM.
+            let pressure_with_vram_resident = scenario == "pressure_with_vram_resident";
             let pressure_after_load = pressure_after_baseline || pressure_with_resident;
             let model_replaced_after_baseline = scenario == "model_replaced_after_baseline";
             let alias_from_start = scenario == "alias_from_start";
@@ -8860,6 +8860,8 @@ mod tests {
                     "/api/show" => serde_json::json!({"model_info":{"general.architecture":"fixture","fixture.context_length":if large_context_budget { 16384 } else if large_creation { 8192 } else { 4096 }},"details":{"format":"gguf"}}),
                     "/api/ps" => if pressure_with_resident {
                         serde_json::json!({"models":[{"name":"fixture:small","digest":"fixture-digest","size":4 * 1024 * 1024 * 1024_u64,"size_vram":0,"context_length":4096,"expires_at":"2100-01-01T00:00:00Z"}]})
+                    } else if pressure_with_vram_resident {
+                        serde_json::json!({"models":[{"name":"fixture:small","digest":"fixture-digest","size":2 * 1024 * 1024 * 1024_u64,"size_vram":2 * 1024 * 1024 * 1024_u64,"context_length":4096,"expires_at":"2100-01-01T00:00:00Z"}]})
                     } else {
                         serde_json::json!({"models":[]})
                     },
@@ -9033,21 +9035,35 @@ mod tests {
             let hardware = HardwareSnapshot {
                 ram_total_bytes: Some(16 * 1024 * 1024 * 1024),
                 ram_available_bytes: Some(8 * 1024 * 1024 * 1024),
+                gpus: if pressure_with_vram_resident {
+                    vec![phonton_types::local::GpuSnapshot {
+                        name: "fixture GPU".into(),
+                        total_bytes: 6 * 1024 * 1024 * 1024,
+                        available_bytes: 6 * 1024 * 1024 * 1024,
+                    }]
+                } else {
+                    Vec::new()
+                },
                 ..HardwareSnapshot::default()
             };
             let hardware_reader = if wall_exhausted_before_edit {
                 let observations = Arc::new(AtomicUsize::new(0));
                 let snapshot = hardware.clone();
+                // Observation 0 admits the run; 1 admits the first edit chat.
                 Arc::new(move || {
-                    if observations.fetch_add(1, Ordering::SeqCst) == 2 {
+                    if observations.fetch_add(1, Ordering::SeqCst) == 1 {
                         std::thread::sleep(Duration::from_millis(10_100));
                     }
                     snapshot.clone()
                 }) as HardwareOverride
-            } else if pressure_after_load {
+            } else if pressure_after_load || pressure_with_vram_resident {
                 let observations = Arc::new(AtomicUsize::new(0));
                 let later = HardwareSnapshot {
-                    ram_available_bytes: Some(3 * 1024 * 1024 * 1024),
+                    ram_available_bytes: Some(if pressure_with_vram_resident {
+                        1024 * 1024 * 1024
+                    } else {
+                        3 * 1024 * 1024 * 1024
+                    }),
                     ..hardware.clone()
                 };
                 let first = hardware.clone();
@@ -9301,7 +9317,8 @@ mod tests {
                 assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
                 continue;
             }
-            if pressure_with_resident {
+            if pressure_with_resident || pressure_with_vram_resident {
+                assert_eq!(receipt.state, "review_ready", "{receipt:?}");
                 assert!(
                     paths
                         .iter()
@@ -10059,7 +10076,7 @@ mod tests {
     }
     #[test]
     fn resident_reuse_still_requires_host_headroom() {
-        let resident = ResidentModel {
+        let mut resident = ResidentModel {
             name: "coder:small".into(),
             digest: "digest-a".into(),
             size_bytes: 1 << 30,
@@ -10067,14 +10084,24 @@ mod tests {
             context_length: 4096,
             expires_at_unix: 4_102_444_800,
         };
-        let mut hardware = HardwareSnapshot {
-            ram_available_bytes: Some(1536 * 1024 * 1024 - 1),
+        let ram = |bytes| HardwareSnapshot {
+            ram_available_bytes: bytes,
             ..Default::default()
         };
-        assert!(!resident_headroom(&hardware, Some(&resident)));
-        hardware.ram_available_bytes = Some(1536 * 1024 * 1024);
-        assert!(resident_headroom(&hardware, Some(&resident)));
-        assert!(!resident_headroom(&hardware, None));
+        let admits = |mib: u64, model: &ResidentModel| {
+            resident_headroom(&ram(Some(mib * 1024 * 1024)), Some(model))
+        };
+        // Entirely in VRAM: the runtime already holds its host allocation.
+        assert!(!admits(511, &resident));
+        assert!(admits(512, &resident));
+        assert!(admits(1535, &resident));
+        // Partly in RAM keeps the full reserve.
+        resident.size_vram_bytes -= 1;
+        assert!(!admits(1535, &resident));
+        assert!(admits(1536, &resident));
+        // Unknown memory or no exact resident model stays closed.
+        assert!(!resident_headroom(&ram(None), Some(&resident)));
+        assert!(!resident_headroom(&ram(Some(8 << 30)), None));
     }
     #[tokio::test]
     async fn python_cache_directories_do_not_become_captured_source() {

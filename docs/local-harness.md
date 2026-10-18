@@ -554,8 +554,9 @@ Cold model admission estimates weights, context and a host reserve. Before each
 strategy or edit request, the runner refreshes runtime version, installed model
 digest and size, observes current host memory, and re-estimates fit at the
 calibrated context. If cold loading no longer fits, Ollama must report the exact
-calibrated digest already loaded at that context, at least 1.5 GiB available
-host RAM, and at least 30 seconds of runtime-reported load time remaining. A
+calibrated digest already loaded at that context, at least 512 MiB available
+host RAM for a copy entirely in VRAM (1.5 GiB when part of it is in RAM), and
+at least 30 seconds of runtime-reported load time remaining. A
 resident model admitted at the start must keep its allocation identity.
 Residency is checked again immediately before chat. Failed admission stops
 before reserving that model call; the receipt records the reason. These
