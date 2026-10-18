@@ -6,7 +6,7 @@ name: Demo desktop walk
 on:
   push:
     branches: ["demo/**"]
-    paths: ["demo/desktop-walk.mjs", "demo/port-config/**", ".github/workflows/demo-desktop.yml"]
+    paths: ["demo/desktop-walk.mjs", "demo/port-config/**", "demo/variants/explain-msg/**", ".github/workflows/demo-desktop.yml"]
 
 permissions:
   contents: read
@@ -49,6 +49,8 @@ jobs:
       - name: Fixture repository
         run: |
           cp -r demo/port-config "$RUNNER_TEMP/port-config"
+          # Same fixture as the verified TUI take (variant explain-msg).
+          cp demo/variants/explain-msg/port.test.js "$RUNNER_TEMP/port-config/test/port.test.js"
           git -C "$RUNNER_TEMP/port-config" init -q
           git -C "$RUNNER_TEMP/port-config" add -A
           git -C "$RUNNER_TEMP/port-config" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
