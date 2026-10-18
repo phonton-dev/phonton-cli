@@ -1,0 +1,85 @@
+name: Demo recording
+
+# Records the launch demo footage on fresh runners with no Ollama and no GPU:
+# the released CLI from npm, managed setup of qwen3.5:4b, then one take of a
+# local goal in the TUI per job. Takes run in parallel; each is independent.
+# Lives only on demo/** branches.
+on:
+  push:
+    branches: ["demo/**"]
+    paths: ["demo/*.tape", "demo/port-config/**", ".github/workflows/demo-recording.yml"]
+
+permissions:
+  contents: read
+
+env:
+  CLI_VERSION: 0.25.1
+  MODEL: qwen3.5:4b
+
+jobs:
+  record:
+    strategy:
+      fail-fast: false
+      matrix:
+        take: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the released CLI
+        run: |
+          mkdir -p out
+          npm install -g "phonton-cli@$CLI_VERSION"
+          phonton version | tee out/version.txt
+          grep -q "$CLI_VERSION" out/version.txt
+
+      - name: Prepare a clean Phonton home
+        run: |
+          echo "PHONTON_HOME=$RUNNER_TEMP/phonton-home" >> "$GITHUB_ENV"
+          echo "DEMO_WORK=$RUNNER_TEMP/demo" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/phonton-home" "$RUNNER_TEMP/demo"
+          printf '[provider]\nname = "ollama"\nmodel = "%s"\n' "$MODEL" > "$RUNNER_TEMP/phonton-home/config.toml"
+          sudo apt-get update -q && sudo apt-get install -yq fonts-jetbrains-mono
+          if command -v ollama || curl -sf http://127.0.0.1:11434/api/version; then
+            echo "an Ollama install or listener is already present" >&2; exit 1
+          fi
+          { free -h; nproc; lscpu | grep 'Model name'; } | tee out/machine.txt
+
+      - name: Record managed setup
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: demo/setup.tape
+
+      - name: Record goal take
+        env:
+          TAKE: ${{ matrix.take }}
+        run: |
+          VHS=$(command -v vhs || find /opt/hostedtoolcache "$RUNNER_TOOL_CACHE" -type f -name vhs 2>/dev/null | head -1)
+          test -x "$VHS" || { echo "vhs not found" >&2; exit 1; }
+          # A fresh folder per take: it asks for trust like a first run.
+          repo="$DEMO_WORK/take$TAKE/port-config"
+          mkdir -p "$DEMO_WORK/take$TAKE"
+          cp -r demo/port-config "$repo"
+          git -C "$repo" init -q
+          git -C "$repo" add -A
+          git -C "$repo" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
+          sed -e "s/TAKE/$TAKE/g" -e "s#DEMO_REPO#$repo#g" demo/goal.tape > "$RUNNER_TEMP/goal.tape"
+          "$VHS" "$RUNNER_TEMP/goal.tape" || echo "take $TAKE failed"
+          git -C "$repo" status --short > "out/goal-$TAKE-status.txt" || true
+          git -C "$repo" diff HEAD > "out/goal-$TAKE.diff" || true
+          (cd "$repo" && npm test > "$GITHUB_WORKSPACE/out/goal-$TAKE-tests.txt" 2>&1) || true
+          phonton models status > out/models-status.txt 2>&1 || true
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-take-${{ matrix.take }}
+          path: |
+            out
+            ${{ runner.temp }}/phonton-home/runs
+            ${{ runner.temp }}/phonton-home/runtime/runtime.log
+          if-no-files-found: warn
