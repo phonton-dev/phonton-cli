@@ -1,0 +1,1 @@
+Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage like 80abc so npm test passes

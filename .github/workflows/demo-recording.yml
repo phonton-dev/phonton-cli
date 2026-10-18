@@ -24,8 +24,8 @@ jobs:
         # Fixture variants: the original port-config fails the same way on
         # every take (qwen3.5:4b output is deterministic here), so each
         # variant puts the failing input "80abc" somewhere the model sees.
-        variant: [name-hint, assert-msg, goal-hint]
-        take: [1, 2]
+        variant: [assert-msg, goal-hint, msg-goal, explain-msg, explain-goal]
+        take: [1]
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -63,11 +63,13 @@ jobs:
           TAKE: ${{ matrix.variant }}-${{ matrix.take }}
           VARIANT: ${{ matrix.variant }}
         run: |
-          if [ "$VARIANT" = goal-hint ]; then
-            export GOAL="Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage like 80abc so npm test passes"
-          else
-            export GOAL="Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage so npm test passes"
-          fi
+          export GOAL="Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage so npm test passes"
+          if [ -f "demo/variants/$VARIANT/goal.txt" ]; then GOAL=$(cat "demo/variants/$VARIANT/goal.txt"); fi
+          # Setup leaves the calibration copy resident for its 2 minute
+          # keep-alive. On this 16 GB CPU-only runner 0.25.1 then refuses the
+          # goal ("Estimated working set exceeds available memory"), so wait
+          # for the runtime to unload it first.
+          sleep 150
           VHS=$(command -v vhs || find /opt/hostedtoolcache "$RUNNER_TOOL_CACHE" -type f -name vhs 2>/dev/null | head -1)
           test -x "$VHS" || { echo "vhs not found" >&2; exit 1; }
           # A fresh folder per take: it asks for trust like a first run.
