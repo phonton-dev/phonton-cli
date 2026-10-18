@@ -21,7 +21,7 @@ Sleep 1.5s
 Show
 
 Sleep 1.5s
-Type "Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage so npm test passes"
+Type "GOAL_TEXT"
 Sleep 700ms
 Enter
 Wait+Screen /Run checks on this machine/

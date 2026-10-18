@@ -7,7 +7,7 @@ name: Demo recording
 on:
   push:
     branches: ["demo/**"]
-    paths: ["demo/*.tape", "demo/port-config/**", ".github/workflows/demo-recording.yml"]
+    paths: ["demo/*.tape", "demo/port-config/**", "demo/variants/**", ".github/workflows/demo-recording.yml"]
 
 permissions:
   contents: read
@@ -21,7 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        take: [1, 2, 3, 4, 5, 6]
+        # Fixture variants: the original port-config fails the same way on
+        # every take (qwen3.5:4b output is deterministic here), so each
+        # variant puts the failing input "80abc" somewhere the model sees.
+        variant: [name-hint, assert-msg, goal-hint]
+        take: [1, 2]
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -56,18 +60,26 @@ jobs:
 
       - name: Record goal take
         env:
-          TAKE: ${{ matrix.take }}
+          TAKE: ${{ matrix.variant }}-${{ matrix.take }}
+          VARIANT: ${{ matrix.variant }}
         run: |
+          if [ "$VARIANT" = goal-hint ]; then
+            export GOAL="Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage like 80abc so npm test passes"
+          else
+            export GOAL="Make parsePort in @src/port.js reject ports outside 1-65535 and trailing garbage so npm test passes"
+          fi
           VHS=$(command -v vhs || find /opt/hostedtoolcache "$RUNNER_TOOL_CACHE" -type f -name vhs 2>/dev/null | head -1)
           test -x "$VHS" || { echo "vhs not found" >&2; exit 1; }
           # A fresh folder per take: it asks for trust like a first run.
           repo="$DEMO_WORK/take$TAKE/port-config"
           mkdir -p "$DEMO_WORK/take$TAKE"
           cp -r demo/port-config "$repo"
+          if [ -f "demo/variants/$VARIANT/port.test.js" ]; then cp "demo/variants/$VARIANT/port.test.js" "$repo/test/port.test.js"; fi
           git -C "$repo" init -q
           git -C "$repo" add -A
           git -C "$repo" -c user.name=demo -c user.email=demo@example.com commit -qm "port config"
-          sed -e "s/TAKE/$TAKE/g" -e "s#DEMO_REPO#$repo#g" demo/goal.tape > "$RUNNER_TEMP/goal.tape"
+          sed -e "s/TAKE/$TAKE/g" -e "s#DEMO_REPO#$repo#g" demo/goal.tape | perl -pe 's/GOAL_TEXT/$ENV{GOAL}/g' > "$RUNNER_TEMP/goal.tape"
+          grep -n "Type \"Make" "$RUNNER_TEMP/goal.tape"
           "$VHS" "$RUNNER_TEMP/goal.tape" || echo "take $TAKE failed"
           git -C "$repo" status --short > "out/goal-$TAKE-status.txt" || true
           git -C "$repo" diff HEAD > "out/goal-$TAKE.diff" || true
@@ -77,7 +89,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demo-take-${{ matrix.take }}
+          name: demo-${{ matrix.variant }}-${{ matrix.take }}
           path: |
             out
             ${{ runner.temp }}/phonton-home/runs
