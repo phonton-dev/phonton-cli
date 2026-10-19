@@ -1,7 +1,7 @@
 name: Demo video render
 
-# Renders the launch demo's silent picture (Remotion, compositions DemoV7 and
-# VerticalV7) from demo/video. Music and sound effects are mixed outside the
+# Renders the launch demo's silent picture (Remotion, compositions DemoV8 and
+# VerticalV8) from demo/video. Music and sound effects are mixed outside the
 # repo; nothing here carries audio. Lives only on demo/** branches.
 on:
   push:
@@ -28,10 +28,10 @@ jobs:
       - name: Render
         run: |
           mkdir -p out
-          npx remotion render DemoV7 out/demo-v7-silent.mp4 --codec=h264 --crf=18 --muted
-          npx remotion render VerticalV7 out/vertical-v7-silent.mp4 --codec=h264 --crf=18 --muted
+          npx remotion render DemoV8 out/demo-v8-silent.mp4 --codec=h264 --crf=18 --muted
+          npx remotion render VerticalV8 out/vertical-v8-silent.mp4 --codec=h264 --crf=18 --muted
       - uses: actions/upload-artifact@v4
         with:
-          name: demo-v7-silent
+          name: demo-v8-silent
           path: demo/video/out/*.mp4
           retention-days: 1

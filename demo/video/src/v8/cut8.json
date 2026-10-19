@@ -1,0 +1,44 @@
+{
+  "_": "v8 timing shared by src/v8/Film8.tsx and audio-work/v8/mix8.py. Everything is in bars of the music (174 BPM). `music` lists track bar ranges played back to back; `sfx` bars are output bars; gains are peak dBFS before the loudness pass.",
+  "bpm": 174,
+  "fps": 30,
+  "musicOrigin": -0.0073,
+  "sfxGain": { "keys": -14, "tick": -12, "fail": -5, "pass": -7 },
+  "cuts": {
+    "main": {
+      "bars": 49,
+      "music": [[0, 32], [36, 50], [75, 78]],
+      "sfx": [
+        { "bar": 11.875, "name": "tick" },
+        { "bar": 12, "name": "fail" },
+        { "bar": 17.75, "name": "tick" },
+        { "bar": 18, "name": "pass" },
+        { "bar": 21.594, "name": "tick", "gain": -16 },
+        { "bar": 22, "name": "fail", "gain": -10 },
+        { "bar": 25.925, "name": "tick", "gain": -16 },
+        { "bar": 26, "name": "pass", "gain": -13 },
+        { "bar": 29.74, "name": "tick", "gain": -16 },
+        { "bar": 41, "name": "keys" }
+      ]
+    },
+    "vertical": {
+      "bars": 11,
+      "music": [[3, 11], [75, 78]],
+      "sfx": [
+        { "bar": 3.875, "name": "tick" },
+        { "bar": 4, "name": "fail" },
+        { "bar": 5.875, "name": "tick" },
+        { "bar": 6, "name": "pass" },
+        { "bar": 8.5, "name": "keys" }
+      ]
+    },
+    "test": {
+      "bars": 8,
+      "music": [[2, 6], [11, 15]],
+      "sfx": [
+        { "bar": 4.875, "name": "tick" },
+        { "bar": 5, "name": "fail" }
+      ]
+    }
+  }
+}
