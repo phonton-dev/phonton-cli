@@ -179,7 +179,7 @@
           "id": "desktop",
           "bars": 4,
           "slot": "desktop",
-          "text": "The desktop app shows the same run. The second try was built from the first one's failed check.",
+          "text": "The desktop app runs the same goal. Its second try was built from the first one's failed check.",
           "label": "Desktop 0.5.2 · same engine and model · real time",
           "shots": [
             {
@@ -188,7 +188,7 @@
               "from": 104.6,
               "rate": 1,
               "cam": [
-                { "at": 0, "x": 725, "y": 696, "s": 1.6 }
+                { "at": 0, "x": 725, "y": 709.4, "s": 1.62 }
               ],
               "marks": [
                 { "x": 236, "y": 722, "w": 380, "h": 24, "at": 0.7, "tone": "fail" },
