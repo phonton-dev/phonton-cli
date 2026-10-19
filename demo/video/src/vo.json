@@ -1,0 +1,1054 @@
+{
+ "hook": {
+  "start": 0.0,
+  "end": 6.34,
+  "words": [
+   {
+    "text": "Your",
+    "start": 0.0,
+    "end": 0.22
+   },
+   {
+    "text": "local",
+    "start": 0.22,
+    "end": 0.52
+   },
+   {
+    "text": "model",
+    "start": 0.52,
+    "end": 0.84
+   },
+   {
+    "text": "just",
+    "start": 0.84,
+    "end": 1.08
+   },
+   {
+    "text": "said",
+    "start": 1.08,
+    "end": 1.28
+   },
+   {
+    "text": "it",
+    "start": 1.28,
+    "end": 1.4
+   },
+   {
+    "text": "fixed",
+    "start": 1.4,
+    "end": 1.62
+   },
+   {
+    "text": "the",
+    "start": 1.62,
+    "end": 1.78
+   },
+   {
+    "text": "bug.",
+    "start": 1.78,
+    "end": 2.04
+   },
+   {
+    "text": "It",
+    "start": 2.56,
+    "end": 2.8
+   },
+   {
+    "text": "didn't.",
+    "start": 2.8,
+    "end": 3.2
+   },
+   {
+    "text": "\"80abc\"",
+    "start": 3.96,
+    "end": 4.52
+   },
+   {
+    "text": "still",
+    "start": 4.52,
+    "end": 5.08
+   },
+   {
+    "text": "parses",
+    "start": 5.08,
+    "end": 5.58
+   },
+   {
+    "text": "as",
+    "start": 5.58,
+    "end": 5.76
+   },
+   {
+    "text": "port",
+    "start": 5.76,
+    "end": 6.0
+   },
+   {
+    "text": "80.",
+    "start": 6.0,
+    "end": 6.34
+   }
+  ]
+ },
+ "caught": {
+  "start": 7.06,
+  "end": 11.78,
+  "words": [
+   {
+    "text": "Phonton",
+    "start": 7.06,
+    "end": 7.48
+   },
+   {
+    "text": "ran",
+    "start": 7.48,
+    "end": 7.7
+   },
+   {
+    "text": "your",
+    "start": 7.7,
+    "end": 7.86
+   },
+   {
+    "text": "tests",
+    "start": 7.86,
+    "end": 8.18
+   },
+   {
+    "text": "on",
+    "start": 8.18,
+    "end": 8.42
+   },
+   {
+    "text": "a",
+    "start": 8.42,
+    "end": 8.52
+   },
+   {
+    "text": "copy",
+    "start": 8.52,
+    "end": 8.8
+   },
+   {
+    "text": "first.",
+    "start": 8.8,
+    "end": 9.16
+   },
+   {
+    "text": "They",
+    "start": 9.66,
+    "end": 9.84
+   },
+   {
+    "text": "failed,",
+    "start": 9.84,
+    "end": 10.2
+   },
+   {
+    "text": "so",
+    "start": 10.38,
+    "end": 10.6
+   },
+   {
+    "text": "your",
+    "start": 10.6,
+    "end": 10.84
+   },
+   {
+    "text": "code",
+    "start": 10.84,
+    "end": 11.1
+   },
+   {
+    "text": "was",
+    "start": 11.1,
+    "end": 11.26
+   },
+   {
+    "text": "never",
+    "start": 11.26,
+    "end": 11.42
+   },
+   {
+    "text": "touched.",
+    "start": 11.42,
+    "end": 11.78
+   }
+  ]
+ },
+ "title": {
+  "start": 12.42,
+  "end": 16.22,
+  "words": [
+   {
+    "text": "This",
+    "start": 12.42,
+    "end": 12.6
+   },
+   {
+    "text": "is",
+    "start": 12.6,
+    "end": 12.74
+   },
+   {
+    "text": "Phonton.",
+    "start": 12.74,
+    "end": 13.22
+   },
+   {
+    "text": "Local",
+    "start": 13.68,
+    "end": 13.92
+   },
+   {
+    "text": "coding",
+    "start": 13.92,
+    "end": 14.2
+   },
+   {
+    "text": "models,",
+    "start": 14.2,
+    "end": 14.58
+   },
+   {
+    "text": "checked",
+    "start": 14.58,
+    "end": 15.08
+   },
+   {
+    "text": "by",
+    "start": 15.08,
+    "end": 15.34
+   },
+   {
+    "text": "your",
+    "start": 15.34,
+    "end": 15.5
+   },
+   {
+    "text": "own",
+    "start": 15.5,
+    "end": 15.78
+   },
+   {
+    "text": "tests.",
+    "start": 15.78,
+    "end": 16.22
+   }
+  ]
+ },
+ "setup": {
+  "start": 16.78,
+  "end": 22.29,
+  "words": [
+   {
+    "text": "One",
+    "start": 16.78,
+    "end": 17.02
+   },
+   {
+    "text": "command",
+    "start": 17.02,
+    "end": 17.32
+   },
+   {
+    "text": "on",
+    "start": 17.32,
+    "end": 17.64
+   },
+   {
+    "text": "a",
+    "start": 17.64,
+    "end": 17.74
+   },
+   {
+    "text": "fresh",
+    "start": 17.74,
+    "end": 17.98
+   },
+   {
+    "text": "machine.",
+    "start": 17.98,
+    "end": 18.44
+   },
+   {
+    "text": "No",
+    "start": 18.82,
+    "end": 18.98
+   },
+   {
+    "text": "account,",
+    "start": 18.98,
+    "end": 19.3
+   },
+   {
+    "text": "no",
+    "start": 19.7,
+    "end": 19.8
+   },
+   {
+    "text": "API",
+    "start": 19.8,
+    "end": 20.18
+   },
+   {
+    "text": "key,",
+    "start": 20.18,
+    "end": 20.56
+   },
+   {
+    "text": "and",
+    "start": 20.84,
+    "end": 20.92
+   },
+   {
+    "text": "every",
+    "start": 20.92,
+    "end": 21.32
+   },
+   {
+    "text": "file",
+    "start": 21.32,
+    "end": 21.66
+   },
+   {
+    "text": "is",
+    "start": 21.66,
+    "end": 21.84
+   },
+   {
+    "text": "hash-checked.",
+    "start": 21.84,
+    "end": 22.29
+   }
+  ]
+ },
+ "calibrate": {
+  "start": 22.74,
+  "end": 27.12,
+  "words": [
+   {
+    "text": "Then",
+    "start": 22.74,
+    "end": 23.0
+   },
+   {
+    "text": "it",
+    "start": 23.0,
+    "end": 23.1
+   },
+   {
+    "text": "measures",
+    "start": 23.1,
+    "end": 23.4
+   },
+   {
+    "text": "what",
+    "start": 23.4,
+    "end": 23.58
+   },
+   {
+    "text": "your",
+    "start": 23.58,
+    "end": 23.7
+   },
+   {
+    "text": "model",
+    "start": 23.7,
+    "end": 23.98
+   },
+   {
+    "text": "can",
+    "start": 23.98,
+    "end": 24.16
+   },
+   {
+    "text": "actually",
+    "start": 24.16,
+    "end": 24.62
+   },
+   {
+    "text": "do,",
+    "start": 24.62,
+    "end": 24.96
+   },
+   {
+    "text": "and",
+    "start": 24.96,
+    "end": 25.3
+   },
+   {
+    "text": "only",
+    "start": 25.3,
+    "end": 25.68
+   },
+   {
+    "text": "asks",
+    "start": 25.68,
+    "end": 25.98
+   },
+   {
+    "text": "for",
+    "start": 25.98,
+    "end": 26.2
+   },
+   {
+    "text": "edits",
+    "start": 26.2,
+    "end": 26.46
+   },
+   {
+    "text": "it",
+    "start": 26.46,
+    "end": 26.66
+   },
+   {
+    "text": "gets",
+    "start": 26.66,
+    "end": 26.86
+   },
+   {
+    "text": "right.",
+    "start": 26.86,
+    "end": 27.12
+   }
+  ]
+ },
+ "ask": {
+  "start": 27.5,
+  "end": 31.36,
+  "words": [
+   {
+    "text": "You",
+    "start": 27.5,
+    "end": 27.7
+   },
+   {
+    "text": "approve",
+    "start": 27.7,
+    "end": 27.96
+   },
+   {
+    "text": "the",
+    "start": 27.96,
+    "end": 28.16
+   },
+   {
+    "text": "plan",
+    "start": 28.16,
+    "end": 28.42
+   },
+   {
+    "text": "first:",
+    "start": 28.42,
+    "end": 28.74
+   },
+   {
+    "text": "the",
+    "start": 28.74,
+    "end": 29.32
+   },
+   {
+    "text": "files,",
+    "start": 29.32,
+    "end": 29.7
+   },
+   {
+    "text": "the",
+    "start": 30.08,
+    "end": 30.16
+   },
+   {
+    "text": "test",
+    "start": 30.16,
+    "end": 30.36
+   },
+   {
+    "text": "command,",
+    "start": 30.36,
+    "end": 30.66
+   },
+   {
+    "text": "the",
+    "start": 31.02,
+    "end": 31.12
+   },
+   {
+    "text": "budget.",
+    "start": 31.12,
+    "end": 31.36
+   }
+  ]
+ },
+ "run": {
+  "start": 31.92,
+  "end": 36.04,
+  "words": [
+   {
+    "text": "The",
+    "start": 31.92,
+    "end": 31.98
+   },
+   {
+    "text": "first",
+    "start": 31.98,
+    "end": 32.22
+   },
+   {
+    "text": "try",
+    "start": 32.22,
+    "end": 32.48
+   },
+   {
+    "text": "failed.",
+    "start": 32.48,
+    "end": 32.94
+   },
+   {
+    "text": "So",
+    "start": 33.4,
+    "end": 33.54
+   },
+   {
+    "text": "the",
+    "start": 33.54,
+    "end": 33.74
+   },
+   {
+    "text": "model",
+    "start": 33.74,
+    "end": 33.96
+   },
+   {
+    "text": "got",
+    "start": 33.96,
+    "end": 34.16
+   },
+   {
+    "text": "the",
+    "start": 34.16,
+    "end": 34.3
+   },
+   {
+    "text": "real",
+    "start": 34.3,
+    "end": 34.6
+   },
+   {
+    "text": "failing",
+    "start": 34.6,
+    "end": 34.94
+   },
+   {
+    "text": "output,",
+    "start": 34.94,
+    "end": 35.3
+   },
+   {
+    "text": "and",
+    "start": 35.3,
+    "end": 35.6
+   },
+   {
+    "text": "tried",
+    "start": 35.6,
+    "end": 35.76
+   },
+   {
+    "text": "again.",
+    "start": 35.76,
+    "end": 36.04
+   }
+  ]
+ },
+ "verified": {
+  "start": 36.52,
+  "end": 43.58,
+  "words": [
+   {
+    "text": "This",
+    "start": 36.52,
+    "end": 36.7
+   },
+   {
+    "text": "one",
+    "start": 36.7,
+    "end": 36.88
+   },
+   {
+    "text": "passed.",
+    "start": 36.88,
+    "end": 37.26
+   },
+   {
+    "text": "Verified",
+    "start": 37.82,
+    "end": 38.2
+   },
+   {
+    "text": "in",
+    "start": 38.2,
+    "end": 38.44
+   },
+   {
+    "text": "two",
+    "start": 38.44,
+    "end": 38.72
+   },
+   {
+    "text": "minutes",
+    "start": 38.72,
+    "end": 39.02
+   },
+   {
+    "text": "on",
+    "start": 39.02,
+    "end": 39.26
+   },
+   {
+    "text": "four",
+    "start": 39.26,
+    "end": 39.62
+   },
+   {
+    "text": "CPU",
+    "start": 39.62,
+    "end": 39.98
+   },
+   {
+    "text": "cores,",
+    "start": 39.98,
+    "end": 40.46
+   },
+   {
+    "text": "for",
+    "start": 40.46,
+    "end": 40.8
+   },
+   {
+    "text": "$0.",
+    "start": 40.8,
+    "end": 41.24
+   },
+   {
+    "text": "Applying",
+    "start": 41.96,
+    "end": 42.44
+   },
+   {
+    "text": "it",
+    "start": 42.44,
+    "end": 42.68
+   },
+   {
+    "text": "is",
+    "start": 42.68,
+    "end": 42.84
+   },
+   {
+    "text": "still",
+    "start": 42.84,
+    "end": 43.12
+   },
+   {
+    "text": "your",
+    "start": 43.12,
+    "end": 43.3
+   },
+   {
+    "text": "call.",
+    "start": 43.3,
+    "end": 43.58
+   }
+  ]
+ },
+ "bench": {
+  "start": 43.96,
+  "end": 59.1,
+  "words": [
+   {
+    "text": "On",
+    "start": 43.96,
+    "end": 44.06
+   },
+   {
+    "text": "51",
+    "start": 44.06,
+    "end": 44.52
+   },
+   {
+    "text": "Aider",
+    "start": 44.52,
+    "end": 45.02
+   },
+   {
+    "text": "Polyglot",
+    "start": 45.02,
+    "end": 45.54
+   },
+   {
+    "text": "exercises",
+    "start": 45.54,
+    "end": 46.14
+   },
+   {
+    "text": "with",
+    "start": 46.14,
+    "end": 46.38
+   },
+   {
+    "text": "the",
+    "start": 46.38,
+    "end": 46.56
+   },
+   {
+    "text": "same",
+    "start": 46.56,
+    "end": 46.86
+   },
+   {
+    "text": "4B",
+    "start": 46.86,
+    "end": 47.3
+   },
+   {
+    "text": "model,",
+    "start": 47.3,
+    "end": 47.68
+   },
+   {
+    "text": "the",
+    "start": 48.0,
+    "end": 48.1
+   },
+   {
+    "text": "bare",
+    "start": 48.1,
+    "end": 48.3
+   },
+   {
+    "text": "model",
+    "start": 48.3,
+    "end": 48.6
+   },
+   {
+    "text": "said",
+    "start": 48.6,
+    "end": 48.86
+   },
+   {
+    "text": "\"done\"",
+    "start": 48.86,
+    "end": 49.28
+   },
+   {
+    "text": "43",
+    "start": 49.28,
+    "end": 49.88
+   },
+   {
+    "text": "times.",
+    "start": 49.88,
+    "end": 50.4
+   },
+   {
+    "text": "37",
+    "start": 50.8,
+    "end": 51.36
+   },
+   {
+    "text": "were",
+    "start": 51.36,
+    "end": 51.76
+   },
+   {
+    "text": "false.",
+    "start": 51.76,
+    "end": 52.1
+   },
+   {
+    "text": "OpenCode",
+    "start": 52.6,
+    "end": 53.18
+   },
+   {
+    "text": "said",
+    "start": 53.18,
+    "end": 53.46
+   },
+   {
+    "text": "\"done\"",
+    "start": 53.46,
+    "end": 53.8
+   },
+   {
+    "text": "51",
+    "start": 53.8,
+    "end": 54.32
+   },
+   {
+    "text": "times.",
+    "start": 54.32,
+    "end": 54.82
+   },
+   {
+    "text": "50",
+    "start": 55.28,
+    "end": 55.62
+   },
+   {
+    "text": "were",
+    "start": 55.62,
+    "end": 55.88
+   },
+   {
+    "text": "false.",
+    "start": 55.88,
+    "end": 56.2
+   },
+   {
+    "text": "Phonton",
+    "start": 56.76,
+    "end": 57.16
+   },
+   {
+    "text": "said",
+    "start": 57.16,
+    "end": 57.4
+   },
+   {
+    "text": "\"done\"",
+    "start": 57.4,
+    "end": 57.72
+   },
+   {
+    "text": "once.",
+    "start": 57.72,
+    "end": 58.12
+   },
+   {
+    "text": "It",
+    "start": 58.4,
+    "end": 58.66
+   },
+   {
+    "text": "was",
+    "start": 58.66,
+    "end": 58.84
+   },
+   {
+    "text": "true.",
+    "start": 58.84,
+    "end": 59.1
+   }
+  ]
+ },
+ "honest": {
+  "start": 59.62,
+  "end": 63.76,
+  "words": [
+   {
+    "text": "Phonton",
+    "start": 59.62,
+    "end": 59.98
+   },
+   {
+    "text": "doesn't",
+    "start": 59.98,
+    "end": 60.32
+   },
+   {
+    "text": "make",
+    "start": 60.32,
+    "end": 60.48
+   },
+   {
+    "text": "a",
+    "start": 60.48,
+    "end": 60.64
+   },
+   {
+    "text": "4B",
+    "start": 60.64,
+    "end": 61.0
+   },
+   {
+    "text": "model",
+    "start": 61.0,
+    "end": 61.26
+   },
+   {
+    "text": "smarter.",
+    "start": 61.26,
+    "end": 61.68
+   },
+   {
+    "text": "It",
+    "start": 62.26,
+    "end": 62.34
+   },
+   {
+    "text": "just",
+    "start": 62.34,
+    "end": 62.5
+   },
+   {
+    "text": "won't",
+    "start": 62.5,
+    "end": 62.76
+   },
+   {
+    "text": "call",
+    "start": 62.76,
+    "end": 62.9
+   },
+   {
+    "text": "a",
+    "start": 62.9,
+    "end": 63.04
+   },
+   {
+    "text": "failure",
+    "start": 63.04,
+    "end": 63.36
+   },
+   {
+    "text": "done.",
+    "start": 63.36,
+    "end": 63.76
+   }
+  ]
+ },
+ "desktop": {
+  "start": 64.2,
+  "end": 67.96,
+  "words": [
+   {
+    "text": "Prefer",
+    "start": 64.2,
+    "end": 64.4
+   },
+   {
+    "text": "a",
+    "start": 64.4,
+    "end": 64.62
+   },
+   {
+    "text": "window?",
+    "start": 64.62,
+    "end": 64.8
+   },
+   {
+    "text": "The",
+    "start": 65.26,
+    "end": 65.36
+   },
+   {
+    "text": "desktop",
+    "start": 65.36,
+    "end": 65.68
+   },
+   {
+    "text": "app",
+    "start": 65.68,
+    "end": 66.02
+   },
+   {
+    "text": "runs",
+    "start": 66.02,
+    "end": 66.26
+   },
+   {
+    "text": "the",
+    "start": 66.26,
+    "end": 66.46
+   },
+   {
+    "text": "same",
+    "start": 66.46,
+    "end": 66.74
+   },
+   {
+    "text": "engine,",
+    "start": 66.74,
+    "end": 67.04
+   },
+   {
+    "text": "and",
+    "start": 67.04,
+    "end": 67.38
+   },
+   {
+    "text": "the",
+    "start": 67.38,
+    "end": 67.52
+   },
+   {
+    "text": "same",
+    "start": 67.52,
+    "end": 67.7
+   },
+   {
+    "text": "checks.",
+    "start": 67.7,
+    "end": 67.96
+   }
+  ]
+ },
+ "outro": {
+  "start": 68.54,
+  "end": 72.14,
+  "words": [
+   {
+    "text": "Phonton.",
+    "start": 68.54,
+    "end": 69.06
+   },
+   {
+    "text": "Free,",
+    "start": 69.3,
+    "end": 69.64
+   },
+   {
+    "text": "open",
+    "start": 70.04,
+    "end": 70.22
+   },
+   {
+    "text": "source,",
+    "start": 70.22,
+    "end": 70.56
+   },
+   {
+    "text": "and",
+    "start": 70.92,
+    "end": 71.0
+   },
+   {
+    "text": "it",
+    "start": 71.0,
+    "end": 71.1
+   },
+   {
+    "text": "runs",
+    "start": 71.1,
+    "end": 71.36
+   },
+   {
+    "text": "on",
+    "start": 71.36,
+    "end": 71.58
+   },
+   {
+    "text": "your",
+    "start": 71.58,
+    "end": 71.78
+   },
+   {
+    "text": "machine.",
+    "start": 71.78,
+    "end": 72.14
+   }
+  ]
+ }
+}

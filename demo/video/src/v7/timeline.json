@@ -1,0 +1,406 @@
+{
+  "_": "v7 edit list. Times are bars of the music (174 BPM, 4/4). Block lengths are bars; shot ends are block-relative bars plus seconds. Video `from`/`to` are seconds in the source file; `rate` is file seconds per output second (0.5 = real time for goal.mp4). Cameras and marks use source pixels. SFX `file` times are source-file seconds, `at` is seconds from the shot start; gains are peak dBFS before the final loudness pass. Read by src/v7/Film.tsx and audio-work/v7/mix.py.",
+  "bpm": 174,
+  "fps": 30,
+  "musicFile": "audio-work/v7/music.mp3",
+  "musicOrigin": -0.0073,
+  "clocks": {
+    "v6/goal.mp4": [
+      [0, -4.2],
+      [4.2, 0],
+      [5, 0.8],
+      [7, 3.4],
+      [9, 6.2],
+      [10, 7.7],
+      [12, 11.5],
+      [20, 24.8],
+      [33, 49.5],
+      [33.6, 50.7],
+      [34, 51.6],
+      [36, 55.6],
+      [50, 77],
+      [70, 107],
+      [74, 115],
+      [77, 120]
+    ],
+    "v6/setup.mp4": [
+      [0, 0],
+      [22, 22],
+      [36, 38.4],
+      [99, 120.4]
+    ]
+  },
+  "sfxGain": { "keys": -14, "tick": -12, "fail": -5, "pass": -7 },
+  "cuts": {
+    "main": {
+      "width": 1920,
+      "height": 1080,
+      "music": [
+        [0, 20],
+        [24, 52],
+        [75, 78]
+      ],
+      "blocks": [
+        {
+          "id": "intro",
+          "bars": 4,
+          "text": "qwen3.5:4b gets a parser bug to fix. The machine has 4 CPU cores and no GPU.",
+          "label": "Real run · phonton 0.25.1 · qwen3.5:4b on 4 vCPU, no GPU",
+          "shots": [
+            {
+              "src": "v7/welcome.png",
+              "endBars": 4,
+              "endOffset": -4.4,
+              "cam": [
+                { "at": 0, "x": 657, "y": 845, "s": 1.32 }
+              ]
+            },
+            {
+              "src": "v6/goal.mp4",
+              "from": 0,
+              "rate": 1,
+              "cam": [
+                { "at": 0, "x": 657, "y": 845, "s": 1.32 }
+              ],
+              "sfx": [
+                { "name": "keys", "file": 0.05 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "plan",
+          "bars": 4,
+          "text": "Before it changes anything, Phonton shows you the file it will edit and the test that decides.",
+          "label": "Real run · the plan Phonton asks you to approve",
+          "shots": [
+            {
+              "src": "v6/plan.png",
+              "cam": [
+                { "at": 0, "x": 955, "y": 342, "s": 1.38 }
+              ],
+              "marks": [
+                { "x": 352, "y": 257, "w": 780, "h": 24, "at": 0.7, "tone": "accent" },
+                { "x": 352, "y": 283, "w": 466, "h": 24, "at": 1.4, "tone": "accent" }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "fail",
+          "bars": 4,
+          "text": "The first fix fails test 3. It still reads \"80abc\" as port 80.",
+          "label": "Real run · the test's failure message was written for this demo (see README)",
+          "shots": [
+            {
+              "src": "v6/goal.mp4",
+              "from": 10,
+              "to": 33.2,
+              "endBars": 2,
+              "endOffset": -0.8,
+              "cam": [
+                { "at": 0, "x": 1190, "y": 222, "s": 1.4 }
+              ]
+            },
+            {
+              "src": "v6/goal.mp4",
+              "from": 33.2,
+              "rate": 0.5,
+              "cam": [
+                { "at": 0, "x": 1190, "y": 222, "s": 1.4 }
+              ],
+              "marks": [
+                { "x": 612, "y": 236, "w": 640, "h": 26, "at": 0.85, "tone": "fail" },
+                { "x": 652, "y": 260, "w": 410, "h": 26, "at": 0.85, "tone": "fail" }
+              ],
+              "sfx": [
+                { "name": "tick", "file": 33.32 },
+                { "name": "fail", "file": 33.6 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "repair",
+          "bars": 4,
+          "text": "Phonton keeps that fix out of your files and gives the model the failing output to try again.",
+          "label": "Real run · the test's failure message was written for this demo (see README)",
+          "shots": [
+            {
+              "src": "v6/goal.mp4",
+              "from": 34.979,
+              "to": 77.0,
+              "endBars": 4,
+              "endOffset": -0.37,
+              "cam": [
+                { "at": 0, "x": 1190, "y": 222, "s": 1.4 }
+              ],
+              "marks": [
+                { "x": 600, "y": 140, "w": 420, "h": 26, "at": 0.3, "tone": "accent" }
+              ]
+            },
+            {
+              "src": "v6/goal.mp4",
+              "from": 77.0,
+              "rate": 0.6,
+              "cam": [
+                { "at": 0, "x": 1190, "y": 222, "s": 1.4 }
+              ],
+              "sfx": [
+                { "name": "tick", "file": 77.16 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "verified",
+          "bars": 4,
+          "text": "The second fix passes. It took 2 minutes on CPU and cost $0.00.",
+          "label": "Real run · Phonton's receipt for this goal",
+          "shots": [
+            {
+              "src": "v6/receipt.png",
+              "cam": [
+                { "at": 0, "x": 1065, "y": 294, "s": 1.75 }
+              ],
+              "marks": [
+                { "x": 1176, "y": 140, "w": 142, "h": 28, "at": 0.05, "tone": "pass" },
+                { "x": 612, "y": 164, "w": 460, "h": 26, "at": 0.05, "tone": "pass" },
+                { "x": 612, "y": 305, "w": 706, "h": 24, "at": 1.38, "tone": "pass" },
+                { "x": 612, "y": 329, "w": 706, "h": 24, "at": 1.38, "tone": "pass" }
+              ],
+              "sfx": [
+                { "name": "pass", "at": 0 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "desktop",
+          "bars": 4,
+          "slot": "desktop",
+          "text": "The desktop app shows the same run. The second try was built from the first one's failed check.",
+          "label": "Desktop 0.5.2 · same engine and model · real time",
+          "shots": [
+            {
+              "src": "v6/desktop.mp4",
+              "source": [1440, 900],
+              "from": 104.6,
+              "rate": 1,
+              "cam": [
+                { "at": 0, "x": 725, "y": 696, "s": 1.6 }
+              ],
+              "marks": [
+                { "x": 236, "y": 722, "w": 380, "h": 24, "at": 0.7, "tone": "fail" },
+                { "x": 232, "y": 852, "w": 745, "h": 24, "at": 2.0, "tone": "accent" }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "apply",
+          "bars": 4,
+          "slot": "desktop",
+          "text": "Your files only change when you apply it. In the terminal that's Ctrl+Y.",
+          "label": "Desktop 0.5.2 · same engine and model · real time",
+          "shots": [
+            {
+              "src": "v6/desktop.mp4",
+              "source": [1440, 900],
+              "from": 112.0,
+              "rate": 1,
+              "cam": [
+                { "at": 0, "x": 720, "y": 690, "s": 1.68 }
+              ],
+              "marks": [
+                { "x": 236, "y": 532, "w": 380, "h": 24, "at": 0.6, "tone": "pass" },
+                { "x": 232, "y": 699, "w": 156, "h": 22, "at": 2.75, "tone": "pass" }
+              ],
+              "sfx": [
+                { "name": "tick", "file": 114.4, "gain": -16 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "bench1",
+          "bars": 4,
+          "card": "bench",
+          "step": 1,
+          "text": "We also ran the same model on 51 Aider Polyglot exercises, three ways."
+        },
+        {
+          "id": "bench2",
+          "bars": 4,
+          "card": "bench",
+          "step": 2,
+          "text": "Phonton said done once, and that one was true."
+        },
+        {
+          "id": "bench3",
+          "bars": 4,
+          "card": "bench",
+          "step": 3,
+          "text": "None of them solved much. Phonton just didn't call the failures done."
+        },
+        {
+          "id": "setup",
+          "bars": 4,
+          "text": "Setup is one command. It tests which edit formats your model gets right, and Phonton only asks for those.",
+          "label": "Real run · phonton models setup qwen3.5:4b",
+          "shots": [
+            {
+              "src": "v6/setup.mp4",
+              "from": 36,
+              "to": 100.5,
+              "endBars": 2,
+              "cam": [
+                { "at": 0, "x": 545, "y": 679, "s": 1.6 }
+              ]
+            },
+            {
+              "src": "v6/setup.png",
+              "cam": [
+                { "at": 0, "x": 545, "y": 679, "s": 1.6 }
+              ],
+              "marks": [
+                { "x": 172, "y": 726, "w": 430, "h": 24, "at": 0.2, "tone": "fail" },
+                { "x": 50, "y": 779, "w": 670, "h": 24, "at": 0.9, "tone": "pass" }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "install",
+          "bars": 7,
+          "card": "install",
+          "text": "It's free, open source and runs on your machine. Install it, then run setup once."
+        }
+      ]
+    },
+    "vertical": {
+      "width": 1080,
+      "height": 1920,
+      "music": [
+        [4, 12],
+        [75, 78]
+      ],
+      "blocks": [
+        {
+          "id": "fail",
+          "bars": 2,
+          "text": "A 4B model's first fix fails the test.",
+          "label": "Real run · 4 vCPU, no GPU",
+          "shots": [
+            {
+              "src": "v6/goal.mp4",
+              "from": 24,
+              "to": 33.2,
+              "endBars": 1,
+              "endOffset": -0.8,
+              "cam": [
+                { "at": 0, "x": 915, "y": 207, "s": 1.55 }
+              ]
+            },
+            {
+              "src": "v6/goal.mp4",
+              "from": 33.2,
+              "rate": 0.5,
+              "cam": [
+                { "at": 0, "x": 915, "y": 207, "s": 1.55 }
+              ],
+              "marks": [
+                { "x": 612, "y": 236, "w": 640, "h": 26, "at": 0.85, "tone": "fail" },
+                { "x": 652, "y": 260, "w": 410, "h": 26, "at": 0.85, "tone": "fail" }
+              ],
+              "sfx": [
+                { "name": "tick", "file": 33.32 },
+                { "name": "fail", "file": 33.6 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "repair",
+          "bars": 2,
+          "text": "Phonton sends the failure back and the model tries again.",
+          "label": "Real run · 4 vCPU, no GPU",
+          "shots": [
+            {
+              "src": "v6/goal.mp4",
+              "from": 34.29,
+              "to": 77.0,
+              "endBars": 2,
+              "endOffset": -0.37,
+              "cam": [
+                { "at": 0, "x": 915, "y": 207, "s": 1.55 }
+              ]
+            },
+            {
+              "src": "v6/goal.mp4",
+              "from": 77.0,
+              "rate": 0.6,
+              "cam": [
+                { "at": 0, "x": 915, "y": 207, "s": 1.55 }
+              ],
+              "sfx": [
+                { "name": "tick", "file": 77.16 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "verified",
+          "bars": 2,
+          "text": "The second fix passes.",
+          "label": "Real run · Phonton's receipt",
+          "shots": [
+            {
+              "src": "v6/receipt.png",
+              "cam": [
+                { "at": 0, "x": 962, "y": 350, "s": 1.36 }
+              ],
+              "marks": [
+                { "x": 1176, "y": 140, "w": 142, "h": 28, "at": 0.05, "tone": "pass" },
+                { "x": 612, "y": 164, "w": 460, "h": 26, "at": 0.05, "tone": "pass" }
+              ],
+              "sfx": [
+                { "name": "pass", "at": 0 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "apply",
+          "bars": 2,
+          "slot": "desktop",
+          "text": "Nothing in your files changes until you apply it.",
+          "label": "Desktop 0.5.2 · real time",
+          "shots": [
+            {
+              "src": "v6/desktop.mp4",
+              "source": [1440, 900],
+              "from": 113.4,
+              "rate": 1,
+              "cam": [
+                { "at": 0, "x": 570, "y": 680, "s": 1.45 }
+              ],
+              "marks": [
+                { "x": 232, "y": 699, "w": 156, "h": 22, "at": 1.35, "tone": "pass" }
+              ],
+              "sfx": [
+                { "name": "tick", "file": 114.4, "gain": -16 }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "end",
+          "bars": 3,
+          "card": "end",
+          "text": "Phonton checks local models with your own tests."
+        }
+      ]
+    }
+  }
+}
