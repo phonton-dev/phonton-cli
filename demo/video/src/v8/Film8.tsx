@@ -3,7 +3,7 @@ import { AbsoluteFill, continueRender, delayRender, Img, Sequence, staticFile, u
 import { Video } from "@remotion/media";
 import { loadFont } from "@remotion/google-fonts/JetBrainsMono";
 import { grad, Grid, hash, P, paint, RAMP } from "./ascii";
-import { BAR, end, FRAME_PX, framed, loop, numbers, open, VERTICAL_LOOP, type Callout, type Ctx, type Scene, type Shot } from "./scenes";
+import { BAR, end, factsPanel, FRAME_PX, framed, loop, numbers, open, PANEL, TAP, tapPanel, VERTICAL_LOOP, type Callout, type Ctx, type Facts, type Scene, type Shot, type TapPhase } from "./scenes";
 import CUT from "./cut8.json";
 
 // v8: the ASCII cut. Everything that moves is characters on a grid in the
@@ -29,18 +29,58 @@ const speedOf = (from: number, to: number, start: number, end: number) => {
   return Math.abs(x - 1) < 0.2 ? "real time" : `${Math.round(x)}× speed`;
 };
 
-const TUI = { cam: { x: 1195, y: 307, s: 1.17 } };
+const rateOf = (s: Shot) => s.rate ?? (s.to !== undefined ? (s.to - s.from) / ((s.end - s.start) * BAR) : 1);
+// Per-candidate figures from the shown take's receipt.json; the TUI prints the same time and output tokens.
+const CANDIDATES: Facts[] = [
+  {
+    title: "candidate 1", sub: "direct implementation", at: 22, tone: P.danger,
+    rows: [["source seen", "src/port.js lines 4-7"], ["generation", "46.4 s"], ["tokens in", "311"], ["tokens out", "123"], ["your files", "untouched"], ["check", "failed · 184 ms"]],
+  },
+  {
+    title: "candidate 2", sub: "repair from failed candidate", at: 25.93, tone: P.ok,
+    rows: [["built from", "candidate 1's failed check"], ["source seen", "src/port.js lines 4-10"], ["generation", "70.1 s"], ["tokens in", "494"], ["tokens out", "177"], ["check", "passed · 146 ms"]],
+  },
+];
+// The check runs at the moment the TUI shows its result (184 ms and 146 ms of real time).
+const TAP1: TapPhase[] = [
+  { at: 20, title: "baseline", lines: TAP.baseline, step: 0.06, done: "fails on the unchanged source" },
+  { at: 21.87, title: "candidate 1", lines: TAP.cand1, step: 0.015, done: "exit code 1", tone: P.danger },
+];
+const TAP2: TapPhase[] = [
+  { at: 24, title: "candidate 1 · the repair's input", lines: TAP.cand1, step: 0, done: "exit code 1", tone: P.danger },
+  { at: 25.8, title: "candidate 2", lines: TAP.cand2, step: 0.015, done: "exit code 0", tone: P.ok },
+];
+// Desktop: what its window shows for this run, then the working tree after Apply.
+const DESKTOP: Facts = {
+  title: "Phonton Desktop · on screen", sub: "a separate run of the same goal", at: 28.2, tone: P.ok,
+  rows: [["candidate 1", "✗ check failed"], ["candidate 2", "repair from failed candidate"], ["output tokens", "177"], ["source seen", "1 excerpt"], ["check", "✓ passed · node --test"]],
+};
+const TREE: Facts = {
+  title: "your working tree", sub: "after Apply selected changes", at: 29.74, tone: P.ok,
+  rows: [["src/port.js", "applied · +3 -0"], ["git status", "M src/port.js"], ["Git index", "unchanged"], ["original bytes", "kept in run backups"]],
+};
+const panels = (left: (c: Ctx, B: number, lb: number) => void, right: (c: Ctx, B: number, lb: number) => void) => (c: Ctx, B: number, lb: number) => {
+  left(c, B, lb);
+  right(c, B, lb);
+};
+const facts = (o: Facts) => (c: Ctx, B: number, lb: number) => factsPanel(c, PANEL.left, B, lb, o);
+const tap = (p: TapPhase[]) => (c: Ctx, B: number, lb: number) => tapPanel(c, PANEL.right, B, lb, p);
+const tree = (c: Ctx, B: number, lb: number) => factsPanel(c, PANEL.right, B, lb, TREE);
+
+// Cropped to the run pane's content: the top 336 px of the TUI, the receipt, the diff, Desktop's check and Apply.
+const TUI = { cam: { x: 1195, y: 192, s: 1.5 } };
 const S = BAR;
 const f1a: Shot = { src: "v6/goal.mp4", from: 10, to: 33.2, start: 20, end: 22 - 0.8 / S, ...TUI, speed: speedOf(10, 33.2, 20, 22 - 0.8 / S) };
 const f1b: Shot = { src: "v6/goal.mp4", from: 33.2, rate: 0.5, start: f1a.end, end: 24, ...TUI, speed: "real time" };
 const f2a: Shot = { src: "v6/goal.mp4", from: 34.979, to: 77.0, start: 24, end: 26 - 0.37 / S, ...TUI, speed: speedOf(34.979, 77.0, 24, 26 - 0.37 / S) };
 const f2b: Shot = { src: "v6/goal.mp4", from: 77.0, rate: 0.6, start: f2a.end, end: 26, ...TUI, speed: "real time" };
-const f2c: Shot = { src: "v6/receipt.png", from: 0, start: 26, end: 28, ...TUI, speed: "screenshot" };
-const f3: Shot = { src: "v6/desktop.mp4", from: 112.0, rate: 1, start: 28, end: 32 + WIPE, source: [1440, 900], cam: { x: 720, y: 643, s: 1.4 }, speed: "real time" };
-const MAIN_SHOTS = [f1a, f1b, f2a, f2b, f2c, f3];
+const f2c: Shot = { src: "v6/receipt.png", from: 0, start: 26, end: 27, cam: { x: 965, y: 262, s: 2 }, speed: "screenshot" };
+const f2d: Shot = { src: "v6/receipt.png", from: 0, start: 27, end: 28, cam: { x: 1070, y: 615, s: 1.7 }, speed: "screenshot" };
+const f3: Shot = { src: "v6/desktop.mp4", from: 112.0, rate: 1, start: 28, end: 32 + WIPE, source: [1440, 900], cam: { x: 720, y: 695, s: 1.5 }, speed: "real time" };
+const MAIN_SHOTS = [f1a, f1b, f2a, f2b, f2c, f2d, f3];
 
 const RUN = "real run · phonton 0.25.1 · qwen3.5:4b · 4 vCPU, no GPU";
-const FIXTURE = "the test's failure message was written for this demo · details in the README";
+const FIXTURE = "the test's failure message was written for this demo";
 const call = (shot: Shot, c: Callout) => ({ ...c, shot });
 
 const MAIN: Scene[] = [
@@ -49,19 +89,20 @@ const MAIN: Scene[] = [
   {
     id: "f1", from: 20, to: 24, footage: true,
     draw: (c, lb) => framed(c, lb, {
-      title: RUN, shots: [f1a, f1b], B: 20 + lb, note: FIXTURE, capAt: 0.3,
+      title: RUN, shots: [f1a, f1b], B: 20 + lb, note: FIXTURE, capAt: 0.3, below: panels(facts(CANDIDATES[0]), tap(TAP1)),
       cap: "This is the real run. Each clip shows its speed in the frame.",
-      callouts: [call(f1b, { at: 22, src: [662, 262, 395, 18], tone: P.danger, lines: [["the failing test,", P.danger], ["straight from node --test", P.muted]] })],
+      callouts: [call(f1b, { at: 22, src: [662, 262, 395, 18], tone: P.danger, lines: [["the failing test, straight from node --test", P.danger]] })],
     }),
   },
   {
     id: "f2", from: 24, to: 28, footage: true,
     draw: (c, lb) => framed(c, lb, {
-      title: RUN, shots: [f2a, f2b, f2c], B: 24 + lb, note: FIXTURE, capAt: 0.2,
+      title: RUN, shots: [f2a, f2b, f2c, f2d], B: 24 + lb, note: FIXTURE, capAt: 0.2, below: panels(facts(CANDIDATES[1]), tap(TAP2)),
       cap: "The second candidate is a repair of the first, built from that output.",
       callouts: [
-        call(f2c, { at: 26.05, src: [1178, 142, 135, 22], tone: P.ok, lines: [["✓ VERIFIED", P.ok]] }),
-        call(f2c, { at: 26.5, src: [618, 309, 712, 18], tone: P.cyan, lines: [["2m 00s on CPU", P.ink], ["$0.00 API cost", P.ink]] }),
+        call(f2c, { at: 26.05, src: [1178, 142, 135, 22], tone: P.ok, mark: "right", lines: [["node --test: 3 of 3 passed", P.ok]] }),
+        call(f2c, { at: 26.4, src: [618, 309, 712, 18], tone: P.cyan, lines: [["2m 00s on CPU", P.ink], ["$0.00 API cost", P.ink]] }),
+        call(f2d, { at: 27.1, src: [1146, 635, 359, 18], tone: P.cyan, mark: "above", lines: [["the only change from candidate 1", P.ink]] }),
       ],
     }),
   },
@@ -69,13 +110,16 @@ const MAIN: Scene[] = [
     id: "f3", from: 28, to: 32, footage: true,
     draw: (c, lb) => framed(c, lb, {
       title: "real run · Phonton Desktop 0.5.2 · same goal, engine and model", shots: [f3], B: 28 + lb,
-      note: "a separate run of the same goal (Actions run 39138396738)", capAt: 0.2,
+      note: "a separate run of the same goal · Actions run 39138396738", capAt: 0.2, below: panels(facts(DESKTOP), tree),
       cap: "Your files only change when you apply it.",
-      callouts: [call(f3, { at: 29.8, src: [242, 703, 150, 18], tone: P.ok, wire: false, lines: [["Applied src/port.js.", P.ok], ["git status: M src/port.js", P.muted]] })],
+      callouts: [
+        call(f3, { at: 28.2, until: 29.74, src: [243, 538, 367, 16], tone: P.ok, lines: [["the same check, passed", P.ok], ["node --test, in Desktop", P.muted]] }),
+        call(f3, { at: 29.8, src: [242, 703, 530, 18], tone: P.ok, lines: [["Applied src/port.js.", P.ok], ["the Git index stayed unchanged", P.muted]] }),
+      ],
     }),
   },
   { id: "numbers", from: 32, to: 40, draw: numbers },
-  { id: "end", from: 40, to: 49, draw: (c, lb) => end(c, lb, { logoX: 8, logoY: 4, cmdY: 17, urlY: 15, footY: 35, last: 9 }) },
+  { id: "end", from: 40, to: 49, draw: (c, lb) => end(c, lb, { logoX: 8, logoY: 4, cmdY: 17, urlY: 15, footY: 35, last: 9, urlAt: 0.6, footAt: 0.9 }) },
 ];
 
 /** Piecewise-linear map through [x, y] points, extended past both ends. */
@@ -227,7 +271,7 @@ const Footage: React.FC<{ shot: Shot }> = ({ shot }) => {
   const [sw, sh] = shot.source ?? [1920, 1080];
   const { x, y, s } = shot.cam;
   const src = staticFile(shot.src);
-  const rate = shot.rate ?? (shot.to !== undefined ? (shot.to - shot.from) / ((shot.end - shot.start) * BAR) : 1);
+  const rate = rateOf(shot);
   return (
     <div style={{ position: "absolute", left: FRAME_PX.x, top: FRAME_PX.y, width: FRAME_PX.w, height: FRAME_PX.h, overflow: "hidden", background: "#11141c" }}>
       <div style={{ position: "absolute", width: sw, height: sh, transformOrigin: "0 0", transform: `translate(${FRAME_PX.w / 2 - x * s}px, ${FRAME_PX.h / 2 - y * s}px) scale(${s})` }}>

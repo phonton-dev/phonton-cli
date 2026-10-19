@@ -106,7 +106,7 @@ export function field(g: Grid, t: number, amp: number, focus?: { x: number; y: n
       const d = clamp01(v * amp);
       const idx = Math.floor(d * 9.99);
       if (idx < 1) continue;
-      g.put(x, y, RAMP[idx], grad((x / g.cols) * 0.8 + (y / g.rows) * 0.25 + t * 0.05), 0.06 + 0.5 * d * d);
+      g.put(x, y, RAMP[idx], grad((x / g.cols) * 0.8 + (y / g.rows) * 0.25 + t * 0.05), 0.1 + 0.6 * d * d);
     }
 }
 
@@ -143,11 +143,11 @@ function ripple(g: Grid, cx: number, cy: number, sb: number, col: RGB, dur = 0.5
 
 const OPEN_LINES = ["Phonton is a local-first coding environment.", "Every change the model makes runs against your tests before you see it."];
 
-export function open(c: Ctx, lb: number, { logoX = 8, logoY = 6, lock = 4, capY = 30, lines = OPEN_LINES, capGrid = "fine" as "fine" | "mid" } = {}) {
+export function open(c: Ctx, lb: number, { logoX = 8, logoY = 7, lock = 4, capY = 32, lines = OPEN_LINES, capGrid = "fine" as "fine" | "mid" } = {}) {
   const { fine, hero, t, f } = c;
   const cg = c[capGrid];
   const reveal = ease((lb - (lock - 2)) / 2);
-  const ampUp = 0.35 + 0.55 * clamp01(lb / lock);
+  const ampUp = 0.5 + 0.4 * clamp01(lb / lock);
   const amp = lb < lock ? ampUp : ampUp * (1 - 0.8 * easeOut((lb - lock) / 0.6));
   const r = hero.cw / fine.cw;
   const lf = {
@@ -192,6 +192,8 @@ export type LoopLayout = {
   /** Fine-grid box for the candidate's diff (main), or mid-grid log lines (vertical). */
   diff?: { x: number; y: number; w: number };
   log?: { x: number; y: number; status: number };
+  /** Fine-grid box with the node --test output of each check (main). */
+  checks?: { x: number; y: number; w: number };
   /** Where "waiting for you" goes once review is reached. */
   wait: { x: number; y: number };
   stamp: { x: number; y: number };
@@ -212,7 +214,7 @@ function backRun(xRight: number, xLeft: number, y: number, label = "repair on fa
 }
 
 const FACTS = "qwen3.5:4b · 4 CPU cores · no GPU";
-const NOTE = "drawn from the real run · footage next";
+const NOTE = "drawn from the real run · the test's failure message was written for this demo";
 
 export const MAIN_LOOP: LoopLayout = {
   goal: { x: 3, y: 1, w: 102, lines: ["Make parsePort in @src/port.js reject ports outside 1-65535", "and trailing garbage so npm test passes"] },
@@ -243,10 +245,11 @@ export const MAIN_LOOP: LoopLayout = {
   },
   travel: 39,
   diff: { x: 4, y: 32, w: 98 },
+  checks: { x: 107, y: 23, w: 51 },
   wait: { x: 76, y: 15 },
   stamp: { x: 3, y: 16 },
   receipt: { x: 94, y: 24, w: 64 },
-  cap: 27,
+  cap: 28,
   captions: [
     ["One parser bug, one small local model, no GPU.", 0.6, 4.25],
     ["The first fix fails test 3. Phonton keeps it out of your files and sends the failure back.", 4.25, 10.1],
@@ -288,11 +291,12 @@ export const VERTICAL_LOOP: LoopLayout = {
     return { x: 34 + col, y: 25 + line - Math.floor(rise), d: Math.max(0, d) };
   },
   travel: 8,
-  log: { x: 1, y: 41, status: 44 },
+  log: { x: 1, y: 43, status: 44 },
   wait: { x: 28, y: 32 },
-  stamp: { x: 0, y: 40 },
-  cap: 51,
+  stamp: { x: 0, y: 39 },
+  cap: 50,
   captions: [
+    ["One parser bug, one small local model.", 2.4, 4.0],
     ["The first fix fails test 3.", 4.0, 10.0],
     ["Phonton sends the failure back.", 4.5, 10.0, 1],
     ["The second fix passes.", 10.0, Infinity],
@@ -307,6 +311,22 @@ const FAIL_AT = 4;
 const PASS_AT = 10;
 const CARRY: [number, number] = [4.5, 6.5];
 const FAIL_LINE = "not ok 3 - rejects trailing garbage";
+/** The repair wire, the excerpt and the baseline check are on screen from here, before candidate 1. */
+const BACK_AT = 1.0;
+const EXCERPT_AT = 1.0;
+const CHECKS_AT = 1.3;
+// src/port.js lines 4-7 as the model saw them (the run's context excerpt, "parsed symbol parsePort").
+const EXCERPT = ["function parsePort(value) {", "  const port = parseInt(value, 10);", "  return port;", "}"];
+// node --test --test-reporter=tap output of the run's three checks (check-1..3.json), TAP detail lines omitted.
+export const TAP = {
+  baseline: ["ok 1 - parses a plain port", "not ok 2 - rejects ports outside 1-65535", "not ok 3 - rejects trailing garbage", "1..3", "# pass 1", "# fail 2"],
+  cand1: [
+    "ok 1 - parses a plain port", "ok 2 - rejects ports outside 1-65535", "not ok 3 - rejects trailing garbage",
+    "  error: 'Missing expected exception:", '    parsePort("80abc") returned 80:', "    parseInt ignores trailing characters'",
+    "1..3", "# pass 2", "# fail 1",
+  ],
+  cand2: ["ok 1 - parses a plain port", "ok 2 - rejects ports outside 1-65535", "ok 3 - rejects trailing garbage", "1..3", "# pass 3", "# fail 0"],
+};
 // The lines each candidate added to src/port.js (after line 5), from the shown take's candidate sources.
 const THROW = '    throw new Error(`parsePort("${value}") returned ${port}: invalid port`);';
 const CAND = [
@@ -418,17 +438,25 @@ export function loop(c: Ctx, lb: number, L: LoopLayout = MAIN_LOOP) {
   ripple(fine, vcx, vcy, lb - FAIL_AT, P.danger);
   ripple(fine, vcx, vcy, lb - PASS_AT, P.cyan, 0.6, 1100);
 
-  // the failing line, carried back along the repair wire to the model
-  if (lb >= FAIL_AT && lb < PASS_AT) {
-    const shown = Math.floor(L.back.length * easeOut((lb - (FAIL_AT + 0.1)) / 0.35));
+  // the repair wire: idle from the start, red from verify back to edit once candidate 1 fails
+  const idle = mix(P.dim, P.muted, 0.45);
+  if (lb < PASS_AT) {
+    const shown = Math.floor(L.back.length * easeOut((lb - BACK_AT) / 0.35));
     const carrying = lb >= CARRY[0] && lb < CARRY[1];
+    const redTo = lb >= FAIL_AT ? L.back.length * easeOut((lb - (FAIL_AT + 0.1)) / 0.35) : 0;
     for (let k = 0; k < shown; k++) {
       const [x, y, ch] = L.back[k];
-      const wire = "─│┘└┐┌".includes(ch);
-      const col = !wire && ch !== "◀" ? P.muted : carrying ? mix(P.danger, P.glow, 0.2 * (1 - frac(lb * 4))) : lb < CARRY[0] ? P.danger : mix(P.dim, P.pink, 0.45);
-      g.put(x, y, carrying && ch === "─" ? "━" : ch, col);
+      const red = k < redTo;
+      const col = !"─│┘└┐┌◀▲".includes(ch) ? P.muted
+        : !red ? idle
+          : carrying ? mix(P.danger, P.glow, 0.2 * (1 - frac(lb * 4))) : lb < CARRY[0] ? P.danger : mix(P.dim, P.pink, 0.45);
+      g.put(x, y, red && carrying && ch === "─" ? "━" : ch, col);
     }
-    if (shown > 0) g.put(L.tee[0], L.tee[1], L.tee[2], stageState(3, lb) === "fail" ? P.danger : P.dim);
+    if (shown > 0) g.put(L.tee[0], L.tee[1], L.tee[2], stageState(3, lb) === "fail" ? P.danger : idle);
+  }
+
+  // the failing line, carried back along the repair wire to the model
+  if (lb >= FAIL_AT && lb < PASS_AT) {
 
     const chars = [...FAIL_LINE];
     const n = chars.length;
@@ -449,8 +477,11 @@ export function loop(c: Ctx, lb: number, L: LoopLayout = MAIN_LOOP) {
 
   // the candidate's diff, typed while edit works; replaced by the stamp once candidate 2 passes
   if (lb >= PASS_AT) stampAndReceipt(c, lb - PASS_AT, L);
-  else if (lb >= 2.85 && L.diff) diffBox(c, lb, L.diff);
-  else if (lb >= 2.85 && L.log) logLines(c, lb, L.log);
+  else {
+    if (L.diff && lb >= EXCERPT_AT) diffBox(c, lb, L.diff);
+    if (L.checks && lb >= CHECKS_AT) checksBox(c, lb, L.checks);
+    if (L.log && lb >= 2.85) logLines(c, lb, L.log);
+  }
 
   for (const [s, at, until, dy = 0] of L.captions) caption(g, centered(g, s), L.cap + dy, s, lb, at, f, dy ? P.muted : P.ink, until);
 }
@@ -465,35 +496,78 @@ function logLines(c: Ctx, lb: number, L: NonNullable<LoopLayout["log"]>) {
   g.text(L.status, L.y + 1, lb < 9.75 ? `${spin(f)} writing` : `${spin(f)} checking`, P.muted);
 }
 
+/** A box title that decodes in when it changes. */
+function boxTitle(g: Grid, x: number, y: number, s: string, since: number, f: number) {
+  g.erase(x, y, [...s].length + 2, 1);
+  decode(g, x + 1, y, s, since / 0.3, f, P.ink, { seed: 27 });
+}
+
 function diffBox(c: Ctx, lb: number, D: NonNullable<LoopLayout["diff"]>) {
   const { fine, t, f } = c;
+  const cand = lb >= 2.85;
   const two = lb >= 6.5;
   const k = two ? 1 : 0;
-  const failed = !two && lb >= FAIL_AT;
-  const title = two ? "src/port.js · candidate 2 · repair from failed candidate" : "src/port.js · candidate 1 · direct implementation";
-  box(fine, D.x, D.y, D.w, 7, (u) => (failed ? mix(P.dim, P.danger, 0.6) : mix(P.dim, grad(u * 2 + t * 0.2), 0.7)), {
-    p: easeOut((lb - (two ? 6.5 : 2.85)) / 0.25), title, titleCol: P.ink,
-  });
-  // candidate 1 is written in 0.65 bar, candidate 2 over 2.5 bars
-  const t0 = two ? 6.6 : 2.9;
-  const rate = two ? 75 : 210;
-  let budget = Math.max(0, Math.floor((lb - t0) * rate));
-  CAND[k].forEach((line, i) => {
-    const y = D.y + 2 + i;
-    if (budget <= 0) return;
-    const shown = line.slice(0, budget);
+  const failed = cand && !two && lb >= FAIL_AT;
+  const h = EXCERPT.length + CAND[0].length + 2;
+  box(fine, D.x, D.y, D.w, h, (u) => (failed ? mix(P.dim, P.danger, 0.6) : mix(P.dim, grad(u * 2 + t * 0.2), 0.7)), { p: easeOut((lb - EXCERPT_AT) / 0.3) });
+  if (lb < EXCERPT_AT + 0.15) return;
+  const title = !cand ? "src/port.js · lines 4-7 · the excerpt the model sees"
+    : two ? "src/port.js · candidate 2 · repair from failed candidate" : "src/port.js · candidate 1 · direct implementation";
+  boxTitle(fine, D.x + 2, D.y, title, lb - (two ? 6.5 : cand ? 2.85 : EXCERPT_AT), f);
+  // candidate 1 is written in 0.65 bar, candidate 2 over 2.5 bars; added lines push 6-7 down
+  let budget = cand ? Math.max(0, Math.floor((lb - (two ? 6.6 : 2.9)) * (two ? 75 : 210))) : 0;
+  const rows: { src: string; s: string; add: boolean }[] = EXCERPT.slice(0, 2).map((s) => ({ src: s, s, add: false }));
+  for (const line of CAND[k]) {
+    if (budget <= 0) break;
+    rows.push({ src: line, s: line.slice(0, budget), add: true });
     budget -= line.length;
-    fine.text(D.x + 2, y, String(6 + i).padStart(3), P.dim);
+  }
+  rows.push(...EXCERPT.slice(2).map((s) => ({ src: s, s, add: false })));
+  rows.forEach((r, i) => {
+    const y = D.y + 1 + i;
+    fine.text(D.x + 2, y, String(4 + i).padStart(3), P.dim);
+    if (!r.add) {
+      decode(fine, D.x + 8, y, r.s, (lb - EXCERPT_AT - 0.15 - i * 0.06) / 0.3, f, P.muted, { seed: 23 + i });
+      return;
+    }
     fine.text(D.x + 6, y, "+", failed ? P.danger : P.ok);
-    const r0 = two ? line.indexOf(REPAIR) : -1;
-    fine.text(D.x + 8, y, shown, (j) => (failed ? mix(P.muted, P.danger, 0.35) : r0 >= 0 && j >= r0 && j < r0 + REPAIR.length ? mix(P.cyan, P.glow, 0.5 + 0.5 * Math.sin(t * 6)) : P.ink));
-    if (shown.length < line.length && Math.floor(f / 4) % 2 === 0) fine.put(D.x + 8 + shown.length, y, "█", P.cyan, 0.8);
+    const r0 = two ? r.src.indexOf(REPAIR) : -1;
+    fine.text(D.x + 8, y, r.s, (j) => (failed ? mix(P.muted, P.danger, 0.35) : r0 >= 0 && j >= r0 && j < r0 + REPAIR.length ? mix(P.cyan, P.glow, 0.5 + 0.5 * Math.sin(t * 6)) : P.ink));
+    if (r.s.length < r.src.length && Math.floor(f / 4) % 2 === 0) fine.put(D.x + 8 + r.s.length, y, "█", P.cyan, 0.8);
   });
-  const status = failed ? "✗ failed test 3 · kept out of your files" : lb >= (two ? 9.75 : 3.875) ? `${spin(f)} checking` : `${spin(f)} writing`;
+  const status = !cand ? "parsed symbol parsePort" : failed ? "✗ failed test 3 · kept out of your files" : lb >= (two ? 9.75 : 3.875) ? `${spin(f)} checking` : `${spin(f)} writing`;
   const st = ` ${status} `;
-  if (failed) fine.erase(D.x + D.w - 2 - st.length, D.y + 6, st.length, 1);
-  if (failed) decode(fine, D.x + D.w - 2 - st.length, D.y + 6, st, (lb - FAIL_AT) / 0.25, f, P.danger, { seed: 15 });
-  else fine.label(D.x + D.w - 2 - st.length, D.y + 6, st, P.muted);
+  const sx = D.x + D.w - 2 - st.length;
+  if (failed) {
+    fine.erase(sx, D.y + h - 1, st.length, 1);
+    decode(fine, sx, D.y + h - 1, st, (lb - FAIL_AT) / 0.25, f, P.danger, { seed: 15 });
+  } else fine.label(sx, D.y + h - 1, st, P.muted);
+}
+
+/** The check's own output: the baseline, then each candidate's run, printed as it comes. */
+function checksBox(c: Ctx, lb: number, D: NonNullable<LoopLayout["checks"]>) {
+  const { fine, t, f } = c;
+  const phase = lb >= 9.75 ? 2 : lb >= 3.875 ? 1 : 0;
+  const lines = [TAP.baseline, TAP.cand1, TAP.cand2][phase];
+  const t0 = [CHECKS_AT + 0.15, 3.9, 9.8][phase];
+  const step = [0.1, 0.05, 0.035][phase];
+  const h = TAP.cand1.length + 2;
+  const tone = phase === 2 && lb >= 9.99 ? P.ok : phase === 1 && lb >= FAIL_AT ? P.danger : undefined;
+  box(fine, D.x, D.y, D.w, h, (u) => (tone ? mix(P.dim, tone, 0.6) : mix(P.dim, grad(u * 2 + t * 0.2 + 0.5), 0.7)), { p: easeOut((lb - CHECKS_AT) / 0.3) });
+  if (lb < CHECKS_AT + 0.15) return;
+  boxTitle(fine, D.x + 2, D.y, `node --test · ${["baseline", "candidate 1", "candidate 2"][phase]}`, lb - [CHECKS_AT, 3.875, 9.75][phase], f);
+  lines.forEach((s, i) => {
+    if (lb < t0 + i * step) return;
+    const y = D.y + 1 + i;
+    const fail = s.startsWith("not ok");
+    const col: RGB = fail ? P.danger : s.startsWith("ok") ? P.ok : s.startsWith("  ") ? mix(P.muted, P.danger, 0.3) : P.muted;
+    decode(fine, D.x + 2, y, s, (lb - t0 - i * step) / 0.12, f, col, { seed: 61 + i });
+    if (phase === 1 && i === 2 && lb >= FAIL_AT) fine.put(D.x + 3 + s.length, y, "◀", P.danger, 0.6 + 0.4 * Math.sin(t * 8));
+  });
+  const done = lb >= t0 + lines.length * step;
+  const status = phase === 0 ? "fails on the unchanged source" : !done ? `${spin(f)} running` : phase === 1 ? "exit code 1" : "exit code 0";
+  const st = ` ${status} `;
+  fine.label(D.x + D.w - 2 - st.length, D.y + h - 1, st, phase === 1 && done ? P.danger : phase === 2 && done ? P.ok : P.muted);
 }
 
 /** Block-letter VERIFIED landing in a heavy frame (mid layer), the receipt printing beside it a line per beat (fine). */
@@ -550,7 +624,8 @@ export function stampAndReceipt(c: Ctx, sb: number, L: Pick<LoopLayout, "stamp" 
 // Footage in ASCII frames (frame on the mid layer, notes on the fine layer)
 // ---------------------------------------------------------------------------
 
-export const FRAME = { x: 2, y: 2, w: 80, h: 22 };
+// Full-width frame cropped to the footage's content; callout labels and the run's panels sit under it.
+export const FRAME = { x: 2, y: 1, w: 102, h: 16 };
 const MID = { ox: 6, cw: 18, ch: 36 };
 export const FRAME_PX = {
   x: MID.ox + (FRAME.x + 1) * MID.cw,
@@ -560,17 +635,26 @@ export const FRAME_PX = {
 };
 
 /** `wire: false` for targets with UI text to their right: markers only, no leader across the footage. */
-export type Callout = { at: number; src: [number, number, number, number]; lines: [string, RGB][]; tone: RGB; wire?: boolean };
+/** Marks a source rectangle inside the frame (▶ ◀ either side, ◀ only, or ▼ above) and labels it under the frame. */
+export type Callout = { at: number; until?: number; src: [number, number, number, number]; lines: [string, RGB][]; tone: RGB; mark?: "line" | "right" | "above" };
 
 /** Source pixel → canvas pixel, through the shot's camera. */
 export function toPx(shot: Shot, sx: number, sy: number) {
   return [FRAME_PX.x + FRAME_PX.w / 2 + (sx - shot.cam.x) * shot.cam.s, FRAME_PX.y + FRAME_PX.h / 2 + (sy - shot.cam.y) * shot.cam.s] as const;
 }
 
+const LABEL_ROW = Math.ceil(((FRAME.y + FRAME.h) * MID.ch) / 24);
+/** Two boxes under the frame (fine grid): the run's figures and its check output. */
+export const PANEL = { y: LABEL_ROW + 3, h: 11, w: 58, left: 20, right: 82 };
+
 export function framed(
   c: Ctx,
   lb: number,
-  o: { title: string; shots: Shot[]; B: number; note: string; cap: string; capAt: number; callouts: (Callout & { shot: Shot })[] },
+  o: {
+    title: string; shots: Shot[]; B: number; note: string; cap: string; capAt: number; callouts: (Callout & { shot: Shot })[];
+    /** Draws the panels under the frame. */
+    below?: (c: Ctx, B: number, lb: number) => void;
+  },
 ) {
   const { fine, mid, t, f } = c;
   dots(fine, t, 0.08);
@@ -578,32 +662,91 @@ export function framed(
   fine.erase(Math.floor(FRAME_PX.x / 12), Math.floor(FRAME_PX.y / 24), Math.ceil(FRAME_PX.w / 12) + 1, Math.ceil(FRAME_PX.h / 24) + 1);
   box(mid, FRAME.x, FRAME.y, FRAME.w, FRAME.h, (u) => mix(P.shadow, grad(u * 1.5 + t * 0.06), 0.85), { style: "double" });
   mid.label(FRAME.x + 2, FRAME.y, ` ${o.title} `, P.ink);
+  mid.label(FRAME.x + 2, FRAME.y + FRAME.h - 1, ` ${o.note} `, P.muted);
   const sp = ` ${shot.speed} `;
   mid.label(FRAME.x + FRAME.w - 2 - sp.length, FRAME.y + FRAME.h - 1, sp, shot.speed === "real time" ? P.muted : P.cyan);
-  const left = Math.floor(FRAME_PX.x / 12) - 1;
-  const noteRow = Math.ceil(((FRAME.y + FRAME.h) * MID.ch) / 24) + 1;
-  fine.text(left, noteRow, o.note, P.muted);
-  caption(mid, FRAME.x, FRAME.y + FRAME.h + 2, o.cap, lb, o.capAt, f);
+  caption(mid, centered(mid, o.cap), 27, o.cap, lb, o.capAt, f);
+  o.below?.(c, o.B, lb);
 
-  const rightPx = MID.ox + (FRAME.x + FRAME.w) * MID.cw;
   for (const co of o.callouts) {
     const sb = o.B - co.at;
-    if (sb < 0 || o.B < co.shot.start || o.B >= co.shot.end) continue;
+    if (sb < 0 || o.B >= (co.until ?? Infinity) || o.B < co.shot.start || o.B >= co.shot.end) continue;
     const [sx, sy, sw, sh] = co.src;
     const [lpx, lpy] = toPx(co.shot, sx, sy + sh / 2);
     const [rpx] = toPx(co.shot, sx + sw, sy);
     const row = Math.floor(lpy / 24);
-    const x1 = Math.ceil(rightPx / 12) + 1;
-    fine.put(Math.floor(lpx / 12) - 1, row, "▶", co.tone);
-    if (co.wire === false) fine.put(x1, row, "◀", co.tone);
+    const mark = co.mark ?? "line";
+    if (mark === "above") fine.put(Math.round((lpx + rpx) / 24), row - 1, "▼", co.tone);
     else {
+      if (mark === "line") fine.put(Math.floor(lpx / 12) - 1, row, "▶", co.tone);
       fine.put(Math.ceil(rpx / 12), row, "◀", co.tone);
-      const x0 = Math.ceil(rpx / 12) + 2;
-      const wire = easeOut((sb - 0.1) / 0.3);
-      for (let x = x0; x < x0 + (x1 - x0) * wire; x++) fine.put(x, row, "─", mix(P.dim, co.tone, 0.8));
     }
-    co.lines.forEach(([s, col], k) => decode(fine, x1 + 1, row + k, s, (sb - 0.3 - k * 0.12) / 0.3, f, col, { seed: 40 + k }));
+    const width = Math.max(...co.lines.map(([s]) => [...s].length)) + 2;
+    const lx = Math.max(4, Math.min(fine.cols - 4 - width, Math.floor(lpx / 12)));
+    co.lines.forEach(([s, col], k) =>
+      decode(fine, lx, LABEL_ROW + k, (k === 0 ? "▲ " : "  ") + s, (sb - 0.1 - k * 0.12) / 0.3, f, (i) => (i === 0 ? co.tone : col), { seed: 40 + k }),
+    );
   }
+}
+
+/** A panel's frame under the footage; its interior is cleared of the dot grid. */
+function panelBox(c: Ctx, x: number, lb: number, tone?: RGB) {
+  const { fine, t } = c;
+  const { y, w, h } = PANEL;
+  box(fine, x, y, w, h, (u) => (tone ? mix(P.dim, tone, 0.6) : mix(P.dim, grad(u * 2 + t * 0.2 + x / 80), 0.7)), { p: easeOut(lb / 0.3) });
+  fine.erase(x + 1, y + 1, w - 2, h - 2);
+}
+
+export type Facts = { title: string; sub: string; at: number; rows: [string, string][]; tone: RGB };
+
+/** Figures from the run: spinners until `at` (output bars), then the values decode in. */
+export function factsPanel(c: Ctx, x: number, B: number, lb: number, o: Facts) {
+  const { fine, f } = c;
+  const done = B >= o.at;
+  const { y, w } = PANEL;
+  panelBox(c, x, lb, done ? o.tone : undefined);
+  if (lb < 0.15) return;
+  boxTitle(fine, x + 2, y, o.title, lb - 0.15, f);
+  decode(fine, x + 2, y + 1, o.sub, (lb - 0.2) / 0.3, f, P.muted, { seed: 96 });
+  o.rows.forEach(([label, value], i) => {
+    if (lb < 0.3 + i * 0.08) return;
+    const yy = y + 3 + i;
+    const last = i === o.rows.length - 1;
+    const v = done ? value : spin(f + i * 3);
+    leader(fine, x + 2, yy, w - 4, label, v, done && last ? o.tone : done ? P.ink : P.muted);
+    if (done && B - o.at < 0.3) {
+      const vx = x + w - 2 - [...value].length;
+      fine.erase(vx, yy, [...value].length, 1);
+      decode(fine, vx, yy, value, (B - o.at) / 0.25, f, last ? o.tone : P.ink, { seed: 97 + i });
+    }
+  });
+}
+
+export type TapPhase = { at: number; title: string; lines: string[]; step: number; done: string; tone?: RGB };
+
+/** node --test output under the frame: the latest phase whose `at` (output bars) has passed, printed a line per `step`. */
+export function tapPanel(c: Ctx, x: number, B: number, lb: number, phases: TapPhase[]) {
+  const { fine, t, f } = c;
+  let k = 0;
+  phases.forEach((p, i) => B >= p.at && (k = i));
+  const ph = phases[k];
+  const t0 = ph.at + 0.05;
+  const finished = B >= t0 + ph.lines.length * ph.step;
+  const tone = finished ? ph.tone : undefined;
+  const { y, w, h } = PANEL;
+  panelBox(c, x, lb, tone);
+  if (lb < 0.15) return;
+  boxTitle(fine, x + 2, y, `node --test · ${ph.title}`, Math.min(lb - 0.15, B - ph.at), f);
+  ph.lines.forEach((s, i) => {
+    const at = t0 + i * ph.step;
+    if (B < at) return;
+    const yy = y + 1 + i;
+    const col: RGB = s.startsWith("not ok") ? P.danger : s.startsWith("ok") ? P.ok : s.startsWith("  ") ? mix(P.muted, P.danger, 0.3) : P.muted;
+    decode(fine, x + 2, yy, s, Math.min(lb - 0.15, B - at) / 0.12, f, col, { seed: 61 + i });
+    if (finished && tone === P.danger && s.startsWith("not ok 3")) fine.put(x + 3 + s.length, yy, "◀", P.danger, 0.6 + 0.4 * Math.sin(t * 8));
+  });
+  const st = ` ${finished ? ph.done : `${spin(f)} running`} `;
+  fine.label(x + w - 2 - st.length, y + h - 1, st, tone ?? P.muted);
 }
 
 // ---------------------------------------------------------------------------
@@ -626,12 +769,12 @@ export function numbers(c: Ctx, lb: number) {
   caption(g, centered(g, c2), 1, c2, lb, 4, f);
   const fx = (mx: number) => Math.round((g.ox + mx * g.cw) / fine.cw);
   decode(fine, fx(60), 6, "said done", (lb - 0.4) / 0.3, f, P.muted, { seed: 51 });
-  decode(fine, fx(82), 6, "said done, tests failed", (lb - 1.8) / 0.3, f, P.muted, { seed: 52 });
+  decode(fine, fx(82), 6, "said done, tests failed", (lb - 0.4) / 0.3, f, P.muted, { seed: 52 });
 
   ARMS.forEach((arm, k) => {
     const y0 = 5 + k * 8;
     const me = k === 2;
-    const at = 0.4 + k * 0.25;
+    const at = 0.3 + k * 0.15;
     decode(g, 3, y0, arm.label, (lb - at) / 0.3, f, me ? P.cyan : P.ink, { seed: 60 + k });
     decode(fine, fx(3 + arm.label.length) + 2, Math.floor((y0 * 36 + 18) / 24), arm.note, (lb - at - 0.1) / 0.3, f, P.muted, { seed: 63 + k });
     const fill = easeOut((lb - at - 0.2) / 1.2);
@@ -673,7 +816,7 @@ export function numbers(c: Ctx, lb: number) {
       }
     }
     if (lb >= at + 0.2) bigText(g, 60, y0, String(claimed), (x) => grad(x / 110 + t * 0.06));
-    if (lb >= 1.8) bigText(g, 82, y0, String(crumbled), () => (arm.wrong ? P.danger : P.ok));
+    if (lb >= at + 0.2) bigText(g, 82, y0, String(crumbled), () => (!arm.wrong ? P.ok : crumbled ? P.danger : mix(P.dim, P.danger, 0.45)));
     if (lb >= 4.25 + k * 0.15) {
       const s = `tests passed ${arm.passed}`;
       const py = Math.floor(((y0 + 4) * 36 + 12) / 24);
