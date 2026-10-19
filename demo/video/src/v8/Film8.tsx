@@ -210,7 +210,7 @@ function blend(spec: Spec, a: Ctx, b: Ctx, p: number, kind: "wipe" | "dissolve",
       const v = kind === "wipe" ? (px / spec.w) * 0.78 + (py / spec.h) * 0.22 + (hash(cell, 1, 3) - 0.5) * 0.04 : hash(cell, 2, 5) * 0.8 + (px / spec.w) * 0.2;
       if (v < front - band) {
         g.copyCell(b[layer], i);
-        if (opaqueB) g.bg[i] = 1;
+        if (opaqueB && layer === "fine") g.bg[i] = 1;
       } else if (v < front) {
         g.bg[i] = layer === "fine" ? 1 : 0;
         if (layer === "fine") {
@@ -220,7 +220,7 @@ function blend(spec: Spec, a: Ctx, b: Ctx, p: number, kind: "wipe" | "dissolve",
         }
       } else {
         g.copyCell(a[layer], i);
-        if (opaqueA) g.bg[i] = 1;
+        if (opaqueA && layer === "fine") g.bg[i] = 1;
       }
     }
   }
