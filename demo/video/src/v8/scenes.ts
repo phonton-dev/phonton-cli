@@ -176,8 +176,8 @@ type StageState = "idle" | "busy" | "done" | "fail" | "wait";
 export type LoopLayout = {
   goal: { x: number; y: number; w: number; lines: string[] };
   facts: { x: number; y: number };
-  /** Fine-grid row and right edge for the "drawn from the real run" note. */
-  note?: { x: number; y: number };
+  /** Fine-grid note saying where the diagram comes from. */
+  note: { x: number; y: number; text: string };
   stages: { name: string; x: number; y: number; w: number }[];
   sh: number;
   /** Forward wires between stages, mid cells in order. */
@@ -217,7 +217,7 @@ const NOTE = "drawn from the real run · footage next";
 export const MAIN_LOOP: LoopLayout = {
   goal: { x: 3, y: 1, w: 102, lines: ["Make parsePort in @src/port.js reject ports outside 1-65535", "and trailing garbage so npm test passes"] },
   facts: { x: 3, y: 5 },
-  note: { x: 157, y: 8 },
+  note: { x: 157 - NOTE.length, y: 8, text: NOTE },
   stages: [
     { name: "goal", x: 3, y: 8, w: 10 },
     { name: "plan", x: 17, y: 8, w: 10 },
@@ -262,6 +262,7 @@ const cells = (pts: [number, number][], ch: string) => pts.map(([x, y]) => [x, y
 export const VERTICAL_LOOP: LoopLayout = {
   goal: { x: 1, y: 1, w: 57, lines: ["Make parsePort in @src/port.js reject", "ports outside 1-65535 and trailing", "garbage so npm test passes"] },
   facts: { x: 1, y: 6 },
+  note: { x: 1, y: 11, text: "drawn from a real run · the failing test's message was written for this demo" },
   stages: ["goal", "plan", "edit", "verify", "review", "remember"].map((name, i) => ({ name, x: 8, y: [8, 13, 18, 26, 31, 36][i], w: 18 })),
   sh: 3,
   wires: [vline(16, 11, 12), vline(16, 16, 17), vline(16, 21, 25), vline(16, 29, 30), vline(16, 34, 35)],
@@ -347,7 +348,7 @@ export function loop(c: Ctx, lb: number, L: LoopLayout = MAIN_LOOP) {
   box(g, G.x, G.y, G.w, G.lines.length + 2, (u) => mix(P.dim, grad(u * 1.5 + t * 0.05), 0.65), { p: easeOut(lb / 0.4), title: "goal", titleCol: P.ink });
   G.lines.forEach((s, k) => decode(g, G.x + 2, G.y + 1 + k, s, (lb - 0.2 - k * 0.3) / 0.8, f, P.ink, { seed: 2 + k }));
   decode(g, L.facts.x, L.facts.y, FACTS, (lb - 0.9) / 0.5, f, P.cyan, { seed: 4 });
-  if (L.note) decode(fine, L.note.x - NOTE.length, L.note.y, NOTE, (lb - 1.1) / 0.5, f, P.muted, { seed: 5 });
+  decode(fine, L.note.x, L.note.y, L.note.text, (lb - 1.1) / 0.5, f, P.muted, { seed: 5 });
 
   // forward wires: dim until the photon passes, then a current in the logo gradient
   L.wires.forEach((cells, w) => {
