@@ -711,6 +711,19 @@ fn native_image_attachments(attachments: &[PromptAttachment]) -> Vec<&PromptAtta
         .collect()
 }
 
+/// Joins the `text` blocks of a Messages response. Claude 5.x models think
+/// by default, so a `thinking` block can come before the text.
+fn anthropic_response_text(resp: &Value) -> Option<String> {
+    let texts: Vec<&str> = resp
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect();
+    (!texts.is_empty()).then(|| texts.concat())
+}
+
 fn anthropic_user_content(user: &str, attachments: &[PromptAttachment]) -> Value {
     let images = native_image_attachments(attachments);
     if images.is_empty() {
@@ -1199,11 +1212,13 @@ impl Provider for AnthropicProvider {
             .await
             .map_err(|e| ProviderError::ParseFail(e.to_string()))?;
 
-        let content = resp
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("anthropic response missing content[0].text"))?
-            .to_string();
+        let content = anthropic_response_text(&resp).ok_or_else(|| {
+            let stop = resp
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow!("anthropic response has no text block (stop_reason: {stop})")
+        })?;
         let usage = resp
             .get("usage")
             .ok_or_else(|| anyhow!("anthropic response missing usage"))?;
@@ -1832,6 +1847,21 @@ impl Provider for OllamaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_text_skips_leading_thinking_block() {
+        let resp = json!({ "content": [
+            { "type": "thinking", "thinking": "", "signature": "sig" },
+            { "type": "text", "text": "--- a/x\n" },
+            { "type": "text", "text": "+++ b/x\n" }
+        ]});
+        assert_eq!(
+            anthropic_response_text(&resp).as_deref(),
+            Some("--- a/x\n+++ b/x\n")
+        );
+        let thinking_only = json!({ "content": [{ "type": "thinking", "thinking": "" }] });
+        assert_eq!(anthropic_response_text(&thinking_only), None);
+    }
 
     #[test]
     fn semantic_only_leaves_prompt_untouched() {

@@ -4,6 +4,16 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased
+
+### Fixed
+
+- [fixed] With an Anthropic key, goals failed with `anthropic response
+  missing content[0].text` whenever the model thought before answering.
+  Claude Sonnet 5.5, Opus 5.5 and Haiku 5.5 think by default, so a reply can
+  start with a `thinking` block. Phonton now reads every text block and skips
+  thinking blocks. A reply with no text reports the API's `stop_reason`.
+
 ## 0.25.1 - Local runs survive a busy laptop
 
 ### Fixed
