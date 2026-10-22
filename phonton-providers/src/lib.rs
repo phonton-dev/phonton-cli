@@ -724,6 +724,68 @@ fn anthropic_response_text(resp: &Value) -> Option<String> {
     (!texts.is_empty()).then(|| texts.concat())
 }
 
+/// Claude 5 and later think by default. Ids look like
+/// `claude-<family>-<major>[-<minor>][-<date>]`; the older
+/// `claude-3-5-haiku-…` shape has a number where the family goes.
+fn anthropic_thinks_by_default(model: &str) -> bool {
+    let mut parts = model.split('-');
+    parts.next() == Some("claude")
+        && parts
+            .next()
+            .is_some_and(|family| family.bytes().all(|b| b.is_ascii_lowercase()))
+        && parts
+            .next()
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= 5)
+}
+
+/// Rebuilds a Messages response from its event stream: the `message_start`
+/// message, each content block with its `text_delta`s appended, and the
+/// `stop_reason` and cumulative `usage` from `message_delta`. An `error`
+/// event, such as `overloaded_error`, becomes the error.
+fn anthropic_message_from_sse(events: &str) -> Result<Value> {
+    let mut message = serde_json::Map::new();
+    let mut content: Vec<Value> = Vec::new();
+    for data in events.lines().filter_map(|line| line.strip_prefix("data:")) {
+        let event: Value = serde_json::from_str(data.trim())
+            .map_err(|e| ProviderError::ParseFail(e.to_string()))?;
+        match event["type"].as_str() {
+            Some("message_start") => {
+                if let Some(start) = event["message"].as_object() {
+                    message = start.clone();
+                }
+            }
+            Some("content_block_start") => content.push(event["content_block"].clone()),
+            Some("content_block_delta") => {
+                let block = event["index"]
+                    .as_u64()
+                    .and_then(|i| content.get_mut(i as usize));
+                if let (Some(Value::String(text)), Some(delta)) = (
+                    block.and_then(|b| b.get_mut("text")),
+                    event["delta"]["text"].as_str(),
+                ) {
+                    text.push_str(delta);
+                }
+            }
+            Some("message_delta") => {
+                message.insert("stop_reason".into(), event["delta"]["stop_reason"].clone());
+                if let (Some(Value::Object(usage)), Some(delta)) =
+                    (message.get_mut("usage"), event["usage"].as_object())
+                {
+                    usage.extend(delta.clone());
+                }
+            }
+            Some("error") => bail!(
+                "Anthropic stream error: {}",
+                event["error"]["message"].as_str().unwrap_or("unknown")
+            ),
+            _ => {}
+        }
+    }
+    message.insert("content".into(), Value::Array(content));
+    Ok(Value::Object(message))
+}
+
 fn anthropic_user_content(user: &str, attachments: &[PromptAttachment]) -> Value {
     let images = native_image_attachments(attachments);
     if images.is_empty() {
@@ -1130,6 +1192,7 @@ impl Provider for MeteredProvider {
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
+    endpoint: String,
     http: Client,
 }
 
@@ -1140,11 +1203,46 @@ impl AnthropicProvider {
         Self {
             api_key,
             model,
+            endpoint: "https://api.anthropic.com/v1/messages".into(),
             http: Client::builder()
-                .timeout(std::time::Duration::from_secs(600))
+                // Replies stream, so a long one is never cut off; this only
+                // catches a stream that has gone quiet.
+                .read_timeout(std::time::Duration::from_secs(600))
                 .build()
                 .unwrap_or_default(),
         }
+    }
+
+    /// Points the adaptor at a stand-in for the Messages API.
+    #[cfg(test)]
+    fn with_endpoint(mut self, endpoint: &str) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Sends one streamed Messages request and returns the reply rebuilt
+    /// from its events, in the shape of a non-streamed response.
+    async fn send_messages(&self, body: &Value) -> Result<Value> {
+        let http_resp = send_with_retry(
+            self.http
+                .post(&self.endpoint)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(body),
+        )
+        .await?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let body = http_resp.text().await.unwrap_or_default();
+            return Err(annotate_http_error("Anthropic", status, &body));
+        }
+        let events = http_resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Transport(error_chain(&e)))?;
+        anthropic_message_from_sse(&events)
     }
 }
 
@@ -1180,37 +1278,37 @@ impl Provider for AnthropicProvider {
         } else {
             json!({ "type": "text", "text": system })
         };
-        // 8192 is the highest `max_tokens` value every current Claude model
-        // accepts (haiku 3.5 caps here; sonnet 4.x/opus go higher). Going
-        // above this would 400 on haiku, going below this throws away
-        // headroom on the bigger models for normal-length completions.
-        let body = json!({
+        // Thinking counts toward `max_tokens`, and Claude 5 and later think
+        // by default: 8192 let hard tasks spend it all thinking and reply
+        // with no text. 64K is Anthropic's starting point for agentic work
+        // and within every such model's output limit. Older models, which
+        // don't think unless asked, keep 8192.
+        let max_tokens = if anthropic_thinks_by_default(&self.model) {
+            64_000
+        } else {
+            8192
+        };
+        let mut body = json!({
             "model": self.model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
+            "stream": true,
             "system": [system_block],
             "messages": [{ "role": "user", "content": anthropic_user_content(user, attachments) }],
         });
 
-        let http_resp = send_with_retry(
-            self.http
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&body),
-        )
-        .await?;
-
-        let status = http_resp.status();
-        if !status.is_success() {
-            let body = http_resp.text().await.unwrap_or_default();
-            return Err(annotate_http_error("Anthropic", status, &body));
+        let mut resp = self.send_messages(&body).await?;
+        let mut first_attempt = Value::Null;
+        // A reply can still think up to the cap and stop before any text.
+        // Ask once more at low effort, which thinks less, instead of failing
+        // the goal. Both attempts are billed, so both are counted below.
+        if anthropic_response_text(&resp).is_none()
+            && resp.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+            && anthropic_thinks_by_default(&self.model)
+        {
+            body["output_config"] = json!({ "effort": "low" });
+            let retry = self.send_messages(&body).await?;
+            first_attempt = std::mem::replace(&mut resp, retry);
         }
-
-        let resp: Value = http_resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::ParseFail(e.to_string()))?;
 
         let content = anthropic_response_text(&resp).ok_or_else(|| {
             let stop = resp
@@ -1219,28 +1317,22 @@ impl Provider for AnthropicProvider {
                 .unwrap_or("unknown");
             anyhow!("anthropic response has no text block (stop_reason: {stop})")
         })?;
-        let usage = resp
-            .get("usage")
-            .ok_or_else(|| anyhow!("anthropic response missing usage"))?;
+        if resp.get("usage").is_none() {
+            bail!("anthropic response missing usage");
+        }
+        let tokens = |key: &str| -> u64 {
+            [&resp, &first_attempt]
+                .iter()
+                .filter_map(|r| r.get("usage")?.get(key)?.as_u64())
+                .sum()
+        };
 
         Ok(LLMResponse {
             content,
-            input_tokens: usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            output_tokens: usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            cached_tokens: usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            cache_creation_tokens: usage
-                .get("cache_creation_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            input_tokens: tokens("input_tokens"),
+            output_tokens: tokens("output_tokens"),
+            cached_tokens: tokens("cache_read_input_tokens"),
+            cache_creation_tokens: tokens("cache_creation_input_tokens"),
             provider: ProviderKind::Anthropic,
             model_name: self.model.clone(),
         })
@@ -1863,6 +1955,126 @@ mod tests {
         assert_eq!(anthropic_response_text(&thinking_only), None);
     }
 
+    /// Regression: Claude 5.x thinks by default and thinking counts toward
+    /// `max_tokens`. With an 8192 cap, hard tasks (Aider Polyglot Rust
+    /// `forth` and `bowling` on claude-haiku-5-5) spent it all thinking, the
+    /// reply had no text, and the goal ended with a dispatch error. Requests
+    /// now stream with room to think, and a reply that still stops at
+    /// `max_tokens` before any text is asked once more at low effort.
+    #[tokio::test]
+    async fn anthropic_thinking_only_max_tokens_reply_is_retried_at_low_effort() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // One streamed reply: a thinking block, then `text` if any, then the
+        // stop reason and the cumulative output tokens.
+        fn reply(text: Option<&str>, stop_reason: &str, output_tokens: u64) -> String {
+            let mut events = vec![
+                json!({ "type": "message_start", "message": {
+                    "role": "assistant", "content": [], "stop_reason": null,
+                    "usage": { "input_tokens": 10, "output_tokens": 1 } } }),
+                json!({ "type": "ping" }),
+                json!({ "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "thinking", "thinking": "", "signature": "" } }),
+                json!({ "type": "content_block_delta", "index": 0,
+                    "delta": { "type": "signature_delta", "signature": "sig" } }),
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ];
+            if let Some(text) = text {
+                events.push(json!({ "type": "content_block_start", "index": 1,
+                    "content_block": { "type": "text", "text": "" } }));
+                for line in text.split_inclusive('\n') {
+                    events.push(json!({ "type": "content_block_delta", "index": 1,
+                        "delta": { "type": "text_delta", "text": line } }));
+                }
+                events.push(json!({ "type": "content_block_stop", "index": 1 }));
+            }
+            events.push(json!({ "type": "message_delta",
+                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                "usage": { "output_tokens": output_tokens } }));
+            events.push(json!({ "type": "message_stop" }));
+            let body: String = events
+                .iter()
+                .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                .collect();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        // Answers each request with the next reply and keeps its JSON body.
+        let replies = [
+            reply(None, "max_tokens", 64_000),
+            reply(Some("--- a/x\n+++ b/x\n"), "end_turn", 900),
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for reply in replies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if body.len() >= len {
+                            break serde_json::from_str::<Value>(&body[..len]).unwrap();
+                        }
+                    }
+                    assert!(n > 0, "request ended early");
+                };
+                bodies.push(body);
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+
+        let p = AnthropicProvider::new("k".into(), "claude-haiku-5-5".into())
+            .with_endpoint(&format!("http://{addr}/v1/messages"));
+        let resp = p.call("sys", "u", &[]).await.unwrap();
+        let bodies = server.await.unwrap();
+
+        assert_eq!(resp.content, "--- a/x\n+++ b/x\n");
+        assert_eq!(bodies[0]["stream"], true);
+        assert_eq!(bodies[0]["max_tokens"], 64_000);
+        assert!(bodies[0].get("output_config").is_none());
+        assert_eq!(bodies[1]["output_config"]["effort"], "low");
+        // Both attempts were billed, so both are counted.
+        assert_eq!(resp.input_tokens, 20);
+        assert_eq!(resp.output_tokens, 64_900);
+    }
+
+    #[test]
+    fn claude_5_and_later_think_by_default() {
+        for model in [
+            "claude-haiku-5-5",
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5-20261001",
+        ] {
+            assert!(anthropic_thinks_by_default(model), "{model}");
+        }
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-7",
+            "claude-3-5-haiku-20241022",
+            "gpt-5",
+        ] {
+            assert!(!anthropic_thinks_by_default(model), "{model}");
+        }
+    }
+
     #[test]
     fn semantic_only_leaves_prompt_untouched() {
         let s = build_system_prompt("base", &[SliceOrigin::Semantic, SliceOrigin::Semantic]);
@@ -2152,13 +2364,25 @@ Content-Length: {}
             eprintln!("skipping: ANTHROPIC_API_KEY not set");
             return;
         };
-        let p = AnthropicProvider::new(key, "claude-haiku-4-5-20251001".into());
-        let resp = p
-            .call("You are a terse assistant.", "Reply with exactly: ok", &[])
-            .await
-            .expect("anthropic call failed");
-        assert!(!resp.content.is_empty(), "content must not be empty");
-        assert!(resp.input_tokens > 0, "input_tokens must be reported");
-        assert!(resp.output_tokens > 0, "output_tokens must be reported");
+        // A model that thinks only when asked, and one that thinks by default.
+        for model in ["claude-haiku-4-5-20251001", "claude-haiku-5-5"] {
+            let p = AnthropicProvider::new(key.clone(), model.into());
+            let resp = p
+                .call("You are a terse assistant.", "Reply with exactly: ok", &[])
+                .await
+                .expect("anthropic call failed");
+            assert!(
+                !resp.content.is_empty(),
+                "{model}: content must not be empty"
+            );
+            assert!(
+                resp.input_tokens > 0,
+                "{model}: input_tokens must be reported"
+            );
+            assert!(
+                resp.output_tokens > 0,
+                "{model}: output_tokens must be reported"
+            );
+        }
     }
 }

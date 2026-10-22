@@ -25,6 +25,12 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 - [fixed] A test command the shell cannot find (`'jest' is not recognized`,
   `command not found`) stops as verification unavailable instead of failing,
   retrying and escalating to a larger model.
+- [fixed] With an Anthropic key, a hard goal on Claude Haiku 5.5, Sonnet 5.5
+  or Opus 5.5 could end at once with `anthropic response has no text block
+  (stop_reason: max_tokens)`: the model's thinking used the whole 8,192-token
+  reply cap. Claude 5 and later models now get 64,000 tokens, replies stream
+  so a long one does not time out, and a reply that still stops before any
+  text is asked once more at low effort. Both attempts count in the receipt.
 
 ## 0.25.2 - Claude 5.5 models work with an Anthropic key
 
