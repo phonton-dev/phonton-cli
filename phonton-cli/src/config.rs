@@ -11,6 +11,8 @@
 //! api_key = "sk-ant-..."
 //! # Optional model override. Defaults are picked per provider.
 //! model = "claude-sonnet-4-5-20251022"
+//! # Optional: use `model` on every tier instead of escalating.
+//! pin_model = true
 //! # Cloudflare-only: Workers AI account ID.
 //! account_id = "..."
 //!
@@ -92,6 +94,11 @@ pub struct ProviderConfig {
     /// Backward-compatible opt-in used by older config files. Current
     /// provider routing keeps unknown model handling in the provider layer.
     pub allow_unverified_model: Option<bool>,
+
+    /// Use `model` on every tier, so retries never escalate to a larger
+    /// model. Off by default: standard and frontier work use stronger models.
+    #[serde(default)]
+    pub pin_model: bool,
 }
 
 impl Default for ProviderConfig {
@@ -104,6 +111,7 @@ impl Default for ProviderConfig {
             base_url: None,
             keys: BTreeMap::new(),
             allow_unverified_model: None,
+            pin_model: false,
         }
     }
 }
@@ -519,6 +527,7 @@ mode = "ask"
             base_url: None,
             keys: BTreeMap::new(),
             allow_unverified_model: None,
+            pin_model: false,
         };
         // No env var set in test — should return None.
         // (In production the real key is present.)
@@ -535,6 +544,7 @@ mode = "ask"
             base_url: None,
             keys: BTreeMap::new(),
             allow_unverified_model: None,
+            pin_model: false,
         };
         assert_eq!(resolve_api_key(&cfg).as_deref(), Some("from-config"));
     }

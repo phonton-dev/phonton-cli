@@ -1793,19 +1793,7 @@ fn parse_goal(args: &[String]) -> Result<GoalOptions> {
                             .map(PathBuf::from)
                             .collect()
                     }
-                    _ => {
-                        let parts: Vec<String> = serde_json::from_str(value)?;
-                        let (program, rest) = parts
-                            .split_first()
-                            .ok_or_else(|| anyhow!("Check command cannot be empty"))?;
-                        options
-                            .request
-                            .checks
-                            .push(phonton_types::local_run::LocalCheck {
-                                program: program.clone(),
-                                args: rest.to_vec(),
-                            });
-                    }
+                    _ => options.request.checks.push(parse_check(value)?),
                 }
             }
             _ => bail!("Unknown local goal option: {flag}"),
@@ -1816,6 +1804,18 @@ fn parse_goal(args: &[String]) -> Result<GoalOptions> {
         bail!("{LOCAL_GOAL_USAGE}");
     }
     Ok(options)
+}
+
+/// One `--check` value: a JSON array of the program and its arguments.
+pub(crate) fn parse_check(value: &str) -> Result<phonton_types::local_run::LocalCheck> {
+    let parts: Vec<String> = serde_json::from_str(value)?;
+    let (program, rest) = parts
+        .split_first()
+        .ok_or_else(|| anyhow!("Check command cannot be empty"))?;
+    Ok(phonton_types::local_run::LocalCheck {
+        program: program.clone(),
+        args: rest.to_vec(),
+    })
 }
 
 #[cfg(test)]

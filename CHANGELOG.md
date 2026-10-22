@@ -6,8 +6,25 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ## Unreleased
 
+### Added
+
+- [added] `phonton goal --check '<JSON array>'` without `--local`, as with
+  `phonton goal --local`. Each check runs on the verification copy in place
+  of the detected Cargo, `npm test` and browser checks and must exit 0;
+  repeat the flag for several. Without it, detection is unchanged.
+- [added] `pin_model = true` under `[provider]` sends every tier to the
+  configured `model` instead of escalating to larger models. Off by default.
+- [added] Receipts price Claude Haiku 5.5, Sonnet 5.5 and Opus 5.5 (list
+  prices for prompts up to 100K tokens) instead of `pricing_known: false`.
+
 ### Fixed
 
+- [fixed] A `node_modules` that is a symlink or a Windows junction now
+  reaches the verification copy. It was dropped, so tests could not find
+  `jest`.
+- [fixed] A test command the shell cannot find (`'jest' is not recognized`,
+  `command not found`) stops as verification unavailable instead of failing,
+  retrying and escalating to a larger model.
 - [fixed] With an Anthropic key, a hard goal on Claude Haiku 5.5, Sonnet 5.5
   or Opus 5.5 could end at once with `anthropic response has no text block
   (stop_reason: max_tokens)`: the model's thinking used the whole 8,192-token

@@ -334,6 +334,7 @@ pub struct Orchestrator<D: WorkerDispatcher + ?Sized> {
     control_rx: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<OrchestratorMessage>>>>,
     working_dir: std::path::PathBuf,
     verification_execution: phonton_types::verification::VerificationExecution,
+    verification_checks: Vec<phonton_types::local_run::LocalCheck>,
     index_backend: Option<String>,
     task_id: TaskId,
     goal_text: String,
@@ -354,6 +355,7 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
             working_dir: std::path::PathBuf::from("."),
             verification_execution:
                 phonton_types::verification::VerificationExecution::RequireIsolation,
+            verification_checks: Vec::new(),
             index_backend: None,
             task_id: TaskId::new(),
             goal_text: String::new(),
@@ -392,6 +394,16 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         policy: phonton_types::verification::VerificationExecution,
     ) -> Self {
         self.verification_execution = policy;
+        self
+    }
+
+    /// User-selected checks that replace detected verification commands.
+    /// Pass the same checks to the dispatcher's workers.
+    pub fn with_verification_checks(
+        mut self,
+        checks: Vec<phonton_types::local_run::LocalCheck>,
+    ) -> Self {
+        self.verification_checks = checks;
         self
     }
 
@@ -1181,11 +1193,12 @@ impl<D: WorkerDispatcher + ?Sized> Orchestrator<D> {
         // the orchestrator marks it Done. No bypass flags. When a memory
         // store is attached, Layer 1.5 (Decision Check) runs between
         // Syntax and CrateCheck — see `with_memory`.
-        let verdict = phonton_verify::verify_diff_with_execution(
+        let verdict = phonton_verify::verify_diff_with_checks(
             &diff_hunks,
             &self.working_dir,
             self.memory.as_ref(),
             self.verification_execution,
+            &self.verification_checks,
         )
         .await?;
         self.apply_verdict(runtimes, id, verdict, joinset, worker_msg_tx)

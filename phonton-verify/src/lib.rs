@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use phonton_memory::MemoryStore;
+use phonton_types::local_run::LocalCheck;
 use phonton_types::verification::VerificationExecution;
 use phonton_types::{DiffHunk, DiffLine, MemoryRecord, VerifyLayer, VerifyResult};
 use tree_sitter::{Node, Parser};
@@ -70,6 +71,19 @@ pub async fn verify_diff_with_execution(
     memory: Option<&MemoryStore>,
     policy: VerificationExecution,
 ) -> Result<VerifyResult> {
+    verify_diff_with_checks(hunks, working_dir, memory, policy, &[]).await
+}
+
+/// [`verify_diff_with_execution`] with caller-selected checks. Non-empty
+/// `checks` replace the detected cargo, npm and browser layers: each runs in
+/// the patched copy of the workspace and must exit 0.
+pub async fn verify_diff_with_checks(
+    hunks: &[DiffHunk],
+    working_dir: &Path,
+    memory: Option<&MemoryStore>,
+    policy: VerificationExecution,
+    checks: &[LocalCheck],
+) -> Result<VerifyResult> {
     if let Some(fail) = verify_patch_applies(hunks, working_dir) {
         return Ok(fail);
     }
@@ -91,7 +105,7 @@ pub async fn verify_diff_with_execution(
         return Ok(VerifyResult::Unavailable { reason: "Verification definition changed in the candidate. Capture independent checks before executing this diff; candidate-authored tests or package scripts cannot authorize or certify themselves.".into() });
     }
 
-    let result = run_command_checks(hunks, working_dir, policy).await?;
+    let result = run_command_checks(hunks, working_dir, policy, checks).await?;
     // New test files run alongside the originals, which stay untouched. If the
     // candidate edits existing tests, those originals must also pass against
     // its source changes, so a candidate can never certify itself by
@@ -109,7 +123,7 @@ pub async fn verify_diff_with_execution(
         .filter(|h| !edited_tests.contains(&h.file_path.as_path()))
         .cloned()
         .collect();
-    match run_command_checks(&without_test_edits, working_dir, policy).await? {
+    match run_command_checks(&without_test_edits, working_dir, policy, checks).await? {
         VerifyResult::Pass { .. } => Ok(result),
         _ => {
             let mut files: Vec<String> = edited_tests
@@ -133,24 +147,31 @@ async fn run_command_checks(
     hunks: &[DiffHunk],
     working_dir: &Path,
     policy: VerificationExecution,
+    checks: &[LocalCheck],
 ) -> Result<VerifyResult> {
     let packages = touched_packages(hunks, working_dir);
-    let patched_worktree = if command_verification_relevant(hunks, working_dir) {
-        Some(patched_verification_worktree(hunks, working_dir)?)
-    } else {
-        None
-    };
+    // Explicit checks always run in the patched copy, never the workspace.
+    let patched_worktree =
+        if !checks.is_empty() || command_verification_relevant(hunks, working_dir) {
+            Some(patched_verification_worktree(hunks, working_dir)?)
+        } else {
+            None
+        };
     let copy_dir = patched_worktree.as_ref().map(VerifyCopy::path);
     let command_dir = copy_dir.as_deref().unwrap_or(working_dir);
     // The worker verifies its diff and the orchestrator verifies it again;
     // the same patched tree gives the same checks, so run them once.
     let memo_key = copy_dir
         .as_deref()
-        .and_then(|dir| tree_fingerprint(dir, &packages, policy).ok());
+        .and_then(|dir| tree_fingerprint(dir, &packages, policy, checks).ok());
     if let Some(cached) = memo_key.and_then(memo_get) {
         return Ok(cached);
     }
-    let result = run_checks_in(&packages, command_dir, policy).await?;
+    let result = if checks.is_empty() {
+        run_checks_in(&packages, command_dir, policy).await?
+    } else {
+        run_explicit_checks(checks, command_dir, policy).await
+    };
     if let Some(key) = memo_key {
         memo_put(key, &result);
     }
@@ -182,7 +203,12 @@ fn memo_put(key: u64, result: &VerifyResult) {
 /// Hash every file path and byte in the patched copy plus what the checks
 /// depend on. 64-bit SipHash: accidental collisions are negligible and the
 /// memo never leaves this process.
-fn tree_fingerprint(dir: &Path, packages: &[String], policy: VerificationExecution) -> Result<u64> {
+fn tree_fingerprint(
+    dir: &Path,
+    packages: &[String],
+    policy: VerificationExecution,
+    checks: &[LocalCheck],
+) -> Result<u64> {
     use std::hash::{Hash, Hasher};
     fn walk(root: &Path, dir: &Path, h: &mut impl Hasher) -> Result<()> {
         let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
@@ -207,7 +233,65 @@ fn tree_fingerprint(dir: &Path, packages: &[String], policy: VerificationExecuti
     walk(dir, dir, &mut h)?;
     packages.hash(&mut h);
     matches!(policy, VerificationExecution::HostApproved).hash(&mut h);
+    checks.hash(&mut h);
     Ok(h.finish())
+}
+
+/// Caller-selected checks, in order, in place of the detected layers.
+async fn run_explicit_checks(
+    checks: &[LocalCheck],
+    command_dir: &Path,
+    policy: VerificationExecution,
+) -> VerifyResult {
+    for check in checks {
+        let output = executor::run(
+            command_dir,
+            &check.program,
+            check.args.clone(),
+            Duration::from_secs(120),
+            policy,
+        )
+        .await;
+        match output {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => return failed_test_verdict(&out),
+            Err(unavailable) => return unavailable,
+        }
+    }
+    VerifyResult::Pass {
+        layer: VerifyLayer::Test,
+    }
+}
+
+/// Verdict for a test command that exited non-zero. A shell that could not
+/// find the test runner means dependencies are missing, which no retry or
+/// stronger model can fix, so it stops as `Unavailable` instead of `Fail`.
+fn failed_test_verdict(out: &std::process::Output) -> VerifyResult {
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    if let Some(line) = missing_command_line(&combined) {
+        return VerifyResult::Unavailable {
+            reason: format!(
+                "Verification unavailable: the test command is not installed ({line}). Install the project's dependencies, then run the goal again."
+            ),
+        };
+    }
+    VerifyResult::Fail {
+        layer: VerifyLayer::Test,
+        errors: vec![last_lines(&combined, 30)],
+        attempt: 1,
+    }
+}
+
+/// The shell's "no such program" line from Windows `cmd`, POSIX `sh`/`bash`,
+/// or macOS `sandbox-exec`, if the output has one.
+fn missing_command_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| {
+        line.contains("is not recognized as an internal or external command")
+            || line.ends_with(": command not found")
+            || (line.starts_with("sh: ") && line.ends_with(": not found"))
+            || (line.contains("execvp() of") && line.ends_with("No such file or directory"))
+    })
 }
 
 /// The executable layers against `command_dir`.
@@ -446,15 +530,17 @@ fn copy_workspace_contents(source: &Path, dest: &Path) -> Result<()> {
         let src_path = entry.path();
         let dst_path = dest.join(&file_name);
         let file_type = entry.file_type()?;
+        // A symlinked or junctioned node_modules (pnpm, shared installs) is
+        // not `is_dir()` on its own entry, so follow it before deciding.
+        if file_name == "node_modules" && src_path.is_dir() {
+            // Checks need the installed packages; without them a model
+            // "fixes" a missing-module error by deleting the dependency.
+            // A link is fast and cleanup removes only the link. On
+            // failure the copy simply runs without dependencies.
+            let _ = link_dependency_dir(&src_path, &dst_path);
+            continue;
+        }
         if file_type.is_dir() {
-            if file_name == "node_modules" {
-                // Checks need the installed packages; without them a model
-                // "fixes" a missing-module error by deleting the dependency.
-                // A link is fast and cleanup removes only the link. On
-                // failure the copy simply runs without dependencies.
-                let _ = link_dependency_dir(&src_path, &dst_path);
-                continue;
-            }
             if should_skip_verification_copy_dir(&file_name) {
                 continue;
             }
@@ -580,15 +666,7 @@ pub async fn verify_node_test_with_execution(
         Ok(out) if out.status.success() => Ok(Some(VerifyResult::Pass {
             layer: VerifyLayer::Test,
         })),
-        Ok(out) => {
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-            Ok(Some(VerifyResult::Fail {
-                layer: VerifyLayer::Test,
-                errors: vec![last_lines(&combined, 30)],
-                attempt: 1,
-            }))
-        }
+        Ok(out) => Ok(Some(failed_test_verdict(&out))),
         Err(unavailable) => Ok(Some(unavailable)),
     }
 }
@@ -1582,6 +1660,112 @@ mod tests {
     }
 
     #[test]
+    fn linked_node_modules_reach_the_check_copy() {
+        // A junction on Windows reports as a symlink, not a directory.
+        let tmp = node_fixture();
+        let shared = tempfile::tempdir().unwrap();
+        let dep = shared.path().join("node_modules/inc");
+        std::fs::create_dir_all(&dep).unwrap();
+        std::fs::write(dep.join("index.js"), "module.exports = (x) => x + 1;\n").unwrap();
+        link_dependency_dir(
+            &shared.path().join("node_modules"),
+            &tmp.path().join("node_modules"),
+        )
+        .unwrap();
+
+        let worktree = patched_verification_worktree(&[], tmp.path()).unwrap();
+        assert!(worktree.path().join("node_modules/inc/index.js").is_file());
+        drop(worktree);
+        assert!(dep.join("index.js").is_file());
+    }
+
+    #[tokio::test]
+    async fn explicit_checks_replace_detection_and_run_in_the_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("app.py"), "VALUE = 1\n").unwrap();
+        std::fs::write(
+            root.join("check.js"),
+            "const fs = require('fs');\nfs.writeFileSync('ran.txt', '');\nprocess.exit(fs.readFileSync('app.py', 'utf8').includes('VALUE = 2') ? 0 : 1);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("missing.js"),
+            "console.error('sh: 1: jest: not found');\nprocess.exit(127);\n",
+        )
+        .unwrap();
+        let check = |script: &str| LocalCheck {
+            program: "node".into(),
+            args: vec![script.into()],
+        };
+        let verify = |new: &str, script: &str| {
+            let hunk = replace_line("app.py", "VALUE = 1", new, 1);
+            let checks = [check(script)];
+            async move {
+                verify_diff_with_checks(
+                    &[hunk],
+                    root,
+                    None,
+                    VerificationExecution::HostApproved,
+                    &checks,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let pass = verify("VALUE = 2", "check.js").await;
+        assert!(
+            matches!(
+                pass,
+                VerifyResult::Pass {
+                    layer: VerifyLayer::Test
+                }
+            ),
+            "{pass:?}"
+        );
+        assert!(
+            !root.join("ran.txt").exists(),
+            "checks run in the copy, never the workspace"
+        );
+        let fail = verify("VALUE = 3", "check.js").await;
+        assert!(
+            matches!(
+                fail,
+                VerifyResult::Fail {
+                    layer: VerifyLayer::Test,
+                    ..
+                }
+            ),
+            "{fail:?}"
+        );
+        let missing = verify("VALUE = 2", "missing.js").await;
+        assert!(
+            matches!(&missing, VerifyResult::Unavailable { reason } if reason.contains("jest: not found")),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn missing_test_runner_is_recognized_on_each_shell() {
+        for line in [
+            "'jest' is not recognized as an internal or external command,",
+            "sh: 1: jest: not found",
+            "bash: jest: command not found",
+            "sandbox-exec: execvp() of 'pytest' failed: No such file or directory",
+        ] {
+            assert_eq!(
+                missing_command_line(&format!("> test\r\n{line}\r\n")),
+                Some(line)
+            );
+        }
+        assert_eq!(
+            missing_command_line("expected element not found\nAssertionError"),
+            None
+        );
+    }
+
+    #[test]
     fn check_memo_keys_on_exact_tree_content_and_skips_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -1592,11 +1776,22 @@ mod tests {
         )
         .unwrap();
         let policy = VerificationExecution::HostApproved;
-        let first = tree_fingerprint(dir.path(), &[], policy).unwrap();
-        assert_eq!(first, tree_fingerprint(dir.path(), &[], policy).unwrap());
+        let first = tree_fingerprint(dir.path(), &[], policy, &[]).unwrap();
+        assert_eq!(
+            first,
+            tree_fingerprint(dir.path(), &[], policy, &[]).unwrap()
+        );
         assert_ne!(
             first,
-            tree_fingerprint(dir.path(), &["p".into()], policy).unwrap()
+            tree_fingerprint(dir.path(), &["p".into()], policy, &[]).unwrap()
+        );
+        let check = LocalCheck {
+            program: "cargo".into(),
+            args: vec!["test".into()],
+        };
+        assert_ne!(
+            first,
+            tree_fingerprint(dir.path(), &[], policy, &[check]).unwrap()
         );
         fs::write(
             dir.path().join("src/lib.rs"),
@@ -1604,7 +1799,7 @@ mod tests {
 ",
         )
         .unwrap();
-        let second = tree_fingerprint(dir.path(), &[], policy).unwrap();
+        let second = tree_fingerprint(dir.path(), &[], policy, &[]).unwrap();
         assert_ne!(first, second);
 
         let pass = VerifyResult::Pass {

@@ -749,6 +749,7 @@ impl Default for App {
                 base_url: None,
                 keys: Default::default(),
                 allow_unverified_model: None,
+                pin_model: false,
             },
             budget: crate::config::BudgetConfig {
                 max_tokens: None,
@@ -5143,12 +5144,18 @@ fn default_model_for(provider: &str) -> String {
 }
 
 /// Cheap/local use the configured model when set. Standard and frontier use
-/// per-tier ids so escalation is not the same model as cheap.
-fn model_for_dispatch(provider: &str, configured: Option<&str>, tier: ModelTier) -> String {
+/// per-tier ids so escalation is not the same model as cheap, unless `pin`
+/// (`pin_model = true`) keeps the configured model on every tier.
+fn model_for_dispatch(
+    provider: &str,
+    configured: Option<&str>,
+    tier: ModelTier,
+    pin: bool,
+) -> String {
     // Keyless providers (Ollama, custom/OpenAI-compatible endpoints) serve
     // whatever the user installed; there is no tier ladder to escalate to,
     // so every tier uses the configured model.
-    if !provider_requires_key(provider) {
+    if pin || !provider_requires_key(provider) {
         if let Some(model) = configured.filter(|s| !s.trim().is_empty()) {
             return model.to_string();
         }
@@ -5227,7 +5234,8 @@ fn print_help() {
          phonton goal --local list\n  \
          phonton goal --local show RUN_ID\n  \
          phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  \
-         phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n\
+         phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  \
+         phonton goal <goal> [--check <JSON-array>]...\n\
          \n\
          BENCHMARK:\n  \
          phonton benchmark export --latest --format json\n\
@@ -5531,6 +5539,8 @@ pub(crate) struct HeadlessGoalOptions {
     direct_task: bool,
     timeout_seconds: u64,
     resume_task_id: Option<TaskId>,
+    /// `--check` commands; empty keeps detected checks.
+    checks: Vec<phonton_types::local_run::LocalCheck>,
 }
 
 #[derive(Debug, Clone)]
@@ -5542,7 +5552,7 @@ pub(crate) struct HeadlessGoalResult {
 
 fn print_goal_help() {
     println!(
-        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nEvery edit is verified by running this repository's own checks on this machine. In a terminal, phonton goal asks first; in scripts, pass --allow-host-checks.
+        "Usage:\n  phonton goal [--prompt-file <path>|--stdin|<goal>] [--json] [--yes]\n  phonton goal [--allow-host-checks] [--timeout-seconds <n>] [--task]\n  phonton goal <goal> [--check '[\"python\",\"-m\",\"pytest\"]']...\n  phonton goal --resume <task-id> [--allow-host-checks]\n\nRuns a noninteractive goal through Phonton's goal -> plan -> edit -> verify -> review loop.\nEvery edit is verified by running this repository's own checks on this machine. In a terminal, phonton goal asks first; in scripts, pass --allow-host-checks.\n--check runs that command (a JSON array: program, then arguments) on a copy of the repository instead of the detected cargo, npm test or browser checks; repeat it for several checks. Each must exit 0.
 With a local provider and a calibrated model, goals run through the local harness; see phonton goal --local --help."
     );
 }
@@ -5574,6 +5584,27 @@ fn apply_budget_pricing(guard: BudgetGuard, cfg: &config::Config) -> BudgetGuard
                 output_usd_micros_per_mtok: 0,
             },
         );
+    }
+    if provider == "anthropic" {
+        // Anthropic list prices for every tier the dispatcher can select.
+        // ponytail: prompts up to 100K tokens only; Haiku 5.5 bills 5x above
+        // that, so long-prompt receipts read low until prices are tiered.
+        let mut guard = guard;
+        for (id, input, output) in [
+            ("claude-haiku-5-5", 100_000, 500_000),
+            ("claude-sonnet-5-5", 2_000_000, 10_000_000),
+            ("claude-opus-5-5", 4_000_000, 20_000_000),
+        ] {
+            guard = guard.with_price(
+                kind,
+                id,
+                ModelPricing {
+                    input_usd_micros_per_mtok: input,
+                    output_usd_micros_per_mtok: output,
+                },
+            );
+        }
+        return guard;
     }
     if provider == "cloudflare" && model == "@cf/moonshotai/kimi-k2.6" {
         return guard.with_price(
@@ -5627,11 +5658,19 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
     let mut prompt_file: Option<PathBuf> = None;
     let mut read_stdin = false;
     let mut resume_task_id: Option<TaskId> = None;
+    let mut checks = Vec::new();
     let mut positionals = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--check" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--check requires a JSON array"))?;
+                checks.push(local_goal_cli::parse_check(raw)?);
+            }
             "--resume" => {
                 i += 1;
                 let raw = args
@@ -5738,6 +5777,7 @@ fn parse_headless_goal_options(args: &[String]) -> Result<HeadlessGoalOptions> {
         direct_task,
         timeout_seconds,
         resume_task_id,
+        checks,
     })
 }
 
@@ -5853,6 +5893,12 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
             }
             if opts.host_checks_approved {
                 local_args.push("--allow-host-checks".into());
+            }
+            for check in &opts.checks {
+                local_args.push("--check".into());
+                let argv: Vec<&String> =
+                    std::iter::once(&check.program).chain(&check.args).collect();
+                local_args.push(serde_json::to_string(&argv)?);
             }
             return Box::pin(local_goal_cli::run(&local_args)).await;
         }
@@ -6099,42 +6145,46 @@ pub(crate) async fn execute_headless_goal(
     } else {
         phonton_types::verification::VerificationExecution::RequireIsolation
     };
-    let dispatcher: Arc<dyn WorkerDispatcher> =
-        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
-            let provider_name = cfg.provider.name.clone();
-            let account_id = cfg.provider.account_id.clone();
-            let base_url = cfg.provider.base_url.clone();
-            let configured_model = cfg.provider.model.clone();
+    let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) =
+        provider_key_for_run(&cfg.provider)
+    {
+        let provider_name = cfg.provider.name.clone();
+        let account_id = cfg.provider.account_id.clone();
+        let base_url = cfg.provider.base_url.clone();
+        let configured_model = cfg.provider.model.clone();
+        let pin_model = cfg.provider.pin_model;
 
-            let factory = move |tier: phonton_types::ModelTier| {
-                let model = model_for_dispatch(&provider_name, configured_model.as_deref(), tier);
-                let provider_cfg = make_api_provider_config(
-                    &provider_name,
-                    api_key.clone(),
-                    model,
-                    account_id.clone(),
-                    base_url.clone(),
-                )
-                .expect("unknown provider config");
-                provider_for(provider_cfg)
-            };
-
-            let guard = ExecutionGuard::new(working_dir.clone());
-            let mut dispatcher =
-                phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
-                    .with_task_id(task_id)
-                    .with_memory(memory_store.clone())
-                    .with_verification_execution(verification_execution);
-            if let Some(ctx) = semantic_context.clone() {
-                dispatcher = dispatcher.with_semantic_context(ctx);
-            }
-            if let Some(runtime) = mcp_runtime.clone() {
-                dispatcher = dispatcher.with_mcp_runtime(runtime);
-            }
-            Arc::new(dispatcher)
-        } else {
-            Arc::new(StubDispatcher::new(sandbox.clone()))
+        let factory = move |tier: phonton_types::ModelTier| {
+            let model =
+                model_for_dispatch(&provider_name, configured_model.as_deref(), tier, pin_model);
+            let provider_cfg = make_api_provider_config(
+                &provider_name,
+                api_key.clone(),
+                model,
+                account_id.clone(),
+                base_url.clone(),
+            )
+            .expect("unknown provider config");
+            provider_for(provider_cfg)
         };
+
+        let guard = ExecutionGuard::new(working_dir.clone());
+        let mut dispatcher =
+            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                .with_task_id(task_id)
+                .with_memory(memory_store.clone())
+                .with_verification_execution(verification_execution)
+                .with_verification_checks(opts.checks.clone());
+        if let Some(ctx) = semantic_context.clone() {
+            dispatcher = dispatcher.with_semantic_context(ctx);
+        }
+        if let Some(runtime) = mcp_runtime.clone() {
+            dispatcher = dispatcher.with_mcp_runtime(runtime);
+        }
+        Arc::new(dispatcher)
+    } else {
+        Arc::new(StubDispatcher::new(sandbox.clone()))
+    };
 
     let diff_applier = DiffApplier::open(&working_dir)
         .ok()
@@ -6148,6 +6198,7 @@ pub(crate) async fn execute_headless_goal(
 
     let mut orchestrator = Orchestrator::new(dispatcher)
         .with_verification_execution(verification_execution)
+        .with_verification_checks(opts.checks.clone())
         .with_naive_baseline(naive)
         .with_budget_guard(budget_guard)
         .with_working_dir(working_dir.clone())
@@ -6949,6 +7000,7 @@ async fn run_app<B: Backend>(
                                     base_url: None,
                                     keys: Default::default(),
                                     allow_unverified_model: None,
+                                    pin_model: false,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -7005,6 +7057,7 @@ async fn run_app<B: Backend>(
                                     base_url: None,
                                     keys: Default::default(),
                                     allow_unverified_model: None,
+                                    pin_model: false,
                                 };
                                 provider_key_for_run(&stub).unwrap_or_default()
                             } else {
@@ -7111,6 +7164,7 @@ async fn run_app<B: Backend>(
                                         base_url: None,
                                         keys: Default::default(),
                                         allow_unverified_model: None,
+                                        pin_model: false,
                                     };
                                     provider_key_for_run(&stub).unwrap_or_default()
                                 } else {
@@ -7912,44 +7966,47 @@ async fn spawn_goal(
         ))
     };
 
-    let dispatcher: Arc<dyn WorkerDispatcher> =
-        if let Some(api_key) = provider_key_for_run(&cfg.provider) {
-            let provider_name = cfg.provider.name.clone();
-            let account_id = cfg.provider.account_id.clone();
-            let base_url = cfg.provider.base_url.clone();
-            // CRITICAL: honour a configured cheap/local model, but escalate on
-            // per-tier ids so Standard/Frontier are not the same model as Cheap.
-            let configured_model = cfg.provider.model.clone();
+    let dispatcher: Arc<dyn WorkerDispatcher> = if let Some(api_key) =
+        provider_key_for_run(&cfg.provider)
+    {
+        let provider_name = cfg.provider.name.clone();
+        let account_id = cfg.provider.account_id.clone();
+        let base_url = cfg.provider.base_url.clone();
+        // CRITICAL: honour a configured cheap/local model, but escalate on
+        // per-tier ids so Standard/Frontier are not the same model as Cheap.
+        let configured_model = cfg.provider.model.clone();
+        let pin_model = cfg.provider.pin_model;
 
-            let factory = move |tier: phonton_types::ModelTier| {
-                let model = model_for_dispatch(&provider_name, configured_model.as_deref(), tier);
-                let provider_cfg = make_api_provider_config(
-                    &provider_name,
-                    api_key.clone(),
-                    model,
-                    account_id.clone(),
-                    base_url.clone(),
-                )
-                .expect("unknown provider config");
-                provider_for(provider_cfg)
-            };
-
-            let guard = ExecutionGuard::new(working_dir.clone());
-            let mut d =
-                phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
-                    .with_task_id(task_id)
-                    .with_memory(memory_store.clone())
-                    .with_verification_execution(verification_execution);
-            if let Some(ctx) = semantic_context.clone() {
-                d = d.with_semantic_context(ctx);
-            }
-            if let Some(runtime) = mcp_runtime.clone() {
-                d = d.with_mcp_runtime(runtime);
-            }
-            Arc::new(d)
-        } else {
-            Arc::new(StubDispatcher::new(sandbox.clone()))
+        let factory = move |tier: phonton_types::ModelTier| {
+            let model =
+                model_for_dispatch(&provider_name, configured_model.as_deref(), tier, pin_model);
+            let provider_cfg = make_api_provider_config(
+                &provider_name,
+                api_key.clone(),
+                model,
+                account_id.clone(),
+                base_url.clone(),
+            )
+            .expect("unknown provider config");
+            provider_for(provider_cfg)
         };
+
+        let guard = ExecutionGuard::new(working_dir.clone());
+        let mut d =
+            phonton_worker::dispatcher::RealDispatcher::new(factory, guard, sandbox.clone())
+                .with_task_id(task_id)
+                .with_memory(memory_store.clone())
+                .with_verification_execution(verification_execution);
+        if let Some(ctx) = semantic_context.clone() {
+            d = d.with_semantic_context(ctx);
+        }
+        if let Some(runtime) = mcp_runtime.clone() {
+            d = d.with_mcp_runtime(runtime);
+        }
+        Arc::new(d)
+    } else {
+        Arc::new(StubDispatcher::new(sandbox.clone()))
+    };
 
     // Wire phonton-diff so the orchestrator takes a checkpoint commit
     // after every subtask passes verify.
@@ -8299,6 +8356,30 @@ mod tests {
     }
 
     #[test]
+    fn claude_5_5_prices_cover_every_dispatch_tier() {
+        let cfg = config::Config::default();
+        assert_eq!(cfg.provider.name, "anthropic");
+        let guard = apply_budget_pricing(BudgetGuard::new(BudgetLimits::default()), &cfg);
+        for (model, usd_micros) in [
+            ("claude-haiku-5-5", 600_000),
+            ("claude-sonnet-5-5", 12_000_000),
+            ("claude-opus-5-5", 24_000_000),
+        ] {
+            let cost = guard.estimate(
+                ProviderKind::Anthropic,
+                model,
+                TokenUsage {
+                    input_tokens: 1_000_000,
+                    output_tokens: 1_000_000,
+                    ..TokenUsage::default()
+                },
+            );
+            assert!(cost.pricing_known, "{model}");
+            assert_eq!(cost.total_usd_micros, usd_micros, "{model}");
+        }
+    }
+
+    #[test]
     fn deepseek_prices_do_not_apply_to_custom_or_lookalike_endpoints() {
         let mut cfg = config::Config::default();
         cfg.provider.name = "deepseek".into();
@@ -8471,6 +8552,7 @@ fn extract_id(line: &str) -> Option<String> {
             base_url: None,
             keys: Default::default(),
             allow_unverified_model: None,
+            pin_model: false,
         };
         assert_eq!(provider_key_for_run(&ollama).as_deref(), Some(""));
 
@@ -8482,6 +8564,7 @@ fn extract_id(line: &str) -> Option<String> {
             base_url: Some("http://localhost:1234/v1".into()),
             keys: Default::default(),
             allow_unverified_model: None,
+            pin_model: false,
         };
         assert_eq!(provider_key_for_run(&custom).as_deref(), Some(""));
     }
@@ -8704,6 +8787,41 @@ fn extract_id(line: &str) -> Option<String> {
         assert!(opts.json);
         assert!(!opts.direct_task);
         assert_eq!(opts.timeout_seconds, 900);
+        assert!(opts.checks.is_empty(), "no --check keeps detected checks");
+        Ok(())
+    }
+
+    #[test]
+    fn headless_goal_check_takes_json_arrays_like_local_goals() -> Result<()> {
+        let opts = parse_headless_goal_options(&[
+            "fix bug".into(),
+            "--check".into(),
+            r#"["python","-m","unittest","discover"]"#.into(),
+            "--check".into(),
+            r#"["cargo","test"]"#.into(),
+        ])?;
+        assert_eq!(opts.goal_text, "fix bug");
+        assert_eq!(
+            opts.checks,
+            [
+                phonton_types::local_run::LocalCheck {
+                    program: "python".into(),
+                    args: vec!["-m".into(), "unittest".into(), "discover".into()],
+                },
+                phonton_types::local_run::LocalCheck {
+                    program: "cargo".into(),
+                    args: vec!["test".into()],
+                },
+            ]
+        );
+        for bad in ["[]", "python -m pytest"] {
+            assert!(
+                parse_headless_goal_options(&["fix bug".into(), "--check".into(), bad.into()])
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_headless_goal_options(&["fix bug".into(), "--check".into()]).is_err());
         Ok(())
     }
 
@@ -8999,7 +9117,7 @@ fn extract_id(line: &str) -> Option<String> {
     fn local_providers_use_the_configured_model_on_every_tier() {
         for tier in [ModelTier::Cheap, ModelTier::Standard, ModelTier::Frontier] {
             assert_eq!(
-                model_for_dispatch("ollama", Some("qwen2.5-coder:7b"), tier),
+                model_for_dispatch("ollama", Some("qwen2.5-coder:7b"), tier, false),
                 "qwen2.5-coder:7b"
             );
         }
@@ -9008,10 +9126,36 @@ fn extract_id(line: &str) -> Option<String> {
             model_for_dispatch(
                 "anthropic",
                 Some("claude-haiku-4-5-20251001"),
-                ModelTier::Frontier
+                ModelTier::Frontier,
+                false
             ),
             "claude-haiku-4-5-20251001"
         );
+    }
+
+    #[test]
+    fn pinned_model_dispatches_on_every_tier() -> Result<()> {
+        let cfg: config::Config =
+            toml::from_str("[provider]\nmodel = \"claude-haiku-5-5\"\npin_model = true\n")?;
+        assert!(cfg.provider.pin_model);
+        assert!(!config::Config::default().provider.pin_model);
+        for tier in [ModelTier::Cheap, ModelTier::Standard, ModelTier::Frontier] {
+            assert_eq!(
+                model_for_dispatch("anthropic", Some("claude-haiku-5-5"), tier, true),
+                "claude-haiku-5-5"
+            );
+        }
+        // Unpinned, frontier work still escalates past the configured model.
+        assert_ne!(
+            model_for_dispatch(
+                "anthropic",
+                Some("claude-haiku-5-5"),
+                ModelTier::Frontier,
+                false
+            ),
+            "claude-haiku-5-5"
+        );
+        Ok(())
     }
 
     #[test]

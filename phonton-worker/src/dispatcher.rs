@@ -55,6 +55,7 @@ pub struct RealDispatcher {
     /// Optional MCP runtime shared by all workers for this goal.
     mcp: Option<Arc<McpRuntime>>,
     verification_execution: VerificationExecution,
+    verification_checks: Vec<phonton_types::local_run::LocalCheck>,
 }
 
 impl RealDispatcher {
@@ -92,6 +93,7 @@ impl RealDispatcher {
             semantic: None,
             mcp: None,
             verification_execution: VerificationExecution::RequireIsolation,
+            verification_checks: Vec::new(),
         }
     }
 
@@ -99,6 +101,16 @@ impl RealDispatcher {
     /// The orchestrator must independently use the same policy.
     pub fn with_verification_execution(mut self, policy: VerificationExecution) -> Self {
         self.verification_execution = policy;
+        self
+    }
+
+    /// User-selected checks for the worker's verification pass. The
+    /// orchestrator must independently use the same checks.
+    pub fn with_verification_checks(
+        mut self,
+        checks: Vec<phonton_types::local_run::LocalCheck>,
+    ) -> Self {
+        self.verification_checks = checks;
         self
     }
 
@@ -146,7 +158,8 @@ impl WorkerDispatcher for RealDispatcher {
         let mut worker = Worker::new(provider, self.guard.clone())
             .with_sandbox(Arc::clone(&self.sandbox))
             .with_context_manager(Arc::clone(&self.context))
-            .with_verification_execution(self.verification_execution);
+            .with_verification_execution(self.verification_execution)
+            .with_verification_checks(self.verification_checks.clone());
 
         if let Some(tx) = msg_tx {
             worker = worker.with_msg_tx(tx);
@@ -299,6 +312,61 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("src/math.js"))?,
             "export function add(a, b) {\n  return a - b;\n}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_checks_reach_worker_verification() -> Result<()> {
+        // No package.json: without the check nothing executable verifies this.
+        let temp = tempfile::tempdir()?;
+        std::fs::create_dir_all(temp.path().join("src"))?;
+        std::fs::write(
+            temp.path().join("src/math.js"),
+            "export function add(a, b) {\n  return a - b;\n}\n",
+        )?;
+        std::fs::write(
+            temp.path().join("check.js"),
+            "process.exit(require('fs').readFileSync('src/math.js', 'utf8').includes('a + b') ? 0 : 1);\n",
+        )?;
+        let sandbox = Arc::new(Sandbox::new(
+            temp.path().to_path_buf(),
+            "checks-test".into(),
+        ));
+        let result = RealDispatcher::new(
+            |_| Box::new(DiffProvider) as Box<dyn Provider>,
+            ExecutionGuard::new(temp.path().to_path_buf()),
+            sandbox,
+        )
+        .with_verification_execution(VerificationExecution::HostApproved)
+        .with_verification_checks(vec![phonton_types::local_run::LocalCheck {
+            program: "node".into(),
+            args: vec!["check.js".into()],
+        }])
+        .dispatch(
+            Subtask {
+                id: SubtaskId::new(),
+                description: "Fix add in src/math.js".into(),
+                model_tier: ModelTier::Cheap,
+                dependencies: Vec::new(),
+                attachments: Vec::new(),
+                prompt_artifacts: Vec::new(),
+                status: SubtaskStatus::Queued,
+            },
+            Vec::new(),
+            0,
+            None,
+        )
+        .await?;
+        assert!(
+            matches!(
+                result.verify_result,
+                VerifyResult::Pass {
+                    layer: VerifyLayer::Test
+                }
+            ),
+            "{:?}",
+            result.verify_result
         );
         Ok(())
     }
