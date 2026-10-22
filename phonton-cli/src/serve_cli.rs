@@ -318,6 +318,7 @@ async fn goal_start(state: AppState, params: Value) -> Result<Value> {
         direct_task,
         timeout_seconds,
         resume_task_id: None,
+        checks: Vec::new(),
     };
     let failure_tx = state_tx.clone();
     let hooks = HeadlessGoalHooks {
