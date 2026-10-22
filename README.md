@@ -164,6 +164,9 @@ phonton goal "add input validation to config loading" --yes --allow-host-checks
 # Run an exact prompt file, useful for benchmark and CI harnesses
 phonton goal --prompt-file prompt.md --yes --allow-host-checks --json
 
+# Verify with your own test command instead of the detected checks
+phonton goal "fix the parser" --check '["python","-m","pytest","-q"]' --yes --allow-host-checks
+
 # Preview the task graph and GoalContract without editing files
 phonton plan --json "refactor auth layer"
 
@@ -205,6 +208,10 @@ openai = "sk-proj-openai-key-here"
 [index]
 backend = "local-hnsw"
 ```
+
+A goal that keeps failing verification escalates to the provider's larger
+models. Add `pin_model = true` under `[provider]` to use `model` on every
+tier instead, for example to compare models fairly.
 
 Optional Qdrant code retrieval:
 

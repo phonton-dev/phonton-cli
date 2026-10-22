@@ -96,6 +96,7 @@ pub struct Worker {
     /// Optional MCP runtime used for attributed tool calls.
     mcp: Option<Arc<McpRuntime>>,
     verification_execution: VerificationExecution,
+    verification_checks: Vec<phonton_types::local_run::LocalCheck>,
 }
 
 /// Bundle of the embedder + prebuilt index used to surface relevant
@@ -137,6 +138,7 @@ impl Worker {
             context: Arc::new(tokio::sync::Mutex::new(context)),
             mcp: None,
             verification_execution: VerificationExecution::RequireIsolation,
+            verification_checks: Vec::new(),
         }
     }
 
@@ -144,6 +146,16 @@ impl Worker {
     /// Without an explicit choice, project checks require isolation.
     pub fn with_verification_execution(mut self, policy: VerificationExecution) -> Self {
         self.verification_execution = policy;
+        self
+    }
+
+    /// User-selected checks that replace detected verification commands.
+    /// Empty keeps detection (cargo, `npm test`, browser).
+    pub fn with_verification_checks(
+        mut self,
+        checks: Vec<phonton_types::local_run::LocalCheck>,
+    ) -> Self {
+        self.verification_checks = checks;
         self
     }
 
@@ -589,11 +601,12 @@ impl Worker {
             };
             debug!(attempt, hunks = hunks.len(), "worker received diff");
 
-            let verdict = phonton_verify::verify_diff_with_execution(
+            let verdict = phonton_verify::verify_diff_with_checks(
                 &hunks,
                 self.guard.project_root(),
                 None,
                 self.verification_execution,
+                &self.verification_checks,
             )
             .await?;
             match verdict {
