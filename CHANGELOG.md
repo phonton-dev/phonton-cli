@@ -4,7 +4,7 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
-## Unreleased
+## 0.26.0 - Cloud goals run your own checks
 
 ### Added
 
