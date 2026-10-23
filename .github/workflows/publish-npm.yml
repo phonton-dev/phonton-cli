@@ -63,14 +63,17 @@ jobs:
           VERSION: ${{ steps.package.outputs.version }}
         shell: bash
         run: |
-          for attempt in {1..30}; do
+          # npm listed 0.25.2 about 7 minutes and 0.26.0 about 5 minutes after
+          # `npm publish` returned, so wait up to 15.
+          for attempt in {1..90}; do
             published="$(npm view "phonton-cli@${VERSION}" version 2>/dev/null || true)"
             if [ "$published" = "$VERSION" ]; then
               echo "$published"
               exit 0
             fi
-            echo "Waiting for phonton-cli@${VERSION} to propagate to npm (${attempt}/30)."
+            echo "Waiting for phonton-cli@${VERSION} to propagate to npm (${attempt}/90)."
             sleep 10
           done
 
+          echo "::error::npm accepted phonton-cli@${VERSION} but has not listed it after 15 minutes. Check 'npm view phonton-cli@${VERSION} version' before re-running: a re-run stops at the already-published check."
           npm view "phonton-cli@${VERSION}" version
