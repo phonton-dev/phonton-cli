@@ -2518,6 +2518,7 @@ mod tests {
                 diff: "--- a/code.py\n+++ b/code.py\n@@ -1,1 +1,1 @@\n-old\n+new\n".into(),
                 context: None,
                 decision: None,
+                sampling: None,
             });
         std::fs::write(
             dir.path().join("receipt.json"),

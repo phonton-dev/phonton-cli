@@ -2,6 +2,7 @@
 
 use crate::{estimate_fit, LocalError, Result};
 use phonton_types::local::*;
+use phonton_types::local_run::Sampling;
 use reqwest::{redirect::Policy, Client, Url};
 use serde_json::{json, Value};
 use std::future::Future;
@@ -275,6 +276,8 @@ pub struct EditRequest<'a> {
     pub create_path: Option<&'a str>,
     /// Require the selected loaded model to remain observable just before chat.
     pub required_resident: Option<&'a ResidentModel>,
+    /// Seeded non-zero temperature; `None` keeps the calibrated temperature 0.
+    pub sampling: Option<Sampling>,
 }
 
 /// Bounded structured strategy request, separate from a candidate edit.
@@ -295,6 +298,8 @@ pub struct HypothesisRequest<'a> {
     pub thinking: LocalThinkingMode,
     /// Exact resident identity required for low-memory reuse.
     pub required_resident: Option<&'a ResidentModel>,
+    /// Seeded non-zero temperature; `None` keeps the calibrated temperature 0.
+    pub sampling: Option<Sampling>,
 }
 
 /// Exact structured-edit constraint schema, shared by context admission and the
@@ -314,6 +319,17 @@ pub fn create_schema(path: &str) -> Value {
 pub struct LocalRuntime {
     endpoint: String,
     http: Client,
+}
+
+/// Bounded generation options. Without `sampling` these are the calibrated
+/// temperature-0 options, byte for byte.
+fn generation_options(context: u32, output: u32, sampling: Option<Sampling>) -> Value {
+    let mut options = json!({ "num_ctx": context, "num_predict": output, "temperature": 0 });
+    if let Some(Sampling { temperature, seed }) = sampling {
+        options["temperature"] = json!(temperature);
+        options["seed"] = json!(seed);
+    }
+    options
 }
 
 fn with_thinking_mode(mut request: Value, thinking: LocalThinkingMode) -> Value {
@@ -818,7 +834,7 @@ impl LocalRuntime {
                 "model": request.model, "stream": false, "keep_alive": "2m",
                 "format": request.schema,
                 "messages": [{"role":"system", "content":request.system}, {"role":"user", "content":request.user}],
-                "options": { "num_ctx": request.context, "num_predict": request.output, "temperature": 0 }
+                "options": generation_options(request.context, request.output, request.sampling)
             }), request.thinking),
         )
         .await
@@ -864,6 +880,7 @@ impl LocalRuntime {
             searches,
             create_path,
             required_resident,
+            sampling,
         } = request;
         if let Some(path) = create_path {
             if paths != [path] || protocol != EditProtocol::SearchReplace {
@@ -882,7 +899,7 @@ impl LocalRuntime {
                 &with_thinking_mode(json!({
                     "model": name, "stream": false, "keep_alive": "2m",
                     "messages": [{"role":"system", "content":system}, {"role":"user", "content":user}],
-                    "options": { "num_ctx": context, "num_predict": output, "temperature": 0 }
+                    "options": generation_options(context, output, sampling)
                 }), thinking),
             ).await;
         }
@@ -892,7 +909,7 @@ impl LocalRuntime {
                 "model": name, "stream": false, "keep_alive": "2m",
                 "format": create_path.map(create_schema).unwrap_or_else(|| edit_schema(paths, searches)),
                 "messages":[{"role":"system","content":system},{"role":"user","content":user}],
-                "options":{"num_ctx":context,"num_predict":output,"temperature":0}
+                "options":generation_options(context, output, sampling)
             }), thinking),
         )
         .await
@@ -1091,6 +1108,7 @@ impl LocalRuntime {
                     searches: &["def add(a, b): return a - b".into()],
                     create_path: None,
                     required_resident: required_resident.as_ref(),
+                    sampling: None,
                 })
                 .await;
             let probe = match result {
@@ -1187,6 +1205,7 @@ impl LocalRuntime {
                 searches: &[],
                 create_path,
                 required_resident: required_resident.as_ref(),
+                sampling: None,
             }).await;
             let creation_probe = match creation_result {
                 Ok(response) => {
@@ -1757,6 +1776,25 @@ fn create_probe_passed(protocol: EditProtocol, output: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generation_options_stay_temperature_zero_unless_sampling_is_requested() {
+        assert_eq!(
+            generation_options(4096, 512, None),
+            json!({"num_ctx": 4096, "num_predict": 512, "temperature": 0})
+        );
+        assert_eq!(
+            generation_options(
+                4096,
+                512,
+                Some(Sampling {
+                    temperature: 0.7,
+                    seed: 3
+                })
+            ),
+            json!({"num_ctx": 4096, "num_predict": 512, "temperature": 0.7, "seed": 3})
+        );
+    }
+
     fn fixed_hardware(
         hardware: HardwareSnapshot,
     ) -> impl Fn() -> std::future::Ready<HardwareSnapshot> {
@@ -2126,6 +2164,7 @@ mod tests {
                 output: 128,
                 thinking: profile.thinking.unwrap_or_default(),
                 required_resident: None,
+                sampling: None,
             })
             .await
             .unwrap();
@@ -2837,6 +2876,7 @@ mod tests {
                 searches: &[],
                 create_path: None,
                 required_resident: Some(&required),
+                sampling: None,
             })
             .await
             .unwrap_err();

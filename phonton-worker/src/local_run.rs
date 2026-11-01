@@ -637,6 +637,7 @@ async fn run_inner(
             receipt.known_gaps.push(decision.reason);
             break;
         }
+        let sampling = search::sampling(&receipt.candidates, number);
         let creating = receipt.request.new_file.is_some() && decision.parent_candidate.is_none();
         let repairing_created_file = !creating
             && decision.action == SearchAction::Repair
@@ -881,6 +882,7 @@ async fn run_inner(
                     output: hypothesis_output,
                     thinking: receipt.profile.thinking.unwrap_or_default(),
                     required_resident: required_resident.as_ref(),
+                    sampling,
                 }),
             )
             .await;
@@ -1244,6 +1246,7 @@ async fn run_inner(
                 searches: &searches,
                 create_path: create_path.as_deref(),
                 required_resident: required_resident.as_ref(),
+                sampling,
             }),
         )
         .await;
@@ -1270,6 +1273,7 @@ async fn run_inner(
             diff: String::new(),
             context: Some(assembly.evidence),
             decision: Some(decision),
+            sampling,
         };
         match response {
             Ok(Ok(response)) => {
@@ -1294,6 +1298,10 @@ async fn run_inner(
                 candidate.rejection =
                     Some("Run wall-time budget exhausted during generation".into())
             }
+        }
+        if search::repeats_output(&receipt.candidates, &candidate.raw_output) {
+            // Same bytes, same verdict: never spend checks on it again.
+            candidate.rejection = Some(search::REPEATED_OUTPUT.into());
         }
         let parent_changed_during_inference =
             scoped_hash(&parent, &files, receipt.request.new_file.as_ref(), true)
