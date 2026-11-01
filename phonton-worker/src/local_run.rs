@@ -133,6 +133,12 @@ fn creation_system_instruction(path: &Path, protocol: EditProtocol) -> String {
     }
 }
 
+/// Whole-file rewrite of one existing file, using the creation transport.
+fn whole_file_system_instruction(path: &Path) -> String {
+    let path = model_relative_path(path);
+    format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly. Your previous search and replacement changed nothing. No prose, commands, test changes, or other paths.")
+}
+
 /// Host RAM a chat with an exact resident model needs free when that copy is
 /// entirely in VRAM. Its runtime allocation was made at load time and is
 /// already outside the available reading, so the 1.5 GiB cold-load reserve
@@ -625,13 +631,25 @@ async fn run_inner(
             .budget
             .generated_tokens
             .saturating_sub(receipt.generated_tokens_reserved);
-        let decision = search::next_with_budget(
+        let mut decision = search::next_with_budget(
             &receipt.candidates,
             receipt.model_calls_reserved,
             receipt.request.budget.generations,
             reserved_left,
             receipt.request.new_file.is_some() && !receipt.request.editable_existing.is_empty(),
         );
+        let mut whole_file = None;
+        if decision.action != SearchAction::Stop
+            && receipt.profile.protocol == Some(EditProtocol::SearchReplace)
+            && receipt.request.new_file.is_none()
+        {
+            if let Some((retry, path)) =
+                search::whole_file_retry(&receipt.candidates, &receipt.request.files, &baseline)
+            {
+                decision = retry;
+                whole_file = Some(path);
+            }
+        }
         if decision.action == SearchAction::Stop {
             receipt.state = "search_stopped".into();
             receipt.known_gaps.push(decision.reason);
@@ -1044,33 +1062,56 @@ async fn run_inner(
         }.to_owned()
         };
         let strategy_reserve = strategy_note.as_ref().map_or(0, String::len);
-        let assembly_result = context::assemble_with_evidence(
-            &edit_request,
-            &parent,
-            &system,
-            context::ModelContext {
-                protocol: receipt
-                    .profile
-                    .protocol
-                    .ok_or_else(|| invalid("Missing measured protocol"))?,
-                capacity: receipt
-                    .profile
-                    .context_tokens
-                    .saturating_sub(strategy_reserve as u32),
+        // A small file the last SearchReplace answer could not change is shown
+        // whole and rewritten whole; if it cannot fit, the ordinary edit runs.
+        let whole_file_assembly = whole_file.as_ref().and_then(|path| {
+            let system = whole_file_system_instruction(path);
+            let model = context::ModelContext {
+                protocol: EditProtocol::SearchReplace,
+                capacity: receipt.profile.context_tokens,
                 output,
-            },
-            context::EvidenceInput {
-                feedback: &diagnostics,
-                verifier: &verifier_diagnostics,
-                focus_path: if repairing_created_file {
-                    receipt.request.new_file.as_deref()
-                } else {
-                    None
+            };
+            context::whole_file(&edit_request, &parent, &system, model, &diagnostics, path)
+                .ok()
+                .map(|assembly| (system, assembly))
+        });
+        if whole_file_assembly.is_none() {
+            whole_file = None;
+        } else {
+            approach = "whole-file rewrite after an unchanged search/replace".into();
+        }
+        let (system, assembly_result) = if let Some((system, assembly)) = whole_file_assembly {
+            (system, Ok(assembly))
+        } else {
+            let assembly = context::assemble_with_evidence(
+                &edit_request,
+                &parent,
+                &system,
+                context::ModelContext {
+                    protocol: receipt
+                        .profile
+                        .protocol
+                        .ok_or_else(|| invalid("Missing measured protocol"))?,
+                    capacity: receipt
+                        .profile
+                        .context_tokens
+                        .saturating_sub(strategy_reserve as u32),
+                    output,
                 },
-            },
-            false,
-            excluded_searches,
-        );
+                context::EvidenceInput {
+                    feedback: &diagnostics,
+                    verifier: &verifier_diagnostics,
+                    focus_path: if repairing_created_file {
+                        receipt.request.new_file.as_deref()
+                    } else {
+                        None
+                    },
+                },
+                false,
+                excluded_searches,
+            );
+            (system, assembly)
+        };
         let mut assembly = match assembly_result {
             Ok(assembly) => assembly,
             Err(error) if !creating && receipt.request.new_file.is_some() => {
@@ -1171,7 +1212,7 @@ async fn run_inner(
                     .as_ref()
                     .map(|path| model_relative_path(path))
             } else {
-                None
+                whole_file.as_deref().map(model_relative_path)
             };
         let directory = run_dir.join(format!("candidate-{number}"));
         copy_with_creation(
@@ -1328,7 +1369,9 @@ async fn run_inner(
                 &parent,
                 &paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
                 &candidate.raw_output,
-                receipt.request.new_file.as_ref().filter(|_| creating),
+                whole_file
+                    .as_ref()
+                    .or(receipt.request.new_file.as_ref().filter(|_| creating)),
             );
             match materialized {
                 Err(e) => candidate.rejection = Some(e.to_string()),

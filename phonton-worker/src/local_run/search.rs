@@ -6,7 +6,7 @@ use phonton_types::{
 };
 use phonton_types::{DiffHunk, DiffLine};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub(super) struct GroundedHypothesis {
@@ -321,6 +321,57 @@ pub(super) fn ground_hypothesis(
         search,
         mechanism,
         difference,
+    })
+}
+
+/// Largest file rewritten whole after SearchReplace changed nothing.
+pub(super) const WHOLE_FILE_MAX_LINES: usize = 300;
+
+/// A SearchReplace answer that changed nothing on a small file is retried as
+/// a whole-file rewrite of the file it chose, from the same parent. A
+/// whole-file answer has no `search` key, so this fires once per branch.
+/// `baseline` is the parent directory of a first edit.
+pub(super) fn whole_file_retry(
+    candidates: &[CandidateEvidence],
+    scope: &[PathBuf],
+    baseline: &Path,
+) -> Option<(SearchDecision, PathBuf)> {
+    let last = candidates.last()?;
+    if !matches!(
+        last.rejection.as_deref(),
+        Some("Edit makes no change" | "No change or file budget exceeded")
+    ) {
+        return None;
+    }
+    let answer: Value = serde_json::from_str(&last.raw_output).ok()?;
+    answer.get("search")?;
+    let chosen = answer["path"].as_str()?;
+    let path = scope
+        .iter()
+        .find(|path| path.to_string_lossy().replace('\\', "/") == chosen)?
+        .clone();
+    let parent = last.decision.as_ref()?.parent_candidate;
+    let directory = match parent {
+        Some(number) => &candidates.iter().find(|c| c.number == number)?.directory,
+        None => baseline,
+    };
+    let lines = std::fs::read_to_string(directory.join(&path))
+        .ok()?
+        .lines()
+        .count();
+    (lines <= WHOLE_FILE_MAX_LINES).then(|| {
+        (
+            SearchDecision {
+                action: if parent.is_some() {
+                    SearchAction::Repair
+                } else {
+                    SearchAction::Initial
+                },
+                parent_candidate: parent,
+                reason: format!("SearchReplace made no applicable change; rewrite {chosen} whole"),
+            },
+            path,
+        )
     })
 }
 
@@ -1459,6 +1510,50 @@ mod tests {
         assert!(feedback(&[], &diagnostic).contains("FAIL initial_invalid_port assertion"));
         assert!(verifier_feedback(&[], &diagnostic).contains("FAIL initial_invalid_port assertion"));
     }
+    #[test]
+    fn noop_search_replace_on_a_small_file_retries_it_whole_once() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = root.path().join("baseline");
+        std::fs::create_dir_all(baseline.join("src")).unwrap();
+        std::fs::write(
+            baseline.join("src/add.py"),
+            "def add(a, b):\n    return a - b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            baseline.join("src/big.py"),
+            "x = 1\n".repeat(WHOLE_FILE_MAX_LINES + 1),
+        )
+        .unwrap();
+        let scope = [PathBuf::from("src").join("add.py"), "src/big.py".into()];
+        let mut noop = failed(1, None, "");
+        noop.content_sha256 = None;
+        noop.checks.clear();
+        noop.rejection = Some("No change or file budget exceeded".into());
+        noop.raw_output =
+            r#"{"path":"src/add.py","search":"return a - b","text":"return a - b"}"#.into();
+        let (decision, path) =
+            whole_file_retry(std::slice::from_ref(&noop), &scope, &baseline).unwrap();
+        assert_eq!(decision.action, SearchAction::Initial);
+        assert_eq!(decision.parent_candidate, None);
+        assert_eq!(path, scope[0]);
+
+        // Over the line limit, out of scope, or already a whole-file answer.
+        let mut big = noop.clone();
+        big.raw_output = r#"{"path":"src/big.py","search":"x = 1","text":"x = 1"}"#.into();
+        assert!(whole_file_retry(&[big], &scope, &baseline).is_none());
+        let mut outside = noop.clone();
+        outside.raw_output = r#"{"path":"other.py","search":"a","text":"a"}"#.into();
+        assert!(whole_file_retry(&[outside], &scope, &baseline).is_none());
+        let mut whole = noop.clone();
+        whole.raw_output =
+            r#"{"path":"src/add.py","text":"def add(a, b):\n    return a - b\n"}"#.into();
+        assert!(whole_file_retry(&[whole], &scope, &baseline).is_none());
+        let mut failed_checks = noop;
+        failed_checks.rejection = Some("Candidate failed the selected verification checks".into());
+        assert!(whole_file_retry(&[failed_checks], &scope, &baseline).is_none());
+    }
+
     #[test]
     fn repeated_output_resends_the_same_request_with_seeded_sampling() {
         let parent = failed(1, None, "failure");

@@ -495,6 +495,72 @@ fn assemble_with_feedback(
     Ok(assembly)
 }
 
+/// One small scoped file shown whole, for a rewrite after SearchReplace made
+/// no applicable change. Prior feedback shrinks first, as in `assemble`. Fails
+/// when the prompt, schema and an output reserve that can hold the whole file
+/// do not fit the calibrated context.
+pub(super) fn whole_file(
+    request: &LocalRunRequest,
+    root: &Path,
+    system: &str,
+    model: ModelContext,
+    diagnostics: &str,
+    path: &Path,
+) -> Result<Assembly> {
+    let started = Instant::now();
+    let source = std::fs::read_to_string(root.join(path))?;
+    // ponytail: ~3 bytes per output token of code; measure if rewrites get cut off.
+    if source.is_empty() || source.contains('\0') || source.len() > model.output as usize * 3 {
+        return Err(invalid(
+            "The file is too large to rewrite whole within the output reserve",
+        ));
+    }
+    let excerpt = SourceExcerpt {
+        path: path.to_path_buf(),
+        start_line: 1,
+        end_line: source.lines().count(),
+        text: source.clone(),
+        source_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
+        reason: "whole file for rewrite".into(),
+    };
+    let relative = model_relative_path(path);
+    let constraint_bytes =
+        serde_json::to_vec(&phonton_local::runtime::create_schema(&relative))?.len();
+    let mut limits = vec![diagnostics.len(), 700, 350, 0];
+    limits.retain(|limit| *limit <= diagnostics.len());
+    limits.dedup();
+    for limit in limits {
+        let feedback = super::truncate(diagnostics, limit);
+        let prompt = render(request, std::slice::from_ref(&excerpt), &feedback, false);
+        if system.len() + prompt.len() + model.output as usize + constraint_bytes + 256
+            > model.capacity as usize
+        {
+            continue;
+        }
+        return Ok(Assembly {
+            paths: vec![relative],
+            searches: Vec::new(),
+            evidence: ContextEvidence {
+                excerpts: vec![excerpt],
+                source_bytes_scanned: source.len(),
+                selected_source_bytes: source.len(),
+                prompt_bytes: system.len() + prompt.len(),
+                constraint_bytes,
+                context_capacity: model.capacity,
+                output_tokens_reserved: model.output,
+                omitted_source: false,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                feedback_omitted: limit < diagnostics.len(),
+                feedback,
+            },
+            prompt,
+        });
+    }
+    Err(invalid(
+        "The whole file does not fit the calibrated context with its output reserve",
+    ))
+}
+
 fn mentions_path_literal(evidence: &str, path: &str) -> bool {
     evidence.match_indices(path).any(|(start, _)| {
         let before = evidence[..start].chars().next_back();
@@ -795,6 +861,60 @@ mod tests {
             expected_source_hashes: Default::default(),
             expected_baseline_sha256: None,
         }
+    }
+    #[test]
+    fn whole_file_shows_every_line_and_needs_room_to_rewrite_it() {
+        let root = tempfile::tempdir().unwrap();
+        let source = "export function sumInclusive(start, end) {\n  return end - start;\n}\n";
+        std::fs::write(root.path().join("math.js"), source).unwrap();
+        let request = request(root.path());
+        let model = ModelContext {
+            protocol: EditProtocol::SearchReplace,
+            capacity: 4096,
+            output: 512,
+        };
+        let assembly = whole_file(
+            &request,
+            root.path(),
+            "Rewrite",
+            model,
+            "",
+            Path::new("math.js"),
+        )
+        .unwrap();
+        assert_eq!(assembly.paths, ["math.js"]);
+        assert!(assembly.searches.is_empty());
+        assert_eq!(assembly.evidence.excerpts[0].text, source);
+        assert_eq!(assembly.evidence.excerpts[0].end_line, 3);
+        assert!(assembly.prompt.contains(source));
+        assert!(!assembly.evidence.omitted_source);
+
+        let tiny_output = ModelContext {
+            output: 16,
+            ..model
+        };
+        assert!(whole_file(
+            &request,
+            root.path(),
+            "Rewrite",
+            tiny_output,
+            "",
+            Path::new("math.js")
+        )
+        .is_err());
+        let tiny_context = ModelContext {
+            capacity: 600,
+            ..model
+        };
+        assert!(whole_file(
+            &request,
+            root.path(),
+            "Rewrite",
+            tiny_context,
+            "",
+            Path::new("math.js")
+        )
+        .is_err());
     }
     #[test]
     fn context_includes_an_unterminated_final_source_line() {
