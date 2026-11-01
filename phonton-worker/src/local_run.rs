@@ -6519,8 +6519,12 @@ mod tests {
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(rustup, bin.join(cargo));
         if let Err(error) = linked {
-            // Windows without Developer Mode or admin cannot create symlinks;
-            // CI runners can, so the case is still covered there.
+            // Windows without Developer Mode or admin cannot create symlinks.
+            // CI runners can, so there a skip would hide this case.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "cannot create symlink fixture in CI: {error}"
+            );
             eprintln!("skipping: cannot create symlink fixture: {error}");
             return;
         }

@@ -67,3 +67,38 @@ jobs:
 
       - name: Test local runtime
         run: cargo test --locked -p phonton-local --no-fail-fast
+
+  windows:
+    name: Windows (workspace)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node test dependencies
+        run: |
+          npm ci --ignore-scripts
+          npx playwright install chromium
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # Includes the symlinked rustup-proxy case (cargo.exe -> rustup.exe, as
+      # scoop installs it); with CI set, that test fails instead of skipping.
+      - name: Test
+        run: cargo test --locked --workspace --no-fail-fast
