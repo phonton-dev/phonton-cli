@@ -5710,7 +5710,7 @@ fn resolve_cargo_executable(directory: &Path, check: &LocalCheck) -> Result<Path
         } else {
             directory.join(raw)
         };
-        std::fs::canonicalize(&path).map_err(|error| {
+        pin_executable(&path).map_err(|error| {
             invalid(format!(
                 "Cannot resolve selected Cargo executable {}: {error}",
                 path.display()
@@ -5729,19 +5729,34 @@ fn resolve_cargo_executable(directory: &Path, check: &LocalCheck) -> Result<Path
                     .find(|path| path.is_file())
             })
             .ok_or_else(|| invalid("Cargo executable was not found on an absolute PATH entry"))?;
-        std::fs::canonicalize(&path).map_err(|error| {
+        pin_executable(&path).map_err(|error| {
             invalid(format!(
                 "Cannot resolve Cargo executable {}: {error}",
                 path.display()
             ))
         })?
     };
-    if !selected.is_file() || selected.starts_with(directory) {
+    // The link target must be outside the candidate too, not only the name.
+    let target = std::fs::canonicalize(&selected)
+        .map_err(|error| invalid(format!("Cannot resolve Cargo executable: {error}")))?;
+    if !target.is_file() || selected.starts_with(&directory) || target.starts_with(&directory) {
         return Err(invalid(
             "Cargo verification requires an executable outside the candidate working directory",
         ));
     }
     Ok(selected)
+}
+
+/// Canonical directory plus the original file name. Rustup proxies are often
+/// symlinks to `rustup(.exe)` (scoop's `rustup-msvc`) and dispatch on the name
+/// they were started as, so canonicalizing the file itself runs rustup, which
+/// rejects `test` as a subcommand.
+fn pin_executable(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("executable path has no file name"))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    Ok(std::fs::canonicalize(parent)?.join(name))
 }
 
 fn inspect_cargo_config(cargo_directory: &Path) -> Result<()> {
@@ -6364,6 +6379,59 @@ mod tests {
             resolve_cargo_executable(&candidate, &external_check).unwrap(),
             std::fs::canonicalize(&external).unwrap()
         );
+    }
+
+    #[test]
+    fn cargo_check_keeps_rustup_proxy_name_when_cargo_is_a_symlink() {
+        // Scoop's rustup installs `cargo.exe -> rustup.exe`; rustup dispatches
+        // on the name it was started as, so the proxy name must survive.
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("candidate");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let (rustup, cargo) = if cfg!(windows) {
+            ("rustup.exe", "cargo.exe")
+        } else {
+            ("rustup", "cargo")
+        };
+        std::fs::write(bin.join(rustup), b"rustup placeholder").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(rustup, bin.join(cargo));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(rustup, bin.join(cargo));
+        if let Err(error) = linked {
+            // Windows without Developer Mode or admin cannot create symlinks;
+            // CI runners can, so the case is still covered there.
+            eprintln!("skipping: cannot create symlink fixture: {error}");
+            return;
+        }
+        let check = LocalCheck {
+            program: bin.join(cargo).to_string_lossy().into_owned(),
+            args: vec!["test".into()],
+        };
+        let resolved = resolve_cargo_executable(&candidate, &check).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), cargo);
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&bin).unwrap().join(cargo),
+            "directory is pinned, file name kept"
+        );
+
+        // A symlink inside the candidate pointing outside is still refused.
+        let inside = candidate.join(cargo);
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(bin.join(rustup), &inside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(bin.join(rustup), &inside).unwrap();
+        let inside_check = LocalCheck {
+            program: inside.to_string_lossy().into_owned(),
+            args: vec!["test".into()],
+        };
+        assert!(resolve_cargo_executable(&candidate, &inside_check)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the candidate"));
     }
     #[tokio::test]
     async fn cargo_runner_added_to_candidate_blocks_check_before_execution() {
