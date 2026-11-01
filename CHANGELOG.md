@@ -4,6 +4,40 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.27.0 - Local Rust checks run cargo; the local search wastes fewer attempts
+
+### Fixed
+
+- [fixed] Local goals on Rust could not run their checks where `cargo.exe` is
+  a symlink to `rustup.exe` (scoop's `rustup-msvc`): Phonton resolved the
+  link and started rustup, which rejected `test` as a subcommand. The check
+  now runs the proxy under its own name. The link target must still be
+  outside the candidate directory.
+- [fixed] A local goal longer than 8,192 bytes was refused before a model was
+  chosen. The limit now comes from the selected model's calibrated context
+  (three quarters of it, 12,288 bytes at 16,384 tokens).
+- [fixed] `Publish npm` failed its last step after successful publishes,
+  because npm took longer than the 5-minute wait to make the version
+  visible. It now waits up to 20 minutes.
+
+### Changed
+
+- [changed] A local model reply that repeats an earlier reply in the run byte
+  for byte is rejected without checks and the request is sent again. After
+  that, the run's model calls sample at temperature 0.7 with a recorded seed
+  instead of temperature 0, which kept returning the same reply.
+- [changed] When a local search/replace reply changes nothing on a file of at
+  most 300 lines, the next attempt asks for the whole corrected file.
+- [changed] With checks selected, a local candidate that does not add an
+  identifier the goal names is no longer rejected before its checks. If it
+  passes them, it is review-ready with a warning in the receipt. Without
+  checks it is still rejected.
+
+### Added
+
+- [added] CI runs clippy and the workspace tests on Windows, including the
+  symlinked rustup-proxy case.
+
 ## 0.26.0 - Cloud goals run your own checks
 
 ### Added

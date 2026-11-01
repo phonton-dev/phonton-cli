@@ -424,13 +424,21 @@ Unchanged failed-check identity and normalized output after a repair start a
 fresh baseline approach unless another selected check newly passes. Losing a
 pass without either signal also restarts. If a check gains a pass, or a
 different selected check now fails with the same message, the controller keeps
-that changed candidate for another repair;
-repeated candidate identities stop further inference. Feedback includes the
+that changed candidate for another repair. Feedback includes the
 rejected edit and bounded check output. The most recent failed checks precede
 copied edits so they survive tight context limits; uncheckable proposals retain
 that evidence with its candidate identity (or baseline evidence if none ran).
-Two identical rejected raw outputs that never formed a checkable candidate also
-stop inference instead of spending the remaining generations on the same reply.
+A reply whose raw output repeats an earlier one in the run byte for byte is
+rejected without parsing or checks, and the same request is sent again. From
+then on every strategy and edit call in that run samples at temperature 0.7
+with the candidate number as seed (recorded as the candidate's `sampling`);
+until then calls stay at the calibrated temperature 0. Two successive repeated
+outputs or candidate identities stop further inference.
+When a search/replace reply changes nothing and its file has at most 300 lines,
+the next edit from the same parent shows that file whole and asks for the
+complete corrected file in the whole-file JSON shape used for new files. This
+happens once per branch, and only when the file and an output reserve that can
+hold it fit the calibrated context; otherwise the ordinary edit runs.
 Different diagnostics are a search signal,
 not proof that code quality improved. Every branch uses the same run budget.
 Feedback is shortened when necessary to admit source; the exact transmitted

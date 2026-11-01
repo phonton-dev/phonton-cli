@@ -280,8 +280,9 @@ to an exact captured source span. It and the following edit spend the same call
 and token budget; the proposal is recorded but never counted as a verified edit.
 If an edit never produced candidate bytes and only one model call remains, the
 controller can retry directly from the captured baseline without a strategy
-call. It still stops on repeated identical rejected output; mixed new-file and
-existing-file work keeps its multi-call reserve.
+call. A byte-identical repeated reply is resent once with seeded sampling,
+and two successive repeats stop; mixed new-file and existing-file work keeps
+its multi-call reserve.
 The same mechanism can be tried at a different reviewed path or source span;
 repeating it at the same target stops that branch.
 Module-style JS/TS files use complete parsed function spans where they fit, and
