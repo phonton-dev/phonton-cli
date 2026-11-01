@@ -3970,7 +3970,8 @@ fn validate_plan_source(request: &LocalRunRequest, root: &Path) -> Result<()> {
 fn content_hash(root: &Path, files: &[PathBuf]) -> Result<String> {
     let canonical_root = std::fs::canonicalize(root)?;
     // Added source files can change runtime behavior without appearing in the
-    // proposed diff. Only conventional build/cache directories are excluded.
+    // proposed diff. Only conventional build/cache directories and a Cargo
+    // lockfile generated beside a captured manifest are excluded.
     let expected: BTreeSet<_> = files.iter().cloned().collect();
     let mut stack = vec![root.to_path_buf()];
     let mut entries = 0;
@@ -3995,18 +3996,20 @@ fn content_hash(root: &Path, files: &[PathBuf]) -> Result<String> {
                 ) {
                     stack.push(entry.path());
                 }
-            } else if kind.is_file()
-                && !expected.contains(
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .map_err(|_| invalid("Candidate path escaped root"))?,
-                )
-            {
-                return Err(invalid(format!(
-                    "Verification created a file outside the returned diff: {}",
-                    entry.path().display()
-                )));
+            } else if kind.is_file() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| invalid("Candidate path escaped root"))?;
+                // `cargo test` writes Cargo.lock beside a manifest that has none.
+                let cargo_lock = relative.file_name() == Some("Cargo.lock".as_ref())
+                    && expected.contains(&relative.with_file_name("Cargo.toml"));
+                if !expected.contains(relative) && !cargo_lock {
+                    return Err(invalid(format!(
+                        "Verification created a file outside the returned diff: {}",
+                        path.display()
+                    )));
+                }
             }
         }
     }
@@ -11541,6 +11544,22 @@ mod tests {
         std::fs::write(dir.path().join("code.py"), "original\n").unwrap();
         std::fs::write(dir.path().join("generated.py"), "hidden dependency\n").unwrap();
         assert!(content_hash(dir.path(), &["code.py".into()]).is_err());
+    }
+
+    #[test]
+    fn cargo_lockfile_written_by_a_check_keeps_candidate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let files: Vec<PathBuf> = vec!["Cargo.toml".into(), "src/lib.rs".into()];
+        let before = content_hash(dir.path(), &files).unwrap();
+        // `cargo test` writes Cargo.lock beside a manifest that has none.
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        assert_eq!(content_hash(dir.path(), &files).unwrap(), before);
+        // Only beside a captured manifest: elsewhere it is still an added file.
+        std::fs::write(dir.path().join("src/Cargo.lock"), "version = 4\n").unwrap();
+        assert!(content_hash(dir.path(), &files).is_err());
     }
 
     #[tokio::test]

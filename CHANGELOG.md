@@ -13,6 +13,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   link and started rustup, which rejected `test` as a subcommand. The check
   now runs the proxy under its own name. The link target must still be
   outside the candidate directory.
+- [fixed] Once cargo ran, a local Rust goal without a `Cargo.lock` stopped at
+  its baseline check: `cargo test` wrote one, and Phonton treated it as a
+  file the check added. A `Cargo.lock` written beside a captured
+  `Cargo.toml` is now ignored like `target/`.
 - [fixed] A local goal longer than 8,192 bytes was refused before a model was
   chosen. The limit now comes from the selected model's calibrated context
   (three quarters of it, 12,288 bytes at 16,384 tokens).
