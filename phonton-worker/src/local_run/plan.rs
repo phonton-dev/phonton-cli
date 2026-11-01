@@ -96,8 +96,12 @@ impl RankedSource {
 /// Inspect a bounded Git working tree without inference or project execution.
 /// Returned checks are proposals. Host permission is always cleared in a preview.
 pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
-    if request.goal.trim().is_empty() || request.goal.len() > 8192 {
-        return Err(invalid("Enter a coding goal of at most 8192 bytes"));
+    // The selected model's calibrated context sets the real limit at run start.
+    if request.goal.trim().is_empty() || request.goal.len() > super::MAX_GOAL_BYTES {
+        return Err(invalid(format!(
+            "Enter a coding goal of at most {} bytes",
+            super::MAX_GOAL_BYTES
+        )));
     }
     let root = std::fs::canonicalize(&request.repository)?;
     request.repository = root.clone();

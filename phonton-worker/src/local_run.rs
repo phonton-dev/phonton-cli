@@ -373,6 +373,7 @@ async fn run_inner(
     mut event: impl FnMut(&LocalRunReceipt),
     hardware_override: Option<HardwareOverride>,
 ) -> Result<LocalRunReceipt> {
+    goal_fits_context(&request, profile.context_tokens)?;
     if runtime_guard.origin() == RuntimeOrigin::ExternalUnverified
         && !request.allow_unverified_runtime
     {
@@ -3219,9 +3220,27 @@ fn conventional_node_test_filename(path: &Path) -> bool {
         || stem.ends_with(".test"))
 }
 
+/// Model-independent ceiling for goal text; `goal_fits_context` sets the real
+/// limit once the calibrated context is known.
+pub(crate) const MAX_GOAL_BYTES: usize = 64 * 1024;
+
+/// Edit output is capped at a quarter of the calibrated context and prompts
+/// are budgeted at one byte per token, so a goal can use at most the other
+/// three quarters. Whether the source also fits is decided at assembly.
+fn goal_fits_context(request: &LocalRunRequest, context_tokens: u32) -> Result<()> {
+    let limit = context_tokens as usize / 4 * 3;
+    if request.goal.len() > limit {
+        return Err(invalid(format!(
+            "The goal is {} bytes; the calibrated {context_tokens}-token context allows at most {limit}. Shorten the goal or calibrate a larger context.",
+            request.goal.len()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_request(request: &LocalRunRequest) -> Result<()> {
     if request.goal.trim().is_empty()
-        || request.goal.len() > 8192
+        || request.goal.len() > MAX_GOAL_BYTES
         || (request.files.is_empty() && request.new_file.is_none())
         || request.files.len() > 8
     {
@@ -8763,6 +8782,21 @@ mod tests {
             ordinary,
             "//go:build customtag\n\npackage pkg\n"
         ));
+    }
+    #[test]
+    fn goal_limit_follows_the_calibrated_context() {
+        let mut request = request();
+        // The Polyglot simple-linked-list goal (8,696 bytes) was refused at a
+        // fixed 8,192-byte limit although a 16,384-token context can hold it.
+        request.goal = "x".repeat(8696);
+        assert!(validate_request(&request).is_ok());
+        assert!(goal_fits_context(&request, 16384).is_ok());
+        assert!(goal_fits_context(&request, 8192)
+            .unwrap_err()
+            .to_string()
+            .contains("calibrated 8192-token context"));
+        request.goal = "x".repeat(MAX_GOAL_BYTES + 1);
+        assert!(validate_request(&request).is_err());
     }
     #[test]
     fn approved_check_budget_covers_baseline_and_candidate() {
