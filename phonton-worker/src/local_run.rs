@@ -1321,6 +1321,7 @@ async fn run_inner(
             &serde_json::to_value(&candidate)?,
         )?;
         let mut pending_candidate_saved = false;
+        let mut goal_name_warning = None;
         if candidate.rejection.is_none() {
             let materialized = parse_candidate(
                 &receipt.profile,
@@ -1388,12 +1389,14 @@ async fn run_inner(
                             .map(String::as_str)
                             .collect::<Vec<_>>()
                             .join("\n");
-                        if let Some(name) =
-                            goal_name_not_added(&receipt.request.goal, &original, &changed)
-                        {
-                            candidate.rejection = Some(format!(
-                                "The goal names `{name}`, but this edit does not add it"
-                            ));
+                        match goal_name_gate(
+                            &receipt.request.goal,
+                            &original,
+                            &changed,
+                            !receipt.request.checks.is_empty(),
+                        ) {
+                            Ok(warning) => goal_name_warning = warning,
+                            Err(rejection) => candidate.rejection = Some(rejection),
                         }
                     }
                     if candidate.rejection.is_some() {
@@ -1516,6 +1519,11 @@ async fn run_inner(
         }
         receipt.elapsed_ms = started.elapsed().as_millis() as u64;
         if accepted {
+            if let Some(warning) = goal_name_warning {
+                receipt
+                    .known_gaps
+                    .push(format!("Advisory for candidate {number}: {warning}. The selected checks decided; review that the change does what the goal asks."));
+            }
             receipt.selected_candidate = Some(number);
             // The candidate is not review ready until model, source, candidate,
             // and original Git-index identity all pass the final review.
@@ -2970,6 +2978,30 @@ fn rust_protected_tail_items_intact(original: &str, candidate: &str, tail: &str)
     rust_scope_signatures(original_prefix, &mut original_scope);
     rust_scope_signatures(candidate_prefix, &mut candidate_scope);
     same_crate_attributes && same_tail_items && original_scope == candidate_scope
+}
+
+/// Without checks the goal-name heuristic is the only guard, so it rejects.
+/// With checks the tests decide and it only warns: in three local Polyglot
+/// runs (2026-10) it rejected 73 candidates before their tests; the 71 that
+/// could be rebuilt all failed those tests, so each rejection only cost a
+/// generation slot.
+fn goal_name_gate(
+    goal: &str,
+    original: &str,
+    candidate: &str,
+    has_checks: bool,
+) -> std::result::Result<Option<String>, String> {
+    match goal_name_not_added(goal, original, candidate) {
+        None => Ok(None),
+        Some(name) => {
+            let detail = format!("The goal names `{name}`, but this edit does not add it");
+            if has_checks {
+                Ok(Some(detail))
+            } else {
+                Err(detail)
+            }
+        }
+    }
 }
 
 /// A name the goal asks for (called like `balanceOn(` or quoted in
@@ -6161,6 +6193,22 @@ mod tests {
         assert_eq!(
             goal_name_not_added("Add a count() method", "account", "account"),
             Some("count".into())
+        );
+    }
+
+    #[test]
+    fn goal_name_gate_rejects_only_when_no_check_can_judge() {
+        let goal = "Add a count() method";
+        assert_eq!(goal_name_gate(goal, "a", "a\ncount()", false), Ok(None));
+        assert_eq!(
+            goal_name_gate(goal, "account", "account", false),
+            Err("The goal names `count`, but this edit does not add it".into())
+        );
+        assert_eq!(
+            goal_name_gate(goal, "account", "account", true),
+            Ok(Some(
+                "The goal names `count`, but this edit does not add it".into()
+            ))
         );
     }
 
