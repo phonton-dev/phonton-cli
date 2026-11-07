@@ -21,9 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu 22.04 keeps the binary's glibc floor at 2.35, so it runs on
-          # Ubuntu 22.04 and later. ubuntu-latest (26.04) would raise it.
-          - os: ubuntu-22.04
+          # Ubuntu 24.04, as for 0.26.0. ubuntu-latest (26.04) would raise the
+          # glibc floor, and 22.04's gcc 11 cannot build numkong (avx512fp16).
+          - os: ubuntu-24.04
             asset: phonton-x86_64-unknown-linux-gnu.tar.gz
             binary: phonton
             archive: tar
