@@ -9,7 +9,9 @@ on:
 jobs:
   test:
     name: Rust workspace
-    runs-on: ubuntu-latest
+    # The Linux release image (see release-binaries.yml). Playwright has no
+    # Chromium for ubuntu-latest, which is Ubuntu 26.04 since October 2026.
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
@@ -48,7 +50,7 @@ jobs:
 
   macos:
     name: macOS (local runtime and CLI)
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Checkout
