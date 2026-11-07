@@ -427,7 +427,7 @@ async fn run_inner(
             .await
             .map_err(|error| {
                 invalid(memory_refusal(&format!(
-                    "{} Resident-model evidence is unavailable: {error}",
+                    "{} Resident-model evidence is unavailable: {error}.",
                     fit.explanation
                 )))
             })?;
@@ -3070,9 +3070,15 @@ fn checks_can_judge(request: &LocalRunRequest) -> bool {
 /// A goal refused before it starts because the model does not fit the free
 /// memory: what happened, that nothing ran, and the next step.
 fn memory_refusal(reason: &str) -> String {
-    format!(
-        "{reason} Nothing ran and no file changed. Next: close other programs to free memory and run the goal again, or choose a smaller model from `phonton models catalog`."
-    )
+    // ponytail: matches phonton-local's host-RAM-floor wording, which already
+    // names the next step and applies to every model; a typed reason on
+    // `ModelFit` would replace this if more refusal kinds appear.
+    let next = if reason.contains("Close other workloads") {
+        ""
+    } else {
+        " Next: close other programs to free memory and run the goal again, or choose a smaller model from `phonton models catalog`."
+    };
+    format!("{reason} Nothing ran and no file changed.{next}")
 }
 
 /// The goal-name gate deferred to the checks: reject unless every selected
@@ -6356,11 +6362,34 @@ mod tests {
 
     #[test]
     fn memory_refusal_says_nothing_ran_and_the_next_step() {
-        let message = memory_refusal("Estimated working set exceeds available memory.");
-        assert!(message.starts_with("Estimated working set exceeds available memory. "));
-        assert!(message.contains("Nothing ran and no file changed."));
-        assert!(message.contains("Next: close other programs"));
-        assert!(message.contains("`phonton models catalog`"));
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let machine = |available: u64| HardwareSnapshot {
+            ram_total_bytes: Some(16 * GIB),
+            ram_available_bytes: Some(available),
+            ..HardwareSnapshot::default()
+        };
+        // Too big for the free memory: freeing memory or a smaller model helps.
+        let too_big =
+            phonton_local::estimate_fit_for_context(64 * GIB, None, &machine(8 * GIB), 4096);
+        assert_eq!(too_big.status, FitStatus::InsufficientMemory);
+        let message = memory_refusal(&too_big.explanation);
+        assert!(
+            message.starts_with(&format!(
+                "{} Nothing ran and no file changed. Next: close other programs",
+                too_big.explanation
+            )),
+            "{message}"
+        );
+        assert!(message.ends_with("`phonton models catalog`."), "{message}");
+        // Under the host-RAM floor every model is refused. The reason already
+        // says to close other workloads, and a smaller model would not help.
+        let floor = phonton_local::estimate_fit_for_context(GIB, None, &machine(GIB), 4096);
+        assert_eq!(floor.status, FitStatus::InsufficientMemory);
+        assert_eq!(
+            memory_refusal(&floor.explanation),
+            format!("{} Nothing ran and no file changed.", floor.explanation)
+        );
+        assert!(floor.explanation.contains("Close other workloads"));
     }
 
     #[test]

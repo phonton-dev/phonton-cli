@@ -37,9 +37,10 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   and select a local model first". It now says nothing ran and gives the
   setup command for this machine. Outside a Git repository it now says why it
   stopped and suggests `git init`.
-- [fixed] A local goal refused because the model does not fit the free memory
-  gave only the estimate. It now says nothing ran and that the next step is
-  to free memory or choose a smaller model from `phonton models catalog`.
+- [fixed] A local goal refused before it started for lack of free memory now
+  says that nothing ran and no file changed. When the model is too big for
+  the free memory, it also says to close other programs or choose a smaller
+  model from `phonton models catalog`.
 - [fixed] A local goal that names a file by its repository path now edits
   that file. Words in the goal such as "list" or "error" also matched symbols
   in unrelated files, and eight of those could push the named file out of
