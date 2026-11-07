@@ -1077,7 +1077,13 @@ async fn run_inner(
                 .map(|assembly| (system, assembly))
         });
         if whole_file_assembly.is_none() {
-            whole_file = None;
+            // ponytail: the retry's parent stays; restoring the controller's
+            // choice needs the fit known before the decision is replaced.
+            if whole_file.take().is_some() {
+                decision.reason.push_str(
+                    "; the whole file did not fit the calibrated context, so an ordinary edit ran",
+                );
+            }
         } else {
             approach = "whole-file rewrite after an unchanged search/replace".into();
         }
@@ -1437,7 +1443,7 @@ async fn run_inner(
                             &receipt.request.goal,
                             &original,
                             &changed,
-                            !receipt.request.checks.is_empty(),
+                            checks_can_judge(&receipt.request),
                         ) {
                             Ok(warning) => goal_name_warning = warning,
                             Err(rejection) => candidate.rejection = Some(rejection),
@@ -1530,6 +1536,11 @@ async fn run_inner(
                                 candidate.rejection = Some(
                                     "Candidate failed the selected verification checks".into(),
                                 );
+                            } else if let Some(rejection) =
+                                deferred_gate_rejection(&candidate.checks, &goal_name_warning)
+                            {
+                                candidate.rejection = Some(rejection);
+                                goal_name_warning = None;
                             }
                         }
                     }
@@ -1564,9 +1575,10 @@ async fn run_inner(
         receipt.elapsed_ms = started.elapsed().as_millis() as u64;
         if accepted {
             if let Some(warning) = goal_name_warning {
+                // First, so summaries that show only the leading gaps keep it.
                 receipt
                     .known_gaps
-                    .push(format!("Advisory for candidate {number}: {warning}. The selected checks decided; review that the change does what the goal asks."));
+                    .insert(0, format!("Advisory for candidate {number}: {warning}. The selected checks decided; review that the change does what the goal asks."));
             }
             receipt.selected_candidate = Some(number);
             // The candidate is not review ready until model, source, candidate,
@@ -3048,6 +3060,21 @@ fn goal_name_gate(
     }
 }
 
+/// Selected checks can judge a candidate only when they may run: without
+/// host approval every check is unavailable and the search would stop on the
+/// first candidate, so the goal-name gate rejects before checks instead.
+fn checks_can_judge(request: &LocalRunRequest) -> bool {
+    request.approve_host_execution && !request.checks.is_empty()
+}
+
+/// The goal-name gate deferred to the checks: reject unless every selected
+/// check ran and passed, because a check that did not run cannot judge.
+fn deferred_gate_rejection(checks: &[CheckEvidence], warning: &Option<String>) -> Option<String> {
+    let warning = warning.as_ref()?;
+    let all_passed = !checks.is_empty() && checks.iter().all(|c| c.status == CheckStatus::Passed);
+    (!all_passed).then(|| format!("{warning}, and the selected checks did not all run and pass"))
+}
+
 /// A name the goal asks for (called like `balanceOn(` or quoted in
 /// backticks, four or more characters) that is in neither the original
 /// scoped source nor the candidate. A small model that edits something
@@ -3777,7 +3804,7 @@ async fn inventory_excluding(
         let output = read_inventory(stdout).await?;
         if !child.wait().await?.success() {
             return Err(invalid(
-                "Open a Git repository with a bounded file inventory",
+                "Git could not list this folder's files, so nothing ran. Local goals need a Git repository to edit and roll back. Next: if the folder is not a repository, run `git init` and commit your files there; otherwise run `git status` there to see Git's error",
             ));
         }
         Ok::<_, RunError>(output)
@@ -6275,6 +6302,48 @@ mod tests {
                 "The goal names `count`, but this edit does not add it".into()
             ))
         );
+    }
+
+    #[test]
+    fn a_deferred_goal_name_gate_needs_checks_that_ran_and_passed() {
+        let check = |status| CheckEvidence {
+            check: None,
+            purpose: Default::default(),
+            status,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            detail: String::new(),
+            elapsed_ms: 0,
+        };
+        let warning = Some("The goal names `count`, but this edit does not add it".to_string());
+        assert_eq!(
+            deferred_gate_rejection(&[check(CheckStatus::Passed)], &warning),
+            None
+        );
+        assert_eq!(
+            deferred_gate_rejection(&[check(CheckStatus::Unavailable)], &None),
+            None
+        );
+        for unjudged in [
+            vec![],
+            vec![check(CheckStatus::Unavailable)],
+            vec![check(CheckStatus::Passed), check(CheckStatus::NotRun)],
+        ] {
+            let rejection = deferred_gate_rejection(&unjudged, &warning).expect("rejected");
+            assert!(
+                rejection.starts_with("The goal names `count`"),
+                "{rejection}"
+            );
+        }
+        // Without host approval every check is unavailable, so the gate must
+        // reject before checks and let the search generate again.
+        let mut unapproved = request();
+        assert!(!checks_can_judge(&unapproved));
+        unapproved.approve_host_execution = true;
+        assert!(checks_can_judge(&unapproved));
+        unapproved.checks.clear();
+        assert!(!checks_can_judge(&unapproved));
     }
 
     #[test]
