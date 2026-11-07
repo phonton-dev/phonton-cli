@@ -426,13 +426,13 @@ async fn run_inner(
             .resident(&profile.model, &profile.digest, profile.context_tokens)
             .await
             .map_err(|error| {
-                invalid(format!(
+                invalid(memory_refusal(&format!(
                     "{} Resident-model evidence is unavailable: {error}",
                     fit.explanation
-                ))
+                )))
             })?;
         if !resident_headroom(&machine, observed.as_ref()) {
-            return Err(invalid(fit.explanation));
+            return Err(invalid(memory_refusal(&fit.explanation)));
         }
         observed
     } else {
@@ -3065,6 +3065,14 @@ fn goal_name_gate(
 /// first candidate, so the goal-name gate rejects before checks instead.
 fn checks_can_judge(request: &LocalRunRequest) -> bool {
     request.approve_host_execution && !request.checks.is_empty()
+}
+
+/// A goal refused before it starts because the model does not fit the free
+/// memory: what happened, that nothing ran, and the next step.
+fn memory_refusal(reason: &str) -> String {
+    format!(
+        "{reason} Nothing ran and no file changed. Next: close other programs to free memory and run the goal again, or choose a smaller model from `phonton models catalog`."
+    )
 }
 
 /// The goal-name gate deferred to the checks: reject unless every selected
@@ -6344,6 +6352,15 @@ mod tests {
         assert!(checks_can_judge(&unapproved));
         unapproved.checks.clear();
         assert!(!checks_can_judge(&unapproved));
+    }
+
+    #[test]
+    fn memory_refusal_says_nothing_ran_and_the_next_step() {
+        let message = memory_refusal("Estimated working set exceeds available memory.");
+        assert!(message.starts_with("Estimated working set exceeds available memory. "));
+        assert!(message.contains("Nothing ran and no file changed."));
+        assert!(message.contains("Next: close other programs"));
+        assert!(message.contains("`phonton models catalog`"));
     }
 
     #[test]
