@@ -91,7 +91,7 @@ checks on a copy, and lands nothing until you apply the result.
 
 ```bash
 phonton models catalog                      # marks the model for this machine
-phonton models setup qwen3.5:9b             # runtime, download,
+phonton models setup qwen3.5:4b             # runtime, download,
                                             # calibrate edit formats, select
 phonton                                     # TUI: goals now run on the local model
 phonton goal "Add a count() method to TodoStore" --yes --allow-host-checks
@@ -117,19 +117,23 @@ half of RAM when that is larger):
 
 | Memory | Recommended | Alternative |
 | --- | --- | --- |
-| 4-6 GB | `qwen3.5:4b` | |
-| 6-16 GB | `qwen3.5:9b` | `gemma4:12b` (10 GB and up) |
+| 4-10 GB | `qwen3.5:4b` | |
+| 10-16 GB | `qwen3.5:9b` | `gemma4:12b` |
 | 16-24 GB | `gpt-oss:20b` | |
 | 24 GB and up | `qwen3.6:35b-a3b` | `qwen3.6:27b` |
 
-Under 4 GB, or without a memory reading, nothing is recommended. The
-recommendation is a size-based starting point; calibration decides
+Under 4 GB, or without a memory reading, nothing is recommended. A 6 GB GPU
+with 16 GB of RAM counts as 8 GB and gets `qwen3.5:4b`, the model with
+measured results there (below). The recommendation is a size-based starting
+point; calibration decides
 whether a model is usable. Any other Ollama tag works with `models setup`.
 
-In our smoke runs, qwen2.5-coder:3b on a 6 GB laptop GPU finished small
-single-file edits in a Node repo in 20-30 s. Small models work best on one
-focused change at a time. Details and limits:
-[docs/local-harness.md](docs/local-harness.md).
+On the 51-exercise Aider Polyglot slice, Phonton 0.27.0 with `qwen3.5:4b` on
+a laptop with a 6 GB GPU passed 3 exercises in each of two runs (Python 1,
+JavaScript 2, Rust 0). One JavaScript pass, `ledger`, is a refactoring
+exercise whose tests pass before any edit. Each run marked 2 candidates ready
+for review, and both passed the exercise's tests. Small models work best on
+one focused change at a time. Details and limits: [docs/local-harness.md](docs/local-harness.md).
 
 ---
 

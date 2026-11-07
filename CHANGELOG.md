@@ -23,19 +23,53 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 - [fixed] `Publish npm` failed its last step after successful publishes,
   because npm took longer than the 5-minute wait to make the version
   visible. It now waits up to 20 minutes.
+- [fixed] `phonton models setup` downloaded a model that could never load on
+  the machine and then failed calibration: 22.6 GB of `qwen3.6:35b-a3b` on a
+  16 GB laptop with a 6 GB GPU. With the managed runtime it now compares the
+  weights, a 4K-token cache and the runtime with the machine's total GPU and
+  RAM, refuses before downloading, and names the setup command for a model
+  that fits.
+- [fixed] When the drive was too small for the local runtime, `phonton models
+  setup` said how much space it needed but not what to do. It now says to
+  free space or choose a folder on another drive with `phonton models storage
+  FOLDER`.
+- [fixed] `phonton goal --local` with no model set up said only "Calibrate
+  and select a local model first". It now says nothing ran and gives the
+  setup command for this machine. Outside a Git repository it now says why it
+  stopped and suggests `git init`.
+- [fixed] A local goal that names a file by its repository path now edits
+  that file. Words in the goal such as "list" or "error" also matched symbols
+  in unrelated files, and eight of those could push the named file out of
+  scope. When the goal names files by path, the scope is those files plus
+  any file that defines a code name the goal uses, such as `createUser`.
+- [fixed] When a local search stopped, the `phonton goal --local` summary
+  showed only the last rejection. It now also prints why the search stopped,
+  such as a restart prompt that does not fit the calibrated context.
+- [fixed] A rerun of `phonton models setup` reported the full model size as
+  left to download. The figure is now labelled an upper bound: layers already
+  in the store are not downloaded again.
 
 ### Changed
 
 - [changed] A local model reply that repeats an earlier reply in the run byte
-  for byte is rejected without checks and the request is sent again. After
-  that, the run's model calls sample at temperature 0.7 with a recorded seed
-  instead of temperature 0, which kept returning the same reply.
+  for byte, or a candidate identical to an earlier one, is rejected without
+  checks and the run asks again. After that, the run's model calls sample at
+  temperature 0.7 with a recorded seed instead of temperature 0, which kept
+  returning the same reply.
 - [changed] When a local search/replace reply changes nothing on a file of at
-  most 300 lines, the next attempt asks for the whole corrected file.
-- [changed] With checks selected, a local candidate that does not add an
-  identifier the goal names is no longer rejected before its checks. If it
-  passes them, it is review-ready with a warning in the receipt. Without
-  checks it is still rejected.
+  most 300 lines, the next attempt asks for the whole corrected file when it
+  fits the calibrated context and output reserve.
+- [changed] With checks selected and approved to run on the host, a local
+  candidate that does not add an identifier the goal names is no longer
+  rejected before its checks. If it passes them, it is review-ready with a
+  warning in the receipt and the run summary. Without checks, without that
+  approval, or when the checks do not all run and pass, it is still
+  rejected.
+- [changed] `phonton models catalog` recommends `qwen3.5:9b` from 10 GB of
+  model memory instead of 6 GB. A laptop with a 6 GB GPU and 16 GB of RAM
+  (8 GB of model memory) now gets `qwen3.5:4b`: no measured run there has
+  beaten it. The help, the Ollama provider default and the docs use
+  `qwen3.5:4b`.
 
 ### Added
 
@@ -568,7 +602,7 @@ accepted by hidden tests, 302,442 tokens, $0.186 in total.
   unavailable".
 - [fixed] Ollama and custom endpoints use the configured model on every tier;
   Standard/Frontier subtasks no longer fall back to a hardcoded `llama3.2:3b`.
-- [fixed] Local edits keep regex escapes like `` that small models write
+- [fixed] Local edits keep regex escapes like `\b` that small models write
   with a single JSON backslash, instead of decoding them to a backspace byte.
 - [fixed] Local-run Apply works on Windows: the saved-review hash no longer
   depends on the OS path separator.
