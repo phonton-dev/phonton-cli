@@ -5134,7 +5134,7 @@ fn default_model_for(provider: &str) -> String {
         "ollama" => models_cli::settings()
             .ok()
             .and_then(|settings| settings.active_model)
-            .unwrap_or_else(|| "qwen3.5:9b".into()),
+            .unwrap_or_else(|| "qwen3.5:4b".into()),
         "deepseek" => "deepseek-flash".into(),
         "xai" | "grok" => "grok-build-0.1".into(),
         "groq" => "openai/gpt-oss-120b".into(),
@@ -5181,7 +5181,7 @@ fn print_help() {
          phonton doctor           check provider key, git, and local tools\n  \
          phonton                  open the TUI and type a goal\n  \
          phonton models           pick a local model sized for this machine\n  \
-         phonton models setup qwen3.5:9b\n                           \
+         phonton models setup qwen3.5:4b\n                           \
          run on a local model instead of a cloud key\n  \
          phonton why-tokens       see where the last goal spent tokens\n\
          \n\

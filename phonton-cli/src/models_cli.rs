@@ -1015,11 +1015,21 @@ async fn install_model(
         let binding = phonton_local::managed_store::bind(root, endpoint)
             .map_err(|error| anyhow!("A previously managed Ollama service can no longer be verified: {error}. Stop that service and rerun models setup, or configure a different loopback endpoint for an external runtime."))?;
         if let Some(binding) = binding {
+            // Memory first: freeing disk space for a model that can never load
+            // is wasted effort.
+            let machine = hardware::detect().await;
+            let manifest_bytes = LocalRuntime::manifest_download_bytes(model).await?;
+            if let Some(reason) = phonton_local::never_fits(manifest_bytes, &machine) {
+                bail!(
+                    "{model} cannot run on this machine: {reason}. No model weights were downloaded. Next: {}",
+                    setup_command_for(&machine).unwrap_or_else(|| NO_RECOMMENDATION.into())
+                );
+            }
             let admission = LocalRuntime::managed_download_admission(model, &binding).await?;
             let reserve = admission.reserve_bytes;
             progress(DownloadProgress {
                 status: format!(
-                    "Model store verified: {} to download ({} of {} bytes){}, {} bytes kept free",
+                    "Model store verified: up to {} to download ({} of {} bytes){}, {} bytes kept free",
                     gigabytes(&json!(admission.remaining_bytes)),
                     admission.remaining_bytes,
                     admission.manifest_bytes,
@@ -2101,7 +2111,7 @@ mod tests {
         );
         assert!(none.contains("RAM 8.0 GB free of 16.0 GB"), "{none}");
         assert!(
-            none.contains("next: install and start Ollama (https://ollama.com/download), then phonton models setup qwen3.5:9b."),
+            none.contains("next: install and start Ollama (https://ollama.com/download), then phonton models setup qwen3.5:4b."),
             "{none}"
         );
         let workstation = serde_json::to_value(HardwareSnapshot {

@@ -140,8 +140,12 @@ fn models_verb_help_prints_usage_without_running_the_verb() {
 
 #[test]
 fn incomplete_local_plan_reports_usage_without_crashing() {
+    // This path starts the managed runtime before it reads the arguments;
+    // an isolated home keeps the test away from the developer's runtime.
+    let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_phonton"))
         .args(["goal", "--local", "--plan"])
+        .env("PHONTON_HOME", home.path())
         .output()
         .unwrap();
     assert!(!output.status.success());

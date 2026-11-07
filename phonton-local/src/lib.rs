@@ -61,7 +61,9 @@ const fn entry(name: &'static str, tier_gb: u64, alternative: bool) -> CatalogEn
 pub const CATALOG: [CatalogEntry; 6] = [
     // 3.3 GB of weights plus KV cache and the runtime: below 4 GB, nothing.
     entry("qwen3.5:4b", 4, false),
-    entry("qwen3.5:9b", 6, false),
+    // From 10 GB: on a 6 GB GPU with 16 GB of RAM (8 GB of model memory) no
+    // measured run has beaten qwen3.5:4b, the model with Polyglot results there.
+    entry("qwen3.5:9b", 10, false),
     entry("gemma4:12b", 10, true),
     entry("gpt-oss:20b", 16, false),
     entry("qwen3.6:27b", 24, true),
@@ -111,6 +113,35 @@ const FALLBACK_KV_BYTES_PER_TOKEN: u64 = 256 * 1024;
 /// ceiling is unknown here, so this is not an automatic recommendation.
 pub fn estimate_fit(weights_bytes: u64, hardware: &HardwareSnapshot) -> ModelFit {
     estimate_fit_for_context(weights_bytes, None, hardware, 4096)
+}
+
+/// Why weights of this size can never load on this machine, or `None` when
+/// they might or memory is unknown. Compares the weights, a 4K-token fallback
+/// KV cache and the runtime reserve with the largest GPU plus all of RAM:
+/// totals, not free memory, so it refuses only what no amount of closing
+/// apps would let run.
+pub fn never_fits(weights_bytes: u64, hardware: &HardwareSnapshot) -> Option<String> {
+    let ram = hardware.ram_total_bytes?;
+    let gpu = hardware
+        .gpus
+        .iter()
+        .map(|gpu| gpu.total_bytes)
+        .max()
+        .unwrap_or(0);
+    let required = weights_bytes
+        .saturating_add(FALLBACK_KV_BYTES_PER_TOKEN.saturating_mul(4096))
+        .saturating_add(RUNTIME_RESERVE_BYTES);
+    let total = gpu.saturating_add(ram);
+    let gb = |bytes: u64| bytes as f64 / 1e9;
+    (weights_bytes > 0 && required > total).then(|| {
+        format!(
+            "loading it needs about {:.1} GB (weights, a 4K-token cache and the runtime), more than this machine's {:.1} GB in total ({:.1} GB GPU, {:.1} GB RAM)",
+            gb(required),
+            gb(total),
+            gb(gpu),
+            gb(ram)
+        )
+    })
 }
 
 /// Estimate a cold load at `context` tokens: weights, KV cache and a fixed
@@ -367,7 +398,11 @@ mod tests {
         };
         assert_eq!(recommended_model(&HardwareSnapshot::default()), None);
         // RTX 4050 laptop: 6 GB VRAM, 16 GB RAM.
-        assert_eq!(recommended_model(&machine(Some(6), 16)), Some("qwen3.5:9b"));
+        assert_eq!(recommended_model(&machine(Some(6), 16)), Some("qwen3.5:4b"));
+        assert_eq!(
+            recommended_model(&machine(Some(12), 16)),
+            Some("qwen3.5:9b")
+        );
         assert_eq!(recommended_model(&machine(None, 8)), Some("qwen3.5:4b"));
         assert_eq!(recommended_model(&machine(Some(4), 6)), Some("qwen3.5:4b"));
         // Under the smallest tier: no download that cannot run.
@@ -386,6 +421,36 @@ mod tests {
             recommended_model(&machine(None, 64)),
             Some("qwen3.6:35b-a3b")
         );
+    }
+
+    #[test]
+    fn never_fits_compares_total_memory_not_free() {
+        // RTX 4050 laptop as hardware::detect read it, with almost no RAM free.
+        let laptop = HardwareSnapshot {
+            ram_total_bytes: Some(16_312_205_312),
+            ram_available_bytes: Some(500_000_000),
+            gpus: vec![GpuSnapshot {
+                name: "RTX 4050".into(),
+                total_bytes: 6_439_305_216,
+                available_bytes: 0,
+            }],
+            ..Default::default()
+        };
+        // qwen3.6:35b-a3b (22.6 GB) can never load here; gpt-oss:20b and
+        // qwen3.5:9b may, with offload, however busy the machine is now.
+        let refused = never_fits(22_600_000_000, &laptop).expect("35b refused");
+        assert!(
+            refused.contains("24.7 GB") && refused.contains("22.8 GB"),
+            "{refused}"
+        );
+        assert_eq!(never_fits(13_800_000_000, &laptop), None);
+        assert_eq!(never_fits(6_600_000_000, &laptop), None);
+        // No memory reading or no size: no verdict.
+        assert_eq!(
+            never_fits(22_600_000_000, &HardwareSnapshot::default()),
+            None
+        );
+        assert_eq!(never_fits(0, &laptop), None);
     }
 
     #[test]
@@ -419,9 +484,10 @@ mod tests {
             estimate_fit_for_context(QWEN35_4B, None, &busy, 16384).status,
             FitStatus::InsufficientMemory
         );
-        // The tier pick for this laptop loads partly offloaded once ~4 GiB
-        // of RAM is free; it never fits the GPU alone.
-        assert_eq!(recommended_model(&busy), Some("qwen3.5:9b"));
+        // The tier pick for this laptop is qwen3.5:4b. qwen3.5:9b loads
+        // partly offloaded once ~4 GiB of RAM is free; it never fits the GPU
+        // alone.
+        assert_eq!(recommended_model(&busy), Some("qwen3.5:4b"));
         assert_eq!(
             estimate_fit_for_context(QWEN35_9B, KV, &busy, 16384).status,
             FitStatus::InsufficientMemory

@@ -402,7 +402,7 @@ pub fn validate_model(name: &str) -> Result<()> {
         || name.to_ascii_lowercase().contains("cloud")
     {
         return Err(LocalError::Invalid(
-            "Use a local model tag such as qwen3.5:9b; cloud models are disabled.".into(),
+            "Use a local model tag such as qwen3.5:4b; cloud models are disabled.".into(),
         ));
     }
     Ok(())
@@ -2475,7 +2475,7 @@ mod tests {
             ..Default::default()
         };
         let mut models = vec![
-            catalog_fixture("qwen3.5:4b", Some(3), FitStatus::LikelyFitsGpu),
+            catalog_fixture("qwen3.5:4b", Some(3), FitStatus::InsufficientMemory),
             catalog_fixture("qwen3.5:9b", Some(6), FitStatus::InsufficientMemory),
             catalog_fixture("gpt-oss:20b", Some(13), FitStatus::InsufficientMemory),
         ];
@@ -2485,8 +2485,8 @@ mod tests {
             .filter(|m| m.first_try_reason.is_some())
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(marked, ["qwen3.5:9b"]);
-        assert!(models[1]
+        assert_eq!(marked, ["qwen3.5:4b"]);
+        assert!(models[0]
             .first_try_reason
             .as_deref()
             .unwrap()
@@ -2583,7 +2583,7 @@ mod tests {
             ram_available_bytes: Some(8u64 << 30),
             gpus: vec![GpuSnapshot {
                 name: "fixture GPU".into(),
-                total_bytes: 8u64 << 30,
+                total_bytes: 12u64 << 30,
                 available_bytes: 6u64 << 30,
             }],
             ..Default::default()
@@ -2618,7 +2618,7 @@ mod tests {
             assert_eq!(model.download_bytes, Some(index as u64 * 100_000_000 + 10));
             assert!(model.error.is_none());
         }
-        // 8 GiB GPU and 16 GiB RAM: the 6 GB tier.
+        // 12 GiB GPU and 16 GiB RAM: the 10 GB tier, qwen3.5:9b.
         assert!(models[1].first_try_reason.is_some());
         assert_eq!(
             models
