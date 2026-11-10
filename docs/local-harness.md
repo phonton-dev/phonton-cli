@@ -191,6 +191,9 @@ reports at least 30 seconds before unload. Automatic context also requires the
 model's reported limit. RAM and the same model identity and allocation are
 rechecked before every probe; residency is a point-in-time observation, not a
 reservation. If the model unloads or pressure rises, remaining probes stop.
+A probe needs 1.5 GiB of host RAM free, or 512 MiB once the model is loaded
+entirely in VRAM at the calibration context: the first probe loads the model,
+and that copy already holds its host memory.
 The creation probe checks exact format and fixture text without executing model
 code; none of these probes establishes general coding quality.
 The small probe output caps do not set the ceiling for a coding goal. The

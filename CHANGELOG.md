@@ -59,6 +59,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   32 layers when 8 keep one: 2 GiB at 16,384 tokens instead of 512 MiB.
   Flagged layers are now left out, so the model is admitted on the GPU with
   1.5 GiB of host RAM free instead of being sized as a CPU offload.
+- [fixed] `phonton models setup` could stop at its second calibration probe
+  with "Available host RAM fell below the 1.5 GiB calibration reserve" on a
+  machine with enough memory for the model. The first probe loads the model,
+  which takes host RAM (about 0.5 GiB of buffers for `qwen3.5:4b` on an RTX
+  4050), and every later probe still asked for the full cold-load reserve.
+  A probe of a copy already loaded entirely in VRAM at the calibration
+  context now needs 512 MiB free, the rule goal runs have used since 0.25.1.
+  The first probe, a copy partly in RAM and an unknown memory reading keep
+  the 1.5 GiB reserve.
 - [fixed] After `phonton models setup`, goals still went to a cloud provider
   when a provider key was in the environment and `config.toml` named no
   provider, because provider autodetection prefers a key. `models setup` and

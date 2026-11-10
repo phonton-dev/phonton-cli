@@ -95,6 +95,23 @@ pub fn recommended_model(hardware: &HardwareSnapshot) -> Option<&'static str> {
 /// conditions it was measured in.
 pub const GPU_HOST_RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
 
+/// Host RAM a chat with the loaded copy `resident` needs free. A copy entirely
+/// in VRAM made its runtime allocation at load time, already outside the
+/// available reading, so the 1.5 GiB cold-load reserve would count it twice;
+/// 512 MiB leaves headroom for the request and the OS. A copy partly in RAM
+/// keeps the full reserve, because paging its weights out would stall
+/// generation. On Ollama 0.34.2 (2026-10-17, RTX 4050) loading qwen3.5:4b at
+/// 16384 tokens took about 700 MiB of host RAM; a later 7000-token chat loaded
+/// nothing.
+// ponytail: fixed floor, measure per-chat host use if a runtime allocates per request.
+pub fn resident_host_reserve(resident: &ResidentModel) -> u64 {
+    if resident.size_vram_bytes >= resident.size_bytes {
+        512 * 1024 * 1024
+    } else {
+        GPU_HOST_RESERVE_BYTES
+    }
+}
+
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Memory the runtime needs beyond weights and KV cache: GPU context, compute

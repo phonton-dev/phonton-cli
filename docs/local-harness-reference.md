@@ -151,7 +151,10 @@ model already loaded in Ollama. The model must have enough context and at least
 30 seconds before unload, while at least 1.5 GiB host RAM remains available.
 Automatic context still requires the model's reported limit. Phonton rechecks
 memory and resident identity before every probe; a loaded model is not reserved
-for the duration of calibration. Probe results remain compatibility evidence.
+for the duration of calibration. A probe needs 1.5 GiB of available host RAM,
+or 512 MiB when the exact model is already loaded entirely in VRAM at the
+calibration context, the rule goal runs use. Probe results remain
+compatibility evidence.
 `models status` keeps an incomplete calibration attempt separate from selectable
 profiles. Finished probes are saved after each request, so cancellation, memory
 pressure or an engine exit does not erase their diagnostic output. A retry runs

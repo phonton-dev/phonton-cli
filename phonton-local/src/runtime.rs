@@ -1025,14 +1025,25 @@ impl LocalRuntime {
         Fut: Future<Output = HardwareSnapshot>,
     {
         let hardware = observe_hardware().await;
+        // Once a probe has loaded the model, later probes talk to that copy.
+        // Entirely in VRAM it already holds its host memory, so the cold-load
+        // reserve would count that memory twice, as it did for goal runs.
+        let reserve = self
+            .resident(&model.name, &model.digest, admission.context_tokens)
+            .await
+            .ok()
+            .flatten()
+            .map_or(CALIBRATION_HOST_RESERVE_BYTES, |loaded| {
+                crate::resident_host_reserve(&loaded)
+            });
         if hardware
             .ram_available_bytes
-            .is_none_or(|bytes| bytes < CALIBRATION_HOST_RESERVE_BYTES)
+            .is_none_or(|bytes| bytes < reserve)
         {
-            return Err(LocalError::Invalid(
-                "Available host RAM fell below the 1.5 GiB calibration reserve; stop probes and free memory before retrying."
-                    .into(),
-            ));
+            return Err(LocalError::Invalid(format!(
+                "Available host RAM fell below the {:.1} GiB calibration reserve; stop probes and free memory before retrying.",
+                reserve as f64 / (1u64 << 30) as f64
+            )));
         }
         let fit = self
             .estimate_cold_load(
@@ -1939,6 +1950,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(explicit.context_tokens, 2048);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probes_of_a_vram_resident_model_need_only_the_resident_reserve() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (runtime, mode, chats, server) = resident_calibration_fixture().await;
+        // The fixture model is loaded entirely in VRAM at 8192 tokens.
+        mode.store(10, Ordering::SeqCst);
+        let hardware = HardwareSnapshot {
+            ram_available_bytes: Some(1800 << 20),
+            gpus: vec![GpuSnapshot {
+                name: "GPU".into(),
+                total_bytes: 4 << 30,
+                available_bytes: 1638 << 20,
+            }],
+            ..Default::default()
+        };
+        // After the first probe free RAM reads below the 1.5 GiB cold-load
+        // reserve. On 2026-11-10 Ollama loaded qwen3.5:4b with 2.1 GiB free,
+        // the load took about 0.5 GiB of host buffers, and `models calibrate`
+        // stopped at its second probe.
+        for (later_mib, completes) in [(1400u64, true), (400, false)] {
+            chats.store(0, Ordering::SeqCst);
+            let readings = Arc::new(AtomicUsize::new(0));
+            let first = hardware.clone();
+            let observe = move || {
+                let mut seen = first.clone();
+                if readings.fetch_add(1, Ordering::SeqCst) > 0 {
+                    seen.ram_available_bytes = Some(later_mib << 20);
+                }
+                std::future::ready(seen)
+            };
+            match runtime
+                .calibrate_with_observer("fixture", None, hardware.clone(), &observe)
+                .await
+            {
+                Ok(profile) => {
+                    assert!(completes, "{later_mib} MiB");
+                    assert_eq!(profile.context_tokens, 8192);
+                }
+                Err(error) => {
+                    assert!(!completes, "{later_mib} MiB: {error}");
+                    assert!(error.to_string().contains("0.5 GiB"), "{error}");
+                    assert_eq!(chats.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
         server.abort();
     }
 
