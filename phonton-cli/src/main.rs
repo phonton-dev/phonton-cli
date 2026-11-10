@@ -5884,6 +5884,20 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
                 }
                 _ => false,
             };
+        // A keyless install resolves to ollama; without a selected model the
+        // cloud pipeline would only blame a missing API key.
+        if !calibrated
+            && cfg.provider.name == "ollama"
+            && configured.is_empty()
+            && base_url.is_empty()
+        {
+            eprintln!(
+                "phonton goal: {}
+Or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) to run in the cloud.",
+                local_goal_cli::no_model_message().await
+            );
+            return Ok(2);
+        }
         if calibrated {
             // Same routing as the TUI: a calibrated local model runs through
             // the local harness built for small models.

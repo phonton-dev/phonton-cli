@@ -59,6 +59,15 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   32 layers when 8 keep one: 2 GiB at 16,384 tokens instead of 512 MiB.
   Flagged layers are now left out, so the model is admitted on the GPU with
   1.5 GiB of host RAM free instead of being sized as a CPU offload.
+- [fixed] After `phonton models setup`, goals still went to a cloud provider
+  when a provider key was in the environment and `config.toml` named no
+  provider, because provider autodetection prefers a key. `models setup` and
+  `models select` now write `name = "ollama"` under `[provider]` when the
+  config names none. A provider the config names is kept, and setup says
+  that goals still use it.
+- [fixed] `phonton goal` with no provider key and no local model said "no
+  provider API key configured". It now says that no local model is set up
+  and gives the setup command for this machine.
 
 ### Changed
 

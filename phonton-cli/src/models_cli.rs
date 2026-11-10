@@ -1774,8 +1774,12 @@ async fn mutate_with_lease(
             validate_profile_context(profile, &metadata)?;
             settings.active_model = Some(model.into());
             storage::save(&path, &settings)?;
+            // Without this, a cloud key in the environment keeps winning
+            // provider autodetection and goals silently leave the machine.
+            let goal_provider = crate::config::prefer_local_provider()
+                .unwrap_or_else(|e| format!("unchanged ({e})"));
             Ok(
-                json!({"active_model": model, "local_only": managed_local_only(&path, &settings), "loopback_only": true}),
+                json!({"active_model": model, "local_only": managed_local_only(&path, &settings), "loopback_only": true, "goal_provider": goal_provider}),
             )
         }
         "remove" => {
@@ -2034,7 +2038,10 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 }
             }
             report(&steps)?;
-            eprintln!("Ready: {model} is calibrated and selected. Run `phonton` and type a goal, or `phonton goal \"<goal>\" --yes --allow-host-checks`.");
+            match steps.get("select").and_then(|s| s["goal_provider"].as_str()) {
+                Some("ollama") | None => eprintln!("Ready: {model} is calibrated and selected. Run `phonton` and type a goal, or `phonton goal \"<goal>\" --yes --allow-host-checks`."),
+                Some(other) => eprintln!("Ready: {model} is calibrated and selected, but goals still use `{other}` from config.toml. Set `name = \"ollama\"` under `[provider]` there to run them on {model}."),
+            }
             return Ok(0);
         }
         "deselect" if args.len() == 1 => {
