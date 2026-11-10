@@ -52,6 +52,13 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 - [fixed] A rerun of `phonton models setup` reported the full model size as
   left to download. The figure is now labelled an upper bound: layers already
   in the store are not downloaded again.
+- [fixed] A local goal on `qwen3.5:4b` could be refused before any model call
+  ("Estimated working set exceeds available memory") on a 6 GB GPU that holds
+  the model. Ollama reports this model's attention as one KV head count plus
+  per-layer `recurrent_layers` flags, and Phonton counted a KV cache for all
+  32 layers when 8 keep one: 2 GiB at 16,384 tokens instead of 512 MiB.
+  Flagged layers are now left out, so the model is admitted on the GPU with
+  1.5 GiB of host RAM free instead of being sized as a CPU offload.
 
 ### Changed
 
