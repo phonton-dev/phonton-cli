@@ -52,6 +52,31 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 - [fixed] A rerun of `phonton models setup` reported the full model size as
   left to download. The figure is now labelled an upper bound: layers already
   in the store are not downloaded again.
+- [fixed] A local goal on `qwen3.5:4b` could be refused before any model call
+  ("Estimated working set exceeds available memory") on a 6 GB GPU that holds
+  the model. Ollama reports this model's attention as one KV head count plus
+  per-layer `recurrent_layers` flags, and Phonton counted a KV cache for all
+  32 layers when 8 keep one: 2 GiB at 16,384 tokens instead of 512 MiB.
+  Flagged layers are now left out, so the model is admitted on the GPU with
+  1.5 GiB of host RAM free instead of being sized as a CPU offload.
+- [fixed] `phonton models setup` could stop at its second calibration probe
+  with "Available host RAM fell below the 1.5 GiB calibration reserve" on a
+  machine with enough memory for the model. The first probe loads the model,
+  which takes host RAM (about 0.5 GiB of buffers for `qwen3.5:4b` on an RTX
+  4050), and every later probe still asked for the full cold-load reserve.
+  A probe of a copy already loaded entirely in VRAM at the calibration
+  context now needs 512 MiB free, the rule goal runs have used since 0.25.1.
+  The first probe, a copy partly in RAM and an unknown memory reading keep
+  the 1.5 GiB reserve.
+- [fixed] After `phonton models setup`, goals still went to a cloud provider
+  when a provider key was in the environment and `config.toml` named no
+  provider, because provider autodetection prefers a key. `models setup` and
+  `models select` now write `name = "ollama"` under `[provider]` when the
+  config names none. A provider the config names is kept, and setup says
+  that goals still use it.
+- [fixed] `phonton goal` with no provider key and no local model said "no
+  provider API key configured". It now says that no local model is set up
+  and gives the setup command for this machine.
 
 ### Changed
 

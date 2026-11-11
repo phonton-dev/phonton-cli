@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Aider Polyglot slice: the same exercises, prompt and local model for
-// Phonton, the bare model and a rival harness (OpenCode). Scores pass rate
+// Phonton, the bare model and rival harnesses (OpenCode, Aider). Scores pass rate
 // and false-pass rate: the harness said it succeeded, the pristine tests fail.
 //
 //   node benchmarks/polyglot/run.mjs --polyglot ../polyglot-benchmark \
@@ -33,13 +33,16 @@ const seed = args.seed ?? "phonton-polyglot-1";
 const testsMode = args.tests ?? "visible";
 const bareTries = Number(args["bare-tries"] ?? (testsMode === "visible" ? 2 : 1));
 const timeoutS = Number(args["timeout-seconds"] ?? 900);
+const minFreeRamGb = Number(args["min-free-ram-gb"] ?? 0);
 const exe = process.platform === "win32" ? "phonton.exe" : "phonton";
 const bin = path.resolve(args.bin ?? path.join(repo, "target", "release", exe));
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 const out = path.resolve(args.out ?? path.join(repo, "benchmarks", "results", `polyglot-${stamp}`));
 // Test dependencies and harness state, reused across runs; never artifacts.
 const cache = path.resolve(args.cache ?? path.join(repo, "benchmarks", "results", ".polyglot-cache"));
-for (const a of arms) if (!["phonton", "bare", "opencode"].includes(a)) throw new Error(`unknown arm ${a}`);
+// Aider's CLI: a venv path such as .venv/Scripts/aider.exe, or `aider` on PATH.
+const aiderBin = args.aider ?? "aider";
+for (const a of arms) if (!["phonton", "bare", "opencode", "aider"].includes(a)) throw new Error(`unknown arm ${a}`);
 if (!["visible", "hidden"].includes(testsMode)) throw new Error("--tests must be visible or hidden");
 if (arms.includes("phonton") && !fs.existsSync(bin)) throw new Error(`phonton binary not found: ${bin} (pass --bin)`);
 fs.mkdirSync(out, { recursive: true });
@@ -276,6 +279,11 @@ function opencodeEntry() {
   const root = run(process.platform === "win32" ? "npm.cmd" : "npm", ["root", "-g"], { shell: process.platform === "win32", timeoutS: 60 }).stdout.trim();
   return path.join(root, "opencode-ai", "bin", "opencode");
 }
+// Older opencode-ai packages ship a Node entry; newer ones a native binary.
+function opencodeCommand(argv) {
+  const entry = opencodeEntry();
+  return /\.exe$/i.test(entry) ? [entry, argv] : [process.execPath, [entry, ...argv]];
+}
 function opencodeArm(ex, dir, logDir) {
   const home = path.join(cache, "opencode");
   const config = path.join(home, "opencode.json");
@@ -306,7 +314,7 @@ function opencodeArm(ex, dir, logDir) {
     OPENCODE_DISABLE_AUTOUPDATE: "1",
     OPENCODE_DISABLE_MODELS_FETCH: "1",
   };
-  const r = run(process.execPath, [opencodeEntry(), "run", "--pure", "--format", "json", "--dangerously-skip-permissions", "--model", `ollama/${model}`, ex.prompt], { cwd: dir, env });
+  const r = run(...opencodeCommand(["run", "--pure", "--format", "json", "--dangerously-skip-permissions", "--model", `ollama/${model}`, ex.prompt]), { cwd: dir, env });
   let tokensIn = 0;
   let tokensOut = 0;
   for (const line of r.stdout.split("\n")) {
@@ -325,17 +333,59 @@ function opencodeArm(ex, dir, logDir) {
   return { r, status: r.timedOut ? "timeout" : r.code === 0 ? "finished" : `exit_${r.code}`, claimed, tokensIn, tokensOut };
 }
 
+// Aider: its own whole-file loop on the same endpoint and model. With visible
+// tests it gets the scorer's test command through --test-cmd/--auto-test, so
+// failing output goes back to the model up to Aider's reflection limit. HOME
+// points at the cache so no user config, history or analytics reach the run.
+function aiderArm(ex, dir, logDir) {
+  const home = path.join(cache, "aider");
+  fs.mkdirSync(home, { recursive: true });
+  const settings = path.join(home, "model-settings.yml");
+  fs.writeFileSync(settings, `- name: ollama_chat/${model}\n  edit_format: whole\n  reasoning_tag: think\n`);
+  const promptFile = path.join(logDir, "aider-message.md");
+  fs.writeFileSync(promptFile, ex.prompt);
+  const [cmd, argv] = testCommand(ex, ".");
+  const testCmd = [cmd, ...argv].map((a) => (/[\s"]/.test(a) ? `"${a}"` : a)).join(" ");
+  // UTF-8 I/O: on Windows a piped stdout is cp1252 and Aider's console crashes on its own glyphs.
+  const env = { ...process.env, HOME: home, USERPROFILE: home, OLLAMA_API_BASE: endpoint.replace(/\/v1$/, ""), PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" };
+  const r = run(
+    aiderBin,
+    [
+      "--model", `ollama_chat/${model}`, "--model-settings-file", settings,
+      "--no-git", "--yes-always", "--no-pretty", "--no-stream", "--no-fancy-input", "--no-check-update",
+      "--analytics-disable", "--no-show-model-warnings", "--no-auto-lint", "--no-suggest-shell-commands", "--no-detect-urls",
+      // Histories go to the logs, not the scored workspace.
+      "--chat-history-file", path.join(logDir, "aider.chat.history.md"), "--input-history-file", path.join(logDir, "aider.input.history"),
+      ...(testsMode === "visible" ? ["--test-cmd", testCmd, "--auto-test"] : []),
+      "--message-file", promptFile, ...ex.solution,
+    ],
+    { cwd: dir, env }
+  );
+  // Aider reports usage per call as "Tokens: 1.2k sent, 345 received."
+  const num = (n, k) => Math.round(Number(n) * (k ? 1000 : 1));
+  let tokensIn = 0;
+  let tokensOut = 0;
+  for (const m of r.stdout.matchAll(/Tokens: ([\d.]+)(k?) sent, ([\d.]+)(k?) received/g)) {
+    tokensIn += num(m[1], m[2]);
+    tokensOut += num(m[3], m[4]);
+  }
+  // Aider shows test failures instead of claiming success, so it makes no claim.
+  return { r, status: r.timedOut ? "timeout" : r.code === 0 ? "finished" : `exit_${r.code}`, claimed: null, tokensIn, tokensOut };
+}
+
 // --- main --------------------------------------------------------------------
 
 const version = (cmd, argv) => run(cmd, argv, { timeoutS: 60, shell: false }).stdout.trim().split("\n")[0];
 const meta = {
   date: new Date().toISOString(),
-  polyglot_commit: git(polyglot, "rev-parse", "HEAD").stdout.trim(),
+  // A per-language checkout (such as exercism/python under <dir>/python) also works.
+  polyglot_commit: git(path.join(polyglot, langs[0]), "rev-parse", "HEAD").stdout.trim(),
   model,
   endpoint,
   runtime_version: await fetch(endpoint.replace(/\/v1$/, "") + "/api/version").then((r) => r.json()).then((j) => j.version).catch(() => "unknown"),
   phonton: arms.includes("phonton") ? version(bin, ["version"]) : null,
-  opencode: arms.includes("opencode") ? version(process.execPath, [opencodeEntry(), "--version"]) : null,
+  opencode: arms.includes("opencode") ? version(...opencodeCommand(["--version"])) : null,
+  aider: arms.includes("aider") ? version(aiderBin, ["--version"]) : null,
   node: process.version,
   os: `${os.type()} ${os.release()} ${os.arch()}`,
   cpu: os.cpus()[0]?.model,
@@ -361,7 +411,23 @@ for (const ex of langs.flatMap(exercises)) {
       method: "POST",
       body: JSON.stringify({ model, keep_alive: 0 }),
     }).catch(() => {});
-    const res = arm === "phonton" ? phontonArm(ex, dir, logDir) : arm === "bare" ? await bareArm(ex, dir) : opencodeArm(ex, dir, logDir);
+    // Unloading is asynchronous. Wait until nothing is resident, plus a
+    // moment for the runner process to release VRAM, so no arm (or memory
+    // admission check) starts against the previous arm's model.
+    for (let i = 0; i < 60; i++) {
+      const ps = await fetch(`${endpoint.replace(/\/v1\/?$/, "")}/api/ps`).then((r) => r.json()).catch(() => ({}));
+      if (!ps.models?.length) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // A busy machine fails memory admission before any model call. Wait up to
+    // ten minutes for --min-free-ram-gb, and record what the arm started with.
+    for (let i = 0; i < 120 && os.freemem() / 2 ** 30 < minFreeRamGb; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    const freeRamGb = Math.round((os.freemem() / 2 ** 30) * 10) / 10;
+    const res =
+      arm === "phonton" ? phontonArm(ex, dir, logDir) : arm === "bare" ? await bareArm(ex, dir) : arm === "aider" ? aiderArm(ex, dir, logDir) : opencodeArm(ex, dir, logDir);
     git(dir, "add", "-A");
     const diff = git(dir, "diff", "--cached", "HEAD").stdout;
     const touched = git(dir, "diff", "--cached", "--name-only", "HEAD").stdout.split("\n").filter(Boolean);
@@ -385,6 +451,7 @@ for (const ex of langs.flatMap(exercises)) {
       tokens_in: res.tokensIn,
       tokens_out: res.tokensOut,
       seconds: Math.round(res.r.seconds * 10) / 10,
+      free_ram_gb: freeRamGb,
       changed: touched.filter((f) => !f.startsWith("node_modules")),
     };
     rows.push(row);
@@ -413,7 +480,7 @@ const lines = [
   `# Aider Polyglot slice`,
   "",
   `Model \`${model}\` via ${endpoint} (runtime ${meta.runtime_version}); polyglot-benchmark \`${meta.polyglot_commit.slice(0, 7)}\`; tests ${testsMode}; ${meta.date}.`,
-  `phonton: \`${meta.phonton ?? "-"}\`; opencode: \`${meta.opencode ?? "-"}\`; ${meta.os}, ${meta.ram_gb} GB RAM.`,
+  `phonton: \`${meta.phonton ?? "-"}\`; opencode: \`${meta.opencode ?? "-"}\`; aider: \`${meta.aider ?? "-"}\`; ${meta.os}, ${meta.ram_gb} GB RAM.`,
   "",
   "| Arm | Lang | n | Pass | Claimed | False passes | False-pass rate | Tests touched | Median tokens | Median s |",
   "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",

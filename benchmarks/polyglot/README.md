@@ -1,7 +1,7 @@
 # Aider Polyglot slice
 
 Runs exercises from the [Aider Polyglot benchmark](https://github.com/Aider-AI/polyglot-benchmark)
-through three arms on the same local model and the same prompt, then scores
+through up to four arms on the same local model and the same prompt, then scores
 every run against the exercise's pristine tests:
 
 | Arm | What runs | Its claim of success |
@@ -9,6 +9,7 @@ every run against the exercise's pristine tests:
 | `phonton` | `phonton goal --local "<prompt>"`, then `goal --local apply` | a verified, review-ready candidate |
 | `bare` | the model alone: one chat call per try, whole files back | any answer that contains the files |
 | `opencode` | `opencode run --pure` with an isolated config, without the user's `~/.claude` instructions or skills | finishing without an error |
+| `aider` | `aider --message-file` with whole-file edits and, when tests are visible, `--test-cmd` and `--auto-test`; its own home, no git | none: it shows test failures instead of claiming success |
 
 The headline numbers are the **pass rate** and the **false-pass rate**: of the
 runs where the arm said it succeeded, how many fail the pristine tests.
@@ -132,11 +133,14 @@ budget. It writes `out/<lang>/`, `setup.log`, `env.txt` and `ollama.log`.
 | `--runtime unverified` | off | Phonton may use an Ollama it did not start |
 | `--bin PATH` | `target/release/phonton` | Phonton build |
 | `--opencode PATH` | from `npm root -g` | OpenCode's `bin/opencode` script |
+| `--aider PATH` | `aider` on `PATH` | Aider's CLI, such as a virtual environment's `Scripts/aider.exe` |
+| `--min-free-ram-gb N` | `0` (off) | before each arm, wait up to ten minutes for this much free RAM |
 | `--timeout-seconds N` | `900` | per arm run |
 | `--out DIR` / `--cache DIR` | `benchmarks/results/...` | artifacts / reusable test deps |
 
 Each run writes `meta.json` (versions, commit, model, hardware, arguments),
-`results.jsonl`, `summary.md`, and per exercise and arm: `prompt.md`,
+`results.jsonl` (each row carries `free_ram_gb`, the free RAM the arm started
+with), `summary.md`, and per exercise and arm: `prompt.md`,
 `stdout.txt`, `stderr.txt`, `diff.patch`, `tests.txt`, plus Phonton's
 `evidence.json` or OpenCode's config. `benchmarks/results/` is not committed;
 copy a run's folder next to its write-up.

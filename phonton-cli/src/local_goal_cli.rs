@@ -647,7 +647,7 @@ fn prepare_at(
 }
 /// Why a local goal stopped before running when no model is selected, with
 /// the setup command for this machine as the next step.
-async fn no_model_message() -> String {
+pub(crate) async fn no_model_message() -> String {
     let machine = phonton_local::hardware::detect().await;
     format!(
         "No local model is set up yet, so nothing ran and no file changed. Next: {}",

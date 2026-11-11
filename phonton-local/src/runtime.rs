@@ -1025,14 +1025,25 @@ impl LocalRuntime {
         Fut: Future<Output = HardwareSnapshot>,
     {
         let hardware = observe_hardware().await;
+        // Once a probe has loaded the model, later probes talk to that copy.
+        // Entirely in VRAM it already holds its host memory, so the cold-load
+        // reserve would count that memory twice, as it did for goal runs.
+        let reserve = self
+            .resident(&model.name, &model.digest, admission.context_tokens)
+            .await
+            .ok()
+            .flatten()
+            .map_or(CALIBRATION_HOST_RESERVE_BYTES, |loaded| {
+                crate::resident_host_reserve(&loaded)
+            });
         if hardware
             .ram_available_bytes
-            .is_none_or(|bytes| bytes < CALIBRATION_HOST_RESERVE_BYTES)
+            .is_none_or(|bytes| bytes < reserve)
         {
-            return Err(LocalError::Invalid(
-                "Available host RAM fell below the 1.5 GiB calibration reserve; stop probes and free memory before retrying."
-                    .into(),
-            ));
+            return Err(LocalError::Invalid(format!(
+                "Available host RAM fell below the {:.1} GiB calibration reserve; stop probes and free memory before retrying.",
+                reserve as f64 / (1u64 << 30) as f64
+            )));
         }
         let fit = self
             .estimate_cold_load(
@@ -1505,11 +1516,13 @@ pub fn model_context_ceiling(metadata: &Value) -> Option<u32> {
 }
 
 /// KV cache bytes per context token at f16, from the attention shape in
-/// Ollama's model metadata. Per-layer KV head counts are summed, so the
-/// linear-attention layers of hybrid models (qwen3.5: 8 of 32 layers keep a
-/// KV cache) cost nothing. Sliding-window layers count as full attention, so
-/// gemma and gpt-oss estimates run high. Missing or malformed shape metadata
-/// returns `None` and the caller's conservative fallback.
+/// Ollama's model metadata. Linear-attention layers of hybrid models keep a
+/// fixed state instead of a KV cache and cost nothing: per-layer KV head
+/// counts are summed, and layers flagged in `attention.recurrent_layers`
+/// (qwen3.5: 24 of 32) are left out of a scalar count. Sliding-window
+/// layers count as full attention, so gemma and gpt-oss estimates run high.
+/// Missing or malformed shape metadata returns `None` and the caller's
+/// conservative fallback.
 pub fn model_kv_bytes_per_token(metadata: &Value) -> Option<u64> {
     let info = metadata.get("model_info")?.as_object()?;
     let architecture = info.get("general.architecture")?.as_str()?;
@@ -1517,7 +1530,19 @@ pub fn model_kv_bytes_per_token(metadata: &Value) -> Option<u64> {
     let number = |name: &str| field(name).and_then(Value::as_u64);
     let kv_heads = match field("attention.head_count_kv")? {
         Value::Array(layers) => layers.iter().map(Value::as_u64).sum::<Option<u64>>()?,
-        heads => heads.as_u64()?.checked_mul(number("block_count")?)?,
+        heads => {
+            let recurrent = field("attention.recurrent_layers")
+                .and_then(Value::as_array)
+                .map_or(0, |layers| {
+                    layers
+                        .iter()
+                        .filter(|layer| layer.as_bool() == Some(true))
+                        .count() as u64
+                });
+            heads
+                .as_u64()?
+                .checked_mul(number("block_count")?.checked_sub(recurrent)?)?
+        }
     };
     let head_dim = || number("embedding_length")?.checked_div(number("attention.head_count")?);
     let key = number("attention.key_length").or_else(head_dim)?;
@@ -1925,6 +1950,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(explicit.context_tokens, 2048);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probes_of_a_vram_resident_model_need_only_the_resident_reserve() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (runtime, mode, chats, server) = resident_calibration_fixture().await;
+        // The fixture model is loaded entirely in VRAM at 8192 tokens.
+        mode.store(10, Ordering::SeqCst);
+        let hardware = HardwareSnapshot {
+            ram_available_bytes: Some(1800 << 20),
+            gpus: vec![GpuSnapshot {
+                name: "GPU".into(),
+                total_bytes: 4 << 30,
+                available_bytes: 1638 << 20,
+            }],
+            ..Default::default()
+        };
+        // After the first probe free RAM reads below the 1.5 GiB cold-load
+        // reserve. On 2026-11-10 Ollama loaded qwen3.5:4b with 2.1 GiB free,
+        // the load took about 0.5 GiB of host buffers, and `models calibrate`
+        // stopped at its second probe.
+        for (later_mib, completes) in [(1400u64, true), (400, false)] {
+            chats.store(0, Ordering::SeqCst);
+            let readings = Arc::new(AtomicUsize::new(0));
+            let first = hardware.clone();
+            let observe = move || {
+                let mut seen = first.clone();
+                if readings.fetch_add(1, Ordering::SeqCst) > 0 {
+                    seen.ram_available_bytes = Some(later_mib << 20);
+                }
+                std::future::ready(seen)
+            };
+            match runtime
+                .calibrate_with_observer("fixture", None, hardware.clone(), &observe)
+                .await
+            {
+                Ok(profile) => {
+                    assert!(completes, "{later_mib} MiB");
+                    assert_eq!(profile.context_tokens, 8192);
+                }
+                Err(error) => {
+                    assert!(!completes, "{later_mib} MiB: {error}");
+                    assert!(error.to_string().contains("0.5 GiB"), "{error}");
+                    assert_eq!(chats.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
         server.abort();
     }
 
@@ -2631,16 +2708,15 @@ mod tests {
 
     #[test]
     fn kv_cache_size_follows_reported_attention_shape() {
-        // qwen3.5:4b as Ollama 0.34.2 reports it: 8 of 32 layers keep KV.
-        let mut kv_heads = vec![0; 32];
-        for layer in (3..32).step_by(4) {
-            kv_heads[layer] = 4;
-        }
+        // qwen3.5:4b as Ollama 0.34.2's /api/show reports it: a scalar KV
+        // head count and 24 of 32 layers flagged recurrent, so 8 keep KV.
+        let recurrent: Vec<bool> = (0..32).map(|layer| layer % 4 != 3).collect();
         let qwen35 = json!({"model_info":{
             "general.architecture":"qwen35",
             "qwen35.block_count":32,
             "qwen35.attention.head_count":16,
-            "qwen35.attention.head_count_kv":kv_heads,
+            "qwen35.attention.head_count_kv":4,
+            "qwen35.attention.recurrent_layers":recurrent,
             "qwen35.attention.key_length":256,
             "qwen35.attention.value_length":256,
             "qwen35.embedding_length":2560
@@ -2648,6 +2724,36 @@ mod tests {
         // 512 MiB at 16384 tokens; llama-server reported 562 MiB of context
         // including the fixed linear-attention state.
         assert_eq!(model_kv_bytes_per_token(&qwen35), Some(32 * 1024));
+        // A 6 GB laptop GPU with 2 GiB of RAM free: counting all 32 layers
+        // estimated 6.5 GB, an offload that refused goals on a busy laptop.
+        let laptop = HardwareSnapshot {
+            ram_available_bytes: Some(2 << 30),
+            gpus: vec![GpuSnapshot {
+                name: "RTX 4050 Laptop".into(),
+                total_bytes: 6141 << 20,
+                available_bytes: 5600 << 20,
+            }],
+            ..HardwareSnapshot::default()
+        };
+        let fit = crate::estimate_fit_for_context(
+            3_324_173_934,
+            model_kv_bytes_per_token(&qwen35),
+            &laptop,
+            16384,
+        );
+        assert_eq!(fit.status, FitStatus::LikelyFitsGpu, "{fit:?}");
+        // The same model with per-layer head counts instead of flags.
+        let mut kv_heads = vec![0; 32];
+        for layer in (3..32).step_by(4) {
+            kv_heads[layer] = 4;
+        }
+        let mut per_layer = qwen35.clone();
+        per_layer["model_info"]["qwen35.attention.head_count_kv"] = json!(kv_heads);
+        assert_eq!(model_kv_bytes_per_token(&per_layer), Some(32 * 1024));
+        // More recurrent flags than layers is malformed, not a free cache.
+        let mut overflagged = qwen35.clone();
+        overflagged["model_info"]["qwen35.block_count"] = json!(16);
+        assert_eq!(model_kv_bytes_per_token(&overflagged), None);
         // qwen2.5-coder 1.5B: head size from embedding width; llama-server
         // logged a 448 MiB KV buffer at 16384 tokens.
         let qwen2 = json!({"model_info":{

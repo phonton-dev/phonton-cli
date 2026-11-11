@@ -139,27 +139,12 @@ fn whole_file_system_instruction(path: &Path) -> String {
     format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly. Your previous search and replacement changed nothing. No prose, commands, test changes, or other paths.")
 }
 
-/// Host RAM a chat with an exact resident model needs free when that copy is
-/// entirely in VRAM. Its runtime allocation was made at load time and is
-/// already outside the available reading, so the 1.5 GiB cold-load reserve
-/// would count it twice; this leaves headroom for the request and the OS. On
-/// Ollama 0.34.2 (2026-10-17, RTX 4050) loading qwen3.5:4b at 16384 tokens
-/// took about 700 MiB of host RAM; a later 7000-token chat loaded nothing.
-// ponytail: fixed floor, measure per-chat host use if a runtime allocates per request.
-const VRAM_RESIDENT_HOST_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Whether `resident` may serve the next chat. A copy partly in RAM keeps the
-/// full reserve, because paging its weights out would stall generation.
+/// Whether `resident` may serve the next chat.
 fn resident_headroom(hardware: &HardwareSnapshot, resident: Option<&ResidentModel>) -> bool {
     resident.is_some_and(|model| {
-        let reserve = if model.size_vram_bytes >= model.size_bytes {
-            VRAM_RESIDENT_HOST_RESERVE_BYTES
-        } else {
-            phonton_local::GPU_HOST_RESERVE_BYTES
-        };
         hardware
             .ram_available_bytes
-            .is_some_and(|bytes| bytes >= reserve)
+            .is_some_and(|bytes| bytes >= phonton_local::resident_host_reserve(model))
     })
 }
 

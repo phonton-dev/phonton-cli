@@ -99,6 +99,9 @@ phonton goal --local apply RUN_ID --yes     # after reviewing the verified candi
 phonton goal --local rollback RUN_ID --yes  # restore the original files
 ```
 
+`models setup` and `models select` set provider `ollama` in `config.toml`
+when it names no provider, so a provider key in your environment does not
+send goals to the cloud; a provider named there is kept, and setup says so.
 With provider `ollama` and a calibrated model selected, both the TUI and
 `phonton goal` use the local harness. Every goal pauses for plan approval,
 local runs never fall back to a cloud model, and the receipt says whether the

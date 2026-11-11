@@ -278,3 +278,37 @@ fn saved_local_attempt_can_be_listed_and_shown_without_a_model() {
     assert!(!mismatched.status.success());
     assert!(String::from_utf8_lossy(&mismatched.stderr).contains("identity"));
 }
+
+#[test]
+fn keyless_goal_without_a_local_model_points_to_model_setup() {
+    let fixture = tempfile::tempdir().unwrap();
+    let repository = fixture.path().join("repository");
+    std::fs::create_dir(&repository).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repository)
+        .status()
+        .unwrap()
+        .success());
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_phonton"));
+    command
+        .args(["goal", "Fix add", "--yes", "--allow-host-checks"])
+        .current_dir(&repository)
+        .env("PHONTON_HOME", fixture.path().join("home"))
+        .env_remove("PHONTON_CONFIG_PATH")
+        .env_remove("PHONTON_LOCAL_STATE");
+    // A provider key in this environment would pick a cloud provider instead.
+    for (name, _) in std::env::vars() {
+        if name.ends_with("_API_KEY") || name.ends_with("_TOKEN") {
+            command.env_remove(name);
+        }
+    }
+    let output = command.output().unwrap();
+
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{error}");
+    assert!(error.contains("No local model is set up yet"), "{error}");
+    assert!(error.contains("phonton models setup"), "{error}");
+    assert!(!error.contains("API key configured"), "{error}");
+}

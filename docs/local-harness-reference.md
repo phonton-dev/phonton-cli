@@ -138,7 +138,8 @@ cold-load estimate with its context; `models status 8192` previews an explicit
 override. Unknown readings do not become a recommendation. You can still pass
 an explicit 2048–32768 context to `models calibrate`.
 The estimate sizes the KV cache from Ollama's reported attention shape: per-layer
-KV head counts, so hybrid models such as `qwen3.5` pay only for their
+KV head counts, or one count for every layer not flagged in
+`attention.recurrent_layers`, so hybrid models such as `qwen3.5` pay only for their
 full-attention layers (32 KiB per token for 4b and 9b). Sliding-window layers
 count as full attention, so gemma and gpt-oss estimates run high. A copy of the
 same model (name and digest) already loaded at another context counts as free
@@ -150,7 +151,10 @@ model already loaded in Ollama. The model must have enough context and at least
 30 seconds before unload, while at least 1.5 GiB host RAM remains available.
 Automatic context still requires the model's reported limit. Phonton rechecks
 memory and resident identity before every probe; a loaded model is not reserved
-for the duration of calibration. Probe results remain compatibility evidence.
+for the duration of calibration. A probe needs 1.5 GiB of available host RAM,
+or 512 MiB when the exact model is already loaded entirely in VRAM at the
+calibration context, the rule goal runs use. Probe results remain
+compatibility evidence.
 `models status` keeps an incomplete calibration attempt separate from selectable
 profiles. Finished probes are saved after each request, so cancellation, memory
 pressure or an engine exit does not erase their diagnostic output. A retry runs
