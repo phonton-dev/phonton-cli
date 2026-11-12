@@ -3080,6 +3080,7 @@ mod tests {
                 diff: baseline_diff(&baseline, &candidate_dir, &["code.py".into()]).unwrap(),
                 context: None,
                 decision: None,
+                sampling: None,
             }],
             hypotheses: vec![],
             selected_candidate: Some(1),

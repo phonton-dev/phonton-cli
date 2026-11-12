@@ -63,14 +63,19 @@ jobs:
           VERSION: ${{ steps.package.outputs.version }}
         shell: bash
         run: |
-          for attempt in {1..30}; do
-            published="$(npm view "phonton-cli@${VERSION}" version 2>/dev/null || true)"
+          # npm processes publishes asynchronously ("may take a few minutes to
+          # become available"). The registry recorded 0.25.2 and 0.26.0 about
+          # 5-7 minutes after publish, so a 5-minute wait failed both releases
+          # although their publishes succeeded. Wait up to 20 minutes, and
+          # revalidate each time instead of reusing npm's cached package document.
+          for attempt in {1..120}; do
+            published="$(npm view "phonton-cli@${VERSION}" version --prefer-online 2>/dev/null || true)"
             if [ "$published" = "$VERSION" ]; then
               echo "$published"
               exit 0
             fi
-            echo "Waiting for phonton-cli@${VERSION} to propagate to npm (${attempt}/30)."
+            echo "Waiting for phonton-cli@${VERSION} to propagate to npm (${attempt}/120)."
             sleep 10
           done
 
-          npm view "phonton-cli@${VERSION}" version
+          npm view "phonton-cli@${VERSION}" version --prefer-online

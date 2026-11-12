@@ -247,6 +247,20 @@ pub struct CandidateEvidence {
     /// Controller choice and lineage. Absent in older saved receipts.
     #[serde(default)]
     pub decision: Option<SearchDecision>,
+    /// Sampling for this candidate's strategy and edit calls. Absent means
+    /// the calibrated default, temperature 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Sampling>,
+}
+
+/// Seeded non-zero temperature, used only after a run repeated model output
+/// or a candidate byte for byte; another temperature-0 call would repeat it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sampling {
+    /// Runtime sampling temperature.
+    pub temperature: f64,
+    /// Runtime sampling seed, so the call can be reproduced.
+    pub seed: u64,
 }
 
 /// Original Git staging identity, observed separately from source snapshots.

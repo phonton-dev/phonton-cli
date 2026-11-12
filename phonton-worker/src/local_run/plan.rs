@@ -18,6 +18,28 @@ struct RankedSource {
     content_hits: usize,
     // Numbers from the goal ("from 120 to 80") found in this file.
     literal_hits: usize,
+    // The goal spells out this file's repository path.
+    named: bool,
+}
+
+/// Whether the goal spells out `path` (repository-relative) as a whole token:
+/// `src/port.js` matches "fix src/port.js." and "./src/port.js", not
+/// "lib/src/port.js".
+fn goal_names_path(goal: &str, path: &Path) -> bool {
+    let goal = goal.to_lowercase().replace('\\', "/").replace("./", "");
+    let path = path.to_string_lossy().to_lowercase().replace('\\', "/");
+    let path_char = |c: char| c.is_alphanumeric() || matches!(c, '/' | '_' | '-');
+    goal.match_indices(&path).any(|(at, _)| {
+        let before = goal[..at].chars().next_back();
+        let mut after = goal[at + path.len()..].chars();
+        // "src/port.js." ends a sentence; "src/port.js.bak" is another file.
+        let continues = match after.next() {
+            Some('.') => after.next().is_some_and(char::is_alphanumeric),
+            Some(c) => path_char(c),
+            None => false,
+        };
+        !matches!(before, Some(c) if path_char(c) || c == '.') && !continues
+    })
 }
 
 /// Standalone numbers of two or more digits.
@@ -96,8 +118,12 @@ impl RankedSource {
 /// Inspect a bounded Git working tree without inference or project execution.
 /// Returned checks are proposals. Host permission is always cleared in a preview.
 pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
-    if request.goal.trim().is_empty() || request.goal.len() > 8192 {
-        return Err(invalid("Enter a coding goal of at most 8192 bytes"));
+    // The selected model's calibrated context sets the real limit at run start.
+    if request.goal.trim().is_empty() || request.goal.len() > super::MAX_GOAL_BYTES {
+        return Err(invalid(format!(
+            "Enter a coding goal of at most {} bytes",
+            super::MAX_GOAL_BYTES
+        )));
     }
     let root = std::fs::canonicalize(&request.repository)?;
     request.repository = root.clone();
@@ -172,6 +198,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
             .count();
         let literal_hits = goal_literals.intersection(&number_literals(source)).count();
         ranked.push(RankedSource {
+            named: goal_names_path(&request.goal, path),
             names,
             path_hits,
             content_hits,
@@ -198,7 +225,7 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
             source
                 .names
                 .retain(|family, (_, matched)| strongest.get(family) == Some(matched));
-            !had_name || !source.names.is_empty()
+            !had_name || !source.names.is_empty() || source.named
         });
     }
     for source in &mut ranked {
@@ -207,15 +234,25 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
     // A value the goal changes ("from 120 to 80") marks the file to edit more
     // reliably than a name match, which can be a local variable like `todo`.
     ranked.sort_by(|a, b| {
-        b.literal_hits
-            .cmp(&a.literal_hits)
+        b.named
+            .cmp(&a.named)
+            .then(b.literal_hits.cmp(&a.literal_hits))
             .then(b.priority().cmp(&a.priority()))
             .then(b.score().cmp(&a.score()))
             .then(a.evidence.path.cmp(&b.evidence.path))
     });
     if inferred {
-        let best = ranked.first().map(RankedSource::score).unwrap_or(0);
-        if best == 0 {
+        let best = ranked.iter().map(RankedSource::score).max().unwrap_or(0);
+        // A file defining a code-shaped name the goal uses exactly
+        // (`parseResponse`, `max_title`) stays; a plain word such as
+        // a local variable `todo` does not.
+        let defines_named_code = |r: &RankedSource| {
+            r.names.values().any(|(name, matched)| {
+                *matched == context::NameMatch::Exact
+                    && (name.contains('_') || name.chars().skip(1).any(char::is_uppercase))
+            })
+        };
+        if best == 0 && !ranked.iter().any(|r| r.named) {
             if request.new_file.is_none() {
                 return Err(invalid("No source matched the goal. Name a symbol or path, or provide the files explicitly"));
             }
@@ -232,8 +269,19 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
                 .map(|r| r.content_hits)
                 .max()
                 .unwrap_or(usize::MAX);
+            // A file the goal names by path is the scope, with any file that
+            // defines a code name the goal uses; words such as "list" or
+            // "error" also match symbols in unrelated files.
+            if ranked.iter().any(|r| r.named) {
+                let before = ranked.len();
+                ranked.retain(|r| r.named || defines_named_code(r));
+                if ranked.len() < before {
+                    warnings.push("Scope limited to the files the goal names by path and the files that define code names it uses.".into());
+                }
+            }
             ranked.retain(|r| {
-                !r.names.is_empty()
+                r.named
+                    || !r.names.is_empty()
                     || r.literal_hits > 0
                     || r.score() >= threshold
                     || (r.content_hits >= 3 && r.content_hits >= named_content)
@@ -245,15 +293,6 @@ pub async fn preview(mut request: LocalRunRequest) -> Result<LocalPlan> {
                 let named = |path: &Path| {
                     path.file_name()
                         .is_some_and(|name| goal.contains(&name.to_string_lossy().to_lowercase()))
-                };
-                // A file defining a code-shaped name the goal uses exactly
-                // (`parseResponse`, `max_title`) stays; a plain word such as
-                // a local variable `todo` does not.
-                let defines_named_code = |r: &RankedSource| {
-                    r.names.values().any(|(name, matched)| {
-                        *matched == context::NameMatch::Exact
-                            && (name.contains('_') || name.chars().skip(1).any(char::is_uppercase))
-                    })
                 };
                 let before = ranked.len();
                 ranked.retain(|r| {
@@ -1270,6 +1309,135 @@ mod tests {
             plan.request.files
         );
     }
+    #[tokio::test]
+    async fn a_file_the_goal_names_by_path_is_the_scope() {
+        // Dogfood on a real repository: the goal named
+        // packages/pytxo/lib/platform.js, but eight files defining `list`,
+        // `add`, `message` or `error` outranked it and it was dropped.
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(root.path().join("lib")).unwrap();
+        std::fs::create_dir_all(root.path().join("other")).unwrap();
+        std::fs::write(
+            root.path().join("lib/platform.js"),
+            "const TARGETS = { \"linux-x64\": \"x86_64-unknown-linux-gnu\" };\nfunction targetFor(platform, arch) {\n  const target = TARGETS[`${platform}-${arch}`];\n  if (!target) throw new Error(`unsupported platform: ${platform}-${arch}`);\n  return target;\n}\nmodule.exports = { targetFor };\n",
+        )
+        .unwrap();
+        for (i, name) in [
+            "list", "add", "message", "error", "list", "add", "message", "error", "list",
+        ]
+        .iter()
+        .enumerate()
+        {
+            std::fs::write(
+                root.path().join(format!("other/m{i}.js")),
+                format!("function {name}(x) {{\n  return x;\n}}\nmodule.exports = {{ {name} }};\n"),
+            )
+            .unwrap();
+        }
+        let request = |goal: &str| LocalRunRequest {
+            goal: goal.into(),
+            repository: root.path().into(),
+            files: vec![],
+            new_file: None,
+            editable_existing: vec![],
+            checks: vec![],
+            preparation: None,
+            approve_host_execution: false,
+            allow_unverified_runtime: false,
+            budget: Default::default(),
+            expected_source_hashes: Default::default(),
+            expected_baseline_sha256: None,
+        };
+        let plan = preview(request("In lib/platform.js, make the unsupported-platform error message list the supported pairs, and add the arch")).await.unwrap();
+        assert_eq!(plan.request.files, vec![PathBuf::from("lib/platform.js")]);
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("names by path")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(goal_names_path(
+            "Fix ./lib/platform.js.",
+            Path::new("lib/platform.js")
+        ));
+        assert!(goal_names_path(
+            "see `lib\\platform.js`",
+            Path::new("lib/platform.js")
+        ));
+        assert!(!goal_names_path(
+            "Fix src/lib/platform.js",
+            Path::new("lib/platform.js")
+        ));
+        assert!(!goal_names_path(
+            "Fix lib/platform.jsx",
+            Path::new("lib/platform.js")
+        ));
+        assert!(!goal_names_path(
+            "Restore lib/platform.js.bak",
+            Path::new("lib/platform.js")
+        ));
+
+        // A reference file named by path keeps the file defining the code
+        // name the goal uses, and a named file with no goal symbol stays.
+        std::fs::write(
+            root.path().join("lib/users.js"),
+            "function createUser(name) {\n  return { name };\n}\nmodule.exports = { createUser };\n",
+        )
+        .unwrap();
+        let both = vec![
+            PathBuf::from("lib/platform.js"),
+            PathBuf::from("lib/users.js"),
+        ];
+        let plan = preview(request("Add validation to createUser like lib/platform.js"))
+            .await
+            .unwrap();
+        assert_eq!(plan.request.files, both);
+        let plan = preview(request(
+            "Move createUser from lib/users.js to lib/platform.js",
+        ))
+        .await
+        .unwrap();
+        let mut files = plan.request.files.clone();
+        files.sort();
+        assert_eq!(files, both);
+
+        // A named test file is protected, so it never becomes the scope.
+        std::fs::create_dir_all(root.path().join("tests")).unwrap();
+        std::fs::write(
+            root.path().join("tests/platform.test.js"),
+            "require('../lib/platform.js');\n",
+        )
+        .unwrap();
+        let plan = preview(request(
+            "Make tests/platform.test.js pass for the platform targets",
+        ))
+        .await
+        .unwrap();
+        assert!(
+            plan.request
+                .files
+                .contains(&PathBuf::from("lib/platform.js")),
+            "{:?}",
+            plan.request.files
+        );
+        assert!(
+            !plan.request.files.iter().any(|f| f.starts_with("tests")),
+            "{:?}",
+            plan.request.files
+        );
+
+        // A named root file whose path has no goal word still counts.
+        std::fs::write(root.path().join("io.go"), "package main\n\nfunc f() {}\n").unwrap();
+        let plan = preview(request("Tidy io.go")).await.unwrap();
+        assert_eq!(plan.request.files, vec![PathBuf::from("io.go")]);
+    }
+
     #[test]
     fn only_replaced_numbers_scope_an_edit() {
         let set = |goal| replaced_literals(goal).into_iter().collect::<Vec<_>>();

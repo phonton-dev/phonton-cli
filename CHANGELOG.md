@@ -4,6 +4,107 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## 0.27.0 - Local Rust checks run cargo; the local search wastes fewer attempts
+
+### Fixed
+
+- [fixed] Local goals on Rust could not run their checks where `cargo.exe` is
+  a symlink to `rustup.exe` (scoop's `rustup-msvc`): Phonton resolved the
+  link and started rustup, which rejected `test` as a subcommand. The check
+  now runs the proxy under its own name. The link target must still be
+  outside the candidate directory.
+- [fixed] Once cargo ran, a local Rust goal without a `Cargo.lock` stopped at
+  its baseline check: `cargo test` wrote one, and Phonton treated it as a
+  file the check added. A `Cargo.lock` written beside a captured
+  `Cargo.toml` is now ignored like `target/`.
+- [fixed] A local goal longer than 8,192 bytes was refused before a model was
+  chosen. The limit now comes from the selected model's calibrated context
+  (three quarters of it, 12,288 bytes at 16,384 tokens).
+- [fixed] `Publish npm` failed its last step after successful publishes,
+  because npm took longer than the 5-minute wait to make the version
+  visible. It now waits up to 20 minutes.
+- [fixed] `phonton models setup` downloaded a model that could never load on
+  the machine and then failed calibration: 22.6 GB of `qwen3.6:35b-a3b` on a
+  16 GB laptop with a 6 GB GPU. With the managed runtime it now compares the
+  weights, a 4K-token cache and the runtime with the machine's total GPU and
+  RAM, refuses before downloading, and names the setup command for a model
+  that fits.
+- [fixed] When the drive was too small for the local runtime, `phonton models
+  setup` said how much space it needed but not what to do. It now says to
+  free space or choose a folder on another drive with `phonton models storage
+  FOLDER`.
+- [fixed] `phonton goal --local` with no model set up said only "Calibrate
+  and select a local model first". It now says nothing ran and gives the
+  setup command for this machine. Outside a Git repository it now says why it
+  stopped and suggests `git init`.
+- [fixed] A local goal refused before it started for lack of free memory now
+  says that nothing ran and no file changed. When the model is too big for
+  the free memory, it also says to close other programs or choose a smaller
+  model from `phonton models catalog`.
+- [fixed] A local goal that names a file by its repository path now edits
+  that file. Words in the goal such as "list" or "error" also matched symbols
+  in unrelated files, and eight of those could push the named file out of
+  scope. When the goal names files by path, the scope is those files plus
+  any file that defines a code name the goal uses, such as `createUser`.
+- [fixed] When a local search stopped, the `phonton goal --local` summary
+  showed only the last rejection. It now also prints why the search stopped,
+  such as a restart prompt that does not fit the calibrated context.
+- [fixed] A rerun of `phonton models setup` reported the full model size as
+  left to download. The figure is now labelled an upper bound: layers already
+  in the store are not downloaded again.
+- [fixed] A local goal on `qwen3.5:4b` could be refused before any model call
+  ("Estimated working set exceeds available memory") on a 6 GB GPU that holds
+  the model. Ollama reports this model's attention as one KV head count plus
+  per-layer `recurrent_layers` flags, and Phonton counted a KV cache for all
+  32 layers when 8 keep one: 2 GiB at 16,384 tokens instead of 512 MiB.
+  Flagged layers are now left out, so the model is admitted on the GPU with
+  1.5 GiB of host RAM free instead of being sized as a CPU offload.
+- [fixed] `phonton models setup` could stop at its second calibration probe
+  with "Available host RAM fell below the 1.5 GiB calibration reserve" on a
+  machine with enough memory for the model. The first probe loads the model,
+  which takes host RAM (about 0.5 GiB of buffers for `qwen3.5:4b` on an RTX
+  4050), and every later probe still asked for the full cold-load reserve.
+  A probe of a copy already loaded entirely in VRAM at the calibration
+  context now needs 512 MiB free, the rule goal runs have used since 0.25.1.
+  The first probe, a copy partly in RAM and an unknown memory reading keep
+  the 1.5 GiB reserve.
+- [fixed] After `phonton models setup`, goals still went to a cloud provider
+  when a provider key was in the environment and `config.toml` named no
+  provider, because provider autodetection prefers a key. `models setup` and
+  `models select` now write `name = "ollama"` under `[provider]` when the
+  config names none. A provider the config names is kept, and setup says
+  that goals still use it.
+- [fixed] `phonton goal` with no provider key and no local model said "no
+  provider API key configured". It now says that no local model is set up
+  and gives the setup command for this machine.
+
+### Changed
+
+- [changed] A local model reply that repeats an earlier reply in the run byte
+  for byte, or a candidate identical to an earlier one, is rejected without
+  checks and the run asks again. After that, the run's model calls sample at
+  temperature 0.7 with a recorded seed instead of temperature 0, which kept
+  returning the same reply.
+- [changed] When a local search/replace reply changes nothing on a file of at
+  most 300 lines, the next attempt asks for the whole corrected file when it
+  fits the calibrated context and output reserve.
+- [changed] With checks selected and approved to run on the host, a local
+  candidate that does not add an identifier the goal names is no longer
+  rejected before its checks. If it passes them, it is review-ready with a
+  warning in the receipt and the run summary. Without checks, without that
+  approval, or when the checks do not all run and pass, it is still
+  rejected.
+- [changed] `phonton models catalog` recommends `qwen3.5:9b` from 10 GB of
+  model memory instead of 6 GB. A laptop with a 6 GB GPU and 16 GB of RAM
+  (8 GB of model memory) now gets `qwen3.5:4b`: no measured run there has
+  beaten it. The help, the Ollama provider default and the docs use
+  `qwen3.5:4b`.
+
+### Added
+
+- [added] CI runs clippy and the workspace tests on Windows, including the
+  symlinked rustup-proxy case.
+
 ## 0.26.0 - Cloud goals run your own checks
 
 ### Added
@@ -530,7 +631,7 @@ accepted by hidden tests, 302,442 tokens, $0.186 in total.
   unavailable".
 - [fixed] Ollama and custom endpoints use the configured model on every tier;
   Standard/Frontier subtasks no longer fall back to a hardcoded `llama3.2:3b`.
-- [fixed] Local edits keep regex escapes like `` that small models write
+- [fixed] Local edits keep regex escapes like `\b` that small models write
   with a single JSON backslash, instead of decoding them to a backspace byte.
 - [fixed] Local-run Apply works on Windows: the saved-review hash no longer
   depends on the OS path separator.

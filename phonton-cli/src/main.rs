@@ -5134,7 +5134,7 @@ fn default_model_for(provider: &str) -> String {
         "ollama" => models_cli::settings()
             .ok()
             .and_then(|settings| settings.active_model)
-            .unwrap_or_else(|| "qwen3.5:9b".into()),
+            .unwrap_or_else(|| "qwen3.5:4b".into()),
         "deepseek" => "deepseek-flash".into(),
         "xai" | "grok" => "grok-build-0.1".into(),
         "groq" => "openai/gpt-oss-120b".into(),
@@ -5181,7 +5181,7 @@ fn print_help() {
          phonton doctor           check provider key, git, and local tools\n  \
          phonton                  open the TUI and type a goal\n  \
          phonton models           pick a local model sized for this machine\n  \
-         phonton models setup qwen3.5:9b\n                           \
+         phonton models setup qwen3.5:4b\n                           \
          run on a local model instead of a cloud key\n  \
          phonton why-tokens       see where the last goal spent tokens\n\
          \n\
@@ -5884,6 +5884,20 @@ async fn run_headless_goal(args: &[String]) -> Result<i32> {
                 }
                 _ => false,
             };
+        // A keyless install resolves to ollama; without a selected model the
+        // cloud pipeline would only blame a missing API key.
+        if !calibrated
+            && cfg.provider.name == "ollama"
+            && configured.is_empty()
+            && base_url.is_empty()
+        {
+            eprintln!(
+                "phonton goal: {}
+Or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...) to run in the cloud.",
+                local_goal_cli::no_model_message().await
+            );
+            return Ok(2);
+        }
         if calibrated {
             // Same routing as the TUI: a calibrated local model runs through
             // the local harness built for small models.

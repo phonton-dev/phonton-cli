@@ -20,7 +20,7 @@ runtime on Windows x64, Linux x64/arm64 and macOS):
 
 ```bash
 phonton models catalog                    # marks the model for this machine
-phonton models setup qwen3.5:9b           # runtime, download, calibrate, select
+phonton models setup qwen3.5:4b           # runtime, download, calibrate, select
 ```
 
 Then check the setup from your project folder:

@@ -645,6 +645,17 @@ fn prepare_at(
     }
     Ok((lease, profile, runtime_guard, directory))
 }
+/// Why a local goal stopped before running when no model is selected, with
+/// the setup command for this machine as the next step.
+pub(crate) async fn no_model_message() -> String {
+    let machine = phonton_local::hardware::detect().await;
+    format!(
+        "No local model is set up yet, so nothing ran and no file changed. Next: {}",
+        crate::models_cli::setup_command_for(&machine)
+            .unwrap_or_else(|| crate::models_cli::NO_RECOMMENDATION.into())
+    )
+}
+
 async fn prepare_live_at(
     request: &LocalRunRequest,
     requested_id: Option<uuid::Uuid>,
@@ -1430,9 +1441,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
         request_from_reviewed_plan_args(args)?
     } else if args.first().is_some_and(|s| s == "--request") {
         let request = request_from_file_args(args)?;
-        let selection = current_model_selection()
-            .await?
-            .ok_or_else(|| anyhow!("Calibrate and select a local model first"))?;
+        let Some(selection) = current_model_selection().await? else {
+            bail!("{}", no_model_message().await);
+        };
         (request, selection)
     } else {
         let options = parse_goal(args)?;
@@ -1472,8 +1483,9 @@ pub async fn run(args: &[String]) -> Result<i32> {
         for warning in &plan.warnings {
             eprintln!("{warning}");
         }
-        let selection =
-            selection.ok_or_else(|| anyhow!("Calibrate and select a local model first"))?;
+        let Some(selection) = selection else {
+            bail!("{}", no_model_message().await);
+        };
         eprintln!(
             "Selected local model: {} (digest {}, runtime {}, context {} tokens, profile SHA-256 {})",
             selection.model,
@@ -1574,7 +1586,24 @@ fn receipt_summary_lines(receipt: &LocalRunReceipt) -> Vec<String> {
         receipt.elapsed_ms as f64 / 1000.0,
         receipt.candidates.len()
     )];
+    // The goal-name advisory asks for review; keep it beside the result.
+    if let Some(number) = receipt.selected_candidate {
+        let prefix = format!("Advisory for candidate {number}:");
+        out.extend(
+            receipt
+                .known_gaps
+                .iter()
+                .filter(|gap| gap.starts_with(&prefix))
+                .map(|gap| format!("  ! {gap}")),
+        );
+    }
     let Some(candidate) = selected else {
+        // A stopped search records why as its last known gap.
+        if receipt.state == "search_stopped" {
+            if let Some(reason) = receipt.known_gaps.last() {
+                out.push(format!("  stopped: {reason}"));
+            }
+        }
         if let Some(reason) = receipt
             .candidates
             .iter()
@@ -2414,9 +2443,20 @@ mod tests {
         };
         let summary = receipt_summary_lines(&receipt);
         assert!(summary[0].starts_with("phonton goal (local fixture): verifying 1"));
+        let mut advised = receipt.clone();
+        advised.known_gaps.push("Advisory for candidate 1: The goal names `count`, but this edit does not add it. The selected checks decided; review that the change does what the goal asks.".into());
+        assert!(receipt_summary_lines(&advised)
+            .iter()
+            .any(|line| line.starts_with("  ! Advisory for candidate 1:")));
         assert!(summary
             .iter()
             .any(|line| line.contains("phonton goal --local show fixture")));
+        let mut stopped = receipt.clone();
+        stopped.state = "search_stopped".into();
+        stopped.selected_candidate = None;
+        stopped.known_gaps.push("No source-anchored strategy fits the calibrated context; restart did not send inference.".into());
+        assert!(receipt_summary_lines(&stopped)
+            .contains(&"  stopped: No source-anchored strategy fits the calibrated context; restart did not send inference.".to_string()));
         for unfinished_state in ["finalizing", "review_ready", "review_unverified"] {
             let mut saved = receipt.clone();
             saved.state = unfinished_state.into();
@@ -2518,6 +2558,7 @@ mod tests {
                 diff: "--- a/code.py\n+++ b/code.py\n@@ -1,1 +1,1 @@\n-old\n+new\n".into(),
                 context: None,
                 decision: None,
+                sampling: None,
             });
         std::fs::write(
             dir.path().join("receipt.json"),

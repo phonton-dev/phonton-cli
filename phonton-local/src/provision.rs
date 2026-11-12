@@ -169,7 +169,7 @@ fn fresh_runtime_root(root: &Path) -> Result<bool> {
 #[cfg(managed_runtime)]
 fn require_install_reserve(free: u64, credited_download_bytes: u64) -> Result<()> {
     if free.saturating_add(credited_download_bytes) < MIN_INSTALL_FREE_BYTES {
-        return Err(LocalError::Invalid(format!("Managed runtime setup requires about {} GB of free disk space, less bytes already allocated to its resumable archive, including extraction reserve.", MIN_INSTALL_FREE_BYTES.div_ceil(1_000_000_000))));
+        return Err(LocalError::Invalid(format!("Managed runtime setup requires about {} GB of free disk space, less bytes already allocated to its resumable archive, including extraction reserve. Free space on that drive, or choose an empty folder on another local drive with `phonton models storage FOLDER`, then rerun `phonton models setup`.", MIN_INSTALL_FREE_BYTES.div_ceil(1_000_000_000))));
     }
     Ok(())
 }
@@ -2485,9 +2485,12 @@ mod tests {
         assert!(allocated > 0);
         assert!(allocated <= bytes.len() as u64);
         assert!(require_install_reserve(MIN_INSTALL_FREE_BYTES - allocated, allocated).is_ok());
-        assert!(
-            require_install_reserve(MIN_INSTALL_FREE_BYTES - allocated - 1, allocated).is_err()
-        );
+        let short = require_install_reserve(MIN_INSTALL_FREE_BYTES - allocated - 1, allocated)
+            .unwrap_err()
+            .to_string();
+        // What happened and what to do next.
+        assert!(short.contains("GB of free disk space"), "{short}");
+        assert!(short.contains("phonton models storage FOLDER"), "{short}");
         assert!(std::fs::OpenOptions::new()
             .write(true)
             .open(&archive)

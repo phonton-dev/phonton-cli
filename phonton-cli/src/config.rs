@@ -292,6 +292,60 @@ fn autodetect_provider(provider: &mut ProviderConfig) {
     provider.name = "ollama".to_string();
 }
 
+/// After a local model is selected, name `ollama` as the provider when the
+/// config names none, so goals and the TUI run on that model instead of
+/// autodetecting a cloud key from the environment. A provider the config
+/// names is left alone. Returns the provider goals now use.
+pub fn prefer_local_provider() -> Result<String> {
+    let Some(path) = config_path() else {
+        return Ok(load()?.provider.name);
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
+    };
+    if let Some(updated) = with_local_provider(&raw) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, updated)?;
+    }
+    Ok(load()?.provider.name)
+}
+
+/// `raw` with `name = "ollama"` added under `[provider]`, or `None` when it
+/// already names a provider or cannot take the line without a rewrite.
+/// Comments, keys and formatting stay as they are.
+fn with_local_provider(raw: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(raw).ok()?;
+    if value.get("provider").and_then(|p| p.get("name")).is_some() {
+        return None;
+    }
+    let nl = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<&str> = raw.lines().collect();
+    let updated = match lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("[provider]"))
+    {
+        Some(header) => {
+            lines.insert(header + 1, "name = \"ollama\"");
+            lines.join(nl) + nl
+        }
+        None => {
+            let sep = if raw.is_empty() || raw.ends_with('\n') {
+                ""
+            } else {
+                nl
+            };
+            format!("{raw}{sep}# Set by `phonton models select`: goals run on the selected local model.{nl}[provider]{nl}name = \"ollama\"{nl}")
+        }
+    };
+    // Save only a result that still parses and names the local provider.
+    let check: toml::Value = toml::from_str(&updated).ok()?;
+    (check.get("provider")?.get("name")?.as_str()? == "ollama").then_some(updated)
+}
+
 /// Save configuration to the resolved config path.
 pub fn save(cfg: &Config) -> Result<()> {
     let path = match config_path() {
@@ -379,6 +433,35 @@ pub const KNOWN_PROVIDERS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selecting_a_local_model_names_ollama_only_when_no_provider_is_named() {
+        use super::with_local_provider;
+        let name = |raw: &str| -> String {
+            toml::from_str::<toml::Value>(raw).unwrap()["provider"]["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // No config yet, as on a fresh install with a cloud key in the env.
+        assert_eq!(name(&with_local_provider("").unwrap()), "ollama");
+        // Keys and other tables stay; a sub-table before [provider] is valid.
+        let keys = "# mine\n[provider.keys]\nopenrouter = \"sk-or-x\"\n\n[index]\nbackend = \"local-hnsw\"\n";
+        let updated = with_local_provider(keys).unwrap();
+        assert!(updated.starts_with(keys), "{updated}");
+        assert_eq!(name(&updated), "ollama");
+        // An existing [provider] table gains only the name line.
+        let model = "[provider]\r\nmodel = \"qwen3.5:4b\"\r\n";
+        assert_eq!(
+            with_local_provider(model).unwrap(),
+            "[provider]\r\nname = \"ollama\"\r\nmodel = \"qwen3.5:4b\"\r\n"
+        );
+        // A named provider is the user's choice, and an inline table cannot
+        // take the line without a rewrite.
+        assert!(with_local_provider("[provider]\nname = \"deepseek\"\n").is_none());
+        assert!(with_local_provider("provider = { model = \"x\" }\n").is_none());
+        assert!(with_local_provider("not toml [").is_none());
+    }
+
     #[test]
     fn autodetect_uses_configured_keys_then_local() {
         let mut p = ProviderConfig::default();

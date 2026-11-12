@@ -33,7 +33,7 @@ jobs:
             model: qwen2.5-coder:3b
           # Apple Silicon, 7 GB with about 3.7 GB free: no model passes the
           # fit check (2 GiB host reserve), so this checks the runtime only.
-          - os: macos-14
+          - os: macos-15
             model: ""
           # Intel Mac, 14 GB: the universal runtime's x86_64 half, end to end.
           - os: macos-15-intel

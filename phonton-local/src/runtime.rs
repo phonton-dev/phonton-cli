@@ -2,6 +2,7 @@
 
 use crate::{estimate_fit, LocalError, Result};
 use phonton_types::local::*;
+use phonton_types::local_run::Sampling;
 use reqwest::{redirect::Policy, Client, Url};
 use serde_json::{json, Value};
 use std::future::Future;
@@ -275,6 +276,8 @@ pub struct EditRequest<'a> {
     pub create_path: Option<&'a str>,
     /// Require the selected loaded model to remain observable just before chat.
     pub required_resident: Option<&'a ResidentModel>,
+    /// Seeded non-zero temperature; `None` keeps the calibrated temperature 0.
+    pub sampling: Option<Sampling>,
 }
 
 /// Bounded structured strategy request, separate from a candidate edit.
@@ -295,6 +298,8 @@ pub struct HypothesisRequest<'a> {
     pub thinking: LocalThinkingMode,
     /// Exact resident identity required for low-memory reuse.
     pub required_resident: Option<&'a ResidentModel>,
+    /// Seeded non-zero temperature; `None` keeps the calibrated temperature 0.
+    pub sampling: Option<Sampling>,
 }
 
 /// Exact structured-edit constraint schema, shared by context admission and the
@@ -314,6 +319,17 @@ pub fn create_schema(path: &str) -> Value {
 pub struct LocalRuntime {
     endpoint: String,
     http: Client,
+}
+
+/// Bounded generation options. Without `sampling` these are the calibrated
+/// temperature-0 options, byte for byte.
+fn generation_options(context: u32, output: u32, sampling: Option<Sampling>) -> Value {
+    let mut options = json!({ "num_ctx": context, "num_predict": output, "temperature": 0 });
+    if let Some(Sampling { temperature, seed }) = sampling {
+        options["temperature"] = json!(temperature);
+        options["seed"] = json!(seed);
+    }
+    options
 }
 
 fn with_thinking_mode(mut request: Value, thinking: LocalThinkingMode) -> Value {
@@ -386,7 +402,7 @@ pub fn validate_model(name: &str) -> Result<()> {
         || name.to_ascii_lowercase().contains("cloud")
     {
         return Err(LocalError::Invalid(
-            "Use a local model tag such as qwen3.5:9b; cloud models are disabled.".into(),
+            "Use a local model tag such as qwen3.5:4b; cloud models are disabled.".into(),
         ));
     }
     Ok(())
@@ -818,7 +834,7 @@ impl LocalRuntime {
                 "model": request.model, "stream": false, "keep_alive": "2m",
                 "format": request.schema,
                 "messages": [{"role":"system", "content":request.system}, {"role":"user", "content":request.user}],
-                "options": { "num_ctx": request.context, "num_predict": request.output, "temperature": 0 }
+                "options": generation_options(request.context, request.output, request.sampling)
             }), request.thinking),
         )
         .await
@@ -864,6 +880,7 @@ impl LocalRuntime {
             searches,
             create_path,
             required_resident,
+            sampling,
         } = request;
         if let Some(path) = create_path {
             if paths != [path] || protocol != EditProtocol::SearchReplace {
@@ -882,7 +899,7 @@ impl LocalRuntime {
                 &with_thinking_mode(json!({
                     "model": name, "stream": false, "keep_alive": "2m",
                     "messages": [{"role":"system", "content":system}, {"role":"user", "content":user}],
-                    "options": { "num_ctx": context, "num_predict": output, "temperature": 0 }
+                    "options": generation_options(context, output, sampling)
                 }), thinking),
             ).await;
         }
@@ -892,7 +909,7 @@ impl LocalRuntime {
                 "model": name, "stream": false, "keep_alive": "2m",
                 "format": create_path.map(create_schema).unwrap_or_else(|| edit_schema(paths, searches)),
                 "messages":[{"role":"system","content":system},{"role":"user","content":user}],
-                "options":{"num_ctx":context,"num_predict":output,"temperature":0}
+                "options":generation_options(context, output, sampling)
             }), thinking),
         )
         .await
@@ -1008,14 +1025,25 @@ impl LocalRuntime {
         Fut: Future<Output = HardwareSnapshot>,
     {
         let hardware = observe_hardware().await;
+        // Once a probe has loaded the model, later probes talk to that copy.
+        // Entirely in VRAM it already holds its host memory, so the cold-load
+        // reserve would count that memory twice, as it did for goal runs.
+        let reserve = self
+            .resident(&model.name, &model.digest, admission.context_tokens)
+            .await
+            .ok()
+            .flatten()
+            .map_or(CALIBRATION_HOST_RESERVE_BYTES, |loaded| {
+                crate::resident_host_reserve(&loaded)
+            });
         if hardware
             .ram_available_bytes
-            .is_none_or(|bytes| bytes < CALIBRATION_HOST_RESERVE_BYTES)
+            .is_none_or(|bytes| bytes < reserve)
         {
-            return Err(LocalError::Invalid(
-                "Available host RAM fell below the 1.5 GiB calibration reserve; stop probes and free memory before retrying."
-                    .into(),
-            ));
+            return Err(LocalError::Invalid(format!(
+                "Available host RAM fell below the {:.1} GiB calibration reserve; stop probes and free memory before retrying.",
+                reserve as f64 / (1u64 << 30) as f64
+            )));
         }
         let fit = self
             .estimate_cold_load(
@@ -1091,6 +1119,7 @@ impl LocalRuntime {
                     searches: &["def add(a, b): return a - b".into()],
                     create_path: None,
                     required_resident: required_resident.as_ref(),
+                    sampling: None,
                 })
                 .await;
             let probe = match result {
@@ -1187,6 +1216,7 @@ impl LocalRuntime {
                 searches: &[],
                 create_path,
                 required_resident: required_resident.as_ref(),
+                sampling: None,
             }).await;
             let creation_probe = match creation_result {
                 Ok(response) => {
@@ -1486,11 +1516,13 @@ pub fn model_context_ceiling(metadata: &Value) -> Option<u32> {
 }
 
 /// KV cache bytes per context token at f16, from the attention shape in
-/// Ollama's model metadata. Per-layer KV head counts are summed, so the
-/// linear-attention layers of hybrid models (qwen3.5: 8 of 32 layers keep a
-/// KV cache) cost nothing. Sliding-window layers count as full attention, so
-/// gemma and gpt-oss estimates run high. Missing or malformed shape metadata
-/// returns `None` and the caller's conservative fallback.
+/// Ollama's model metadata. Linear-attention layers of hybrid models keep a
+/// fixed state instead of a KV cache and cost nothing: per-layer KV head
+/// counts are summed, and layers flagged in `attention.recurrent_layers`
+/// (qwen3.5: 24 of 32) are left out of a scalar count. Sliding-window
+/// layers count as full attention, so gemma and gpt-oss estimates run high.
+/// Missing or malformed shape metadata returns `None` and the caller's
+/// conservative fallback.
 pub fn model_kv_bytes_per_token(metadata: &Value) -> Option<u64> {
     let info = metadata.get("model_info")?.as_object()?;
     let architecture = info.get("general.architecture")?.as_str()?;
@@ -1498,7 +1530,19 @@ pub fn model_kv_bytes_per_token(metadata: &Value) -> Option<u64> {
     let number = |name: &str| field(name).and_then(Value::as_u64);
     let kv_heads = match field("attention.head_count_kv")? {
         Value::Array(layers) => layers.iter().map(Value::as_u64).sum::<Option<u64>>()?,
-        heads => heads.as_u64()?.checked_mul(number("block_count")?)?,
+        heads => {
+            let recurrent = field("attention.recurrent_layers")
+                .and_then(Value::as_array)
+                .map_or(0, |layers| {
+                    layers
+                        .iter()
+                        .filter(|layer| layer.as_bool() == Some(true))
+                        .count() as u64
+                });
+            heads
+                .as_u64()?
+                .checked_mul(number("block_count")?.checked_sub(recurrent)?)?
+        }
     };
     let head_dim = || number("embedding_length")?.checked_div(number("attention.head_count")?);
     let key = number("attention.key_length").or_else(head_dim)?;
@@ -1757,6 +1801,25 @@ fn create_probe_passed(protocol: EditProtocol, output: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generation_options_stay_temperature_zero_unless_sampling_is_requested() {
+        assert_eq!(
+            generation_options(4096, 512, None),
+            json!({"num_ctx": 4096, "num_predict": 512, "temperature": 0})
+        );
+        assert_eq!(
+            generation_options(
+                4096,
+                512,
+                Some(Sampling {
+                    temperature: 0.7,
+                    seed: 3
+                })
+            ),
+            json!({"num_ctx": 4096, "num_predict": 512, "temperature": 0.7, "seed": 3})
+        );
+    }
+
     fn fixed_hardware(
         hardware: HardwareSnapshot,
     ) -> impl Fn() -> std::future::Ready<HardwareSnapshot> {
@@ -1887,6 +1950,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(explicit.context_tokens, 2048);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probes_of_a_vram_resident_model_need_only_the_resident_reserve() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (runtime, mode, chats, server) = resident_calibration_fixture().await;
+        // The fixture model is loaded entirely in VRAM at 8192 tokens.
+        mode.store(10, Ordering::SeqCst);
+        let hardware = HardwareSnapshot {
+            ram_available_bytes: Some(1800 << 20),
+            gpus: vec![GpuSnapshot {
+                name: "GPU".into(),
+                total_bytes: 4 << 30,
+                available_bytes: 1638 << 20,
+            }],
+            ..Default::default()
+        };
+        // After the first probe free RAM reads below the 1.5 GiB cold-load
+        // reserve. On 2026-11-10 Ollama loaded qwen3.5:4b with 2.1 GiB free,
+        // the load took about 0.5 GiB of host buffers, and `models calibrate`
+        // stopped at its second probe.
+        for (later_mib, completes) in [(1400u64, true), (400, false)] {
+            chats.store(0, Ordering::SeqCst);
+            let readings = Arc::new(AtomicUsize::new(0));
+            let first = hardware.clone();
+            let observe = move || {
+                let mut seen = first.clone();
+                if readings.fetch_add(1, Ordering::SeqCst) > 0 {
+                    seen.ram_available_bytes = Some(later_mib << 20);
+                }
+                std::future::ready(seen)
+            };
+            match runtime
+                .calibrate_with_observer("fixture", None, hardware.clone(), &observe)
+                .await
+            {
+                Ok(profile) => {
+                    assert!(completes, "{later_mib} MiB");
+                    assert_eq!(profile.context_tokens, 8192);
+                }
+                Err(error) => {
+                    assert!(!completes, "{later_mib} MiB: {error}");
+                    assert!(error.to_string().contains("0.5 GiB"), "{error}");
+                    assert_eq!(chats.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
         server.abort();
     }
 
@@ -2126,6 +2241,7 @@ mod tests {
                 output: 128,
                 thinking: profile.thinking.unwrap_or_default(),
                 required_resident: None,
+                sampling: None,
             })
             .await
             .unwrap();
@@ -2436,7 +2552,7 @@ mod tests {
             ..Default::default()
         };
         let mut models = vec![
-            catalog_fixture("qwen3.5:4b", Some(3), FitStatus::LikelyFitsGpu),
+            catalog_fixture("qwen3.5:4b", Some(3), FitStatus::InsufficientMemory),
             catalog_fixture("qwen3.5:9b", Some(6), FitStatus::InsufficientMemory),
             catalog_fixture("gpt-oss:20b", Some(13), FitStatus::InsufficientMemory),
         ];
@@ -2446,8 +2562,8 @@ mod tests {
             .filter(|m| m.first_try_reason.is_some())
             .map(|m| m.name.as_str())
             .collect();
-        assert_eq!(marked, ["qwen3.5:9b"]);
-        assert!(models[1]
+        assert_eq!(marked, ["qwen3.5:4b"]);
+        assert!(models[0]
             .first_try_reason
             .as_deref()
             .unwrap()
@@ -2544,7 +2660,7 @@ mod tests {
             ram_available_bytes: Some(8u64 << 30),
             gpus: vec![GpuSnapshot {
                 name: "fixture GPU".into(),
-                total_bytes: 8u64 << 30,
+                total_bytes: 12u64 << 30,
                 available_bytes: 6u64 << 30,
             }],
             ..Default::default()
@@ -2579,7 +2695,7 @@ mod tests {
             assert_eq!(model.download_bytes, Some(index as u64 * 100_000_000 + 10));
             assert!(model.error.is_none());
         }
-        // 8 GiB GPU and 16 GiB RAM: the 6 GB tier.
+        // 12 GiB GPU and 16 GiB RAM: the 10 GB tier, qwen3.5:9b.
         assert!(models[1].first_try_reason.is_some());
         assert_eq!(
             models
@@ -2592,16 +2708,15 @@ mod tests {
 
     #[test]
     fn kv_cache_size_follows_reported_attention_shape() {
-        // qwen3.5:4b as Ollama 0.34.2 reports it: 8 of 32 layers keep KV.
-        let mut kv_heads = vec![0; 32];
-        for layer in (3..32).step_by(4) {
-            kv_heads[layer] = 4;
-        }
+        // qwen3.5:4b as Ollama 0.34.2's /api/show reports it: a scalar KV
+        // head count and 24 of 32 layers flagged recurrent, so 8 keep KV.
+        let recurrent: Vec<bool> = (0..32).map(|layer| layer % 4 != 3).collect();
         let qwen35 = json!({"model_info":{
             "general.architecture":"qwen35",
             "qwen35.block_count":32,
             "qwen35.attention.head_count":16,
-            "qwen35.attention.head_count_kv":kv_heads,
+            "qwen35.attention.head_count_kv":4,
+            "qwen35.attention.recurrent_layers":recurrent,
             "qwen35.attention.key_length":256,
             "qwen35.attention.value_length":256,
             "qwen35.embedding_length":2560
@@ -2609,6 +2724,36 @@ mod tests {
         // 512 MiB at 16384 tokens; llama-server reported 562 MiB of context
         // including the fixed linear-attention state.
         assert_eq!(model_kv_bytes_per_token(&qwen35), Some(32 * 1024));
+        // A 6 GB laptop GPU with 2 GiB of RAM free: counting all 32 layers
+        // estimated 6.5 GB, an offload that refused goals on a busy laptop.
+        let laptop = HardwareSnapshot {
+            ram_available_bytes: Some(2 << 30),
+            gpus: vec![GpuSnapshot {
+                name: "RTX 4050 Laptop".into(),
+                total_bytes: 6141 << 20,
+                available_bytes: 5600 << 20,
+            }],
+            ..HardwareSnapshot::default()
+        };
+        let fit = crate::estimate_fit_for_context(
+            3_324_173_934,
+            model_kv_bytes_per_token(&qwen35),
+            &laptop,
+            16384,
+        );
+        assert_eq!(fit.status, FitStatus::LikelyFitsGpu, "{fit:?}");
+        // The same model with per-layer head counts instead of flags.
+        let mut kv_heads = vec![0; 32];
+        for layer in (3..32).step_by(4) {
+            kv_heads[layer] = 4;
+        }
+        let mut per_layer = qwen35.clone();
+        per_layer["model_info"]["qwen35.attention.head_count_kv"] = json!(kv_heads);
+        assert_eq!(model_kv_bytes_per_token(&per_layer), Some(32 * 1024));
+        // More recurrent flags than layers is malformed, not a free cache.
+        let mut overflagged = qwen35.clone();
+        overflagged["model_info"]["qwen35.block_count"] = json!(16);
+        assert_eq!(model_kv_bytes_per_token(&overflagged), None);
         // qwen2.5-coder 1.5B: head size from embedding width; llama-server
         // logged a 448 MiB KV buffer at 16384 tokens.
         let qwen2 = json!({"model_info":{
@@ -2837,6 +2982,7 @@ mod tests {
                 searches: &[],
                 create_path: None,
                 required_resident: Some(&required),
+                sampling: None,
             })
             .await
             .unwrap_err();

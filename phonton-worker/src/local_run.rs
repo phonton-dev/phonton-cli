@@ -133,27 +133,18 @@ fn creation_system_instruction(path: &Path, protocol: EditProtocol) -> String {
     }
 }
 
-/// Host RAM a chat with an exact resident model needs free when that copy is
-/// entirely in VRAM. Its runtime allocation was made at load time and is
-/// already outside the available reading, so the 1.5 GiB cold-load reserve
-/// would count it twice; this leaves headroom for the request and the OS. On
-/// Ollama 0.34.2 (2026-10-17, RTX 4050) loading qwen3.5:4b at 16384 tokens
-/// took about 700 MiB of host RAM; a later 7000-token chat loaded nothing.
-// ponytail: fixed floor, measure per-chat host use if a runtime allocates per request.
-const VRAM_RESIDENT_HOST_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+/// Whole-file rewrite of one existing file, using the creation transport.
+fn whole_file_system_instruction(path: &Path) -> String {
+    let path = model_relative_path(path);
+    format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly. Your previous search and replacement changed nothing. No prose, commands, test changes, or other paths.")
+}
 
-/// Whether `resident` may serve the next chat. A copy partly in RAM keeps the
-/// full reserve, because paging its weights out would stall generation.
+/// Whether `resident` may serve the next chat.
 fn resident_headroom(hardware: &HardwareSnapshot, resident: Option<&ResidentModel>) -> bool {
     resident.is_some_and(|model| {
-        let reserve = if model.size_vram_bytes >= model.size_bytes {
-            VRAM_RESIDENT_HOST_RESERVE_BYTES
-        } else {
-            phonton_local::GPU_HOST_RESERVE_BYTES
-        };
         hardware
             .ram_available_bytes
-            .is_some_and(|bytes| bytes >= reserve)
+            .is_some_and(|bytes| bytes >= phonton_local::resident_host_reserve(model))
     })
 }
 
@@ -367,6 +358,7 @@ async fn run_inner(
     mut event: impl FnMut(&LocalRunReceipt),
     hardware_override: Option<HardwareOverride>,
 ) -> Result<LocalRunReceipt> {
+    goal_fits_context(&request, profile.context_tokens)?;
     if runtime_guard.origin() == RuntimeOrigin::ExternalUnverified
         && !request.allow_unverified_runtime
     {
@@ -419,13 +411,13 @@ async fn run_inner(
             .resident(&profile.model, &profile.digest, profile.context_tokens)
             .await
             .map_err(|error| {
-                invalid(format!(
-                    "{} Resident-model evidence is unavailable: {error}",
+                invalid(memory_refusal(&format!(
+                    "{} Resident-model evidence is unavailable: {error}.",
                     fit.explanation
-                ))
+                )))
             })?;
         if !resident_headroom(&machine, observed.as_ref()) {
-            return Err(invalid(fit.explanation));
+            return Err(invalid(memory_refusal(&fit.explanation)));
         }
         observed
     } else {
@@ -625,18 +617,31 @@ async fn run_inner(
             .budget
             .generated_tokens
             .saturating_sub(receipt.generated_tokens_reserved);
-        let decision = search::next_with_budget(
+        let mut decision = search::next_with_budget(
             &receipt.candidates,
             receipt.model_calls_reserved,
             receipt.request.budget.generations,
             reserved_left,
             receipt.request.new_file.is_some() && !receipt.request.editable_existing.is_empty(),
         );
+        let mut whole_file = None;
+        if decision.action != SearchAction::Stop
+            && receipt.profile.protocol == Some(EditProtocol::SearchReplace)
+            && receipt.request.new_file.is_none()
+        {
+            if let Some((retry, path)) =
+                search::whole_file_retry(&receipt.candidates, &receipt.request.files, &baseline)
+            {
+                decision = retry;
+                whole_file = Some(path);
+            }
+        }
         if decision.action == SearchAction::Stop {
             receipt.state = "search_stopped".into();
             receipt.known_gaps.push(decision.reason);
             break;
         }
+        let sampling = search::sampling(&receipt.candidates, number);
         let creating = receipt.request.new_file.is_some() && decision.parent_candidate.is_none();
         let repairing_created_file = !creating
             && decision.action == SearchAction::Repair
@@ -881,6 +886,7 @@ async fn run_inner(
                     output: hypothesis_output,
                     thinking: receipt.profile.thinking.unwrap_or_default(),
                     required_resident: required_resident.as_ref(),
+                    sampling,
                 }),
             )
             .await;
@@ -1042,33 +1048,62 @@ async fn run_inner(
         }.to_owned()
         };
         let strategy_reserve = strategy_note.as_ref().map_or(0, String::len);
-        let assembly_result = context::assemble_with_evidence(
-            &edit_request,
-            &parent,
-            &system,
-            context::ModelContext {
-                protocol: receipt
-                    .profile
-                    .protocol
-                    .ok_or_else(|| invalid("Missing measured protocol"))?,
-                capacity: receipt
-                    .profile
-                    .context_tokens
-                    .saturating_sub(strategy_reserve as u32),
+        // A small file the last SearchReplace answer could not change is shown
+        // whole and rewritten whole; if it cannot fit, the ordinary edit runs.
+        let whole_file_assembly = whole_file.as_ref().and_then(|path| {
+            let system = whole_file_system_instruction(path);
+            let model = context::ModelContext {
+                protocol: EditProtocol::SearchReplace,
+                capacity: receipt.profile.context_tokens,
                 output,
-            },
-            context::EvidenceInput {
-                feedback: &diagnostics,
-                verifier: &verifier_diagnostics,
-                focus_path: if repairing_created_file {
-                    receipt.request.new_file.as_deref()
-                } else {
-                    None
+            };
+            context::whole_file(&edit_request, &parent, &system, model, &diagnostics, path)
+                .ok()
+                .map(|assembly| (system, assembly))
+        });
+        if whole_file_assembly.is_none() {
+            // ponytail: the retry's parent stays; restoring the controller's
+            // choice needs the fit known before the decision is replaced.
+            if whole_file.take().is_some() {
+                decision.reason.push_str(
+                    "; the whole file did not fit the calibrated context, so an ordinary edit ran",
+                );
+            }
+        } else {
+            approach = "whole-file rewrite after an unchanged search/replace".into();
+        }
+        let (system, assembly_result) = if let Some((system, assembly)) = whole_file_assembly {
+            (system, Ok(assembly))
+        } else {
+            let assembly = context::assemble_with_evidence(
+                &edit_request,
+                &parent,
+                &system,
+                context::ModelContext {
+                    protocol: receipt
+                        .profile
+                        .protocol
+                        .ok_or_else(|| invalid("Missing measured protocol"))?,
+                    capacity: receipt
+                        .profile
+                        .context_tokens
+                        .saturating_sub(strategy_reserve as u32),
+                    output,
                 },
-            },
-            false,
-            excluded_searches,
-        );
+                context::EvidenceInput {
+                    feedback: &diagnostics,
+                    verifier: &verifier_diagnostics,
+                    focus_path: if repairing_created_file {
+                        receipt.request.new_file.as_deref()
+                    } else {
+                        None
+                    },
+                },
+                false,
+                excluded_searches,
+            );
+            (system, assembly)
+        };
         let mut assembly = match assembly_result {
             Ok(assembly) => assembly,
             Err(error) if !creating && receipt.request.new_file.is_some() => {
@@ -1169,7 +1204,7 @@ async fn run_inner(
                     .as_ref()
                     .map(|path| model_relative_path(path))
             } else {
-                None
+                whole_file.as_deref().map(model_relative_path)
             };
         let directory = run_dir.join(format!("candidate-{number}"));
         copy_with_creation(
@@ -1244,6 +1279,7 @@ async fn run_inner(
                 searches: &searches,
                 create_path: create_path.as_deref(),
                 required_resident: required_resident.as_ref(),
+                sampling,
             }),
         )
         .await;
@@ -1270,6 +1306,7 @@ async fn run_inner(
             diff: String::new(),
             context: Some(assembly.evidence),
             decision: Some(decision),
+            sampling,
         };
         match response {
             Ok(Ok(response)) => {
@@ -1295,6 +1332,10 @@ async fn run_inner(
                     Some("Run wall-time budget exhausted during generation".into())
             }
         }
+        if search::repeats_output(&receipt.candidates, &candidate.raw_output) {
+            // Same bytes, same verdict: never spend checks on it again.
+            candidate.rejection = Some(search::REPEATED_OUTPUT.into());
+        }
         let parent_changed_during_inference =
             scoped_hash(&parent, &files, receipt.request.new_file.as_ref(), true)
                 .ok()
@@ -1313,13 +1354,16 @@ async fn run_inner(
             &serde_json::to_value(&candidate)?,
         )?;
         let mut pending_candidate_saved = false;
+        let mut goal_name_warning = None;
         if candidate.rejection.is_none() {
             let materialized = parse_candidate(
                 &receipt.profile,
                 &parent,
                 &paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
                 &candidate.raw_output,
-                receipt.request.new_file.as_ref().filter(|_| creating),
+                whole_file
+                    .as_ref()
+                    .or(receipt.request.new_file.as_ref().filter(|_| creating)),
             );
             match materialized {
                 Err(e) => candidate.rejection = Some(e.to_string()),
@@ -1380,12 +1424,14 @@ async fn run_inner(
                             .map(String::as_str)
                             .collect::<Vec<_>>()
                             .join("\n");
-                        if let Some(name) =
-                            goal_name_not_added(&receipt.request.goal, &original, &changed)
-                        {
-                            candidate.rejection = Some(format!(
-                                "The goal names `{name}`, but this edit does not add it"
-                            ));
+                        match goal_name_gate(
+                            &receipt.request.goal,
+                            &original,
+                            &changed,
+                            checks_can_judge(&receipt.request),
+                        ) {
+                            Ok(warning) => goal_name_warning = warning,
+                            Err(rejection) => candidate.rejection = Some(rejection),
                         }
                     }
                     if candidate.rejection.is_some() {
@@ -1475,6 +1521,11 @@ async fn run_inner(
                                 candidate.rejection = Some(
                                     "Candidate failed the selected verification checks".into(),
                                 );
+                            } else if let Some(rejection) =
+                                deferred_gate_rejection(&candidate.checks, &goal_name_warning)
+                            {
+                                candidate.rejection = Some(rejection);
+                                goal_name_warning = None;
                             }
                         }
                     }
@@ -1508,6 +1559,12 @@ async fn run_inner(
         }
         receipt.elapsed_ms = started.elapsed().as_millis() as u64;
         if accepted {
+            if let Some(warning) = goal_name_warning {
+                // First, so summaries that show only the leading gaps keep it.
+                receipt
+                    .known_gaps
+                    .insert(0, format!("Advisory for candidate {number}: {warning}. The selected checks decided; review that the change does what the goal asks."));
+            }
             receipt.selected_candidate = Some(number);
             // The candidate is not review ready until model, source, candidate,
             // and original Git-index identity all pass the final review.
@@ -2964,6 +3021,59 @@ fn rust_protected_tail_items_intact(original: &str, candidate: &str, tail: &str)
     same_crate_attributes && same_tail_items && original_scope == candidate_scope
 }
 
+/// Without checks the goal-name heuristic is the only guard, so it rejects.
+/// With checks the tests decide and it only warns: in three local Polyglot
+/// runs (2026-10) it rejected 73 candidates before their tests; the 71 that
+/// could be rebuilt all failed those tests, so each rejection only cost a
+/// generation slot.
+fn goal_name_gate(
+    goal: &str,
+    original: &str,
+    candidate: &str,
+    has_checks: bool,
+) -> std::result::Result<Option<String>, String> {
+    match goal_name_not_added(goal, original, candidate) {
+        None => Ok(None),
+        Some(name) => {
+            let detail = format!("The goal names `{name}`, but this edit does not add it");
+            if has_checks {
+                Ok(Some(detail))
+            } else {
+                Err(detail)
+            }
+        }
+    }
+}
+
+/// Selected checks can judge a candidate only when they may run: without
+/// host approval every check is unavailable and the search would stop on the
+/// first candidate, so the goal-name gate rejects before checks instead.
+fn checks_can_judge(request: &LocalRunRequest) -> bool {
+    request.approve_host_execution && !request.checks.is_empty()
+}
+
+/// A goal refused before it starts because the model does not fit the free
+/// memory: what happened, that nothing ran, and the next step.
+fn memory_refusal(reason: &str) -> String {
+    // ponytail: matches phonton-local's host-RAM-floor wording, which already
+    // names the next step and applies to every model; a typed reason on
+    // `ModelFit` would replace this if more refusal kinds appear.
+    let next = if reason.contains("Close other workloads") {
+        ""
+    } else {
+        " Next: close other programs to free memory and run the goal again, or choose a smaller model from `phonton models catalog`."
+    };
+    format!("{reason} Nothing ran and no file changed.{next}")
+}
+
+/// The goal-name gate deferred to the checks: reject unless every selected
+/// check ran and passed, because a check that did not run cannot judge.
+fn deferred_gate_rejection(checks: &[CheckEvidence], warning: &Option<String>) -> Option<String> {
+    let warning = warning.as_ref()?;
+    let all_passed = !checks.is_empty() && checks.iter().all(|c| c.status == CheckStatus::Passed);
+    (!all_passed).then(|| format!("{warning}, and the selected checks did not all run and pass"))
+}
+
 /// A name the goal asks for (called like `balanceOn(` or quoted in
 /// backticks, four or more characters) that is in neither the original
 /// scoped source nor the candidate. A small model that edits something
@@ -3136,9 +3246,27 @@ fn conventional_node_test_filename(path: &Path) -> bool {
         || stem.ends_with(".test"))
 }
 
+/// Model-independent ceiling for goal text; `goal_fits_context` sets the real
+/// limit once the calibrated context is known.
+pub(crate) const MAX_GOAL_BYTES: usize = 64 * 1024;
+
+/// Edit output is capped at a quarter of the calibrated context and prompts
+/// are budgeted at one byte per token, so a goal can use at most the other
+/// three quarters. Whether the source also fits is decided at assembly.
+fn goal_fits_context(request: &LocalRunRequest, context_tokens: u32) -> Result<()> {
+    let limit = context_tokens as usize / 4 * 3;
+    if request.goal.len() > limit {
+        return Err(invalid(format!(
+            "The goal is {} bytes; the calibrated {context_tokens}-token context allows at most {limit}. Shorten the goal or calibrate a larger context.",
+            request.goal.len()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_request(request: &LocalRunRequest) -> Result<()> {
     if request.goal.trim().is_empty()
-        || request.goal.len() > 8192
+        || request.goal.len() > MAX_GOAL_BYTES
         || (request.files.is_empty() && request.new_file.is_none())
         || request.files.len() > 8
     {
@@ -3675,7 +3803,7 @@ async fn inventory_excluding(
         let output = read_inventory(stdout).await?;
         if !child.wait().await?.success() {
             return Err(invalid(
-                "Open a Git repository with a bounded file inventory",
+                "Git could not list this folder's files, so nothing ran. Local goals need a Git repository to edit and roll back. Next: if the folder is not a repository, run `git init` and commit your files there; otherwise run `git status` there to see Git's error",
             ));
         }
         Ok::<_, RunError>(output)
@@ -3868,7 +3996,8 @@ fn validate_plan_source(request: &LocalRunRequest, root: &Path) -> Result<()> {
 fn content_hash(root: &Path, files: &[PathBuf]) -> Result<String> {
     let canonical_root = std::fs::canonicalize(root)?;
     // Added source files can change runtime behavior without appearing in the
-    // proposed diff. Only conventional build/cache directories are excluded.
+    // proposed diff. Only conventional build/cache directories and a Cargo
+    // lockfile generated beside a captured manifest are excluded.
     let expected: BTreeSet<_> = files.iter().cloned().collect();
     let mut stack = vec![root.to_path_buf()];
     let mut entries = 0;
@@ -3893,18 +4022,20 @@ fn content_hash(root: &Path, files: &[PathBuf]) -> Result<String> {
                 ) {
                     stack.push(entry.path());
                 }
-            } else if kind.is_file()
-                && !expected.contains(
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .map_err(|_| invalid("Candidate path escaped root"))?,
-                )
-            {
-                return Err(invalid(format!(
-                    "Verification created a file outside the returned diff: {}",
-                    entry.path().display()
-                )));
+            } else if kind.is_file() {
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|_| invalid("Candidate path escaped root"))?;
+                // `cargo test` writes Cargo.lock beside a manifest that has none.
+                let cargo_lock = relative.file_name() == Some("Cargo.lock".as_ref())
+                    && expected.contains(&relative.with_file_name("Cargo.toml"));
+                if !expected.contains(relative) && !cargo_lock {
+                    return Err(invalid(format!(
+                        "Verification created a file outside the returned diff: {}",
+                        path.display()
+                    )));
+                }
             }
         }
     }
@@ -5710,7 +5841,7 @@ fn resolve_cargo_executable(directory: &Path, check: &LocalCheck) -> Result<Path
         } else {
             directory.join(raw)
         };
-        std::fs::canonicalize(&path).map_err(|error| {
+        pin_executable(&path).map_err(|error| {
             invalid(format!(
                 "Cannot resolve selected Cargo executable {}: {error}",
                 path.display()
@@ -5729,19 +5860,34 @@ fn resolve_cargo_executable(directory: &Path, check: &LocalCheck) -> Result<Path
                     .find(|path| path.is_file())
             })
             .ok_or_else(|| invalid("Cargo executable was not found on an absolute PATH entry"))?;
-        std::fs::canonicalize(&path).map_err(|error| {
+        pin_executable(&path).map_err(|error| {
             invalid(format!(
                 "Cannot resolve Cargo executable {}: {error}",
                 path.display()
             ))
         })?
     };
-    if !selected.is_file() || selected.starts_with(directory) {
+    // The link target must be outside the candidate too, not only the name.
+    let target = std::fs::canonicalize(&selected)
+        .map_err(|error| invalid(format!("Cannot resolve Cargo executable: {error}")))?;
+    if !target.is_file() || selected.starts_with(&directory) || target.starts_with(&directory) {
         return Err(invalid(
             "Cargo verification requires an executable outside the candidate working directory",
         ));
     }
     Ok(selected)
+}
+
+/// Canonical directory plus the original file name. Rustup proxies are often
+/// symlinks to `rustup(.exe)` (scoop's `rustup-msvc`) and dispatch on the name
+/// they were started as, so canonicalizing the file itself runs rustup, which
+/// rejects `test` as a subcommand.
+fn pin_executable(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("executable path has no file name"))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    Ok(std::fs::canonicalize(parent)?.join(name))
 }
 
 fn inspect_cargo_config(cargo_directory: &Path) -> Result<()> {
@@ -6142,6 +6288,96 @@ mod tests {
     }
 
     #[test]
+    fn goal_name_gate_rejects_only_when_no_check_can_judge() {
+        let goal = "Add a count() method";
+        assert_eq!(goal_name_gate(goal, "a", "a\ncount()", false), Ok(None));
+        assert_eq!(
+            goal_name_gate(goal, "account", "account", false),
+            Err("The goal names `count`, but this edit does not add it".into())
+        );
+        assert_eq!(
+            goal_name_gate(goal, "account", "account", true),
+            Ok(Some(
+                "The goal names `count`, but this edit does not add it".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_deferred_goal_name_gate_needs_checks_that_ran_and_passed() {
+        let check = |status| CheckEvidence {
+            check: None,
+            purpose: Default::default(),
+            status,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            detail: String::new(),
+            elapsed_ms: 0,
+        };
+        let warning = Some("The goal names `count`, but this edit does not add it".to_string());
+        assert_eq!(
+            deferred_gate_rejection(&[check(CheckStatus::Passed)], &warning),
+            None
+        );
+        assert_eq!(
+            deferred_gate_rejection(&[check(CheckStatus::Unavailable)], &None),
+            None
+        );
+        for unjudged in [
+            vec![],
+            vec![check(CheckStatus::Unavailable)],
+            vec![check(CheckStatus::Passed), check(CheckStatus::NotRun)],
+        ] {
+            let rejection = deferred_gate_rejection(&unjudged, &warning).expect("rejected");
+            assert!(
+                rejection.starts_with("The goal names `count`"),
+                "{rejection}"
+            );
+        }
+        // Without host approval every check is unavailable, so the gate must
+        // reject before checks and let the search generate again.
+        let mut unapproved = request();
+        assert!(!checks_can_judge(&unapproved));
+        unapproved.approve_host_execution = true;
+        assert!(checks_can_judge(&unapproved));
+        unapproved.checks.clear();
+        assert!(!checks_can_judge(&unapproved));
+    }
+
+    #[test]
+    fn memory_refusal_says_nothing_ran_and_the_next_step() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let machine = |available: u64| HardwareSnapshot {
+            ram_total_bytes: Some(16 * GIB),
+            ram_available_bytes: Some(available),
+            ..HardwareSnapshot::default()
+        };
+        // Too big for the free memory: freeing memory or a smaller model helps.
+        let too_big =
+            phonton_local::estimate_fit_for_context(64 * GIB, None, &machine(8 * GIB), 4096);
+        assert_eq!(too_big.status, FitStatus::InsufficientMemory);
+        let message = memory_refusal(&too_big.explanation);
+        assert!(
+            message.starts_with(&format!(
+                "{} Nothing ran and no file changed. Next: close other programs",
+                too_big.explanation
+            )),
+            "{message}"
+        );
+        assert!(message.ends_with("`phonton models catalog`."), "{message}");
+        // Under the host-RAM floor every model is refused. The reason already
+        // says to close other workloads, and a smaller model would not help.
+        let floor = phonton_local::estimate_fit_for_context(GIB, None, &machine(GIB), 4096);
+        assert_eq!(floor.status, FitStatus::InsufficientMemory);
+        assert_eq!(
+            memory_refusal(&floor.explanation),
+            format!("{} Nothing ran and no file changed.", floor.explanation)
+        );
+        assert!(floor.explanation.contains("Close other workloads"));
+    }
+
+    #[test]
     fn run_storage_admission_counts_all_candidate_copies_and_check_headroom() {
         let mut request = request();
         request.budget.generations = 4;
@@ -6364,6 +6600,63 @@ mod tests {
             resolve_cargo_executable(&candidate, &external_check).unwrap(),
             std::fs::canonicalize(&external).unwrap()
         );
+    }
+
+    #[test]
+    fn cargo_check_keeps_rustup_proxy_name_when_cargo_is_a_symlink() {
+        // Scoop's rustup installs `cargo.exe -> rustup.exe`; rustup dispatches
+        // on the name it was started as, so the proxy name must survive.
+        let root = tempfile::tempdir().unwrap();
+        let candidate = root.path().join("candidate");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let (rustup, cargo) = if cfg!(windows) {
+            ("rustup.exe", "cargo.exe")
+        } else {
+            ("rustup", "cargo")
+        };
+        std::fs::write(bin.join(rustup), b"rustup placeholder").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(rustup, bin.join(cargo));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(rustup, bin.join(cargo));
+        if let Err(error) = linked {
+            // Windows without Developer Mode or admin cannot create symlinks.
+            // CI runners can, so there a skip would hide this case.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "cannot create symlink fixture in CI: {error}"
+            );
+            eprintln!("skipping: cannot create symlink fixture: {error}");
+            return;
+        }
+        let check = LocalCheck {
+            program: bin.join(cargo).to_string_lossy().into_owned(),
+            args: vec!["test".into()],
+        };
+        let resolved = resolve_cargo_executable(&candidate, &check).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), cargo);
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&bin).unwrap().join(cargo),
+            "directory is pinned, file name kept"
+        );
+
+        // A symlink inside the candidate pointing outside is still refused.
+        let inside = candidate.join(cargo);
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(bin.join(rustup), &inside).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(bin.join(rustup), &inside).unwrap();
+        let inside_check = LocalCheck {
+            program: inside.to_string_lossy().into_owned(),
+            args: vec!["test".into()],
+        };
+        assert!(resolve_cargo_executable(&candidate, &inside_check)
+            .unwrap_err()
+            .to_string()
+            .contains("outside the candidate"));
     }
     #[tokio::test]
     async fn cargo_runner_added_to_candidate_blocks_check_before_execution() {
@@ -8596,6 +8889,21 @@ mod tests {
             ordinary,
             "//go:build customtag\n\npackage pkg\n"
         ));
+    }
+    #[test]
+    fn goal_limit_follows_the_calibrated_context() {
+        let mut request = request();
+        // The Polyglot simple-linked-list goal (8,696 bytes) was refused at a
+        // fixed 8,192-byte limit although a 16,384-token context can hold it.
+        request.goal = "x".repeat(8696);
+        assert!(validate_request(&request).is_ok());
+        assert!(goal_fits_context(&request, 16384).is_ok());
+        assert!(goal_fits_context(&request, 8192)
+            .unwrap_err()
+            .to_string()
+            .contains("calibrated 8192-token context"));
+        request.goal = "x".repeat(MAX_GOAL_BYTES + 1);
+        assert!(validate_request(&request).is_err());
     }
     #[test]
     fn approved_check_budget_covers_baseline_and_candidate() {
@@ -11336,6 +11644,22 @@ mod tests {
         std::fs::write(dir.path().join("code.py"), "original\n").unwrap();
         std::fs::write(dir.path().join("generated.py"), "hidden dependency\n").unwrap();
         assert!(content_hash(dir.path(), &["code.py".into()]).is_err());
+    }
+
+    #[test]
+    fn cargo_lockfile_written_by_a_check_keeps_candidate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let files: Vec<PathBuf> = vec!["Cargo.toml".into(), "src/lib.rs".into()];
+        let before = content_hash(dir.path(), &files).unwrap();
+        // `cargo test` writes Cargo.lock beside a manifest that has none.
+        std::fs::write(dir.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        assert_eq!(content_hash(dir.path(), &files).unwrap(), before);
+        // Only beside a captured manifest: elsewhere it is still an added file.
+        std::fs::write(dir.path().join("src/Cargo.lock"), "version = 4\n").unwrap();
+        assert!(content_hash(dir.path(), &files).is_err());
     }
 
     #[tokio::test]

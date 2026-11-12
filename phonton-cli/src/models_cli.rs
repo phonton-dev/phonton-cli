@@ -1015,11 +1015,21 @@ async fn install_model(
         let binding = phonton_local::managed_store::bind(root, endpoint)
             .map_err(|error| anyhow!("A previously managed Ollama service can no longer be verified: {error}. Stop that service and rerun models setup, or configure a different loopback endpoint for an external runtime."))?;
         if let Some(binding) = binding {
+            // Memory first: freeing disk space for a model that can never load
+            // is wasted effort.
+            let machine = hardware::detect().await;
+            let manifest_bytes = LocalRuntime::manifest_download_bytes(model).await?;
+            if let Some(reason) = phonton_local::never_fits(manifest_bytes, &machine) {
+                bail!(
+                    "{model} cannot run on this machine: {reason}. No model weights were downloaded. Next: {}",
+                    setup_command_for(&machine).unwrap_or_else(|| NO_RECOMMENDATION.into())
+                );
+            }
             let admission = LocalRuntime::managed_download_admission(model, &binding).await?;
             let reserve = admission.reserve_bytes;
             progress(DownloadProgress {
                 status: format!(
-                    "Model store verified: {} to download ({} of {} bytes){}, {} bytes kept free",
+                    "Model store verified: up to {} to download ({} of {} bytes){}, {} bytes kept free",
                     gigabytes(&json!(admission.remaining_bytes)),
                     admission.remaining_bytes,
                     admission.manifest_bytes,
@@ -1764,8 +1774,12 @@ async fn mutate_with_lease(
             validate_profile_context(profile, &metadata)?;
             settings.active_model = Some(model.into());
             storage::save(&path, &settings)?;
+            // Without this, a cloud key in the environment keeps winning
+            // provider autodetection and goals silently leave the machine.
+            let goal_provider = crate::config::prefer_local_provider()
+                .unwrap_or_else(|e| format!("unchanged ({e})"));
             Ok(
-                json!({"active_model": model, "local_only": managed_local_only(&path, &settings), "loopback_only": true}),
+                json!({"active_model": model, "local_only": managed_local_only(&path, &settings), "loopback_only": true, "goal_provider": goal_provider}),
             )
         }
         "remove" => {
@@ -2024,7 +2038,10 @@ pub async fn run(args: &[String]) -> Result<i32> {
                 }
             }
             report(&steps)?;
-            eprintln!("Ready: {model} is calibrated and selected. Run `phonton` and type a goal, or `phonton goal \"<goal>\" --yes --allow-host-checks`.");
+            match steps.get("select").and_then(|s| s["goal_provider"].as_str()) {
+                Some("ollama") | None => eprintln!("Ready: {model} is calibrated and selected. Run `phonton` and type a goal, or `phonton goal \"<goal>\" --yes --allow-host-checks`."),
+                Some(other) => eprintln!("Ready: {model} is calibrated and selected, but goals still use `{other}` from config.toml. Set `name = \"ollama\"` under `[provider]` there to run them on {model}."),
+            }
             return Ok(0);
         }
         "deselect" if args.len() == 1 => {
@@ -2101,7 +2118,7 @@ mod tests {
         );
         assert!(none.contains("RAM 8.0 GB free of 16.0 GB"), "{none}");
         assert!(
-            none.contains("next: install and start Ollama (https://ollama.com/download), then phonton models setup qwen3.5:9b."),
+            none.contains("next: install and start Ollama (https://ollama.com/download), then phonton models setup qwen3.5:4b."),
             "{none}"
         );
         let workstation = serde_json::to_value(HardwareSnapshot {

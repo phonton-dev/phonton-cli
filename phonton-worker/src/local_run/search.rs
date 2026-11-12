@@ -6,7 +6,7 @@ use phonton_types::{
 };
 use phonton_types::{DiffHunk, DiffLine};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub(super) struct GroundedHypothesis {
@@ -324,6 +324,88 @@ pub(super) fn ground_hypothesis(
     })
 }
 
+/// Largest file rewritten whole after SearchReplace changed nothing.
+pub(super) const WHOLE_FILE_MAX_LINES: usize = 300;
+
+/// A SearchReplace answer that changed nothing on a small file is retried as
+/// a whole-file rewrite of the file it chose, from the same parent. A
+/// whole-file answer has no `search` key, so this fires once per branch.
+/// `baseline` is the parent directory of a first edit.
+pub(super) fn whole_file_retry(
+    candidates: &[CandidateEvidence],
+    scope: &[PathBuf],
+    baseline: &Path,
+) -> Option<(SearchDecision, PathBuf)> {
+    let last = candidates.last()?;
+    if !matches!(
+        last.rejection.as_deref(),
+        Some("Edit makes no change" | "No change or file budget exceeded")
+    ) {
+        return None;
+    }
+    let answer: Value = serde_json::from_str(&last.raw_output).ok()?;
+    answer.get("search")?;
+    let chosen = answer["path"].as_str()?;
+    let path = scope
+        .iter()
+        .find(|path| path.to_string_lossy().replace('\\', "/") == chosen)?
+        .clone();
+    let parent = last.decision.as_ref()?.parent_candidate;
+    let directory = match parent {
+        Some(number) => &candidates.iter().find(|c| c.number == number)?.directory,
+        None => baseline,
+    };
+    let lines = std::fs::read_to_string(directory.join(&path))
+        .ok()?
+        .lines()
+        .count();
+    (lines <= WHOLE_FILE_MAX_LINES).then(|| {
+        (
+            SearchDecision {
+                action: if parent.is_some() {
+                    SearchAction::Repair
+                } else {
+                    SearchAction::Initial
+                },
+                parent_candidate: parent,
+                reason: format!("SearchReplace made no applicable change; rewrite {chosen} whole"),
+            },
+            path,
+        )
+    })
+}
+
+/// Rejection for a generation whose raw output equals an earlier one in the
+/// same run. Its verdict is already known, so it never reaches the checks.
+pub(super) const REPEATED_OUTPUT: &str =
+    "Repeated model output; resample with a seeded non-zero temperature";
+
+/// Resampling temperature after a byte-identical repeat. Runs stay at the
+/// calibrated temperature 0 until it has repeated itself.
+const RESAMPLE_TEMPERATURE: f64 = 0.7;
+
+/// Whether `raw` repeats an earlier generation of this run byte for byte.
+pub(super) fn repeats_output(candidates: &[CandidateEvidence], raw: &str) -> bool {
+    !raw.trim().is_empty() && candidates.iter().any(|prior| prior.raw_output == raw)
+}
+
+/// Once a run has repeated model output or a candidate, another temperature-0
+/// call would likely repeat it again. Later calls sample, seeded by the
+/// candidate number so the run stays reproducible.
+pub(super) fn sampling(candidates: &[CandidateEvidence], number: u32) -> Option<Sampling> {
+    candidates
+        .iter()
+        .any(|c| {
+            c.rejection
+                .as_deref()
+                .is_some_and(|r| r.starts_with("Repeated"))
+        })
+        .then_some(Sampling {
+            temperature: RESAMPLE_TEMPERATURE,
+            seed: u64::from(number),
+        })
+}
+
 pub(super) fn next(candidates: &[CandidateEvidence]) -> SearchDecision {
     let choice = |action, parent_candidate, reason: &str| SearchDecision {
         action,
@@ -373,34 +455,30 @@ pub(super) fn next(candidates: &[CandidateEvidence]) -> SearchDecision {
             "Selected verification is unavailable; more generation cannot establish its result",
         );
     }
-    if last.content_sha256.is_none()
-        && !last.raw_output.trim().is_empty()
-        && candidates[..candidates.len() - 1].iter().any(|prior| {
-            prior.content_sha256.is_none()
-                && prior.raw_output == last.raw_output
-                && prior.rejection == last.rejection
-        })
-    {
-        return choice(
-            SearchAction::Stop,
-            None,
-            "The same rejected model output appeared twice without a checkable candidate",
-        );
-    }
     let repeated = candidates
         .iter()
         .rev()
         .take_while(|c| {
             c.rejection
                 .as_deref()
-                .is_some_and(|r| r.starts_with("Repeated candidate"))
+                .is_some_and(|r| r.starts_with("Repeated"))
         })
         .count();
     if repeated >= 2 {
         return choice(
             SearchAction::Stop,
             None,
-            "Two successive proposals repeated rejected candidate identities",
+            "Two successive proposals repeated earlier model output or candidate identities",
+        );
+    }
+    if repeated == 1 && rejection == REPEATED_OUTPUT {
+        // The verdict is already known; the same request at a seeded
+        // non-zero temperature is the cheapest way to get a new proposal.
+        let previous = last.decision.as_ref();
+        return choice(
+            previous.map_or(SearchAction::Initial, |d| d.action.clone()),
+            previous.and_then(|d| d.parent_candidate),
+            "Model output repeated an earlier generation byte for byte; resend the request with a seeded non-zero temperature",
         );
     }
     if repeated == 1 {
@@ -940,11 +1018,25 @@ mod tests {
             malformed.clone(),
             CandidateEvidence {
                 number: 2,
-                ..malformed
+                rejection: Some(REPEATED_OUTPUT.into()),
+                ..malformed.clone()
             },
         ];
         assert_eq!(
             next_with_budget(&duplicate, 2, 3, 512, false).action,
+            SearchAction::Initial
+        );
+        let twice = vec![
+            duplicate[0].clone(),
+            duplicate[1].clone(),
+            CandidateEvidence {
+                number: 3,
+                rejection: Some(REPEATED_OUTPUT.into()),
+                ..malformed
+            },
+        ];
+        assert_eq!(
+            next_with_budget(&twice, 3, 4, 512, false).action,
             SearchAction::Stop
         );
     }
@@ -1068,6 +1160,7 @@ mod tests {
                 parent_candidate: parent,
                 reason: String::new(),
             }),
+            sampling: None,
         }
     }
     #[test]
@@ -1209,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_unmaterialized_output_stops_inference() {
+    fn repeated_unmaterialized_output_resamples_once_then_stops() {
         let mut first = failed(1, None, "");
         first.content_sha256 = None;
         first.checks.clear();
@@ -1221,12 +1314,14 @@ mod tests {
         );
         let mut second = first.clone();
         second.number = 2;
+        second.rejection = Some(REPEATED_OUTPUT.into());
         assert_eq!(
             next(&[first.clone(), second.clone()]).action,
-            SearchAction::Stop
+            SearchAction::Initial
         );
-        second.content_sha256 = Some("checkable bytes".into());
-        assert_ne!(next(&[first, second]).action, SearchAction::Stop);
+        let mut third = second.clone();
+        third.number = 3;
+        assert_eq!(next(&[first, second, third]).action, SearchAction::Stop);
     }
     #[test]
     fn unchanged_node_failure_ignores_candidate_location_and_timing() {
@@ -1414,6 +1509,78 @@ mod tests {
         assert!(diagnostic.len() <= 450);
         assert!(feedback(&[], &diagnostic).contains("FAIL initial_invalid_port assertion"));
         assert!(verifier_feedback(&[], &diagnostic).contains("FAIL initial_invalid_port assertion"));
+    }
+    #[test]
+    fn noop_search_replace_on_a_small_file_retries_it_whole_once() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = root.path().join("baseline");
+        std::fs::create_dir_all(baseline.join("src")).unwrap();
+        std::fs::write(
+            baseline.join("src/add.py"),
+            "def add(a, b):\n    return a - b\n",
+        )
+        .unwrap();
+        std::fs::write(
+            baseline.join("src/big.py"),
+            "x = 1\n".repeat(WHOLE_FILE_MAX_LINES + 1),
+        )
+        .unwrap();
+        let scope = [PathBuf::from("src").join("add.py"), "src/big.py".into()];
+        let mut noop = failed(1, None, "");
+        noop.content_sha256 = None;
+        noop.checks.clear();
+        noop.rejection = Some("No change or file budget exceeded".into());
+        noop.raw_output =
+            r#"{"path":"src/add.py","search":"return a - b","text":"return a - b"}"#.into();
+        let (decision, path) =
+            whole_file_retry(std::slice::from_ref(&noop), &scope, &baseline).unwrap();
+        assert_eq!(decision.action, SearchAction::Initial);
+        assert_eq!(decision.parent_candidate, None);
+        assert_eq!(path, scope[0]);
+
+        // Over the line limit, out of scope, or already a whole-file answer.
+        let mut big = noop.clone();
+        big.raw_output = r#"{"path":"src/big.py","search":"x = 1","text":"x = 1"}"#.into();
+        assert!(whole_file_retry(&[big], &scope, &baseline).is_none());
+        let mut outside = noop.clone();
+        outside.raw_output = r#"{"path":"other.py","search":"a","text":"a"}"#.into();
+        assert!(whole_file_retry(&[outside], &scope, &baseline).is_none());
+        let mut whole = noop.clone();
+        whole.raw_output =
+            r#"{"path":"src/add.py","text":"def add(a, b):\n    return a - b\n"}"#.into();
+        assert!(whole_file_retry(&[whole], &scope, &baseline).is_none());
+        let mut failed_checks = noop;
+        failed_checks.rejection = Some("Candidate failed the selected verification checks".into());
+        assert!(whole_file_retry(&[failed_checks], &scope, &baseline).is_none());
+    }
+
+    #[test]
+    fn repeated_output_resends_the_same_request_with_seeded_sampling() {
+        let parent = failed(1, None, "failure");
+        let mut repeat = failed(2, Some(1), "");
+        repeat.raw_output = parent.raw_output.clone();
+        assert!(repeats_output(
+            std::slice::from_ref(&parent),
+            &repeat.raw_output
+        ));
+        assert!(!repeats_output(std::slice::from_ref(&parent), "  \n"));
+        assert!(!repeats_output(std::slice::from_ref(&parent), "new edit"));
+        assert_eq!(sampling(std::slice::from_ref(&parent), 2), None);
+
+        repeat.content_sha256 = None;
+        repeat.checks.clear();
+        repeat.rejection = Some(REPEATED_OUTPUT.into());
+        let run = [parent, repeat];
+        let decision = next(&run);
+        assert_eq!(decision.action, SearchAction::Repair);
+        assert_eq!(decision.parent_candidate, Some(1));
+        assert_eq!(
+            sampling(&run, 3),
+            Some(Sampling {
+                temperature: RESAMPLE_TEMPERATURE,
+                seed: 3
+            })
+        );
     }
     #[test]
     fn repeated_identity_stops_without_another_generation() {
