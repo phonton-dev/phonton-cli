@@ -4,6 +4,41 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased
+
+Measured on one 16-thread laptop, old and new binary back to back.
+
+### Changed
+
+- [changed] A hosted goal no longer waits for the semantic index. The index
+  is built on a background thread. A goal's first lookup waits up to 10
+  seconds for it, and until it is ready the goal runs without indexed
+  context. Before, every hosted goal rebuilt the whole index before its
+  first model call. The same goal on a generated repository of 6,000
+  functions took 29 seconds the first time and 13 seconds after that,
+  instead of 52 seconds every time.
+- [changed] Symbol vectors are kept on disk, one file per repository under
+  `vectors/` in the embedding cache, so each signature is embedded once.
+  Indexing this repository (106 source files, 3,278 signatures) again took 4
+  CPU-seconds instead of 1,360. The files hold vectors, not source text.
+  `phonton index watch` fills the same cache.
+- [changed] Signatures are embedded one per model run, with the runs spread
+  over the cores, instead of in padded batches of 32. The vectors are the
+  same. A first index of this repository took 347 CPU-seconds and 405 MB
+  instead of 1,360 CPU-seconds and 803 MB.
+- [changed] On Windows the CPU name is read from the registry instead of
+  through a PowerShell process. A local goal starts 29 processes instead of
+  33 and finished in 13.7 seconds instead of 17.5 on the same fixture.
+  `phonton models status` took 0.2 seconds instead of 2.0.
+
+### Fixed
+
+- [fixed] The 120-second limit on building the semantic index could not
+  stop a slow build, because the build never yielded to the timer. A large
+  repository held a hosted goal back for as long as its index took. The
+  build now runs apart from the goal, and ending the goal stops it after
+  the batch in flight.
+
 ## 0.27.0 - Local Rust checks run cargo; the local search wastes fewer attempts
 
 ### Fixed
