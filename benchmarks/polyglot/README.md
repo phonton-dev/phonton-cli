@@ -145,6 +145,11 @@ with), `summary.md`, and per exercise and arm: `prompt.md`,
 `evidence.json` or OpenCode's config. `benchmarks/results/` is not committed;
 copy a run's folder next to its write-up.
 
+The raw results of the published `qwen3.5:4b` runs (17 October to 6 November
+2026) are attached to the [`polyglot-results-2026-11`](https://github.com/phonton-dev/phonton-cli/releases/tag/polyglot-results-2026-11)
+release: every prompt, reply, diff and test log, with local paths replaced and
+a script that recomputes the table.
+
 ## Limits
 
 - Comparisons hold only for one model, one runtime, one context length and one

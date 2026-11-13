@@ -137,6 +137,7 @@ JavaScript 2, Rust 0). One JavaScript pass, `ledger`, is a refactoring
 exercise whose tests pass before any edit. Each run marked 2 candidates ready
 for review, and both passed the exercise's tests. Small models work best on
 one focused change at a time. Details and limits: [docs/local-harness.md](docs/local-harness.md).
+Every prompt, reply, diff and test log of these runs: [raw results](https://github.com/phonton-dev/phonton-cli/releases/tag/polyglot-results-2026-11).
 
 ---
 
