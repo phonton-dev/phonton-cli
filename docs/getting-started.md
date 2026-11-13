@@ -72,6 +72,9 @@ phonton goal --resume <task-id> --allow-host-checks
 phonton index watch
 ```
 
+The first index of a repository embeds every symbol, which can take minutes.
+Hosted goals do not wait for it; this command builds it ahead of time.
+
 ## Claims
 
 Public comparisons need reproducible artifacts; see

@@ -4578,16 +4578,18 @@ async fn build_semantic_context_with_warnings(
                 embedder,
             ))
         } else {
-            let embedder = phonton_index::Embedder::new_for_workspace(&root)?;
-            let index = match phonton_index::discover_nexus_config(&root) {
-                Ok(Some(cfg)) => {
-                    phonton_index::index_workspace_with_nexus_using_embedder(&root, &cfg, &embedder)
-                        .await
-                }
-                Ok(None) => phonton_index::index_workspace_using_embedder(&root, &embedder).await,
-                Err(e) => Err(e),
-            }?;
-            Arc::new(phonton_index::LocalCodeRetriever::new(embedder, index))
+            // Built on its own thread: a repository's first index embeds every
+            // symbol, and the goal does not wait for that.
+            Arc::new(phonton_index::BackgroundCodeRetriever::spawn(
+                root,
+                move |e| {
+                    if emit_warnings {
+                        eprintln!(
+                            "phonton: semantic index unavailable ({e}); continuing without indexed context"
+                        );
+                    }
+                },
+            )?)
         };
         anyhow::Ok(Arc::new(phonton_worker::SemanticContext { retriever }))
     };
@@ -6778,7 +6780,7 @@ async fn probe_selection() -> Machine {
     machine
 }
 
-/// Add hardware headroom to a probed selection (nvidia-smi and CIM are slow).
+/// Add hardware headroom to a probed selection (nvidia-smi is slow).
 async fn probe_hardware(mut machine: Machine) -> Machine {
     let hw = phonton_local::hardware::detect().await;
     machine.gpu = hw

@@ -7,7 +7,15 @@ use async_trait::async_trait;
 use phonton_types::{CodeSlice, SliceOrigin};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "semantic")]
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "semantic")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "semantic")]
+use std::sync::{Arc, OnceLock};
+#[cfg(feature = "semantic")]
+use std::time::{Duration, Instant};
 
 /// Symbol kinds extracted from source files.
 const RUST_KINDS: &[&str] = &[
@@ -237,6 +245,8 @@ pub const EMBED_DIM: usize = 384;
 #[cfg(feature = "semantic")]
 pub struct Embedder {
     model: fastembed::TextEmbedding,
+    /// Where vectors made by this model are kept between runs.
+    vectors: PathBuf,
 }
 
 #[cfg(feature = "semantic")]
@@ -255,20 +265,32 @@ impl Embedder {
             std::env::var_os("FASTEMBED_CACHE_DIR"),
             std::env::var_os("HF_HOME"),
         )?;
+        let vectors = cache_dir.join("vectors");
         let model = fastembed::TextEmbedding::try_new(
             fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
                 .with_cache_dir(cache_dir)
                 .with_show_download_progress(false),
         )
         .context("loading all-MiniLM-L6-v2")?;
-        Ok(Self { model })
+        Ok(Self { model, vectors })
+    }
+
+    /// The vector cache file of one workspace.
+    fn vector_file(&self, root: &Path) -> PathBuf {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        self.vectors
+            .join(format!("{:016x}.bin", text_key(&root.to_string_lossy())))
     }
 
     /// Embed a batch of texts. Returns one 384-dim vector per input.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let docs: Vec<&str> = texts.to_vec();
+        // One text per model run, with the runs spread over the cores. As one
+        // batch the texts are padded to the longest and run as a single large
+        // tensor: the same vectors for 4.3 times the CPU time and twice the
+        // memory (512 symbols: 237 CPU-seconds and 385 MB against 55 and 205).
         self.model
-            .embed(docs, None)
+            .embed(docs, Some(1))
             .map_err(|e| anyhow::anyhow!("fastembed: {e}"))
     }
 }
@@ -437,6 +459,143 @@ impl SemanticIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Vector cache
+// ---------------------------------------------------------------------------
+
+/// First bytes of a vector cache file. Vectors are only valid for the model
+/// that made them: change this when the embedding model changes.
+#[cfg(feature = "semantic")]
+const VECTOR_CACHE_MAGIC: &[u8; 8] = b"PHVEC001";
+
+/// One record of a vector cache file: the key, then the vector.
+#[cfg(feature = "semantic")]
+const VECTOR_RECORD_BYTES: usize = 8 + EMBED_DIM * 4;
+
+/// Seconds of embedding between two saves of an unfinished build.
+#[cfg(feature = "semantic")]
+const VECTOR_SAVE_INTERVAL: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "semantic")]
+fn text_key(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(text, &mut hasher);
+    std::hash::Hasher::finish(&hasher)
+}
+
+/// Read a vector cache. A missing, foreign or cut-off file yields the whole
+/// records it holds, which may be none.
+#[cfg(feature = "semantic")]
+fn load_vectors(path: &Path) -> HashMap<u64, Vec<f32>> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    let Some(records) = bytes.strip_prefix(VECTOR_CACHE_MAGIC) else {
+        return HashMap::new();
+    };
+    records
+        .as_chunks::<VECTOR_RECORD_BYTES>()
+        .0
+        .iter()
+        .filter_map(|record| {
+            let (key, values) = record.split_first_chunk::<8>()?;
+            let vector = values
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect();
+            Some((u64::from_le_bytes(*key), vector))
+        })
+        .collect()
+}
+
+/// Write the vectors whose key is in `live`, replacing the file in one step.
+#[cfg(feature = "semantic")]
+fn save_vectors(
+    path: &Path,
+    vectors: &HashMap<u64, Vec<f32>>,
+    live: &HashSet<u64>,
+) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(8 + live.len() * VECTOR_RECORD_BYTES);
+    bytes.extend_from_slice(VECTOR_CACHE_MAGIC);
+    for (key, vector) in vectors.iter().filter(|(key, _)| live.contains(key)) {
+        bytes.extend_from_slice(&key.to_le_bytes());
+        for value in vector {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    // Written beside the target and renamed over it, so another Phonton
+    // process reading the cache never sees half a file.
+    let partial = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&partial, bytes)?;
+    std::fs::rename(&partial, path)
+}
+
+/// Give every slice its vector and add it to `index`.
+///
+/// A vector depends only on the signature text, and embedding costs about
+/// 0.1 CPU-seconds per symbol, so vectors are kept in `cache_file` and each
+/// text is embedded once. `stop` is checked between batches. What was embedded
+/// is saved even when the build stops early or fails, so the next build
+/// continues from there. Slices left without a vector are not indexed.
+#[cfg(feature = "semantic")]
+fn add_embedded(
+    index: &mut SemanticIndex,
+    slices: Vec<CodeSlice>,
+    cache_file: &Path,
+    stop: &AtomicBool,
+    embed: impl Fn(&[&str]) -> Result<Vec<Vec<f32>>>,
+) -> Result<()> {
+    let mut vectors = load_vectors(cache_file);
+    let keys: Vec<u64> = slices.iter().map(|s| text_key(&s.signature)).collect();
+    let live: HashSet<u64> = keys.iter().copied().collect();
+    let stale = vectors.keys().any(|key| !live.contains(key));
+    let mut queued = HashSet::new();
+    let missing: Vec<(u64, &str)> = keys
+        .iter()
+        .zip(&slices)
+        .filter(|(key, _)| !vectors.contains_key(key) && queued.insert(**key))
+        .map(|(key, slice)| (*key, slice.signature.as_str()))
+        .collect();
+
+    let mut outcome = Ok(());
+    let mut saved = Instant::now();
+    for chunk in missing.chunks(32) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let texts: Vec<&str> = chunk.iter().map(|(_, text)| *text).collect();
+        match embed(&texts) {
+            Ok(made) => vectors.extend(chunk.iter().map(|(key, _)| *key).zip(made)),
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+        if saved.elapsed() >= VECTOR_SAVE_INTERVAL {
+            let _ = save_vectors(cache_file, &vectors, &live);
+            saved = Instant::now();
+        }
+    }
+    if stale || !missing.is_empty() {
+        // A cache that cannot be written costs time on the next build, not
+        // correctness, so the index is still returned.
+        let _ = save_vectors(cache_file, &vectors, &live);
+    }
+    outcome?;
+
+    for (key, slice) in keys.into_iter().zip(slices) {
+        if let Some(vector) = vectors.get(&key) {
+            index.add(slice, vector.clone())?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Nexus: cross-repo indexing
 // ---------------------------------------------------------------------------
 
@@ -569,6 +728,16 @@ pub async fn index_workspace_with_nexus_using_embedder(
     config: &NexusConfig,
     embedder: &Embedder,
 ) -> Result<SemanticIndex> {
+    index_nexus(root, config, embedder, &AtomicBool::new(false))
+}
+
+#[cfg(feature = "semantic")]
+fn index_nexus(
+    root: &Path,
+    config: &NexusConfig,
+    embedder: &Embedder,
+    stop: &AtomicBool,
+) -> Result<SemanticIndex> {
     let mut index = SemanticIndex::new(EMBED_DIM);
     let mut all_slices: Vec<CodeSlice> = Vec::new();
 
@@ -611,18 +780,16 @@ pub async fn index_workspace_with_nexus_using_embedder(
         }
     }
 
-    for chunk in all_slices.chunks(32) {
-        let texts: Vec<&str> = chunk.iter().map(|s| s.signature.as_str()).collect();
-        let vecs = embedder.embed(&texts)?;
-        for (slice, vec) in chunk.iter().cloned().zip(vecs) {
-            index.add(slice, vec)?;
-        }
-    }
+    let cache_file = embedder.vector_file(root);
+    add_embedded(&mut index, all_slices, &cache_file, stop, |texts| {
+        embedder.embed(texts)
+    })?;
     Ok(index)
 }
 
 /// Walk `root`, extract symbols from all Rust/Python/TypeScript sources,
-/// embed their signatures in batches of 32, and return an HNSW index.
+/// embed the signatures the vector cache does not hold yet in batches of 32,
+/// and return an HNSW index.
 #[cfg(feature = "semantic")]
 pub async fn index_workspace(root: &Path) -> Result<SemanticIndex> {
     let embedder = Embedder::new_for_workspace(root)?;
@@ -635,6 +802,11 @@ pub async fn index_workspace_using_embedder(
     root: &Path,
     embedder: &Embedder,
 ) -> Result<SemanticIndex> {
+    index_single(root, embedder, &AtomicBool::new(false))
+}
+
+#[cfg(feature = "semantic")]
+fn index_single(root: &Path, embedder: &Embedder, stop: &AtomicBool) -> Result<SemanticIndex> {
     let mut files: Vec<PathBuf> = Vec::new();
     collect_source_files(root, &mut files)?;
 
@@ -655,13 +827,10 @@ pub async fn index_workspace_using_embedder(
         }
     }
 
-    for chunk in all_slices.chunks(32) {
-        let texts: Vec<&str> = chunk.iter().map(|s| s.signature.as_str()).collect();
-        let vecs = embedder.embed(&texts)?;
-        for (slice, vec) in chunk.iter().cloned().zip(vecs) {
-            index.add(slice, vec)?;
-        }
-    }
+    let cache_file = embedder.vector_file(root);
+    add_embedded(&mut index, all_slices, &cache_file, stop, |texts| {
+        embedder.embed(texts)
+    })?;
     Ok(index)
 }
 
@@ -721,6 +890,129 @@ impl CodeRetriever for LocalCodeRetriever {
 
     async fn query(&self, query: &str, k: usize) -> Result<Vec<CodeSlice>> {
         Ok(query_relevant_slices(&self.index, &self.embedder, query, k).await)
+    }
+}
+
+/// How long the first query waits for an index that is still being built.
+/// With every vector in the cache the build takes a second or two. Longer
+/// than this means symbols are being embedded, which can take minutes.
+#[cfg(feature = "semantic")]
+const FIRST_QUERY_WAIT: Duration = Duration::from_secs(10);
+
+/// How long dropping the retriever waits for the build thread to end. A batch
+/// takes under a second. A first run that is still downloading the model
+/// is not worth holding the caller for, and gets no more than this.
+#[cfg(feature = "semantic")]
+const DROP_WAIT: Duration = Duration::from_secs(3);
+
+/// The local retriever, built on its own thread.
+///
+/// The first index of a repository embeds every symbol, which takes minutes of
+/// CPU time, and a goal should not wait for that. The first query waits
+/// [`FIRST_QUERY_WAIT`] at most; until the index is ready, queries return
+/// nothing, the same as a goal that has no index. Dropping the retriever stops
+/// the build after the batch in flight and waits for the thread to end, so no
+/// model code is running if the process exits next. The vectors made so far
+/// stay in the cache for the next goal.
+#[cfg(feature = "semantic")]
+pub struct BackgroundCodeRetriever {
+    ready: Arc<OnceLock<LocalCodeRetriever>>,
+    stop: Arc<AtomicBool>,
+    /// Closes when the build thread ends, ready or not.
+    finished: tokio::sync::watch::Receiver<()>,
+    thread: std::thread::JoinHandle<()>,
+    wait: Duration,
+    waited: AtomicBool,
+}
+
+#[cfg(feature = "semantic")]
+impl BackgroundCodeRetriever {
+    /// Start indexing `root`. `on_error` runs on the build thread if the
+    /// model cannot be loaded or the workspace cannot be indexed.
+    pub fn spawn(
+        root: PathBuf,
+        on_error: impl FnOnce(anyhow::Error) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let build = move |stop: &AtomicBool| {
+            let embedder = Embedder::new_for_workspace(&root)?;
+            let index = match discover_nexus_config(&root)? {
+                Some(config) => index_nexus(&root, &config, &embedder, stop)?,
+                None => index_single(&root, &embedder, stop)?,
+            };
+            Ok(LocalCodeRetriever::new(embedder, index))
+        };
+        Self::start(build, on_error, FIRST_QUERY_WAIT)
+    }
+
+    fn start(
+        build: impl FnOnce(&AtomicBool) -> Result<LocalCodeRetriever> + Send + 'static,
+        on_error: impl FnOnce(anyhow::Error) + Send + 'static,
+        wait: Duration,
+    ) -> std::io::Result<Self> {
+        let ready = Arc::new(OnceLock::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done, finished) = tokio::sync::watch::channel(());
+        let (slot, flag) = (Arc::clone(&ready), Arc::clone(&stop));
+        // A thread of its own, not `spawn_blocking`: a runtime waits for its
+        // blocking tasks when it shuts down, and the process should not. The
+        // stack matches the runtime's threads, which ran this work before.
+        let thread = std::thread::Builder::new()
+            .name("phonton-index".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let _done = done;
+                match build(&flag) {
+                    // A stopped build leaves symbols out, so it is not used.
+                    Ok(retriever) if !flag.load(Ordering::Relaxed) => {
+                        let _ = slot.set(retriever);
+                    }
+                    Ok(_) => {}
+                    Err(error) => on_error(error),
+                }
+            })?;
+        Ok(Self {
+            ready,
+            stop,
+            finished,
+            thread,
+            wait,
+            waited: AtomicBool::new(false),
+        })
+    }
+}
+
+#[cfg(feature = "semantic")]
+#[async_trait]
+impl CodeRetriever for BackgroundCodeRetriever {
+    fn backend_name(&self) -> &str {
+        "local-hnsw"
+    }
+
+    async fn query(&self, query: &str, k: usize) -> Result<Vec<CodeSlice>> {
+        if self.ready.get().is_none() && !self.waited.load(Ordering::Relaxed) {
+            let mut finished = self.finished.clone();
+            if tokio::time::timeout(self.wait, finished.changed())
+                .await
+                .is_err()
+            {
+                self.waited.store(true, Ordering::Relaxed);
+            }
+        }
+        match self.ready.get() {
+            Some(retriever) => retriever.query(query, k).await,
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+#[cfg(feature = "semantic")]
+impl Drop for BackgroundCodeRetriever {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + DROP_WAIT;
+        while !self.thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -1232,6 +1524,136 @@ mod tests {
             slices.iter().all(|s| s.token_count > 0),
             "all extracted slices should carry a non-zero token estimate: {slices:?}"
         );
+    }
+
+    /// A stand-in for the model: one fixed vector per text length.
+    #[cfg(feature = "semantic")]
+    fn fake_vectors(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts
+            .iter()
+            .map(|text| {
+                let mut vector = vec![0.0; EMBED_DIM];
+                vector[text.len() % EMBED_DIM] = 1.0;
+                vector
+            })
+            .collect())
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn each_signature_is_embedded_once_and_reused_by_later_builds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = temp.path().join("vectors").join("repo.bin");
+        let never = AtomicBool::new(false);
+        let embedded = std::cell::RefCell::new(Vec::new());
+        let embed = |texts: &[&str]| {
+            embedded
+                .borrow_mut()
+                .extend(texts.iter().map(|text| text.to_string()));
+            fake_vectors(texts)
+        };
+        let build = |signatures: &[&str]| -> Result<SemanticIndex> {
+            let mut index = SemanticIndex::new(EMBED_DIM);
+            let slices = signatures.iter().map(|s| synth("f", s)).collect();
+            add_embedded(&mut index, slices, &cache, &never, embed)?;
+            Ok(index)
+        };
+
+        // The same text twice is one embedding and two indexed slices.
+        let first = build(&["fn a()", "fn bb()", "fn a()"])?;
+        assert_eq!(first.len(), 3);
+        assert_eq!(*embedded.borrow(), ["fn a()", "fn bb()"]);
+
+        // Nothing changed: the model is not called, and search still works.
+        embedded.borrow_mut().clear();
+        let second = build(&["fn a()", "fn bb()", "fn a()"])?;
+        assert_eq!(second.len(), 3);
+        assert!(embedded.borrow().is_empty());
+        let query = fake_vectors(&["fn bb()"])?.remove(0);
+        assert_eq!(second.search(&query, 1)[0].signature, "fn bb()");
+
+        // One signature changed: one embedding, and the old text leaves the file.
+        let third = build(&["fn a()", "fn ccc()"])?;
+        assert_eq!(third.len(), 2);
+        assert_eq!(*embedded.borrow(), ["fn ccc()"]);
+        assert_eq!(load_vectors(&cache).len(), 2);
+
+        // A cut-off file costs only the record that was cut.
+        let mut bytes = std::fs::read(&cache)?;
+        bytes.truncate(bytes.len() - 5);
+        std::fs::write(&cache, bytes)?;
+        assert_eq!(load_vectors(&cache).len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn a_stopped_build_keeps_the_vectors_it_made() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cache = temp.path().join("repo.bin");
+        let signatures: Vec<String> = (0..40).map(|i| format!("fn f{i}()")).collect();
+        let slices = || signatures.iter().map(|s| synth("f", s)).collect::<Vec<_>>();
+
+        // Stop is raised during the first batch of 32, so the second never runs.
+        let stop = AtomicBool::new(false);
+        let mut index = SemanticIndex::new(EMBED_DIM);
+        add_embedded(&mut index, slices(), &cache, &stop, |texts| {
+            stop.store(true, Ordering::Relaxed);
+            fake_vectors(texts)
+        })?;
+        assert_eq!(index.len(), 32);
+        assert_eq!(load_vectors(&cache).len(), 32);
+
+        // The next build embeds only the eight that are left.
+        let embedded = std::cell::Cell::new(0);
+        let mut index = SemanticIndex::new(EMBED_DIM);
+        let never = AtomicBool::new(false);
+        add_embedded(&mut index, slices(), &cache, &never, |texts| {
+            embedded.set(embedded.get() + texts.len());
+            fake_vectors(texts)
+        })?;
+        assert_eq!((index.len(), embedded.get()), (40, 8));
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic")]
+    #[tokio::test]
+    async fn queries_do_not_wait_for_a_failed_or_slow_index_build() -> Result<()> {
+        // A build that fails: the error is reported and queries return nothing.
+        let (reported, report) = std::sync::mpsc::channel();
+        let failed = BackgroundCodeRetriever::start(
+            |_| anyhow::bail!("no model"),
+            move |error| {
+                let _ = reported.send(error.to_string());
+            },
+            Duration::from_secs(60),
+        )?;
+        assert!(failed.query("anything", 5).await?.is_empty());
+        assert_eq!(report.recv()?, "no model");
+
+        // A build that is still running: the first query waits `wait` and no
+        // longer, later ones do not wait, and dropping the retriever stops it
+        // and returns once the thread has ended.
+        let (stopped, stop_seen) = std::sync::mpsc::channel();
+        let slow = BackgroundCodeRetriever::start(
+            move |stop| {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = stopped.send(());
+                anyhow::bail!("stopped")
+            },
+            |_| {},
+            Duration::from_millis(50),
+        )?;
+        let asked = Instant::now();
+        assert!(slow.query("anything", 5).await?.is_empty());
+        assert!(asked.elapsed() >= Duration::from_millis(50));
+        assert!(slow.waited.load(Ordering::Relaxed));
+        assert!(slow.query("anything", 5).await?.is_empty());
+        drop(slow);
+        stop_seen.try_recv()?;
+        Ok(())
     }
 
     #[cfg(feature = "semantic")]

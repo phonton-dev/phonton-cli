@@ -30,27 +30,18 @@ pub async fn detect() -> HardwareSnapshot {
     #[cfg(windows)]
     {
         let native_ram = windows_ram();
-        // Native memory needs no subprocess. If it fails, keep the RAM-only
-        // fallback independent of the optional CPU-name query.
+        // Native memory and the CPU name need no subprocess. PowerShell
+        // starts only if the native memory call fails.
         let cim_ram = if native_ram.is_none() {
             output("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "$c=Get-CimInstance Win32_ComputerSystem; $o=Get-CimInstance Win32_OperatingSystem; @{total=[uint64]$c.TotalPhysicalMemory;available=([uint64]$o.FreePhysicalMemory*1024)} | ConvertTo-Json -Compress"]).await
         } else {
             None
         };
-        // CPU naming is optional. A slow CIM call must not delay first-use
-        // memory admission for the full hardware-probe timeout.
-        let cim_cpu = tokio::time::timeout(
-            Duration::from_secs(3),
-            output("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", "$p=Get-CimInstance Win32_Processor; @{cpu=($p.Name -join ', ')} | ConvertTo-Json -Compress"]),
-        )
-        .await
-        .ok()
-        .flatten();
         apply_windows_observations(
             &mut hardware,
             native_ram,
             cim_ram.as_deref(),
-            cim_cpu.as_deref(),
+            windows_cpu_name(),
         );
     }
     #[cfg(target_os = "linux")]
@@ -119,19 +110,55 @@ fn windows_ram() -> Option<(u64, u64)> {
         .then_some((memory.ullTotalPhys, memory.ullAvailPhys))
 }
 
+/// The processor's name from the registry. A CIM query through PowerShell
+/// returned the same string, but it cost about a second of CPU time and
+/// 65 MB of memory on every hardware probe, including the one before each
+/// local goal, while the model needed both.
+#[cfg(windows)]
+fn windows_cpu_name() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+    let wide = |text: &str| {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let key = wide(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+    let value = wide("ProcessorNameString");
+    let mut name = [0u16; 128];
+    let mut bytes = std::mem::size_of_val(&name) as u32;
+    // SAFETY: key and value are NUL-terminated UTF-16 strings that outlive
+    // the call. name is a writable buffer and bytes holds its size in bytes;
+    // the call writes at most that many bytes and stores the count in bytes.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            name.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let units = (bytes as usize / 2).min(name.len());
+    Some(String::from_utf16_lossy(&name[..units]))
+}
+
 #[cfg(windows)]
 fn apply_windows_observations(
     hardware: &mut HardwareSnapshot,
     native_ram: Option<(u64, u64)>,
     cim_ram_json: Option<&str>,
-    cim_cpu_json: Option<&str>,
+    cpu_name: Option<String>,
 ) {
-    let cim_cpu =
-        cim_cpu_json.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
-    if let Some(cpu) = cim_cpu
-        .as_ref()
-        .and_then(|data| data["cpu"].as_str())
-        .map(str::trim)
+    // The registry pads the name with spaces and ends it with a NUL.
+    if let Some(cpu) = cpu_name
+        .as_deref()
+        .map(|name| name.trim_matches(|c: char| c == '\0' || c.is_whitespace()))
         .filter(|cpu| !cpu.is_empty())
     {
         hardware.cpu = Some(cpu.to_owned());
@@ -296,22 +323,34 @@ mod tests {
             &mut hardware,
             Some((16u64 << 30, 8u64 << 30)),
             None,
-            Some("not json"),
+            Some("  \0".into()),
         );
         assert_eq!(hardware.ram_available_bytes, Some(8u64 << 30));
+        assert_eq!(hardware.cpu, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_name_comes_from_the_registry_trimmed() {
+        let mut hardware = HardwareSnapshot::default();
+        apply_windows_observations(&mut hardware, None, None, windows_cpu_name());
+        let cpu = hardware
+            .cpu
+            .expect("the registry names processor 0 on every Windows machine");
+        assert_eq!(cpu, cpu.trim());
+        assert!(!cpu.is_empty() && !cpu.contains('\0'));
     }
 
     #[cfg(windows)]
     #[test]
     fn native_ram_is_authoritative_and_cim_can_fall_back() {
         let cim_ram = r#"{"total":34359738368,"available":3221225472}"#;
-        let cim_cpu = r#"{"cpu":"Fixture CPU"}"#;
         let mut hardware = HardwareSnapshot::default();
         apply_windows_observations(
             &mut hardware,
             Some((16u64 << 30, 8u64 << 30)),
             Some(cim_ram),
-            Some(cim_cpu),
+            Some("Fixture CPU          \0".into()),
         );
         assert_eq!(hardware.cpu.as_deref(), Some("Fixture CPU"));
         assert_eq!(hardware.ram_total_bytes, Some(16u64 << 30));

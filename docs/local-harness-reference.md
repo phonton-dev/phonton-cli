@@ -268,6 +268,12 @@ directory, outside the active repository. Custom `FASTEMBED_CACHE_DIR` or
 `HF_HOME` paths must be absolute and outside the indexed repository, even when
 the process is started from a different directory; unsafe
 paths leave semantic context unavailable without changing project files.
+Symbol vectors are kept in the same cache, under `vectors/`, one file per
+repository, so each signature is embedded once; the files hold vectors, not
+source text. The index is built on a background thread. A goal's first lookup
+waits up to 10 seconds for it; while a repository's first index is still being
+built, the goal continues without indexed context and later goals reuse the
+vectors already made.
 Repair prompts prioritize failed checks and retain their candidate identity when
 later edits are unchanged or malformed.
 Verbose baseline and candidate check logs keep marked start/end excerpts in
