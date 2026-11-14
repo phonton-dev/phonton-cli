@@ -1119,6 +1119,16 @@ async fn query_qdrant_search(
     Ok(out)
 }
 
+/// True for the files the index reads: every extension [`extract_symbols`]
+/// parses, so a `.mjs` or `.cts` module is found like a `.js` or `.ts` one.
+#[cfg(any(feature = "semantic", test))]
+fn is_indexed_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("rs" | "py" | "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+    )
+}
+
 #[cfg(any(feature = "semantic", test))]
 fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if !root.exists() {
@@ -1134,12 +1144,8 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
             collect_source_files(&path, out)?;
-        } else if ft.is_file() {
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if matches!(ext, "rs" | "py" | "ts" | "tsx" | "js" | "jsx") {
-                    out.push(path);
-                }
-            }
+        } else if ft.is_file() && is_indexed_source(&path) {
+            out.push(path);
         }
     }
     Ok(())
@@ -1182,8 +1188,7 @@ pub async fn watch_and_reindex(index: &mut SemanticIndex, root: &Path) {
         let mut changed_files = HashSet::new();
         for event in events {
             for path in event.paths {
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                if matches!(ext, "rs" | "py" | "ts" | "tsx" | "js" | "jsx") {
+                if is_indexed_source(&path) {
                     changed_files.insert(path);
                 }
             }
@@ -1511,6 +1516,30 @@ mod tests {
         collect_source_files(tmp.path(), &mut out).unwrap();
         assert_eq!(out.len(), 1, "expected only src/lib.rs, got {out:?}");
         assert!(out[0].ends_with("lib.rs"));
+    }
+
+    #[test]
+    fn collect_source_files_finds_every_parsed_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parsed = [
+            "rs", "py", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs",
+        ];
+        for extension in parsed {
+            write(tmp.path(), &format!("src/rules.{extension}"), "");
+        }
+        write(tmp.path(), "README.md", "");
+        write(tmp.path(), "data.json", "{}");
+
+        let mut out = Vec::new();
+        collect_source_files(tmp.path(), &mut out).unwrap();
+        let mut found: Vec<&str> = out
+            .iter()
+            .filter_map(|path| path.extension()?.to_str())
+            .collect();
+        found.sort_unstable();
+        let mut expected = parsed.to_vec();
+        expected.sort_unstable();
+        assert_eq!(found, expected);
     }
 
     #[test]

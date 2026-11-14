@@ -4,6 +4,33 @@ All notable Phonton CLI release changes should be documented here.
 
 This project follows pre-1.0 SemVer: minor versions may still include breaking changes while the public API and CLI surface settle.
 
+## Unreleased
+
+### Fixed
+
+- [fixed] The semantic index reads `.mjs`, `.cjs`, `.mts` and `.cts` files.
+  It could parse them but never collected them, so a project written as ES
+  modules had none of its own source in the index and a goal's first context
+  came from whatever `.js` and `.ts` files lay around it.
+- [fixed] A hosted worker can read a large file it has to edit. A file it
+  asks for with `NEED_FILES` is sent whole while the files it asked for
+  total 160 KB or less. Before, a file that did not fit the 48 KB source
+  budget came as excerpts of at most 16 KB around names from the goal and
+  the index, and those could leave out the lines to change. A file past the
+  160 KB budget still comes as excerpts.
+- [fixed] A hosted worker may ask for files three times in a subtask instead
+  of once, and a request that is granted no longer uses up one of its three
+  attempts at the diff. A second request used to be refused, which ended a
+  subtask whose first request had returned excerpts without the code it
+  needed. A request made while repairing a failed diff keeps the
+  verification errors in the next prompt.
+
+### Changed
+
+- [changed] With `PHONTON_LOG=debug`, each worker reply is logged with its
+  prompt size and the token counts the provider reported, so the cost of a
+  goal can be traced request by request.
+
 ## 0.27.1 - Hosted goals no longer wait for the index
 
 Measured on one 16-thread laptop, old and new binary back to back.

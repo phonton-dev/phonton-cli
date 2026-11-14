@@ -75,7 +75,8 @@ receipt you can audit with `phonton review latest` and `phonton why-tokens`.
 - **Local memory.** Decisions, rejected approaches and conventions live in
   local SQLite and steer the next plan.
 - **Designed for context efficiency.** Workers get only the files they edit
-  plus retrieved symbols (excerpts of large files); finished subtasks are
+  plus retrieved symbols (excerpts of large files, and the whole file once a
+  worker asks for it); finished subtasks are
   carried forward as one-line notes instead of full transcripts; test
   subtasks are planned only when a goal asks for tests, while the project's
   own tests run on every edit; and only failures escalate to a stronger
