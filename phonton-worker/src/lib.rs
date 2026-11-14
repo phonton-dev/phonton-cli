@@ -344,7 +344,7 @@ impl Worker {
         // it is no longer duplicated into the shared context window.
         // Retrieval can miss the file a change belongs in, so the worker
         // also sees the repository's file list and may ask for files by
-        // path once (`NEED_FILES:`) instead of guessing their contents.
+        // path (`NEED_FILES:`) instead of guessing their contents.
         let file_list = render_file_list(&repository_file_list(self.guard.project_root()).await);
         let mut requested_files: Vec<PathBuf> = Vec::new();
         let mut file_requests = 0usize;
@@ -360,6 +360,9 @@ impl Worker {
             .await;
 
         let mut last_errors: Vec<String> = prior_errors;
+        // What verifying the last diff reported. A file request made while
+        // repairing brings these back with the new source.
+        let mut verify_errors = last_errors.clone();
         let mut last_layer = VerifyLayer::Syntax;
         let mut last_signature: Option<String> = None;
         let mut total_tokens: u64 = 0;
@@ -369,7 +372,10 @@ impl Worker {
         let mut mcp_results: Vec<McpResultContext> = Vec::new();
         let mut mcp_calls = 0usize;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        // Counted by hand: a granted file request gives its attempt back.
+        let mut attempt = 0u8;
+        while attempt < MAX_ATTEMPTS {
+            attempt += 1;
             let user_prompt = if !last_errors.is_empty() {
                 build_surgical_repair_context(
                     &subtask,
@@ -425,6 +431,13 @@ impl Worker {
             total_tokens = total_tokens
                 .saturating_add(response.input_tokens)
                 .saturating_add(response.output_tokens);
+            debug!(
+                attempt,
+                prompt_bytes = full_prompt.len(),
+                input_tokens = response.input_tokens,
+                output_tokens = response.output_tokens,
+                "worker received reply"
+            );
 
             if let Some(tx) = &self.msg_tx {
                 let _ = tx.try_send(
@@ -504,20 +517,30 @@ impl Worker {
             if let Some(paths) = parse_file_request(&response.content) {
                 let root = self.guard.project_root();
                 let (found, missing) = existing_requested_files(paths, root);
-                if file_requests >= 1 || found.is_empty() {
-                    last_errors = vec![if file_requests >= 1 {
-                        "Files were already provided once for this subtask. Write the unified diff now from the source shown.".to_string()
-                    } else {
+                let new: Vec<PathBuf> = found
+                    .iter()
+                    .filter(|path| !requested_files.contains(path))
+                    .cloned()
+                    .collect();
+                if file_requests >= MAX_FILE_REQUESTS || new.is_empty() {
+                    debug!(attempt, files = ?found, "worker file request refused");
+                    last_errors = vec![if found.is_empty() {
                         format!(
                             "None of the requested files exist: {}. Request paths from # Repository files, or write the diff.",
                             missing.join(", ")
+                        )
+                    } else if new.is_empty() {
+                        "Those files are already under # Current source, as much of each as fits. Write the unified diff now from the source shown.".to_string()
+                    } else {
+                        format!(
+                            "This subtask has used its {MAX_FILE_REQUESTS} file requests. Write the unified diff now from the source shown."
                         )
                     }];
                     continue;
                 }
                 file_requests += 1;
-                debug!(attempt, files = ?found, "worker requested files");
-                requested_files.extend(found);
+                debug!(attempt, files = ?new, "worker requested files");
+                requested_files.extend(new);
                 let (sources, inlined) = inline_target_sources(
                     &subtask,
                     &context_slices,
@@ -528,7 +551,9 @@ impl Worker {
                 target_sources = sources + &file_list;
                 self.report_context(&subtask, inlined, &context_slices, &relevant_slices)
                     .await;
-                last_errors.clear();
+                last_errors.clone_from(&verify_errors);
+                // Reading a file is not a try at the diff.
+                attempt -= 1;
                 continue;
             }
 
@@ -630,6 +655,7 @@ impl Worker {
                         let repeated_signature_count =
                             update_repeated_signature_count(&mut last_signature, &signature);
                         last_errors = errors;
+                        verify_errors.clone_from(&last_errors);
                         if repeated_signature_count >= SAME_DIAGNOSTIC_LIMIT {
                             return Ok(failed_result(
                                 subtask.id,
@@ -704,6 +730,7 @@ impl Worker {
                         update_repeated_signature_count(&mut last_signature, &signature);
                     last_errors = errors.clone();
                     last_errors.extend(repair_guidance_for_errors(&errors));
+                    verify_errors.clone_from(&last_errors);
                     if repeated_signature_count >= SAME_DIAGNOSTIC_LIMIT {
                         return Ok(failed_result(
                             subtask.id,
@@ -1367,6 +1394,11 @@ const MAX_TARGET_SOURCE_FILES: usize = 4;
 const MAX_TARGET_SOURCE_FILE_BYTES: usize = 24_000;
 /// Total inlined source budget per prompt.
 const MAX_TARGET_SOURCE_TOTAL_BYTES: usize = 48_000;
+/// Total budget for the files the model asked for by path. One it asked for
+/// is sent whole while this lasts, because excerpts picked for it may leave
+/// out the lines it has to change. Enough for a 100 KB file and a 50 KB one;
+/// with the rest of a prompt that stays under about 100,000 tokens.
+const MAX_REQUESTED_SOURCE_BYTES: usize = 160_000;
 /// Excerpt budget for one large file.
 const MAX_EXCERPT_BYTES: usize = 16_000;
 /// Lines shown before and after each excerpt anchor.
@@ -1450,7 +1482,9 @@ fn render_target_sources(
 
 /// Render the current contents of the files this subtask most likely edits:
 /// files the model asked for (`requested`), then paths named in the
-/// description, then files of retrieved slices. Files already attached to
+/// description, then files of retrieved slices. What was asked for is sent
+/// whole within [`MAX_REQUESTED_SOURCE_BYTES`]; the rest share
+/// [`MAX_TARGET_SOURCE_TOTAL_BYTES`]. Files already attached to
 /// the subtask are skipped. Returns an empty string when nothing qualifies,
 /// plus one attribution per inlined file (`whole file` or `excerpts`, with a
 /// bytes/4 token estimate) so the review shows what the model read.
@@ -1461,13 +1495,19 @@ fn inline_target_sources(
     root: &Path,
     requested: &[PathBuf],
 ) -> (String, Vec<ContextAttribution>) {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Each candidate, with whether the task itself names it.
+    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
     let task = phonton_types::task_description_without_prior_context(&subtask.description);
+    let asked_for = requested.iter().cloned().map(|path| (path, false));
     let named = named_source_paths(task)
         .into_iter()
-        .chain(named_root_documents(task, root));
-    let from_slices = slices.iter().chain(relevant).map(|s| s.file_path.clone());
-    for path in requested.iter().cloned().chain(named).chain(from_slices) {
+        .chain(named_root_documents(task, root))
+        .map(|path| (path, true));
+    let from_slices = slices
+        .iter()
+        .chain(relevant)
+        .map(|s| (s.file_path.clone(), false));
+    for (path, named) in asked_for.chain(named).chain(from_slices) {
         let Some(rel) = relative_to_root(&path, root) else {
             continue;
         };
@@ -1475,18 +1515,34 @@ fn inline_target_sources(
             .attachments
             .iter()
             .any(|a| path_matches_required(&a.path, &rel));
-        if !already_attached && !candidates.iter().any(|c| c == &rel) {
-            candidates.push(rel);
+        if !already_attached && !candidates.iter().any(|(c, _)| c == &rel) {
+            candidates.push((rel, named));
         }
     }
 
     let mut out = String::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut inlined: Vec<ContextAttribution> = Vec::new();
-    let mut total = 0usize;
-    let mut included = 0usize;
-    for rel in candidates {
-        if included >= MAX_TARGET_SOURCE_FILES {
+    // Bytes inlined from the files the model asked for, and from the rest.
+    let (mut asked_total, mut other_total) = (0usize, 0usize);
+    let mut others = 0usize;
+    for (rel, named) in candidates {
+        // A file the model asked for comes whole while the larger budget
+        // allows: an excerpt may miss the lines it needs and leave it unable
+        // to edit. Files the task names keep the default budget whatever was
+        // asked for. Files of retrieved slices are guesses and only fill what
+        // the other two leave of the default budget.
+        let asked = requested.iter().any(|r| r == &rel);
+        let (limit, used) = if asked {
+            (MAX_REQUESTED_SOURCE_BYTES, asked_total)
+        } else if named {
+            (MAX_TARGET_SOURCE_TOTAL_BYTES, other_total)
+        } else {
+            (MAX_TARGET_SOURCE_TOTAL_BYTES, asked_total + other_total)
+        };
+        // Candidates run asked-for, named, guessed, so once one of the last
+        // two groups is out of room nothing after it fits either.
+        if !asked && (others >= MAX_TARGET_SOURCE_FILES || used >= limit) {
             break;
         }
         if !inside_root(root, &rel) {
@@ -1497,45 +1553,51 @@ fn inline_target_sources(
         };
         let display = rel.to_string_lossy().replace('\\', "/");
         let lang = rel.extension().and_then(|e| e.to_str()).unwrap_or("");
-        // A file the model asked for comes whole if the total budget allows:
-        // an excerpt may miss the lines it needs and leave it unable to edit.
-        let asked = requested.iter().any(|r| r == &rel);
-        if total + bytes.len() > MAX_TARGET_SOURCE_TOTAL_BYTES
+        let shown = if used + bytes.len() > limit
             || (bytes.len() > MAX_TARGET_SOURCE_FILE_BYTES && !asked)
         {
             // Too big to send whole: send the regions around the names this
             // subtask mentions or retrieved. Hunk anchoring places edits made
             // against an excerpt.
-            let budget = MAX_EXCERPT_BYTES.min(MAX_TARGET_SOURCE_TOTAL_BYTES.saturating_sub(total));
+            let budget = MAX_EXCERPT_BYTES.min(limit.saturating_sub(used));
             let anchors = excerpt_anchors(subtask, slices, relevant, root, &rel);
             let excerpt = std::str::from_utf8(&bytes)
                 .ok()
                 .and_then(|text| source_excerpt(text, &anchors, budget, lang));
-            match excerpt {
-                Some(excerpt) => {
-                    total += excerpt.len();
-                    included += 1;
-                    inlined.push(inlined_attribution(&rel, "excerpts", excerpt.len()));
-                    out.push_str(&format!(
-                        "## {display} (excerpts of a {} byte file; edit only lines shown)\n{excerpt}",
-                        bytes.len()
-                    ));
-                }
-                None => skipped.push(format!("{display} ({} bytes)", bytes.len())),
+            // Asking helps only when the whole file fits the larger budget.
+            let more = if !asked && bytes.len() <= MAX_REQUESTED_SOURCE_BYTES {
+                format!(", or reply `NEED_FILES: {display}` for the whole file")
+            } else {
+                String::new()
+            };
+            let Some(excerpt) = excerpt else {
+                skipped.push(format!("{display} ({} bytes{more})", bytes.len()));
+                continue;
+            };
+            inlined.push(inlined_attribution(&rel, "excerpts", excerpt.len()));
+            out.push_str(&format!(
+                "## {display} (excerpts of a {} byte file; edit only lines shown{more})\n{excerpt}",
+                bytes.len()
+            ));
+            excerpt.len()
+        } else {
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            inlined.push(inlined_attribution(&rel, "whole file", text.len()));
+            out.push_str(&format!("## {display}\n```{lang}\n{text}"));
+            if !text.ends_with('\n') {
+                out.push('\n');
             }
-            continue;
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
+            out.push_str("```\n");
+            text.len()
         };
-        total += text.len();
-        included += 1;
-        inlined.push(inlined_attribution(&rel, "whole file", text.len()));
-        out.push_str(&format!("## {display}\n```{lang}\n{text}"));
-        if !text.ends_with('\n') {
-            out.push('\n');
+        if asked {
+            asked_total += shown;
+        } else {
+            other_total += shown;
+            others += 1;
         }
-        out.push_str("```\n");
     }
     if out.is_empty() && skipped.is_empty() {
         return (String::new(), inlined);
@@ -1580,8 +1642,11 @@ fn named_root_documents(task: &str, root: &Path) -> Vec<PathBuf> {
     docs
 }
 
-/// Most files the model may ask for in one subtask.
+/// Most files the model may ask for in one request.
 const MAX_REQUESTED_FILES: usize = 4;
+/// Most file requests granted in one subtask. A granted request costs a
+/// model call but none of the [`MAX_ATTEMPTS`] tries at the diff.
+const MAX_FILE_REQUESTS: usize = 3;
 /// Character budget for the repository file list shown to the model.
 const FILE_LIST_BUDGET: usize = 6_000;
 
@@ -1629,7 +1694,7 @@ fn render_file_list(paths: &[String]) -> String {
         return String::new();
     }
     let mut out = format!(
-        "# Repository files\nIf a file you must edit is not shown under # Current source, reply with only `NEED_FILES: <path>, <path>` (at most {MAX_REQUESTED_FILES} paths from this list) instead of a diff. You will get their current source.\n"
+        "# Repository files\nIf a file you must edit is not shown under # Current source, or the excerpts shown leave out the lines you must edit, reply with only `NEED_FILES: <path>, <path>` (at most {MAX_REQUESTED_FILES} paths from this list) instead of a diff. You will get their current source.\n"
     );
     let mut shown = 0usize;
     for path in paths {
@@ -3029,6 +3094,252 @@ mod tests {
             render_target_sources(&subtask, &[], &[], temp.path(), &[PathBuf::from("cli.mjs")]);
         assert!(asked.contains("export function lastLine() {}"));
         assert!(!asked.contains("excerpts of"));
+    }
+
+    /// About `bytes` of comment lines, then one function to look for.
+    fn filler_source(bytes: usize, last: &str) -> String {
+        format!(
+            "{}export function {last}() {{}}\n",
+            "// filler line for size\n".repeat(bytes / 24)
+        )
+    }
+
+    #[test]
+    fn a_requested_file_larger_than_the_default_budget_comes_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let big = filler_source(100_000, "lastLine");
+        assert!(big.len() > MAX_TARGET_SOURCE_TOTAL_BYTES);
+        assert!(big.len() <= MAX_REQUESTED_SOURCE_BYTES);
+        std::fs::write(temp.path().join("rules.mjs"), &big).unwrap();
+        std::fs::write(temp.path().join("site.js"), "export const x = 1;\n").unwrap();
+        std::fs::write(temp.path().join("cli.js"), "export const run = 1;\n").unwrap();
+        let subtask = plain_subtask("Fix the false positives cli.js reports from the catalog");
+        let slices = vec![slice_for("rules.mjs", "RULES"), slice_for("site.js", "x")];
+
+        let unasked = render_target_sources(&subtask, &slices, &[], temp.path(), &[]);
+        assert!(!unasked.contains("lastLine"));
+        assert!(
+            unasked.contains("reply `NEED_FILES: rules.mjs` for the whole file"),
+            "{unasked}"
+        );
+        assert!(unasked.contains("## site.js"));
+
+        let asked = render_target_sources(
+            &subtask,
+            &slices,
+            &[],
+            temp.path(),
+            &[PathBuf::from("rules.mjs")],
+        );
+        assert!(asked.contains("export function lastLine() {}"));
+        assert!(!asked.contains("excerpts of"));
+        // The file the task names stays. The guessed one gives way once
+        // what was asked for fills the default budget, and is not reported
+        // as too large.
+        assert!(asked.contains("## cli.js"));
+        assert!(!asked.contains("## site.js"));
+        assert!(!asked.contains("Too large to inline"));
+    }
+
+    #[test]
+    fn requested_files_past_their_budget_are_not_sent_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("first.mjs"),
+            filler_source(100_000, "firstEnd"),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("second.mjs"),
+            filler_source(100_000, "secondEnd"),
+        )
+        .unwrap();
+        let subtask = plain_subtask("Fix the false positives in the rule catalog");
+
+        let rendered = render_target_sources(
+            &subtask,
+            &[],
+            &[],
+            temp.path(),
+            &[PathBuf::from("first.mjs"), PathBuf::from("second.mjs")],
+        );
+
+        assert!(rendered.contains("export function firstEnd() {}"));
+        assert!(!rendered.contains("secondEnd"));
+        assert!(rendered.contains("Too large to inline"), "{rendered}");
+        // Asking again would not help, so the file is not offered again.
+        assert!(!rendered.contains("NEED_FILES: second.mjs"));
+    }
+
+    #[test]
+    fn every_requested_file_is_shown_past_the_guessed_file_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let requested: Vec<PathBuf> = (0..MAX_TARGET_SOURCE_FILES + 2)
+            .map(|n| PathBuf::from(format!("part{n}.js")))
+            .collect();
+        for path in &requested {
+            std::fs::write(temp.path().join(path), "export const part = 1;\n").unwrap();
+        }
+        let subtask = plain_subtask("Rename part to piece everywhere");
+
+        let rendered = render_target_sources(&subtask, &[], &[], temp.path(), &requested);
+
+        for path in &requested {
+            assert!(rendered.contains(&format!("## {}", path.display())));
+        }
+    }
+
+    #[tokio::test]
+    async fn file_requests_do_not_use_up_diff_attempts() {
+        #[derive(Clone)]
+        struct Scripted {
+            replies: Arc<Mutex<std::collections::VecDeque<&'static str>>>,
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for Scripted {
+            async fn call(
+                &self,
+                _system: &str,
+                user: &str,
+                _slice_origins: &[SliceOrigin],
+            ) -> Result<phonton_types::LLMResponse> {
+                self.prompts.lock().unwrap().push(user.to_string());
+                let content = self.replies.lock().unwrap().pop_front().unwrap_or("");
+                Ok(phonton_types::LLMResponse {
+                    content: content.into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    cache_creation_tokens: 0,
+                    provider: phonton_types::ProviderKind::OpenAiCompatible,
+                    model_name: "fixture".into(),
+                })
+            }
+            fn kind(&self) -> phonton_types::ProviderKind {
+                phonton_types::ProviderKind::OpenAiCompatible
+            }
+            fn model(&self) -> String {
+                "fixture".into()
+            }
+            fn clone_box(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.js", "b.js", "c.js", "d.js"] {
+            std::fs::write(temp.path().join(name), format!("// {name}\n")).unwrap();
+        }
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let provider = Scripted {
+            replies: Arc::new(Mutex::new(
+                [
+                    "NEED_FILES: a.js",
+                    "NEED_FILES: b.js",
+                    "NEED_FILES: c.js, a.js",
+                    // The fourth request is refused and is the first attempt.
+                    "NEED_FILES: d.js",
+                    // Second attempt.
+                    "I cannot write that as a diff.",
+                    // Third attempt: under the old count this was never asked for.
+                    "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1,1 @@\n+ok\n",
+                ]
+                .into(),
+            )),
+            prompts: Arc::clone(&prompts),
+        };
+        let worker = Worker::new(
+            Box::new(provider),
+            ExecutionGuard::new(temp.path().to_path_buf()),
+        );
+
+        let result = worker
+            .execute_with_prior_errors(
+                plain_subtask("Make the greeting friendlier"),
+                Vec::new(),
+                vec!["Verifier Test: greeting spec failed".into()],
+            )
+            .await
+            .unwrap();
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 6, "{:?}", result.status);
+        // The third attempt's diff reached the verifier, which has no
+        // backend to run checks with in a unit test.
+        assert!(
+            matches!(result.verify_result, VerifyResult::Unavailable { .. }),
+            "{:?}",
+            result.status
+        );
+        // A granted request shows the file and keeps what the last
+        // verification said.
+        assert!(prompts[1].contains("## a.js"));
+        assert!(prompts[1].contains("greeting spec failed"));
+        assert!(!prompts[1].contains("## b.js"));
+        // Files from earlier requests stay in the prompt.
+        for name in ["## a.js", "## b.js", "## c.js"] {
+            assert!(prompts[3].contains(name), "{name}");
+        }
+        assert!(prompts[4].contains("used its 3 file requests"));
+        assert!(!prompts[4].contains("## d.js"));
+    }
+
+    #[tokio::test]
+    async fn asking_again_for_files_already_shown_is_an_attempt() {
+        #[derive(Clone, Default)]
+        struct AlwaysAsks(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait::async_trait]
+        impl Provider for AlwaysAsks {
+            async fn call(
+                &self,
+                _system: &str,
+                user: &str,
+                _slice_origins: &[SliceOrigin],
+            ) -> Result<phonton_types::LLMResponse> {
+                self.0.lock().unwrap().push(user.to_string());
+                Ok(phonton_types::LLMResponse {
+                    content: "NEED_FILES: a.js".into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_tokens: 0,
+                    cache_creation_tokens: 0,
+                    provider: phonton_types::ProviderKind::OpenAiCompatible,
+                    model_name: "fixture".into(),
+                })
+            }
+            fn kind(&self) -> phonton_types::ProviderKind {
+                phonton_types::ProviderKind::OpenAiCompatible
+            }
+            fn model(&self) -> String {
+                "fixture".into()
+            }
+            fn clone_box(&self) -> Box<dyn Provider> {
+                Box::new(self.clone())
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.js"), "// a\n").unwrap();
+        let provider = AlwaysAsks::default();
+        let prompts = Arc::clone(&provider.0);
+        let worker = Worker::new(
+            Box::new(provider),
+            ExecutionGuard::new(temp.path().to_path_buf()),
+        );
+
+        let result = worker
+            .execute(plain_subtask("Make the greeting friendlier"), Vec::new())
+            .await
+            .unwrap();
+
+        // One granted request, then MAX_ATTEMPTS refusals: the loop ends.
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1 + usize::from(MAX_ATTEMPTS));
+        assert!(matches!(result.status, SubtaskStatus::Failed { .. }));
+        assert!(prompts[2].contains("already under # Current source"));
     }
 
     #[test]

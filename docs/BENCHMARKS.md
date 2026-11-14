@@ -21,7 +21,7 @@ Fixtures:
 - `todo-api`: four small files; add methods, sort, change a limit.
 - `ledger`: one 339-line module; edits land mid-file.
 - `shop`: one 955-line, 28 KB module, larger than the worker's whole-file
-  limit, so workers see excerpts.
+  limit, so workers see excerpts unless they ask for the file.
 
 ```bash
 cargo build --release -p phonton-cli
