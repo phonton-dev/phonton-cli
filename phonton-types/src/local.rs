@@ -147,6 +147,10 @@ pub const CREATION_PROBE_NAME: &str = "Structured create";
 /// Name of the unified-diff new-file transport probe in a model profile.
 pub const DIFF_CREATION_PROBE_NAME: &str = "UnifiedDiff create";
 
+/// Appended to an edit probe's detail when the runtime returned thinking
+/// output beside the answer. [`ModelProfile::reasons`] reads it back.
+pub const THINKING_OUTPUT_NOTE: &str = " Runtime returned separate thinking output.";
+
 /// Editing wire protocol demonstrated by a compatibility probe.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -228,6 +232,17 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    /// Whether coding requests with this profile reason before they answer:
+    /// the saved mode leaves thinking to the runtime, and a probe returned
+    /// thinking output. Goals budget output for that reasoning.
+    pub fn reasons(&self) -> bool {
+        self.thinking == Some(LocalThinkingMode::RuntimeDefault)
+            && self
+                .probes
+                .iter()
+                .any(|probe| probe.detail.contains(THINKING_OUTPUT_NOTE))
+    }
+
     /// Keep absent probes on older profiles distinct from measured success.
     pub fn creation_status(&self) -> CheckStatus {
         let name = match self.protocol {

@@ -375,12 +375,18 @@ pub(super) fn whole_file_retry(
     })
 }
 
+/// Largest file a one-file scope rewrites whole from its first edit. The
+/// slice that measured the rewrite (Polyglot, 2026-11-11) had no file over
+/// 96 lines, and a longer file costs a rewrite far more output than a span.
+pub(super) const WHOLE_FILE_SCOPE_MAX_LINES: usize = 100;
+
 /// The file of a one-file scope when `decision`'s edit should rewrite it
 /// whole. A SearchReplace answer changes one span, so a stub with two
 /// functions took one model call per function, and a repair of several
-/// failures one call per failure (Polyglot slice, 2026-11-11). A restart
-/// keeps its source anchor, and a file over [`WHOLE_FILE_MAX_LINES`] keeps
-/// span edits. `baseline` is the parent directory of a first edit.
+/// failures one call per failure. A restart keeps its source anchor, and a
+/// file over [`WHOLE_FILE_SCOPE_MAX_LINES`] keeps span edits. The caller
+/// asks only for a model that reasons: the rewrite was measured with one.
+/// `baseline` is the parent directory of a first edit.
 pub(super) fn whole_file_scope(
     candidates: &[CandidateEvidence],
     decision: &SearchDecision,
@@ -404,7 +410,7 @@ pub(super) fn whole_file_scope(
         .ok()?
         .lines()
         .count();
-    (lines <= WHOLE_FILE_MAX_LINES).then(|| path.clone())
+    (lines <= WHOLE_FILE_SCOPE_MAX_LINES).then(|| path.clone())
 }
 
 /// Rejection for a generation whose raw output equals an earlier one in the
@@ -1663,13 +1669,13 @@ mod tests {
         .unwrap();
         std::fs::write(
             baseline.join("big.py"),
-            "x = 1\n".repeat(WHOLE_FILE_MAX_LINES + 1),
+            "x = 1\n".repeat(WHOLE_FILE_SCOPE_MAX_LINES + 1),
         )
         .unwrap();
         // The failed candidate outgrew the limit; the baseline copy did not.
         std::fs::write(
             repaired.join("stub.py"),
-            "x = 1\n".repeat(WHOLE_FILE_MAX_LINES + 1),
+            "x = 1\n".repeat(WHOLE_FILE_SCOPE_MAX_LINES + 1),
         )
         .unwrap();
         let decide = |action, parent_candidate| SearchDecision {

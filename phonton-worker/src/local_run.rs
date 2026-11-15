@@ -644,7 +644,7 @@ async fn run_inner(
                 decision = retry;
                 whole_file = Some(path);
                 after_noop = true;
-            } else {
+            } else if receipt.profile.reasons() {
                 whole_file = search::whole_file_scope(
                     &receipt.candidates,
                     &decision,
@@ -1068,9 +1068,9 @@ async fn run_inner(
         }.to_owned()
         };
         let strategy_reserve = strategy_note.as_ref().map_or(0, String::len);
-        // A small one-file scope, or a small file the last SearchReplace answer
-        // could not change, is shown whole and rewritten whole; if it cannot
-        // fit, the ordinary edit runs.
+        // A small one-file scope on a model that reasons, or a small file the
+        // last SearchReplace answer could not change, is shown whole and
+        // rewritten whole; if it cannot fit, the ordinary edit runs.
         let whole_file_assembly = whole_file.as_ref().and_then(|path| {
             let system = whole_file_system_instruction(path, after_noop);
             let model = context::ModelContext {

@@ -168,13 +168,19 @@ the goal's shared token budget can reduce it further. When later attempts are
 allowed, the runner keeps half the remaining token budget for them. This is a
 generation allowance, not a measured claim that the model can produce a file
 of that size. Existing profiles keep their saved ceiling until recalibrated.
-Calibration first probes the runtime's default thinking behavior, so a model
-that reasons before it answers keeps doing so in coding goals. If no new-file
-format passes, it also probes with `think:false` and prefers a mode that demonstrated
-new-file creation. When neither mode did, it keeps the runtime default if that
-passed an edit probe, and `think:false` if not. The chosen request mode
+Calibration first requests `think:false` so a thinking model can spend the
+small edit-probe budget on the actual edit. It also probes the runtime's
+default thinking behavior when no edit format or no new-file format passed,
+or when the `think:false` probes generated at 20 tokens per second or more
+by the runtime's own timing: a machine that fast can afford a model that
+reasons before each edit. It then prefers the runtime default if that mode
+demonstrated new-file creation. A slower machine, or a runtime that reports
+no generation timing, keeps `think:false`. The chosen request mode
 is saved in a schema-2 digest-bound profile and reused for tool-call probes,
-coding edits, and strategy requests. A profile saved by 0.27.1 or earlier
+coding edits, and strategy requests. A profile in the runtime-default mode
+whose probes returned thinking output is treated as a model that reasons:
+its goals get the larger budget and the whole-file edits described in
+[local-harness.md](local-harness.md). A profile saved by 0.27.1 or earlier
 keeps its mode, usually `think:false`, until `phonton models calibrate MODEL`
 runs again. Older schema-1 profiles retain their
 original runtime-default request behavior until recalibrated. Probe

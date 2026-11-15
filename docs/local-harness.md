@@ -407,19 +407,24 @@ candidate passes. A host-approved request needs enough slots for one complete
 baseline and one complete candidate pass: twice the total of selected checks
 and any offline dependency-preparation command. A smaller explicit budget is
 shown as a plan warning and refused before host checks run.
-A reviewed plan with one editable path and an implicit budget reserves 8
-model calls and up to 16,384 output tokens (one calibrated response per call),
-and raises the check reserve to cover those calls, up to 32 launches. A failed
-first attempt then leaves room for repairs and a restart; the 600-second wall
-budget still bounds the run.
+On a model that reasons before it answers (a calibrated profile in the
+runtime's own thinking mode whose probes returned thinking output), a reviewed
+plan with one editable path and an implicit budget reserves 8 model calls and
+up to 16,384 output tokens (one calibrated response per call), and raises the
+check reserve to cover those calls, up to 32 launches. Reasoning then leaves
+room for the edit, and a failed first attempt for repairs and a restart; the
+600-second wall budget still bounds the run. Other models keep 4 calls and
+4,096 tokens: without reasoning the larger reserve only lengthens a reply
+that runs to its output limit.
 When a selected model uses SearchReplace, each model response edits one path.
 Reviewed plans with an implicit budget reserve at least one call per editable
 path and scale check/output reserves up to the worker caps. The displayed plan
 warns about caps and the lack of repair slack; it does not promise that every
 path will be edited. A plan with several editable paths on a unified-diff
-model keeps its four calls, with an output reserve of one calibrated response
-per call, up to 16,384 tokens. Explicit budgets submitted for plan review are
-preserved and warned about when they cannot cover even a straight sequence.
+model that reasons keeps its four calls, with an output reserve of one
+calibrated response per call, up to 16,384 tokens. Explicit budgets submitted
+for plan review are preserved and warned about when they cannot cover even a
+straight sequence.
 The original Git index is captured separately before checks. Its resolved path
 and exact byte hash are compared before each generation and at final review.
 Changes or unavailable observations stop the run and clear candidate selection;
@@ -450,12 +455,13 @@ until then calls stay at the calibrated temperature 0. Two successive repeated
 outputs or candidate identities stop further inference.
 A search/replace reply changes one span, so a file that needs several changes
 took one model call per change. When the scope is one existing file of at most
-300 lines and the model uses SearchReplace, the first edit and every repair
-show that file whole and ask for the complete corrected file in the whole-file
-JSON shape used for new files. A restart keeps its span edit, anchored to the
-strategy's source span. In a larger scope, when a search/replace reply changes
-nothing and its file has at most 300 lines, the next edit from the same parent
-is a whole-file edit, once per branch. Either way the whole-file edit runs only
+100 lines and the model uses SearchReplace and reasons before it answers, the
+first edit and every repair show that file whole and ask for the complete
+corrected file in the whole-file JSON shape used for new files. A restart
+keeps its span edit, anchored to the strategy's source span. For any model,
+when a search/replace reply changes nothing and its file has at most 300
+lines, the next edit from the same parent is a whole-file edit, once per
+branch. Either way the whole-file edit runs only
 when the file and an output reserve that can hold it fit the calibrated
 context; otherwise the ordinary edit runs. The candidate is still reviewed as
 a diff against the captured source.
