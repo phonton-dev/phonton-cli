@@ -134,9 +134,15 @@ fn creation_system_instruction(path: &Path, protocol: EditProtocol) -> String {
 }
 
 /// Whole-file rewrite of one existing file, using the creation transport.
-fn whole_file_system_instruction(path: &Path) -> String {
+/// `after_noop` tells the model that its search and replacement changed nothing.
+fn whole_file_system_instruction(path: &Path, after_noop: bool) -> String {
     let path = model_relative_path(path);
-    format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly. Your previous search and replacement changed nothing. No prose, commands, test changes, or other paths.")
+    let noop = if after_noop {
+        " Your previous search and replacement changed nothing."
+    } else {
+        ""
+    };
+    format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly.{noop} No prose, commands, test changes, or other paths.")
 }
 
 /// Whether `resident` may serve the next chat.
@@ -627,6 +633,7 @@ async fn run_inner(
             receipt.request.new_file.is_some() && !receipt.request.editable_existing.is_empty(),
         );
         let mut whole_file = None;
+        let mut after_noop = false;
         if decision.action != SearchAction::Stop
             && receipt.profile.protocol == Some(EditProtocol::SearchReplace)
             && receipt.request.new_file.is_none()
@@ -636,6 +643,14 @@ async fn run_inner(
             {
                 decision = retry;
                 whole_file = Some(path);
+                after_noop = true;
+            } else {
+                whole_file = search::whole_file_scope(
+                    &receipt.candidates,
+                    &decision,
+                    &receipt.request.files,
+                    &baseline,
+                );
             }
         }
         if decision.action == SearchAction::Stop {
@@ -1053,10 +1068,11 @@ async fn run_inner(
         }.to_owned()
         };
         let strategy_reserve = strategy_note.as_ref().map_or(0, String::len);
-        // A small file the last SearchReplace answer could not change is shown
-        // whole and rewritten whole; if it cannot fit, the ordinary edit runs.
+        // A small one-file scope, or a small file the last SearchReplace answer
+        // could not change, is shown whole and rewritten whole; if it cannot
+        // fit, the ordinary edit runs.
         let whole_file_assembly = whole_file.as_ref().and_then(|path| {
-            let system = whole_file_system_instruction(path);
+            let system = whole_file_system_instruction(path, after_noop);
             let model = context::ModelContext {
                 protocol: EditProtocol::SearchReplace,
                 capacity: receipt.profile.context_tokens,
@@ -1078,8 +1094,10 @@ async fn run_inner(
                     "; the whole file did not fit the calibrated context, so an ordinary edit ran",
                 );
             }
-        } else {
+        } else if after_noop {
             approach = "whole-file rewrite after an unchanged search/replace".into();
+        } else {
+            approach.push_str(", file rewritten whole");
         }
         let (system, assembly_result) = if let Some((system, assembly)) = whole_file_assembly {
             (system, Ok(assembly))

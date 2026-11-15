@@ -375,6 +375,38 @@ pub(super) fn whole_file_retry(
     })
 }
 
+/// The file of a one-file scope when `decision`'s edit should rewrite it
+/// whole. A SearchReplace answer changes one span, so a stub with two
+/// functions took one model call per function, and a repair of several
+/// failures one call per failure (Polyglot slice, 2026-11-11). A restart
+/// keeps its source anchor, and a file over [`WHOLE_FILE_MAX_LINES`] keeps
+/// span edits. `baseline` is the parent directory of a first edit.
+pub(super) fn whole_file_scope(
+    candidates: &[CandidateEvidence],
+    decision: &SearchDecision,
+    scope: &[PathBuf],
+    baseline: &Path,
+) -> Option<PathBuf> {
+    let [path] = scope else {
+        return None;
+    };
+    if !matches!(
+        decision.action,
+        SearchAction::Initial | SearchAction::Repair
+    ) {
+        return None;
+    }
+    let directory = match decision.parent_candidate {
+        Some(number) => &candidates.iter().find(|c| c.number == number)?.directory,
+        None => baseline,
+    };
+    let lines = std::fs::read_to_string(directory.join(path))
+        .ok()?
+        .lines()
+        .count();
+    (lines <= WHOLE_FILE_MAX_LINES).then(|| path.clone())
+}
+
 /// Rejection for a generation whose raw output equals an earlier one in the
 /// same run. Its verdict is already known, so it never reaches the checks.
 pub(super) const REPEATED_OUTPUT: &str =
@@ -1614,6 +1646,69 @@ mod tests {
         let mut failed_checks = noop;
         failed_checks.rejection = Some("Candidate failed the selected verification checks".into());
         assert!(whole_file_retry(&[failed_checks], &scope, &baseline).is_none());
+    }
+
+    #[test]
+    fn a_small_one_file_scope_is_rewritten_whole_in_direct_edits_and_repairs() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = root.path().join("baseline");
+        let repaired = root.path().join("candidate-1");
+        for directory in [&baseline, &repaired] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            baseline.join("stub.py"),
+            "def count():\n    pass\n\ndef total():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            baseline.join("big.py"),
+            "x = 1\n".repeat(WHOLE_FILE_MAX_LINES + 1),
+        )
+        .unwrap();
+        // The failed candidate outgrew the limit; the baseline copy did not.
+        std::fs::write(
+            repaired.join("stub.py"),
+            "x = 1\n".repeat(WHOLE_FILE_MAX_LINES + 1),
+        )
+        .unwrap();
+        let decide = |action, parent_candidate| SearchDecision {
+            action,
+            parent_candidate,
+            reason: String::new(),
+        };
+        let one = [PathBuf::from("stub.py")];
+        let initial = decide(SearchAction::Initial, None);
+        assert_eq!(
+            whole_file_scope(&[], &initial, &one, &baseline),
+            Some(one[0].clone())
+        );
+        // Two files, a file over the line limit, a restart or a stop keep span edits.
+        let two = [PathBuf::from("stub.py"), PathBuf::from("big.py")];
+        assert_eq!(whole_file_scope(&[], &initial, &two, &baseline), None);
+        let big = [PathBuf::from("big.py")];
+        assert_eq!(whole_file_scope(&[], &initial, &big, &baseline), None);
+        for action in [SearchAction::Restart, SearchAction::Stop] {
+            assert_eq!(
+                whole_file_scope(&[], &decide(action, None), &one, &baseline),
+                None
+            );
+        }
+        // A repair is sized by the candidate it repairs, not by the baseline.
+        let mut parent = failed(1, None, "FAIL");
+        parent.directory = repaired.clone();
+        let repair = decide(SearchAction::Repair, Some(1));
+        assert_eq!(
+            whole_file_scope(std::slice::from_ref(&parent), &repair, &one, &baseline),
+            None
+        );
+        std::fs::write(repaired.join("stub.py"), "def count():\n    return 0\n").unwrap();
+        assert_eq!(
+            whole_file_scope(std::slice::from_ref(&parent), &repair, &one, &baseline),
+            Some(one[0].clone())
+        );
+        // A parent that is not in the run has no file to size.
+        assert_eq!(whole_file_scope(&[], &repair, &one, &baseline), None);
     }
 
     #[test]
