@@ -491,6 +491,7 @@ fn reviewed_selection(
         context_tokens: profile.context_tokens,
         output_tokens: profile.output_tokens,
         protocol: profile.protocol,
+        reasons: profile.reasons(),
         profile_sha256: crate::models_cli::profile_sha256(profile)?,
     })
 }
@@ -824,22 +825,46 @@ fn adjust_reviewed_plan_budget(
     selection: Option<&ReviewedModelSelection>,
     explicit_budget: bool,
 ) {
-    if selection.and_then(|selected| selected.protocol) != Some(EditProtocol::SearchReplace) {
-        return;
-    }
     let editable = if plan.request.new_file.is_some() {
         1 + plan.request.editable_existing.len()
     } else {
         plan.request.files.len()
     } as u32;
-    if editable <= 1 {
-        return;
-    }
     let checks_per_candidate =
         plan.request.checks.len() as u32 + u32::from(plan.request.preparation.is_some());
     let per_call = selection.map_or(0, |selected| {
         selected.output_tokens.min(selected.context_tokens / 4)
     });
+    // A model that reasons first spends output tokens before it reaches the
+    // edit. Other models keep the smaller reserves: on a CPU runner a reply
+    // that ran to an 8,192-token limit used up the whole wall budget.
+    let reasons = selection.is_some_and(|selected| selected.reasons);
+    if editable <= 1 {
+        // A one-path goal stopped after 4 calls, at a median 41 s of its
+        // 600 s wall budget, with later calls cut to 512 output tokens.
+        // Give repairs and restarts the worker's caps; the wall clock still
+        // bounds the run.
+        if !explicit_budget && reasons {
+            let budget = &mut plan.request.budget;
+            budget.generations = budget.generations.max(8);
+            let checks = (budget.generations + 1).saturating_mul(checks_per_candidate);
+            budget.check_runs = budget.check_runs.max(checks.min(32));
+            let tokens = u64::from(per_call).saturating_mul(u64::from(budget.generations));
+            budget.generated_tokens = budget.generated_tokens.max(tokens.min(16_384));
+        }
+        return;
+    }
+    if selection.and_then(|selected| selected.protocol) != Some(EditProtocol::SearchReplace) {
+        // A multi-path diff plan keeps its calls. The 4,096-token reserve
+        // gave them 2,048, 1,024, 512 and 512 output tokens, which a model
+        // that reasons first uses up before it reaches the edit.
+        if !explicit_budget && reasons {
+            let budget = &mut plan.request.budget;
+            let tokens = u64::from(per_call).saturating_mul(u64::from(budget.generations));
+            budget.generated_tokens = budget.generated_tokens.max(tokens.min(16_384));
+        }
+        return;
+    }
     if explicit_budget {
         if plan.request.budget.generations < editable {
             plan.warnings.push(format!(
@@ -1894,7 +1919,12 @@ mod tests {
             context_tokens: 4096,
             output_tokens: 1024,
             protocol: Some(EditProtocol::SearchReplace),
+            reasons: false,
             profile_sha256: "fixture".into(),
+        };
+        let reasoning = ReviewedModelSelection {
+            reasons: true,
+            ..selection.clone()
         };
         let make_plan = |files: usize, checks: usize| {
             let request: LocalRunRequest = serde_json::from_value(json!({
@@ -1937,10 +1967,28 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("above the 32-slot cap")));
 
+        // A one-path goal gets room to reason only on a model that reasons.
         let mut one = make_plan(1, 1);
-        adjust_reviewed_plan_budget(&mut one, Some(&selection), false);
-        assert_eq!(one.request.budget.generations, 4);
-        assert_eq!(one.request.budget.generated_tokens, 4096);
+        adjust_reviewed_plan_budget(&mut one, Some(&reasoning), false);
+        assert_eq!(one.request.budget.generations, 8);
+        assert_eq!(one.request.budget.check_runs, 16);
+        assert_eq!(one.request.budget.generated_tokens, 8192);
+        assert_eq!(one.request.budget.wall_seconds, 600);
+        assert!(one.warnings.is_empty());
+
+        let mut one_plain = make_plan(1, 1);
+        adjust_reviewed_plan_budget(&mut one_plain, Some(&selection), false);
+        assert_eq!(one_plain.request.budget.generations, 4);
+        assert_eq!(one_plain.request.budget.generated_tokens, 4096);
+
+        let mut one_explicit = make_plan(1, 1);
+        adjust_reviewed_plan_budget(&mut one_explicit, Some(&reasoning), true);
+        assert_eq!(one_explicit.request.budget.generations, 4);
+        assert_eq!(one_explicit.request.budget.generated_tokens, 4096);
+
+        let mut one_unselected = make_plan(1, 1);
+        adjust_reviewed_plan_budget(&mut one_unselected, None, false);
+        assert_eq!(one_unselected.request.budget.generations, 4);
 
         let mut explicit = make_plan(5, 1);
         adjust_reviewed_plan_budget(&mut explicit, Some(&selection), true);
@@ -1974,7 +2022,24 @@ mod tests {
         diff_selection.protocol = Some(EditProtocol::UnifiedDiff);
         adjust_reviewed_plan_budget(&mut diff, Some(&diff_selection), false);
         assert_eq!(diff.request.budget.generations, 4);
+        assert_eq!(diff.request.budget.generated_tokens, 4096);
         assert!(diff.warnings.is_empty());
+
+        // On a model that reasons, a larger calibrated allowance gives each
+        // of the four calls its share.
+        diff_selection.context_tokens = 16_384;
+        diff_selection.output_tokens = 4096;
+        let mut plain_diff = make_plan(5, 4);
+        adjust_reviewed_plan_budget(&mut plain_diff, Some(&diff_selection), false);
+        assert_eq!(plain_diff.request.budget.generated_tokens, 4096);
+        diff_selection.reasons = true;
+        let mut roomy = make_plan(5, 4);
+        adjust_reviewed_plan_budget(&mut roomy, Some(&diff_selection), false);
+        assert_eq!(roomy.request.budget.generations, 4);
+        assert_eq!(roomy.request.budget.generated_tokens, 16_384);
+        let mut roomy_explicit = make_plan(5, 4);
+        adjust_reviewed_plan_budget(&mut roomy_explicit, Some(&diff_selection), true);
+        assert_eq!(roomy_explicit.request.budget.generated_tokens, 4096);
     }
 
     #[test]
@@ -2261,6 +2326,7 @@ mod tests {
             context_tokens: 4096,
             output_tokens: 512,
             protocol: None,
+            reasons: false,
             profile_sha256: "profile-hash".into(),
         };
         let mut reviewed = ReviewedLocalPlan {

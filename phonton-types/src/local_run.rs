@@ -117,6 +117,10 @@ pub struct ReviewedModelSelection {
     pub context_tokens: u32,
     pub output_tokens: u32,
     pub protocol: Option<EditProtocol>,
+    /// Whether the profile reasons before it answers
+    /// ([`crate::local::ModelProfile::reasons`]); the plan budgets for it.
+    #[serde(default)]
+    pub reasons: bool,
     /// Hash of the complete saved profile, including probes and calibration.
     pub profile_sha256: String,
 }

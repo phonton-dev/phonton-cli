@@ -160,18 +160,29 @@ profiles. Finished probes are saved after each request, so cancellation, memory
 pressure or an engine exit does not erase their diagnostic output. A retry runs
 the probes again; an earlier passing profile remains until recalibration finishes.
 The attempt's starting digest does not certify each later probe's weights.
-Calibration keeps its format probes small. For coding goals, the saved profile
+Calibration keeps its format probes small: 512 output tokens for an edit or
+creation probe and 256 for the tool-call probe, or a quarter of the context
+(at most 2,048) when the model may think first. For coding goals, the saved profile
 reserves up to one quarter of that context for each complete edit response;
 the goal's shared token budget can reduce it further. When later attempts are
 allowed, the runner keeps half the remaining token budget for them. This is a
 generation allowance, not a measured claim that the model can produce a file
 of that size. Existing profiles keep their saved ceiling until recalibrated.
 Calibration first requests `think:false` so a thinking model can spend the
-small edit-probe budget on the actual edit. If no edit format or no new-file
-format passes, it also probes the runtime's default thinking behavior and
-prefers a mode that demonstrated new-file creation. The chosen request mode
+small edit-probe budget on the actual edit. It also probes the runtime's
+default thinking behavior when no edit format or no new-file format passed,
+or when the `think:false` probes generated at 20 tokens per second or more
+by the runtime's own timing: a machine that fast can afford a model that
+reasons before each edit. It then prefers the runtime default if that mode
+demonstrated new-file creation. A slower machine, or a runtime that reports
+no generation timing, keeps `think:false`. The chosen request mode
 is saved in a schema-2 digest-bound profile and reused for tool-call probes,
-coding edits, and strategy requests. Older schema-1 profiles retain their
+coding edits, and strategy requests. A profile in the runtime-default mode
+whose probes returned thinking output is treated as a model that reasons:
+its goals get the larger budget and the whole-file edits described in
+[local-harness.md](local-harness.md). A profile saved by 0.27.1 or earlier
+keeps its mode, usually `think:false`, until `phonton models calibrate MODEL`
+runs again. Older schema-1 profiles retain their
 original runtime-default request behavior until recalibrated. Probe
 results show format compatibility, not general coding quality or proof that a
 runtime honored the requested thinking setting.

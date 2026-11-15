@@ -375,6 +375,44 @@ pub(super) fn whole_file_retry(
     })
 }
 
+/// Largest file a one-file scope rewrites whole from its first edit. The
+/// slice that measured the rewrite (Polyglot, 2026-11-11) had no file over
+/// 96 lines, and a longer file costs a rewrite far more output than a span.
+pub(super) const WHOLE_FILE_SCOPE_MAX_LINES: usize = 100;
+
+/// The file of a one-file scope when `decision`'s edit should rewrite it
+/// whole. A SearchReplace answer changes one span, so a stub with two
+/// functions took one model call per function, and a repair of several
+/// failures one call per failure. A restart keeps its source anchor, and a
+/// file over [`WHOLE_FILE_SCOPE_MAX_LINES`] keeps span edits. The caller
+/// asks only for a model that reasons: the rewrite was measured with one.
+/// `baseline` is the parent directory of a first edit.
+pub(super) fn whole_file_scope(
+    candidates: &[CandidateEvidence],
+    decision: &SearchDecision,
+    scope: &[PathBuf],
+    baseline: &Path,
+) -> Option<PathBuf> {
+    let [path] = scope else {
+        return None;
+    };
+    if !matches!(
+        decision.action,
+        SearchAction::Initial | SearchAction::Repair
+    ) {
+        return None;
+    }
+    let directory = match decision.parent_candidate {
+        Some(number) => &candidates.iter().find(|c| c.number == number)?.directory,
+        None => baseline,
+    };
+    let lines = std::fs::read_to_string(directory.join(path))
+        .ok()?
+        .lines()
+        .count();
+    (lines <= WHOLE_FILE_SCOPE_MAX_LINES).then(|| path.clone())
+}
+
 /// Rejection for a generation whose raw output equals an earlier one in the
 /// same run. Its verdict is already known, so it never reaches the checks.
 pub(super) const REPEATED_OUTPUT: &str =
@@ -522,8 +560,20 @@ pub(super) fn next(candidates: &[CandidateEvidence]) -> SearchDecision {
         "Rejected edit did not produce a checkable change; revise it without altering the source scope")
 }
 
-fn failures(candidate: &CandidateEvidence) -> String {
-    failed_checks_feedback(&candidate.checks)
+fn failures(candidate: &CandidateEvidence, chars: usize) -> String {
+    failed_checks_excerpt(&candidate.checks, chars)
+}
+
+/// Characters of failed check output kept for retrieval anchors, and for a
+/// prompt whose source does not fit beside the detailed excerpt.
+const COMPACT_CHECK_CHARS: usize = 450;
+
+/// Characters of failed check output an edit prompt tries first: one per four
+/// tokens of calibrated context, at most 4,000. At 16,384 tokens the compact
+/// excerpt held one traceback of a ten-test failure, and repairs by a 4B model
+/// passed 1 time in 25 (Polyglot slice, 2026-11-11).
+pub(super) fn check_feedback_chars(context_tokens: u32) -> usize {
+    (context_tokens as usize / 4).clamp(COMPACT_CHECK_CHARS, 4000)
 }
 
 fn feedback_output_excerpt(text: &str, max: usize) -> String {
@@ -549,6 +599,11 @@ fn feedback_output_excerpt(text: &str, max: usize) -> String {
 }
 
 pub(super) fn failed_checks_feedback(checks: &[CheckEvidence]) -> String {
+    failed_checks_excerpt(checks, COMPACT_CHECK_CHARS)
+}
+
+/// The failed checks' output in `chars` characters, shared between them.
+pub(super) fn failed_checks_excerpt(checks: &[CheckEvidence], chars: usize) -> String {
     let failed: Vec<_> = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Failed)
@@ -558,7 +613,7 @@ pub(super) fn failed_checks_feedback(checks: &[CheckEvidence]) -> String {
     }
     // Retain both output streams independently. Concatenating first can hide
     // a useful stdout tail inside the omitted middle of verbose stderr.
-    let available = 450usize.saturating_sub(failed.len().saturating_sub(1));
+    let available = chars.saturating_sub(failed.len().saturating_sub(1));
     let per_check = available / failed.len();
     let remainder = available % failed.len();
     failed
@@ -753,6 +808,15 @@ fn comparison_output(output: &str, directory: &std::path::Path) -> String {
 /// Retain the rejected edit as well as its outcome; a failure label alone cannot
 /// explain what the next generation must improve. All content remains untrusted.
 pub(super) fn feedback(candidates: &[CandidateEvidence], baseline: &str) -> String {
+    feedback_with(candidates, baseline, COMPACT_CHECK_CHARS)
+}
+
+/// `feedback` with `check_chars` characters of failed check output.
+pub(super) fn feedback_with(
+    candidates: &[CandidateEvidence],
+    baseline: &str,
+    check_chars: usize,
+) -> String {
     let Some(last) = candidates.last() else {
         return baseline.into();
     };
@@ -781,7 +845,7 @@ pub(super) fn feedback(candidates: &[CandidateEvidence], baseline: &str) -> Stri
         sections.push(format!(
             "Check evidence from candidate {} (data):\n{}",
             checked.number,
-            failures(checked)
+            failures(checked, check_chars)
         ));
     } else if !baseline.is_empty() {
         sections.push(format!("Baseline check evidence (data):\n{}", baseline));
@@ -798,7 +862,7 @@ pub(super) fn feedback(candidates: &[CandidateEvidence], baseline: &str) -> Stri
             super::truncate(&c.raw_output, 350)
         ));
     }
-    super::truncate(&sections.join("\n"), 1400)
+    super::truncate(&sections.join("\n"), 950 + check_chars)
 }
 
 /// Only executed check output may provide verifier context anchors.
@@ -812,8 +876,8 @@ pub(super) fn verifier_feedback(candidates: &[CandidateEvidence], baseline: &str
                 .iter()
                 .any(|check| check.status == CheckStatus::Failed)
         })
-        .map(failures)
-        .unwrap_or_else(|| super::truncate(baseline, 450))
+        .map(|candidate| failures(candidate, COMPACT_CHECK_CHARS))
+        .unwrap_or_else(|| super::truncate(baseline, COMPACT_CHECK_CHARS))
 }
 
 #[cfg(test)]
@@ -1435,6 +1499,42 @@ mod tests {
         assert!(verifier.len() <= 450);
     }
     #[test]
+    fn detailed_feedback_shows_failures_the_compact_excerpt_drops() {
+        assert_eq!(check_feedback_chars(1024), 450);
+        assert_eq!(check_feedback_chars(4096), 1024);
+        assert_eq!(check_feedback_chars(16_384), 4000);
+        // Ten failing tests of about 300 characters each, as a unittest run prints them.
+        let output: String = (1..=10)
+            .map(|n| {
+                format!(
+                    "FAIL: test_case_{n}\n{}\nAssertionError: case {n}\n",
+                    "-".repeat(260)
+                )
+            })
+            .collect();
+        let candidate = failed(1, None, &output);
+        let compact = feedback(std::slice::from_ref(&candidate), "");
+        assert!(compact.contains("AssertionError: case 10"));
+        assert!(!compact.contains("AssertionError: case 5"));
+        let detailed = feedback_with(
+            std::slice::from_ref(&candidate),
+            "",
+            check_feedback_chars(16_384),
+        );
+        for n in 1..=10 {
+            assert!(
+                detailed.contains(&format!("AssertionError: case {n}\n")),
+                "{n}"
+            );
+        }
+        assert!(detailed.len() <= 4950);
+        // No candidate yet: the baseline excerpt is the feedback, at either size.
+        let baseline = failed_checks_excerpt(&candidate.checks, 4000);
+        assert!(baseline.contains("AssertionError: case 1\n"));
+        assert_eq!(feedback_with(&[], &baseline, 4000), baseline);
+        assert!(failed_checks_feedback(&candidate.checks).len() <= 450);
+    }
+    #[test]
     fn four_verbose_failures_keep_each_stream_tail() {
         let mut candidate = failed(1, None, "");
         candidate.checks.clear();
@@ -1552,6 +1652,69 @@ mod tests {
         let mut failed_checks = noop;
         failed_checks.rejection = Some("Candidate failed the selected verification checks".into());
         assert!(whole_file_retry(&[failed_checks], &scope, &baseline).is_none());
+    }
+
+    #[test]
+    fn a_small_one_file_scope_is_rewritten_whole_in_direct_edits_and_repairs() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = root.path().join("baseline");
+        let repaired = root.path().join("candidate-1");
+        for directory in [&baseline, &repaired] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            baseline.join("stub.py"),
+            "def count():\n    pass\n\ndef total():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            baseline.join("big.py"),
+            "x = 1\n".repeat(WHOLE_FILE_SCOPE_MAX_LINES + 1),
+        )
+        .unwrap();
+        // The failed candidate outgrew the limit; the baseline copy did not.
+        std::fs::write(
+            repaired.join("stub.py"),
+            "x = 1\n".repeat(WHOLE_FILE_SCOPE_MAX_LINES + 1),
+        )
+        .unwrap();
+        let decide = |action, parent_candidate| SearchDecision {
+            action,
+            parent_candidate,
+            reason: String::new(),
+        };
+        let one = [PathBuf::from("stub.py")];
+        let initial = decide(SearchAction::Initial, None);
+        assert_eq!(
+            whole_file_scope(&[], &initial, &one, &baseline),
+            Some(one[0].clone())
+        );
+        // Two files, a file over the line limit, a restart or a stop keep span edits.
+        let two = [PathBuf::from("stub.py"), PathBuf::from("big.py")];
+        assert_eq!(whole_file_scope(&[], &initial, &two, &baseline), None);
+        let big = [PathBuf::from("big.py")];
+        assert_eq!(whole_file_scope(&[], &initial, &big, &baseline), None);
+        for action in [SearchAction::Restart, SearchAction::Stop] {
+            assert_eq!(
+                whole_file_scope(&[], &decide(action, None), &one, &baseline),
+                None
+            );
+        }
+        // A repair is sized by the candidate it repairs, not by the baseline.
+        let mut parent = failed(1, None, "FAIL");
+        parent.directory = repaired.clone();
+        let repair = decide(SearchAction::Repair, Some(1));
+        assert_eq!(
+            whole_file_scope(std::slice::from_ref(&parent), &repair, &one, &baseline),
+            None
+        );
+        std::fs::write(repaired.join("stub.py"), "def count():\n    return 0\n").unwrap();
+        assert_eq!(
+            whole_file_scope(std::slice::from_ref(&parent), &repair, &one, &baseline),
+            Some(one[0].clone())
+        );
+        // A parent that is not in the run has no file to size.
+        assert_eq!(whole_file_scope(&[], &repair, &one, &baseline), None);
     }
 
     #[test]

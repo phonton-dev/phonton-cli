@@ -27,6 +27,34 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Changed
 
+- [changed] On a machine that generates 20 tokens per second or more, local
+  calibration also measures the model's own thinking mode and keeps it when
+  its edit and new-file probes pass. It used to keep `think:false` whenever
+  that worked. Probes in the runtime-default mode may generate a quarter of
+  the context (512 to 2,048 tokens) so reasoning does not use up the limit
+  before the answer. Slower machines keep `think:false`. A saved profile
+  keeps its mode: run `phonton models calibrate MODEL` to measure the model
+  again. Calibrating a model that reasons takes longer, because its probes
+  reason too, and its goals take longer per call.
+- [changed] On a model that reasons before it answers, a local goal with one
+  editable path and no explicit budget reserves 8 model calls and up to
+  16,384 output tokens, instead of 4 calls and 4,096 tokens. The earlier
+  budget stopped a run after four calls, well inside its 600-second limit,
+  and cut the later calls to 512 output tokens, which the reasoning used up.
+  A multi-path goal on a unified-diff model keeps four calls and gets one
+  calibrated response of output per call. Other models and explicit budgets
+  are unchanged.
+- [changed] On a model that reasons before it answers, when a local goal's
+  scope is one existing file of at most 100 lines and the model uses
+  search/replace, the first edit and every repair ask for the complete
+  corrected file. A search/replace reply changes one span, so a file that
+  needed several changes took one model call for each. The whole file must
+  fit the calibrated context with an output reserve that can hold it;
+  otherwise the span edit runs as before.
+- [changed] A repair prompt for a local goal carries up to 4,000 characters
+  of the failed checks' output (a quarter of the context in characters, at
+  least 450), instead of 450. A test run with several failures no longer
+  reaches the model as the first and last few lines of one of them.
 - [changed] With `PHONTON_LOG=debug`, each worker reply is logged with its
   prompt size and the token counts the provider reported, so the cost of a
   goal can be traced request by request.

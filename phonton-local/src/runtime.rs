@@ -339,10 +339,53 @@ fn with_thinking_mode(mut request: Value, thinking: LocalThinkingMode) -> Value 
     request
 }
 
+/// Output limit for one calibration probe. A model that reasons first spends
+/// part of the limit before it writes the answer, so the runtime-default mode
+/// gets room in proportion to the context; `think:false` keeps the small limit.
+fn probe_output_tokens(thinking: LocalThinkingMode, context: u32, small: u32) -> u32 {
+    match thinking {
+        LocalThinkingMode::Off => small,
+        LocalThinkingMode::RuntimeDefault => (context / 4).clamp(small, 2048),
+    }
+}
+
+/// Slowest generation, in tokens per second, at which calibration also
+/// measures the runtime's own thinking mode. A goal on a model that reasons
+/// first may spend 4,096 output tokens on each of its first three calls; at
+/// 20 tokens per second those fit the default 600-second wall budget. A
+/// slower machine keeps `think:false`.
+const MIN_REASONING_TOKENS_PER_SECOND: f64 = 20.0;
+
+/// Generation speed summed over probe replies, from the runtime's own
+/// `eval_count` and `eval_duration`: model load and prompt time are not in it.
+#[derive(Default)]
+struct GenerationRate {
+    tokens: u64,
+    nanos: u64,
+}
+
+impl GenerationRate {
+    fn record(&mut self, response: &Value) {
+        if let (Some(tokens), Some(nanos)) = (
+            response["eval_count"].as_u64(),
+            response["eval_duration"].as_u64(),
+        ) {
+            self.tokens += tokens;
+            self.nanos += nanos;
+        }
+    }
+
+    fn tokens_per_second(&self) -> Option<f64> {
+        (self.nanos > 0).then(|| self.tokens as f64 * 1e9 / self.nanos as f64)
+    }
+}
+
 struct ModeCalibration {
     probes: Vec<ModelProbe>,
     edit_protocol: Option<EditProtocol>,
     creation_protocol: Option<EditProtocol>,
+    /// None when the runtime reported no generation timing.
+    tokens_per_second: Option<f64>,
 }
 
 impl ModeCalibration {
@@ -1086,6 +1129,7 @@ impl LocalRuntime {
         model: &LocalModel,
         admission: &CalibrationAdmission,
         thinking: LocalThinkingMode,
+        rate: &mut GenerationRate,
         observe_hardware: &F,
         on_probe: &mut P,
     ) -> Result<(Vec<ModelProbe>, Vec<EditProtocol>)>
@@ -1113,7 +1157,7 @@ impl LocalRuntime {
                     system: instruction,
                     user: "File add.py contains exactly:\ndef add(a, b): return a - b\n\nFix add so it adds its two arguments.",
                     context,
-                    output: 512,
+                    output: probe_output_tokens(thinking, context, 512),
                     thinking,
                     paths: &["add.py".into()],
                     searches: &["def add(a, b): return a - b".into()],
@@ -1124,6 +1168,7 @@ impl LocalRuntime {
                 .await;
             let probe = match result {
                 Ok(response) => {
+                    rate.record(&response);
                     let output = response["message"]["content"]
                         .as_str()
                         .unwrap_or("")
@@ -1138,7 +1183,7 @@ impl LocalRuntime {
                         .as_str()
                         .is_some_and(|value| !value.is_empty());
                     let thinking_note = if has_thinking {
-                        " Runtime returned separate thinking output."
+                        THINKING_OUTPUT_NOTE
                     } else {
                         ""
                     };
@@ -1183,8 +1228,16 @@ impl LocalRuntime {
     {
         let name = model.name.as_str();
         let context = admission.context_tokens;
+        let mut rate = GenerationRate::default();
         let (mut probes, passing_edit_protocols) = self
-            .calibrate_edit_probes(model, admission, thinking, observe_hardware, on_probe)
+            .calibrate_edit_probes(
+                model,
+                admission,
+                thinking,
+                &mut rate,
+                observe_hardware,
+                on_probe,
+            )
             .await?;
         let mut creation_protocol = None;
         for kind in passing_edit_protocols.iter().copied() {
@@ -1210,7 +1263,7 @@ impl LocalRuntime {
                 system: instruction,
                 user: "Create the absent file probe_add.py with exactly this content:\ndef add(a, b):\n    return a + b\n",
                 context,
-                output: 512,
+                output: probe_output_tokens(thinking, context, 512),
                 thinking,
                 paths: &["probe_add.py".into()],
                 searches: &[],
@@ -1220,6 +1273,7 @@ impl LocalRuntime {
             }).await;
             let creation_probe = match creation_result {
                 Ok(response) => {
+                    rate.record(&response);
                     let output = response["message"]["content"]
                         .as_str()
                         .unwrap_or("")
@@ -1260,6 +1314,7 @@ impl LocalRuntime {
             probes,
             edit_protocol: passing_edit_protocols.first().copied(),
             creation_protocol,
+            tokens_per_second: rate.tokens_per_second(),
         })
     }
 
@@ -1392,7 +1447,14 @@ impl LocalRuntime {
                 &mut record_probe,
             )
             .await?;
-        let (thinking, mut selected) = if off.creation_protocol.is_some() {
+        // A machine that generates fast enough can afford a model that reasons
+        // before each edit, so the runtime's own mode is measured too and
+        // preferred when it can also create a file. A slower machine, or a
+        // runtime that reports no timing, keeps `think:false` as before.
+        let fast = off
+            .tokens_per_second
+            .is_some_and(|rate| rate >= MIN_REASONING_TOKENS_PER_SECOND);
+        let (thinking, mut selected) = if off.creation_protocol.is_some() && !fast {
             (LocalThinkingMode::Off, off)
         } else {
             let mut default = self
@@ -1433,7 +1495,7 @@ impl LocalRuntime {
             "model": name, "stream": false, "keep_alive": "2m",
             "messages": [{"role":"user", "content":"Call read_file with path add.py. Do not answer in prose."}],
             "tools": [{"type":"function", "function": {"name":"read_file", "description":"Read a file", "parameters":{"type":"object", "properties":{"path":{"type":"string", "enum":["add.py"]}}, "required":["path"]}}}],
-            "options": {"num_ctx": context, "num_predict": 256, "temperature": 0}
+            "options": {"num_ctx": context, "num_predict": probe_output_tokens(thinking, context, 256), "temperature": 0}
         }), thinking)).await;
         let tool_probe = match tool_result {
             Ok(response) => {
@@ -2116,6 +2178,8 @@ mod tests {
         let server_seen = Arc::clone(&seen);
         let thinking_requests = Arc::new(Mutex::new(Vec::<bool>::new()));
         let server_thinking_requests = Arc::clone(&thinking_requests);
+        let output_limits = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let server_output_limits = Arc::clone(&output_limits);
         let thinking_case = Arc::new(AtomicU8::new(0));
         let server_thinking_case = Arc::clone(&thinking_case);
         let server = tokio::spawn(async move {
@@ -2169,6 +2233,10 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(thinking_disabled);
+                        server_output_limits
+                            .lock()
+                            .unwrap()
+                            .push(input["options"]["num_predict"].as_u64().unwrap_or(0));
                         let instruction = input["messages"][0]["content"].as_str().unwrap_or("");
                         let (kind, output) = if instruction.contains("exactly path and text") {
                             (
@@ -2189,16 +2257,27 @@ mod tests {
                         };
                         server_seen.lock().unwrap().push(kind.into());
                         let case = server_thinking_case.load(Ordering::Relaxed);
+                        // Cases 3 and 4 report 50 tokens per second, case 5
+                        // reports 5; the earlier cases report no timing.
                         if thinking_disabled && case == 1 {
                             json!({"error":"think=false unsupported"})
-                        } else if !thinking_disabled && case == 0 {
+                        } else if !thinking_disabled && matches!(case, 0 | 4) {
                             json!({"message":{"thinking":"reasoning used the output limit","content":""},"done":true,"done_reason":"length","eval_count":512})
                         } else if thinking_disabled && case == 2 && kind.contains("creation") {
                             json!({"message":{"content":"creation did not match"},"done":true})
                         } else if kind == "tool call" {
                             json!({"message":{"content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"add.py"}}}]},"done":true})
                         } else {
-                            json!({"message":{"content":output},"done":true,"prompt_eval_count":12,"eval_count":20})
+                            let mut reply = json!({"message":{"content":output},"done":true,"prompt_eval_count":12,"eval_count":20});
+                            match case {
+                                3 | 4 => reply["eval_duration"] = json!(400_000_000_u64),
+                                5 => reply["eval_duration"] = json!(4_000_000_000_u64),
+                                _ => {}
+                            }
+                            if !thinking_disabled && case == 3 {
+                                reply["message"]["thinking"] = json!("the operator is wrong");
+                            }
+                            reply
                         }
                     }
                     _ => json!({"error":"Unexpected fixture endpoint"}),
@@ -2340,7 +2419,6 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        server.abort();
         assert_eq!(
             new_file_profile.thinking,
             Some(LocalThinkingMode::RuntimeDefault)
@@ -2355,6 +2433,79 @@ mod tests {
         assert_eq!(
             &thinking_requests.lock().unwrap()[13..],
             [true, true, true, true, false, false, false, false, false],
+        );
+        // None of these runs reported generation timing, and none reasons.
+        assert!(!profile.reasons() && !default_profile.reasons() && !new_file_profile.reasons());
+
+        let calibrate = |case: u8| {
+            thinking_case.store(case, Ordering::Relaxed);
+            let endpoint = endpoint.clone();
+            let observe_hardware = &observe_hardware;
+            async move {
+                let runtime = LocalRuntime::new(&endpoint).unwrap();
+                let hardware = HardwareSnapshot {
+                    ram_total_bytes: Some(16u64 << 30),
+                    ram_available_bytes: Some(8u64 << 30),
+                    ..Default::default()
+                };
+                let calibration = runtime.calibrate_with_observer(
+                    "fixture:small",
+                    Some(4096),
+                    hardware,
+                    observe_hardware,
+                );
+                let result = tokio::time::timeout(Duration::from_secs(10), calibration).await;
+                result.unwrap().unwrap()
+            }
+        };
+
+        // A machine measured at 50 tokens per second can afford reasoning: the
+        // runtime's own mode is probed too, with room to reason, and kept.
+        let fast_profile = calibrate(3).await;
+        assert_eq!(
+            fast_profile.thinking,
+            Some(LocalThinkingMode::RuntimeDefault)
+        );
+        assert_eq!(fast_profile.protocol, Some(EditProtocol::UnifiedDiff));
+        assert_eq!(fast_profile.creation_status(), CheckStatus::Passed);
+        assert_eq!(fast_profile.probes[0].name, "Think off: SearchReplace edit");
+        assert_eq!(fast_profile.probes[0].status, CheckStatus::Passed);
+        assert!(fast_profile.reasons());
+        assert_eq!(
+            &thinking_requests.lock().unwrap()[22..],
+            [true, true, true, true, false, false, false, false, false],
+        );
+        assert_eq!(
+            &output_limits.lock().unwrap()[22..],
+            [512, 512, 512, 512, 1024, 1024, 1024, 1024, 1024],
+        );
+
+        // As fast, but reasoning uses up the probe limit: `think:false` stays.
+        let cut_profile = calibrate(4).await;
+        assert_eq!(cut_profile.thinking, Some(LocalThinkingMode::Off));
+        assert_eq!(cut_profile.creation_status(), CheckStatus::Passed);
+        assert!(cut_profile
+            .probes
+            .iter()
+            .any(|probe| probe.name == "Runtime default: SearchReplace edit"
+                && probe.status == CheckStatus::Failed));
+        assert!(!cut_profile.reasons());
+        assert_eq!(
+            &thinking_requests.lock().unwrap()[31..],
+            [true, true, true, true, false, false, true],
+        );
+
+        // At 5 tokens per second the runtime's own mode is never requested.
+        let slow_profile = calibrate(5).await;
+        server.abort();
+        assert_eq!(slow_profile.thinking, Some(LocalThinkingMode::Off));
+        assert!(slow_profile
+            .probes
+            .iter()
+            .all(|probe| !probe.name.starts_with("Runtime default")));
+        assert_eq!(
+            &thinking_requests.lock().unwrap()[38..],
+            [true, true, true, true, true],
         );
     }
 

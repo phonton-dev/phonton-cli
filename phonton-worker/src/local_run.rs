@@ -134,9 +134,15 @@ fn creation_system_instruction(path: &Path, protocol: EditProtocol) -> String {
 }
 
 /// Whole-file rewrite of one existing file, using the creation transport.
-fn whole_file_system_instruction(path: &Path) -> String {
+/// `after_noop` tells the model that its search and replacement changed nothing.
+fn whole_file_system_instruction(path: &Path, after_noop: bool) -> String {
     let path = model_relative_path(path);
-    format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly. Your previous search and replacement changed nothing. No prose, commands, test changes, or other paths.")
+    let noop = if after_noop {
+        " Your previous search and replacement changed nothing."
+    } else {
+        ""
+    };
+    format!("Return only JSON with keys path and text. Set path to exactly {path} and text to the complete corrected file, newline-terminated, with every line you do not change kept exactly.{noop} No prose, commands, test changes, or other paths.")
 }
 
 /// Whether `resident` may serve the next chat.
@@ -586,6 +592,8 @@ async fn run_inner(
     seen.insert(receipt.baseline_sha256.clone());
     let mut unproductive_searches = BTreeSet::new();
     let baseline_diagnostics = search::failed_checks_feedback(&receipt.baseline_checks);
+    let check_chars = search::check_feedback_chars(receipt.profile.context_tokens);
+    let baseline_detail = search::failed_checks_excerpt(&receipt.baseline_checks, check_chars);
     for number in 1..=receipt.request.budget.generations {
         if let Err(error) = observe_original_source(
             &repository,
@@ -625,6 +633,7 @@ async fn run_inner(
             receipt.request.new_file.is_some() && !receipt.request.editable_existing.is_empty(),
         );
         let mut whole_file = None;
+        let mut after_noop = false;
         if decision.action != SearchAction::Stop
             && receipt.profile.protocol == Some(EditProtocol::SearchReplace)
             && receipt.request.new_file.is_none()
@@ -634,6 +643,14 @@ async fn run_inner(
             {
                 decision = retry;
                 whole_file = Some(path);
+                after_noop = true;
+            } else if receipt.profile.reasons() {
+                whole_file = search::whole_file_scope(
+                    &receipt.candidates,
+                    &decision,
+                    &receipt.request.files,
+                    &baseline,
+                );
             }
         }
         if decision.action == SearchAction::Stop {
@@ -768,6 +785,9 @@ async fn run_inner(
             .and_then(|candidate| candidate.content_sha256.clone())
             .unwrap_or_else(|| receipt.baseline_sha256.clone());
         let diagnostics = search::feedback(&receipt.candidates, &baseline_diagnostics);
+        // Edit prompts try this larger excerpt of the failed checks first and
+        // keep `diagnostics` for a source that does not fit beside it.
+        let detail = search::feedback_with(&receipt.candidates, &baseline_detail, check_chars);
         let verifier_diagnostics =
             search::verifier_feedback(&receipt.candidates, &baseline_diagnostics);
         let mut strategy_note = None;
@@ -1048,18 +1068,23 @@ async fn run_inner(
         }.to_owned()
         };
         let strategy_reserve = strategy_note.as_ref().map_or(0, String::len);
-        // A small file the last SearchReplace answer could not change is shown
-        // whole and rewritten whole; if it cannot fit, the ordinary edit runs.
+        // A small one-file scope on a model that reasons, or a small file the
+        // last SearchReplace answer could not change, is shown whole and
+        // rewritten whole; if it cannot fit, the ordinary edit runs.
         let whole_file_assembly = whole_file.as_ref().and_then(|path| {
-            let system = whole_file_system_instruction(path);
+            let system = whole_file_system_instruction(path, after_noop);
             let model = context::ModelContext {
                 protocol: EditProtocol::SearchReplace,
                 capacity: receipt.profile.context_tokens,
                 output,
             };
-            context::whole_file(&edit_request, &parent, &system, model, &diagnostics, path)
-                .ok()
-                .map(|assembly| (system, assembly))
+            let fit = |feedback: &str| {
+                context::whole_file(&edit_request, &parent, &system, model, feedback, path).ok()
+            };
+            let assembly = fit(&detail)
+                .filter(|assembly| !assembly.evidence.feedback_omitted)
+                .or_else(|| fit(&diagnostics));
+            assembly.map(|assembly| (system, assembly))
         });
         if whole_file_assembly.is_none() {
             // ponytail: the retry's parent stays; restoring the controller's
@@ -1069,39 +1094,48 @@ async fn run_inner(
                     "; the whole file did not fit the calibrated context, so an ordinary edit ran",
                 );
             }
-        } else {
+        } else if after_noop {
             approach = "whole-file rewrite after an unchanged search/replace".into();
+        } else {
+            approach.push_str(", file rewritten whole");
         }
         let (system, assembly_result) = if let Some((system, assembly)) = whole_file_assembly {
             (system, Ok(assembly))
         } else {
-            let assembly = context::assemble_with_evidence(
-                &edit_request,
-                &parent,
-                &system,
-                context::ModelContext {
-                    protocol: receipt
-                        .profile
-                        .protocol
-                        .ok_or_else(|| invalid("Missing measured protocol"))?,
-                    capacity: receipt
-                        .profile
-                        .context_tokens
-                        .saturating_sub(strategy_reserve as u32),
-                    output,
-                },
-                context::EvidenceInput {
-                    feedback: &diagnostics,
-                    verifier: &verifier_diagnostics,
-                    focus_path: if repairing_created_file {
-                        receipt.request.new_file.as_deref()
-                    } else {
-                        None
+            let model = context::ModelContext {
+                protocol: receipt
+                    .profile
+                    .protocol
+                    .ok_or_else(|| invalid("Missing measured protocol"))?,
+                capacity: receipt
+                    .profile
+                    .context_tokens
+                    .saturating_sub(strategy_reserve as u32),
+                output,
+            };
+            let assemble = |feedback: &str| {
+                context::assemble_with_evidence(
+                    &edit_request,
+                    &parent,
+                    &system,
+                    model,
+                    context::EvidenceInput {
+                        feedback,
+                        verifier: &verifier_diagnostics,
+                        focus_path: if repairing_created_file {
+                            receipt.request.new_file.as_deref()
+                        } else {
+                            None
+                        },
                     },
-                },
-                false,
-                excluded_searches,
-            );
+                    false,
+                    excluded_searches,
+                )
+            };
+            let assembly = match assemble(&detail) {
+                Ok(assembly) if assembly.evidence.feedback_omitted => assemble(&diagnostics),
+                result => result,
+            };
             (system, assembly)
         };
         let mut assembly = match assembly_result {
