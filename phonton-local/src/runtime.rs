@@ -339,6 +339,16 @@ fn with_thinking_mode(mut request: Value, thinking: LocalThinkingMode) -> Value 
     request
 }
 
+/// Output limit for one calibration probe. A model that reasons first spends
+/// part of the limit before it writes the answer, so the runtime-default mode
+/// gets room in proportion to the context; `think:false` keeps the small limit.
+fn probe_output_tokens(thinking: LocalThinkingMode, context: u32, small: u32) -> u32 {
+    match thinking {
+        LocalThinkingMode::Off => small,
+        LocalThinkingMode::RuntimeDefault => (context / 4).clamp(small, 2048),
+    }
+}
+
 struct ModeCalibration {
     probes: Vec<ModelProbe>,
     edit_protocol: Option<EditProtocol>,
@@ -1113,7 +1123,7 @@ impl LocalRuntime {
                     system: instruction,
                     user: "File add.py contains exactly:\ndef add(a, b): return a - b\n\nFix add so it adds its two arguments.",
                     context,
-                    output: 512,
+                    output: probe_output_tokens(thinking, context, 512),
                     thinking,
                     paths: &["add.py".into()],
                     searches: &["def add(a, b): return a - b".into()],
@@ -1210,7 +1220,7 @@ impl LocalRuntime {
                 system: instruction,
                 user: "Create the absent file probe_add.py with exactly this content:\ndef add(a, b):\n    return a + b\n",
                 context,
-                output: 512,
+                output: probe_output_tokens(thinking, context, 512),
                 thinking,
                 paths: &["probe_add.py".into()],
                 searches: &[],
@@ -1383,36 +1393,40 @@ impl LocalRuntime {
             attempt.probes.push(saved);
             on_progress(&attempt)
         };
-        let mut off = self
+        // Goals do better when the model may reason before it edits, so the
+        // runtime's own mode is measured first and kept when it can also
+        // create a file. `think:false` is the fallback for a model whose
+        // reasoning does not fit the probe limit.
+        let mut default = self
             .calibrate_mode(
                 model,
                 &admission,
-                LocalThinkingMode::Off,
+                LocalThinkingMode::RuntimeDefault,
                 observe_hardware,
                 &mut record_probe,
             )
             .await?;
-        let (thinking, mut selected) = if off.creation_protocol.is_some() {
-            (LocalThinkingMode::Off, off)
+        let (thinking, mut selected) = if default.creation_protocol.is_some() {
+            (LocalThinkingMode::RuntimeDefault, default)
         } else {
-            let mut default = self
+            let mut off = self
                 .calibrate_mode(
                     model,
                     &admission,
-                    LocalThinkingMode::RuntimeDefault,
+                    LocalThinkingMode::Off,
                     observe_hardware,
                     &mut record_probe,
                 )
                 .await?;
-            if default.creation_protocol.is_some() || off.edit_protocol.is_none() {
-                off.prefix_probes("Think off");
-                off.probes.extend(default.probes);
-                default.probes = off.probes;
-                (LocalThinkingMode::RuntimeDefault, default)
-            } else {
+            if off.creation_protocol.is_some() || default.edit_protocol.is_none() {
                 default.prefix_probes("Runtime default");
-                off.probes.extend(default.probes);
+                default.probes.extend(off.probes);
+                off.probes = default.probes;
                 (LocalThinkingMode::Off, off)
+            } else {
+                off.prefix_probes("Think off");
+                default.probes.extend(off.probes);
+                (LocalThinkingMode::RuntimeDefault, default)
             }
         };
         // The selected mode must own the unprefixed edit/creation probes.
@@ -1433,7 +1447,7 @@ impl LocalRuntime {
             "model": name, "stream": false, "keep_alive": "2m",
             "messages": [{"role":"user", "content":"Call read_file with path add.py. Do not answer in prose."}],
             "tools": [{"type":"function", "function": {"name":"read_file", "description":"Read a file", "parameters":{"type":"object", "properties":{"path":{"type":"string", "enum":["add.py"]}}, "required":["path"]}}}],
-            "options": {"num_ctx": context, "num_predict": 256, "temperature": 0}
+            "options": {"num_ctx": context, "num_predict": probe_output_tokens(thinking, context, 256), "temperature": 0}
         }), thinking)).await;
         let tool_probe = match tool_result {
             Ok(response) => {
@@ -2116,6 +2130,8 @@ mod tests {
         let server_seen = Arc::clone(&seen);
         let thinking_requests = Arc::new(Mutex::new(Vec::<bool>::new()));
         let server_thinking_requests = Arc::clone(&thinking_requests);
+        let output_limits = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let server_output_limits = Arc::clone(&output_limits);
         let thinking_case = Arc::new(AtomicU8::new(0));
         let server_thinking_case = Arc::clone(&thinking_case);
         let server = tokio::spawn(async move {
@@ -2169,6 +2185,10 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(thinking_disabled);
+                        server_output_limits
+                            .lock()
+                            .unwrap()
+                            .push(input["options"]["num_predict"].as_u64().unwrap_or(0));
                         let instruction = input["messages"][0]["content"].as_str().unwrap_or("");
                         let (kind, output) = if instruction.contains("exactly path and text") {
                             (
@@ -2189,11 +2209,14 @@ mod tests {
                         };
                         server_seen.lock().unwrap().push(kind.into());
                         let case = server_thinking_case.load(Ordering::Relaxed);
-                        if thinking_disabled && case == 1 {
+                        if thinking_disabled && matches!(case, 1 | 3) {
                             json!({"error":"think=false unsupported"})
                         } else if !thinking_disabled && case == 0 {
-                            json!({"message":{"thinking":"reasoning used the output limit","content":""},"done":true,"done_reason":"length","eval_count":512})
-                        } else if thinking_disabled && case == 2 && kind.contains("creation") {
+                            json!({"message":{"thinking":"reasoning used the output limit","content":""},"done":true,"done_reason":"length","eval_count":1024})
+                        } else if !thinking_disabled
+                            && matches!(case, 2 | 3)
+                            && kind.contains("creation")
+                        {
                             json!({"message":{"content":"creation did not match"},"done":true})
                         } else if kind == "tool call" {
                             json!({"message":{"content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"add.py"}}}]},"done":true})
@@ -2268,9 +2291,18 @@ mod tests {
                 .status,
             CheckStatus::Passed
         );
+        // Reasoning used up the runtime-default probes, so `think:false` is
+        // the measured fallback and owns the unprefixed probes.
+        assert_eq!(
+            profile.probes[0].name,
+            "Runtime default: SearchReplace edit"
+        );
+        assert_eq!(profile.probes[0].status, CheckStatus::Failed);
         assert_eq!(
             seen.lock().unwrap().as_slice(),
             [
+                "structured edit",
+                "diff edit",
                 "structured edit",
                 "diff edit",
                 "structured creation",
@@ -2279,12 +2311,18 @@ mod tests {
                 "tool call"
             ]
         );
-        assert!(thinking_requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|disabled| *disabled));
+        assert_eq!(
+            thinking_requests.lock().unwrap().as_slice(),
+            [false, false, true, true, true, true, true, true],
+        );
+        // Runtime-default probes get a quarter of the context to reason in;
+        // `think:false` probes keep the small limits.
+        assert_eq!(
+            output_limits.lock().unwrap().as_slice(),
+            [1024, 1024, 512, 512, 512, 512, 256, 128],
+        );
 
+        // The runtime's own mode passes, so it is kept without a second pass.
         thinking_case.store(1, Ordering::Relaxed);
         let default_profile = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2311,16 +2349,23 @@ mod tests {
         );
         assert_eq!(default_profile.protocol, Some(EditProtocol::UnifiedDiff));
         assert_eq!(default_profile.creation_status(), CheckStatus::Passed);
+        assert_eq!(default_profile.probes[0].name, "SearchReplace edit");
+        assert_eq!(default_profile.probes[0].status, CheckStatus::Passed);
+        assert!(default_profile
+            .probes
+            .iter()
+            .all(|probe| !probe.name.starts_with("Think off")));
         assert_eq!(
-            default_profile.probes[0].name,
-            "Think off: SearchReplace edit"
+            &thinking_requests.lock().unwrap()[8..],
+            [false, false, false, false, false],
         );
-        assert_eq!(default_profile.probes[0].status, CheckStatus::Unavailable);
         assert_eq!(
-            thinking_requests.lock().unwrap().as_slice(),
-            [true, true, true, true, true, true, true, true, false, false, false, false, false],
+            &output_limits.lock().unwrap()[8..],
+            [1024, 1024, 1024, 1024, 1024],
         );
 
+        // The runtime's own mode edits but cannot create a file; `think:false`
+        // can, so it is selected.
         thinking_case.store(2, Ordering::Relaxed);
         let new_file_profile = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2340,21 +2385,59 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        server.abort();
-        assert_eq!(
-            new_file_profile.thinking,
-            Some(LocalThinkingMode::RuntimeDefault)
-        );
+        assert_eq!(new_file_profile.thinking, Some(LocalThinkingMode::Off));
         assert_eq!(new_file_profile.protocol, Some(EditProtocol::UnifiedDiff));
         assert_eq!(new_file_profile.creation_status(), CheckStatus::Passed);
         assert!(new_file_profile
             .probes
             .iter()
-            .any(|probe| probe.name == "Think off: UnifiedDiff create"
+            .any(|probe| probe.name == "Runtime default: UnifiedDiff create"
                 && probe.status == CheckStatus::Failed));
         assert_eq!(
             &thinking_requests.lock().unwrap()[13..],
-            [true, true, true, true, false, false, false, false, false],
+            [false, false, false, false, true, true, true, true, true],
+        );
+
+        // Neither mode can create a file and `think:false` is refused: the
+        // runtime's own mode keeps its measured existing-file edits.
+        thinking_case.store(3, Ordering::Relaxed);
+        let edit_only_profile = tokio::time::timeout(
+            Duration::from_secs(10),
+            LocalRuntime::new(&endpoint)
+                .unwrap()
+                .calibrate_with_observer(
+                    "fixture:small",
+                    Some(4096),
+                    HardwareSnapshot {
+                        ram_total_bytes: Some(16u64 << 30),
+                        ram_available_bytes: Some(8u64 << 30),
+                        ..Default::default()
+                    },
+                    &observe_hardware,
+                ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        assert_eq!(
+            edit_only_profile.thinking,
+            Some(LocalThinkingMode::RuntimeDefault)
+        );
+        assert_eq!(
+            edit_only_profile.protocol,
+            Some(EditProtocol::SearchReplace)
+        );
+        assert_eq!(edit_only_profile.creation_status(), CheckStatus::Failed);
+        assert_eq!(edit_only_profile.probes[0].name, "SearchReplace edit");
+        assert!(edit_only_profile
+            .probes
+            .iter()
+            .any(|probe| probe.name == "Think off: SearchReplace edit"
+                && probe.status == CheckStatus::Unavailable));
+        assert_eq!(
+            &thinking_requests.lock().unwrap()[22..],
+            [false, false, false, false, true, true, false],
         );
     }
 
@@ -2514,7 +2597,10 @@ mod tests {
         let reopened = crate::storage::load(&state_path).unwrap();
         let attempt = reopened.calibration_attempt.unwrap();
         assert_eq!(attempt.probes.len(), 1);
-        assert_eq!(attempt.probes[0].name, "Think off: SearchReplace edit");
+        assert_eq!(
+            attempt.probes[0].name,
+            "Runtime default: SearchReplace edit"
+        );
         assert_eq!(attempt.probes[0].status, CheckStatus::Failed);
         assert_eq!(attempt.probes[0].input_tokens, Some(1));
         assert_eq!(attempt.starting_digest, "digest-a");
