@@ -586,6 +586,8 @@ async fn run_inner(
     seen.insert(receipt.baseline_sha256.clone());
     let mut unproductive_searches = BTreeSet::new();
     let baseline_diagnostics = search::failed_checks_feedback(&receipt.baseline_checks);
+    let check_chars = search::check_feedback_chars(receipt.profile.context_tokens);
+    let baseline_detail = search::failed_checks_excerpt(&receipt.baseline_checks, check_chars);
     for number in 1..=receipt.request.budget.generations {
         if let Err(error) = observe_original_source(
             &repository,
@@ -768,6 +770,9 @@ async fn run_inner(
             .and_then(|candidate| candidate.content_sha256.clone())
             .unwrap_or_else(|| receipt.baseline_sha256.clone());
         let diagnostics = search::feedback(&receipt.candidates, &baseline_diagnostics);
+        // Edit prompts try this larger excerpt of the failed checks first and
+        // keep `diagnostics` for a source that does not fit beside it.
+        let detail = search::feedback_with(&receipt.candidates, &baseline_detail, check_chars);
         let verifier_diagnostics =
             search::verifier_feedback(&receipt.candidates, &baseline_diagnostics);
         let mut strategy_note = None;
@@ -1057,9 +1062,13 @@ async fn run_inner(
                 capacity: receipt.profile.context_tokens,
                 output,
             };
-            context::whole_file(&edit_request, &parent, &system, model, &diagnostics, path)
-                .ok()
-                .map(|assembly| (system, assembly))
+            let fit = |feedback: &str| {
+                context::whole_file(&edit_request, &parent, &system, model, feedback, path).ok()
+            };
+            let assembly = fit(&detail)
+                .filter(|assembly| !assembly.evidence.feedback_omitted)
+                .or_else(|| fit(&diagnostics));
+            assembly.map(|assembly| (system, assembly))
         });
         if whole_file_assembly.is_none() {
             // ponytail: the retry's parent stays; restoring the controller's
@@ -1075,33 +1084,40 @@ async fn run_inner(
         let (system, assembly_result) = if let Some((system, assembly)) = whole_file_assembly {
             (system, Ok(assembly))
         } else {
-            let assembly = context::assemble_with_evidence(
-                &edit_request,
-                &parent,
-                &system,
-                context::ModelContext {
-                    protocol: receipt
-                        .profile
-                        .protocol
-                        .ok_or_else(|| invalid("Missing measured protocol"))?,
-                    capacity: receipt
-                        .profile
-                        .context_tokens
-                        .saturating_sub(strategy_reserve as u32),
-                    output,
-                },
-                context::EvidenceInput {
-                    feedback: &diagnostics,
-                    verifier: &verifier_diagnostics,
-                    focus_path: if repairing_created_file {
-                        receipt.request.new_file.as_deref()
-                    } else {
-                        None
+            let model = context::ModelContext {
+                protocol: receipt
+                    .profile
+                    .protocol
+                    .ok_or_else(|| invalid("Missing measured protocol"))?,
+                capacity: receipt
+                    .profile
+                    .context_tokens
+                    .saturating_sub(strategy_reserve as u32),
+                output,
+            };
+            let assemble = |feedback: &str| {
+                context::assemble_with_evidence(
+                    &edit_request,
+                    &parent,
+                    &system,
+                    model,
+                    context::EvidenceInput {
+                        feedback,
+                        verifier: &verifier_diagnostics,
+                        focus_path: if repairing_created_file {
+                            receipt.request.new_file.as_deref()
+                        } else {
+                            None
+                        },
                     },
-                },
-                false,
-                excluded_searches,
-            );
+                    false,
+                    excluded_searches,
+                )
+            };
+            let assembly = match assemble(&detail) {
+                Ok(assembly) if assembly.evidence.feedback_omitted => assemble(&diagnostics),
+                result => result,
+            };
             (system, assembly)
         };
         let mut assembly = match assembly_result {

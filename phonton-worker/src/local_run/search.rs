@@ -522,8 +522,20 @@ pub(super) fn next(candidates: &[CandidateEvidence]) -> SearchDecision {
         "Rejected edit did not produce a checkable change; revise it without altering the source scope")
 }
 
-fn failures(candidate: &CandidateEvidence) -> String {
-    failed_checks_feedback(&candidate.checks)
+fn failures(candidate: &CandidateEvidence, chars: usize) -> String {
+    failed_checks_excerpt(&candidate.checks, chars)
+}
+
+/// Characters of failed check output kept for retrieval anchors, and for a
+/// prompt whose source does not fit beside the detailed excerpt.
+const COMPACT_CHECK_CHARS: usize = 450;
+
+/// Characters of failed check output an edit prompt tries first: one per four
+/// tokens of calibrated context, at most 4,000. At 16,384 tokens the compact
+/// excerpt held one traceback of a ten-test failure, and repairs by a 4B model
+/// passed 1 time in 25 (Polyglot slice, 2026-11-11).
+pub(super) fn check_feedback_chars(context_tokens: u32) -> usize {
+    (context_tokens as usize / 4).clamp(COMPACT_CHECK_CHARS, 4000)
 }
 
 fn feedback_output_excerpt(text: &str, max: usize) -> String {
@@ -549,6 +561,11 @@ fn feedback_output_excerpt(text: &str, max: usize) -> String {
 }
 
 pub(super) fn failed_checks_feedback(checks: &[CheckEvidence]) -> String {
+    failed_checks_excerpt(checks, COMPACT_CHECK_CHARS)
+}
+
+/// The failed checks' output in `chars` characters, shared between them.
+pub(super) fn failed_checks_excerpt(checks: &[CheckEvidence], chars: usize) -> String {
     let failed: Vec<_> = checks
         .iter()
         .filter(|c| c.status == CheckStatus::Failed)
@@ -558,7 +575,7 @@ pub(super) fn failed_checks_feedback(checks: &[CheckEvidence]) -> String {
     }
     // Retain both output streams independently. Concatenating first can hide
     // a useful stdout tail inside the omitted middle of verbose stderr.
-    let available = 450usize.saturating_sub(failed.len().saturating_sub(1));
+    let available = chars.saturating_sub(failed.len().saturating_sub(1));
     let per_check = available / failed.len();
     let remainder = available % failed.len();
     failed
@@ -753,6 +770,15 @@ fn comparison_output(output: &str, directory: &std::path::Path) -> String {
 /// Retain the rejected edit as well as its outcome; a failure label alone cannot
 /// explain what the next generation must improve. All content remains untrusted.
 pub(super) fn feedback(candidates: &[CandidateEvidence], baseline: &str) -> String {
+    feedback_with(candidates, baseline, COMPACT_CHECK_CHARS)
+}
+
+/// `feedback` with `check_chars` characters of failed check output.
+pub(super) fn feedback_with(
+    candidates: &[CandidateEvidence],
+    baseline: &str,
+    check_chars: usize,
+) -> String {
     let Some(last) = candidates.last() else {
         return baseline.into();
     };
@@ -781,7 +807,7 @@ pub(super) fn feedback(candidates: &[CandidateEvidence], baseline: &str) -> Stri
         sections.push(format!(
             "Check evidence from candidate {} (data):\n{}",
             checked.number,
-            failures(checked)
+            failures(checked, check_chars)
         ));
     } else if !baseline.is_empty() {
         sections.push(format!("Baseline check evidence (data):\n{}", baseline));
@@ -798,7 +824,7 @@ pub(super) fn feedback(candidates: &[CandidateEvidence], baseline: &str) -> Stri
             super::truncate(&c.raw_output, 350)
         ));
     }
-    super::truncate(&sections.join("\n"), 1400)
+    super::truncate(&sections.join("\n"), 950 + check_chars)
 }
 
 /// Only executed check output may provide verifier context anchors.
@@ -812,8 +838,8 @@ pub(super) fn verifier_feedback(candidates: &[CandidateEvidence], baseline: &str
                 .iter()
                 .any(|check| check.status == CheckStatus::Failed)
         })
-        .map(failures)
-        .unwrap_or_else(|| super::truncate(baseline, 450))
+        .map(|candidate| failures(candidate, COMPACT_CHECK_CHARS))
+        .unwrap_or_else(|| super::truncate(baseline, COMPACT_CHECK_CHARS))
 }
 
 #[cfg(test)]
@@ -1433,6 +1459,42 @@ mod tests {
             assert!(excerpt.contains("warning: package cache unavailable"));
         }
         assert!(verifier.len() <= 450);
+    }
+    #[test]
+    fn detailed_feedback_shows_failures_the_compact_excerpt_drops() {
+        assert_eq!(check_feedback_chars(1024), 450);
+        assert_eq!(check_feedback_chars(4096), 1024);
+        assert_eq!(check_feedback_chars(16_384), 4000);
+        // Ten failing tests of about 300 characters each, as a unittest run prints them.
+        let output: String = (1..=10)
+            .map(|n| {
+                format!(
+                    "FAIL: test_case_{n}\n{}\nAssertionError: case {n}\n",
+                    "-".repeat(260)
+                )
+            })
+            .collect();
+        let candidate = failed(1, None, &output);
+        let compact = feedback(std::slice::from_ref(&candidate), "");
+        assert!(compact.contains("AssertionError: case 10"));
+        assert!(!compact.contains("AssertionError: case 5"));
+        let detailed = feedback_with(
+            std::slice::from_ref(&candidate),
+            "",
+            check_feedback_chars(16_384),
+        );
+        for n in 1..=10 {
+            assert!(
+                detailed.contains(&format!("AssertionError: case {n}\n")),
+                "{n}"
+            );
+        }
+        assert!(detailed.len() <= 4950);
+        // No candidate yet: the baseline excerpt is the feedback, at either size.
+        let baseline = failed_checks_excerpt(&candidate.checks, 4000);
+        assert!(baseline.contains("AssertionError: case 1\n"));
+        assert_eq!(feedback_with(&[], &baseline, 4000), baseline);
+        assert!(failed_checks_feedback(&candidate.checks).len() <= 450);
     }
     #[test]
     fn four_verbose_failures_keep_each_stream_tail() {
