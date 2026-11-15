@@ -407,12 +407,19 @@ candidate passes. A host-approved request needs enough slots for one complete
 baseline and one complete candidate pass: twice the total of selected checks
 and any offline dependency-preparation command. A smaller explicit budget is
 shown as a plan warning and refused before host checks run.
+A reviewed plan with one editable path and an implicit budget reserves 8
+model calls and up to 16,384 output tokens (one calibrated response per call),
+and raises the check reserve to cover those calls, up to 32 launches. A failed
+first attempt then leaves room for repairs and a restart; the 600-second wall
+budget still bounds the run.
 When a selected model uses SearchReplace, each model response edits one path.
 Reviewed plans with an implicit budget reserve at least one call per editable
 path and scale check/output reserves up to the worker caps. The displayed plan
 warns about caps and the lack of repair slack; it does not promise that every
-path will be edited. Explicit budgets submitted for plan review are preserved
-and warned about when they cannot cover even a straight sequence.
+path will be edited. A plan with several editable paths on a unified-diff
+model keeps its four calls, with an output reserve of one calibrated response
+per call, up to 16,384 tokens. Explicit budgets submitted for plan review are
+preserved and warned about when they cannot cover even a straight sequence.
 The original Git index is captured separately before checks. Its resolved path
 and exact byte hash are compared before each generation and at final review.
 Changes or unavailable observations stop the run and clear candidate selection;
@@ -428,7 +435,11 @@ fresh baseline approach unless another selected check newly passes. Losing a
 pass without either signal also restarts. If a check gains a pass, or a
 different selected check now fails with the same message, the controller keeps
 that changed candidate for another repair. Feedback includes the
-rejected edit and bounded check output. The most recent failed checks precede
+rejected edit and the output of the failed checks: a quarter of the calibrated
+context in characters, between 450 and 4,000, shared between the failed checks
+and keeping the start and the end of each stream. When that much does not fit
+beside the source, the 450-character excerpt is sent instead. The most recent
+failed checks precede
 copied edits so they survive tight context limits; uncheckable proposals retain
 that evidence with its candidate identity (or baseline evidence if none ran).
 A reply whose raw output repeats an earlier one in the run byte for byte is
@@ -437,11 +448,17 @@ then on every strategy and edit call in that run samples at temperature 0.7
 with the candidate number as seed (recorded as the candidate's `sampling`);
 until then calls stay at the calibrated temperature 0. Two successive repeated
 outputs or candidate identities stop further inference.
-When a search/replace reply changes nothing and its file has at most 300 lines,
-the next edit from the same parent shows that file whole and asks for the
-complete corrected file in the whole-file JSON shape used for new files. This
-happens once per branch, and only when the file and an output reserve that can
-hold it fit the calibrated context; otherwise the ordinary edit runs.
+A search/replace reply changes one span, so a file that needs several changes
+took one model call per change. When the scope is one existing file of at most
+300 lines and the model uses SearchReplace, the first edit and every repair
+show that file whole and ask for the complete corrected file in the whole-file
+JSON shape used for new files. A restart keeps its span edit, anchored to the
+strategy's source span. In a larger scope, when a search/replace reply changes
+nothing and its file has at most 300 lines, the next edit from the same parent
+is a whole-file edit, once per branch. Either way the whole-file edit runs only
+when the file and an output reserve that can hold it fit the calibrated
+context; otherwise the ordinary edit runs. The candidate is still reviewed as
+a diff against the captured source.
 Different diagnostics are a search signal,
 not proof that code quality improved. Every branch uses the same run budget.
 Feedback is shortened when necessary to admit source; the exact transmitted
