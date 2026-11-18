@@ -1227,6 +1227,15 @@ async fn run_inner(
                             phonton_local::runtime::edit_schema(&assembly.paths, &assembly.searches)
                         };
                         assembly.evidence.constraint_bytes = serde_json::to_vec(&schema)?.len();
+                        // The edit may use only its bound choice, which can
+                        // be the whole symbol around a one-line anchor, so
+                        // the returned edit is checked against that choice.
+                        if let Some(bound) = assembly.searches.first() {
+                            if search.as_ref() != Some(bound) {
+                                decision.reason.push_str("; the strategy's source anchor is inside a larger edit choice, so the edit was bound to that choice");
+                                strategy_anchor = Some((path.clone(), Some(bound.clone())));
+                            }
+                        }
                     }
                 }
                 Err(detail) => {
@@ -9940,11 +9949,12 @@ mod tests {
         (endpoint, done_tx, server)
     }
 
-    /// A Git repository whose `value()` returns 1 while its test expects 2.
-    fn value_fixture(root: &Path) -> PathBuf {
+    /// A Git repository whose `app.py` is `app`, a `value()` that returns 1,
+    /// while its test expects 2.
+    fn value_fixture(root: &Path, app: &str) -> PathBuf {
         let repository = root.join("repository");
         std::fs::create_dir(&repository).unwrap();
-        std::fs::write(repository.join("app.py"), "def value():\n    return 1\n").unwrap();
+        std::fs::write(repository.join("app.py"), app).unwrap();
         std::fs::write(repository.join("test_app.py"), "import unittest\nfrom app import value\n\nclass TestApp(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(value(), 2)\n").unwrap();
         for args in [
             &["init", "--quiet"][..],
@@ -10007,7 +10017,7 @@ mod tests {
             })
             .await;
             let root = tempfile::tempdir().unwrap();
-            let repository = value_fixture(root.path());
+            let repository = value_fixture(root.path(), "def value():\n    return 1\n");
             let mut request = request();
             request.goal = "Make value return 2".into();
             request.repository = repository.clone();
@@ -10131,7 +10141,7 @@ mod tests {
         })
         .await;
         let root = tempfile::tempdir().unwrap();
-        let repository = value_fixture(root.path());
+        let repository = value_fixture(root.path(), "def value():\n    return 1\n");
         let mut request = request();
         request.goal = "Make value return 2".into();
         request.repository = repository;
@@ -10195,6 +10205,110 @@ mod tests {
         assert_eq!(receipt.state, "review_ready", "{receipt:?}");
         assert_eq!(receipt.selected_candidate, Some(4));
         assert_eq!(receipt.generated_tokens_reserved, 400);
+    }
+    #[tokio::test]
+    async fn restart_line_anchor_inside_a_symbol_choice_binds_to_that_symbol() {
+        use phonton_types::local::ModelProbe;
+
+        // The 230-byte function is one choice at the edit's 512-token limit
+        // but separate lines at the strategy's 192. The strategy picks the
+        // return line, which the restart edit no longer offers on its own.
+        const APP: &str = "def value():\n    # Callers compare against this number, so it lives in one place.\n    # Keep it a plain literal: no lookups, no side effects, no I/O.\n    # The unit test in test_app.py pins the number callers expect.\n    return 1\n";
+        let (endpoint, done_tx, server) = fixture_runtime(|input, earlier| {
+            let answer = |content: serde_json::Value| serde_json::json!({"message":{"content":content.to_string()},"done":true,"prompt_eval_count":40,"eval_count":40});
+            if earlier == 0 {
+                return serde_json::json!({"message":{"content":"{\"path\":\"app.py\""},"done":true,"done_reason":"length","prompt_eval_count":40,"eval_count":input["options"]["num_predict"]});
+            }
+            let properties = &input["format"]["properties"];
+            if properties["mechanism"].is_object() {
+                return answer(serde_json::json!({"path":"app.py","search":"    return 1","mechanism":"Use a literal two as the return value","difference":"Edits only the single return line"}));
+            }
+            let choice = properties["search"]["enum"][0].as_str().unwrap_or_default();
+            answer(serde_json::json!({"path":"app.py","search":choice,"text":choice.replace("return 1", "return 2")}))
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let repository = value_fixture(root.path(), APP);
+        let mut request = request();
+        request.goal = "Make value return 2".into();
+        request.repository = repository.clone();
+        request.files = vec!["app.py".into()];
+        request.checks = vec![LocalCheck {
+            program: "python".into(),
+            args: vec!["-m".into(), "unittest".into(), "discover".into()],
+        }];
+        request.approve_host_execution = true;
+        request.budget.generations = 4;
+        request.budget.check_runs = 3;
+        request.budget.wall_seconds = 60;
+        request.budget.generated_tokens = 2048;
+        let profile = ModelProfile {
+            schema: 2,
+            model: "fixture:small".into(),
+            digest: "fixture-digest".into(),
+            runtime_version: "fixture-version".into(),
+            endpoint: endpoint.clone(),
+            context_tokens: 4096,
+            output_tokens: 512,
+            protocol: Some(EditProtocol::SearchReplace),
+            thinking: Some(phonton_types::local::LocalThinkingMode::Off),
+            probes: vec![ModelProbe {
+                name: "SearchReplace edit".into(),
+                status: CheckStatus::Passed,
+                output: String::new(),
+                detail: "fixture transport".into(),
+                input_tokens: None,
+                output_tokens: None,
+                elapsed_ms: 0,
+            }],
+            hardware: HardwareSnapshot::default(),
+            measured_at_unix: 0,
+        };
+        let hardware = HardwareSnapshot {
+            ram_total_bytes: Some(16 * 1024 * 1024 * 1024),
+            ram_available_bytes: Some(8 * 1024 * 1024 * 1024),
+            ..HardwareSnapshot::default()
+        };
+        let run_dir = root.path().join("44444444-4444-4444-8444-444444444444");
+        let result = run_inner(
+            request,
+            profile,
+            RuntimeGuard::external_unverified(endpoint),
+            &run_dir,
+            |_| {},
+            Some(fixed_hardware(hardware)),
+        )
+        .await;
+        let _ = done_tx.send(());
+        let chats = server.await.unwrap();
+        let receipt = result.unwrap();
+        let choices = |chat: &serde_json::Value| -> Vec<String> {
+            chat["format"]["properties"]["search"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|choice| choice.as_str().map(str::to_owned))
+                .collect()
+        };
+        let function = APP.trim_end();
+        assert_eq!(chats.len(), 3, "{receipt:?}");
+        assert_eq!(chats[1]["options"]["num_predict"], 192);
+        assert!(choices(&chats[1]).contains(&"    return 1".to_owned()));
+        assert!(!choices(&chats[1]).contains(&function.to_owned()));
+        assert_eq!(chats[2]["options"]["num_predict"], 512);
+        assert_eq!(choices(&chats[2]), [function]);
+        assert_eq!(receipt.state, "review_ready", "{receipt:?}");
+        assert_eq!(receipt.hypotheses[0].status, HypothesisStatus::Accepted);
+        assert_eq!(receipt.selected_candidate, Some(2));
+        let reason = &receipt.candidates[1].decision.as_ref().unwrap().reason;
+        assert!(
+            reason.contains("the edit was bound to that choice"),
+            "{reason}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("app.py")).unwrap(),
+            APP
+        );
     }
     #[tokio::test]
     async fn offline_npm_setup_is_not_a_verification_pass_without_execution() {

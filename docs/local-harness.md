@@ -715,8 +715,13 @@ and following edit each reserve one of the same `generations` model-attempt
 budget, even if admission later stops a chat request; the
 strategy is a proposal, and only the resulting candidate bytes and fixed checks
 can justify review. The edit's actual returned path and source anchor are
-checked before materialization. An interrupted strategy remains pending evidence, not a
-candidate.
+checked before materialization. The edit call usually has a larger output
+limit than the strategy call, so a small symbol the strategy saw as separate
+lines can be one whole-symbol choice in the edit prompt. A one-line anchor
+inside such a symbol binds the edit to the smallest choice that contains it,
+and the candidate's decision reason says so. An anchor that no edit choice
+contains still ends the search. An interrupted strategy remains pending
+evidence, not a candidate.
 Cancellation retains evidence. Reopening an unfinished receipt labels it
 interrupted; it does not silently resume or mark it complete. Inspect the selected
 candidate and its diff before applying it.

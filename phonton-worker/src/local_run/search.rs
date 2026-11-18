@@ -87,11 +87,17 @@ pub(super) fn bound_edit_choices(
         return Ok((vec![path.into()], Vec::new()));
     }
     let search = search.ok_or("Strategy has no source anchor")?;
-    if !searches.iter().any(|allowed| allowed == search) {
-        return Err("Strategy source anchor was omitted from the edit choices".into());
-    }
+    // The edit call's larger output limit can turn the symbol around a
+    // one-line strategy anchor into one whole-block choice. Both are unique
+    // in the source, so the smallest choice containing the anchor is the
+    // anchor itself or the tightest block around it.
+    let bound = searches
+        .iter()
+        .filter(|allowed| allowed.contains(search))
+        .min_by_key(|allowed| allowed.len())
+        .ok_or("Strategy source anchor was omitted from the edit choices")?;
     let constrained = if protocol == EditProtocol::SearchReplace {
-        vec![search.into()]
+        vec![bound.clone()]
     } else {
         Vec::new()
     };
@@ -1128,6 +1134,36 @@ mod tests {
             &searches,
         )
         .is_err());
+    }
+    #[test]
+    fn restart_line_anchor_binds_to_the_smallest_block_choice_around_it() {
+        let paths = vec!["src/stock.ts".into()];
+        let searches = vec![
+            "class Stock {\n  restock(n) {\n    this.n += n;\n  }\n}".into(),
+            "  restock(n) {\n    this.n += n;\n  }".into(),
+            "export const unit = 1;".into(),
+        ];
+        let bind = |search, protocol| {
+            bound_edit_choices(
+                "src/stock.ts",
+                Some(search),
+                false,
+                protocol,
+                &paths,
+                &searches,
+            )
+        };
+        let (_, bound) = bind("class Stock {", EditProtocol::SearchReplace).unwrap();
+        assert_eq!(bound, [searches[0].clone()]);
+        let (_, bound) = bind("    this.n += n;", EditProtocol::SearchReplace).unwrap();
+        assert_eq!(bound, [searches[1].clone()]);
+        let (_, bound) = bind("export const unit = 1;", EditProtocol::SearchReplace).unwrap();
+        assert_eq!(bound, ["export const unit = 1;"]);
+        let (_, bound) = bind("class Stock {", EditProtocol::UnifiedDiff).unwrap();
+        assert!(bound.is_empty());
+        assert!(bind("class Order {", EditProtocol::SearchReplace)
+            .unwrap_err()
+            .contains("omitted from the edit choices"));
     }
     #[test]
     fn restart_checks_actual_edit_even_if_runtime_ignores_schema() {
