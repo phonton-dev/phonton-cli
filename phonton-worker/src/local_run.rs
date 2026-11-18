@@ -9825,9 +9825,9 @@ mod tests {
             assert_eq!(chats, selected_number, "{paths:?}");
             assert_eq!(receipt.model_calls_reserved, selected_number);
             if large_context_budget {
-                // The 2,048-token creation reply reported 1,500 tokens and the
-                // 1,298-token edit 50; each is charged its reported count.
-                assert_eq!(receipt.generated_tokens_reserved, 1550);
+                // Both replies reported 50 output tokens, and each call is
+                // charged that instead of its 2,048- or 2,023-token limit.
+                assert_eq!(receipt.generated_tokens_reserved, 100);
             }
             assert_eq!(receipt.baseline_checks[0].status, CheckStatus::Failed);
             assert_eq!(
