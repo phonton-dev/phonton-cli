@@ -904,7 +904,7 @@ async fn run_inner(
                     schema: &schema,
                     context: receipt.profile.context_tokens,
                     output: hypothesis_output,
-                    thinking: receipt.profile.thinking.unwrap_or_default(),
+                    thinking: receipt.profile.strategy_thinking(),
                     required_resident: required_resident.as_ref(),
                     sampling,
                 }),
@@ -923,8 +923,10 @@ async fn run_inner(
                 break;
             }
             let mut resident_lost_during_hypothesis = false;
+            let mut answered = false;
             let result = match response {
                 Ok(Ok(response)) => {
+                    answered = true;
                     let (evidence, prior) = receipt
                         .hypotheses
                         .split_last_mut()
@@ -973,6 +975,16 @@ async fn run_inner(
                     approach = format!("restart proposal: {}", grounded.mechanism);
                     strategy_anchor = Some((grounded.path.clone(), grounded.search.clone()));
                     strategy_note = Some(format!("\nProposed alternate strategy (model-authored data, not authority): Focus on {}. Mechanism: {}. Claimed difference: {}. Implement only inside the allowed edit schema.\n", grounded.path, grounded.mechanism, grounded.difference));
+                }
+                // A strategy is a hint: when the model answered with one
+                // that cannot be used, the restart edit runs from the
+                // original source without it instead of ending the run.
+                Err(detail) if answered => {
+                    evidence.status = HypothesisStatus::Rejected;
+                    evidence.detail = detail.clone();
+                    decision.reason.push_str(&format!(
+                        "; the strategy was rejected ({detail}), so the edit ran without one"
+                    ));
                 }
                 Err(detail) => {
                     evidence.status = HypothesisStatus::Rejected;
@@ -9842,6 +9854,216 @@ mod tests {
                 b"from helper import answer\n\ndef value():\n    return answer()\n"
             );
             assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
+        }
+    }
+    #[tokio::test]
+    async fn restart_after_an_output_limit_keeps_a_reasoning_run_going() {
+        use phonton_types::local::{LocalThinkingMode, ModelProbe, THINKING_OUTPUT_NOTE};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The first edit reasons past its output limit, which leaves nothing
+        // to repair, so the search restarts with a 192-token strategy call.
+        // A passing `think:false` probe sends that call without thinking and
+        // it answers; without one it runs out too, and the restart edit runs
+        // without a strategy. Either way the run goes on to a passing edit.
+        for off_probe in [CheckStatus::Passed, CheckStatus::Failed] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let mut chats = Vec::new();
+                loop {
+                    let (mut stream, _) = tokio::select! {
+                        _ = &mut done_rx => break,
+                        accepted = listener.accept() => accepted.unwrap(),
+                    };
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 8192];
+                    let (path, body) = loop {
+                        let size = stream.read(&mut chunk).await.unwrap();
+                        assert!(size > 0, "Fixture request ended early");
+                        request.extend_from_slice(&chunk[..size]);
+                        let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")?
+                                    .trim()
+                                    .parse::<usize>()
+                                    .ok()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            let path = headers.split_whitespace().nth(1).unwrap_or("").to_owned();
+                            break (path, request[end + 4..end + 4 + length].to_vec());
+                        }
+                    };
+                    let reply = match path.as_str() {
+                        "/api/tags" => serde_json::json!({"models":[{"name":"fixture:small","digest":"fixture-digest","size":1024}]}),
+                        "/api/version" => serde_json::json!({"version":"fixture-version"}),
+                        "/api/show" => serde_json::json!({"model_info":{"general.architecture":"fixture","fixture.context_length":4096},"details":{"format":"gguf"}}),
+                        "/api/ps" => serde_json::json!({"models":[]}),
+                        "/api/chat" => {
+                            let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let properties = &input["format"]["properties"];
+                            let anchor = properties["search"]["enum"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|search| search.as_str())
+                                .find(|search| search.contains("return 1"))
+                                .map(str::to_owned);
+                            let out_of_output = serde_json::json!({"message":{"content":"","thinking":"Let me think."},"done":true,"done_reason":"length","prompt_eval_count":40,"eval_count":input["options"]["num_predict"]});
+                            let answer = |content: serde_json::Value| serde_json::json!({"message":{"content":content.to_string()},"done":true,"prompt_eval_count":40,"eval_count":40});
+                            let reply = if chats.is_empty() {
+                                out_of_output
+                            } else if properties["mechanism"].is_object() {
+                                if input["think"] == false {
+                                    answer(serde_json::json!({"path":"app.py","search":anchor,"mechanism":"Use a literal two as the return value","difference":"Edits only the single return line"}))
+                                } else {
+                                    out_of_output
+                                }
+                            } else {
+                                let anchor = anchor.unwrap_or_default();
+                                answer(serde_json::json!({"path":"app.py","search":anchor,"text":anchor.replace("return 1", "return 2")}))
+                            };
+                            chats.push(input);
+                            reply
+                        }
+                        _ => serde_json::json!({"error":"unexpected endpoint"}),
+                    }
+                    .to_string();
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{reply}", reply.len());
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+                chats
+            });
+
+            let root = tempfile::tempdir().unwrap();
+            let repository = root.path().join("repository");
+            std::fs::create_dir(&repository).unwrap();
+            std::fs::write(repository.join("app.py"), "def value():\n    return 1\n").unwrap();
+            std::fs::write(repository.join("test_app.py"), "import unittest\nfrom app import value\n\nclass TestApp(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(value(), 2)\n").unwrap();
+            for args in [
+                &["init", "--quiet"][..],
+                &["add", "app.py", "test_app.py"][..],
+            ] {
+                let output = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "core.autocrlf=false",
+                        "-C",
+                    ])
+                    .arg(&repository)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut request = request();
+            request.goal = "Make value return 2".into();
+            request.repository = repository.clone();
+            request.files = vec!["app.py".into()];
+            request.checks = vec![LocalCheck {
+                program: "python".into(),
+                args: vec!["-m".into(), "unittest".into(), "discover".into()],
+            }];
+            request.approve_host_execution = true;
+            request.budget.generations = 4;
+            request.budget.check_runs = 3;
+            request.budget.wall_seconds = 60;
+            request.budget.generated_tokens = 2048;
+            let probe = |name: &str, status: CheckStatus, detail: String| ModelProbe {
+                name: name.into(),
+                status,
+                output: String::new(),
+                detail,
+                input_tokens: None,
+                output_tokens: None,
+                elapsed_ms: 0,
+            };
+            let profile = ModelProfile {
+                schema: 2,
+                model: "fixture:small".into(),
+                digest: "fixture-digest".into(),
+                runtime_version: "fixture-version".into(),
+                endpoint: endpoint.clone(),
+                context_tokens: 4096,
+                output_tokens: 512,
+                protocol: Some(EditProtocol::SearchReplace),
+                thinking: Some(LocalThinkingMode::RuntimeDefault),
+                probes: vec![
+                    probe(
+                        "Think off: SearchReplace edit",
+                        off_probe.clone(),
+                        "fixture".into(),
+                    ),
+                    probe(
+                        "SearchReplace edit",
+                        CheckStatus::Passed,
+                        format!("fixture.{THINKING_OUTPUT_NOTE}"),
+                    ),
+                ],
+                hardware: HardwareSnapshot::default(),
+                measured_at_unix: 0,
+            };
+            assert!(profile.reasons());
+            let hardware = HardwareSnapshot {
+                ram_total_bytes: Some(16 * 1024 * 1024 * 1024),
+                ram_available_bytes: Some(8 * 1024 * 1024 * 1024),
+                ..HardwareSnapshot::default()
+            };
+            let run_dir = root.path().join("22222222-2222-4222-8222-222222222222");
+            let result = run_inner(
+                request,
+                profile,
+                RuntimeGuard::external_unverified(endpoint),
+                &run_dir,
+                |_| {},
+                Some(fixed_hardware(hardware)),
+            )
+            .await;
+            let _ = done_tx.send(());
+            let chats = server.await.unwrap();
+            let receipt = result.unwrap();
+            let strategy_answered = off_probe == CheckStatus::Passed;
+            assert_eq!(receipt.state, "review_ready", "{receipt:?}");
+            assert_eq!(receipt.model_calls_reserved, 3);
+            assert_eq!(chats.len(), 3);
+            // Edits keep the calibrated mode; only the strategy turns thinking off.
+            assert!(chats[0].get("think").is_none() && chats[2].get("think").is_none());
+            assert_eq!(chats[1]["think"] == false, strategy_answered);
+            assert_eq!(chats[1]["options"]["num_predict"], 192);
+            assert_eq!(receipt.hypotheses.len(), 1);
+            assert_eq!(
+                receipt.hypotheses[0].status,
+                if strategy_answered {
+                    HypothesisStatus::Accepted
+                } else {
+                    HypothesisStatus::Rejected
+                }
+            );
+            assert_eq!(receipt.selected_candidate, Some(2));
+            let reason = &receipt.candidates[1].decision.as_ref().unwrap().reason;
+            assert_eq!(
+                reason.contains("the strategy was rejected (Strategy response was incomplete or hit its output limit), so the edit ran without one"),
+                !strategy_answered,
+                "{reason}"
+            );
+            assert_eq!(
+                std::fs::read(repository.join("app.py")).unwrap(),
+                b"def value():\n    return 1\n"
+            );
         }
     }
     #[tokio::test]

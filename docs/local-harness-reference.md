@@ -180,7 +180,9 @@ is saved in a schema-2 digest-bound profile and reused for tool-call probes,
 coding edits, and strategy requests. A profile in the runtime-default mode
 whose probes returned thinking output is treated as a model that reasons:
 its goals get the larger budget and the whole-file edits described in
-[local-harness.md](local-harness.md). A profile saved by 0.27.1 or earlier
+[local-harness.md](local-harness.md), and its restart strategy requests use
+`think:false` when its `think:false` probes passed, because a strategy has a
+192-token limit that reasoning uses up. A profile saved by 0.27.1 or earlier
 keeps its mode, usually `think:false`, until `phonton models calibrate MODEL`
 runs again. Older schema-1 profiles retain their
 original runtime-default request behavior until recalibrated. Probe
@@ -304,8 +306,10 @@ controller can retry directly from the captured baseline without a strategy
 call. A byte-identical repeated reply is resent once with seeded sampling,
 and two successive repeats stop; mixed new-file and existing-file work keeps
 its multi-call reserve.
-The same mechanism can be tried at a different reviewed path or source span;
-repeating it at the same target stops that branch.
+The same mechanism can be tried at a different reviewed path or source span.
+A strategy that repeats an accepted one at the same target, or that cannot be
+used for another reason, is recorded as rejected, and the edit runs from the
+captured baseline without it.
 Module-style JS/TS files use complete parsed function spans where they fit, and
 named failing-check evidence puts the relevant function first for the next edit.
 Original Git staging has separate integrity evidence, with changes stopping the run.

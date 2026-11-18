@@ -458,7 +458,8 @@ took one model call per change. When the scope is one existing file of at most
 100 lines and the model uses SearchReplace and reasons before it answers, the
 first edit and every repair show that file whole and ask for the complete
 corrected file in the whole-file JSON shape used for new files. A restart
-keeps its span edit, anchored to the strategy's source span. For any model,
+keeps its span edit, anchored to the strategy's source span when it has one.
+For any model,
 when a search/replace reply changes nothing and its file has at most 300
 lines, the next edit from the same parent is a whole-file edit, once per
 branch. Either way the whole-file edit runs only
@@ -699,7 +700,14 @@ existing parsers; it does not download an embedding model or call a remote servi
 After an unchanged repair or repeated candidate, a baseline restart uses a separate
 bounded model call to propose a strategy anchored to an exact reviewed source span.
 The receipt keeps its raw reply, selected anchor, claimed difference, context and
-token usage. A missing or repeated strategy stops that branch. The strategy
+token usage. A reply that cannot be used (cut off at its output limit, outside
+the reviewed paths and spans, a repeat of an accepted strategy at the same
+target, or otherwise malformed) is recorded as rejected, and the edit then runs
+from the original source without a strategy. A strategy call that fails, times
+out or loses the resident model ends the search. On a model that reasons, the
+strategy call sends `think:false` when the profile's `think:false` calibration
+probes passed, because reasoning would use up its 192-token limit before the
+answer. The strategy
 and following edit each reserve one of the same `generations` model-attempt
 budget, even if admission later stops a chat request; the
 strategy is a proposal, and only the resulting candidate bytes and fixed checks

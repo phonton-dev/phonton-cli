@@ -8,6 +8,17 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] A local goal on a model that reasons no longer stops after one model
+  call when the first reply runs out of output. The baseline restart that
+  follows asks for a strategy, a JSON answer of about 100 tokens under a
+  192-token limit, and the model's reasoning used up that limit every time:
+  14 of 14 strategy calls across four runs of 20 exercises. Each of those
+  goals ended with the rest of its calls unused. The strategy call now sends
+  `think:false` when the profile's `think:false` calibration probes passed.
+  A strategy the model answered but that cannot be used, because it was cut
+  off, points outside the reviewed source or repeats an accepted one, no
+  longer ends the goal either: the restart edit runs from the original
+  source without it, and the receipt records the strategy as rejected.
 - [fixed] The semantic index reads `.mjs`, `.cjs`, `.mts` and `.cts` files.
   It could parse them but never collected them, so a project written as ES
   modules had none of its own source in the index and a goal's first context
