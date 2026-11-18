@@ -1420,7 +1420,7 @@ impl LocalRuntime {
             saved.name = format!(
                 "{}: {}",
                 match thinking {
-                    LocalThinkingMode::Off => "Think off",
+                    LocalThinkingMode::Off => THINK_OFF_PROBE_PREFIX,
                     LocalThinkingMode::RuntimeDefault => "Runtime default",
                 },
                 saved.name
@@ -1467,7 +1467,7 @@ impl LocalRuntime {
                 )
                 .await?;
             if default.creation_protocol.is_some() || off.edit_protocol.is_none() {
-                off.prefix_probes("Think off");
+                off.prefix_probes(THINK_OFF_PROBE_PREFIX);
                 off.probes.extend(default.probes);
                 default.probes = off.probes;
                 (LocalThinkingMode::RuntimeDefault, default)

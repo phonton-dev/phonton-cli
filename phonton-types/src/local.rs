@@ -151,6 +151,11 @@ pub const DIFF_CREATION_PROBE_NAME: &str = "UnifiedDiff create";
 /// output beside the answer. [`ModelProfile::reasons`] reads it back.
 pub const THINKING_OUTPUT_NOTE: &str = " Runtime returned separate thinking output.";
 
+/// Name prefix of the `think:false` probes that a profile saved in the
+/// runtime-default mode keeps. [`ModelProfile::strategy_thinking`] reads it
+/// back.
+pub const THINK_OFF_PROBE_PREFIX: &str = "Think off";
+
 /// Editing wire protocol demonstrated by a compatibility probe.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +246,22 @@ impl ModelProfile {
                 .probes
                 .iter()
                 .any(|probe| probe.detail.contains(THINKING_OUTPUT_NOTE))
+    }
+
+    /// Thinking mode for a restart strategy: a JSON answer of about 100
+    /// tokens under a 192-token limit, which a model that reasons uses up
+    /// before it answers. Such a profile asks with `think:false` when one of
+    /// its `think:false` calibration probes passed; any other profile keeps
+    /// its own mode.
+    pub fn strategy_thinking(&self) -> LocalThinkingMode {
+        let off_answered = self.probes.iter().any(|probe| {
+            probe.name.starts_with(THINK_OFF_PROBE_PREFIX) && probe.status == CheckStatus::Passed
+        });
+        if self.reasons() && off_answered {
+            LocalThinkingMode::Off
+        } else {
+            self.thinking.unwrap_or_default()
+        }
     }
 
     /// Keep absent probes on older profiles distinct from measured success.
