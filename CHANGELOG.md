@@ -11,13 +11,12 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 - [fixed] The later model calls of a local goal no longer run short of
   output after short replies. Each call was charged its whole output limit
   even when the model wrote far less, and each call keeps half of what is
-  left for later ones, so calls 5 to 8 of an 8-call goal got 1,024, 512, 256
-  and 256 tokens. In a laptop run of 20 exercises with `qwen3.5:4b`, edits
-  that finished wrote a median of 1,057 output tokens, half of them between
-  about 880 and 1,310, and three of the four goals that failed ended with
-  their last calls cut off at 256 to 512 tokens. A call is now charged the
-  output tokens the runtime reports once it answers, and a reply without a
-  count stays charged its whole limit. The receipt's
+  left for later ones, so the four calls of a goal with the default
+  4,096-token budget got 2,048, 1,024, 512 and 512 tokens however short the
+  replies were. In a CI run of 36 goals with `qwen2.5-coder:3b`, the calls
+  were charged 120,160 output tokens and the runtime reported 29,353. A call
+  is now charged the output tokens the runtime reports once it answers, and
+  a reply without a count stays charged its whole limit. The receipt's
   `generated_tokens_reserved` total follows the same rule.
 - [fixed] A restart edit no longer stops when its strategy's one-line source
   anchor sits inside a small symbol that the edit prompt offers as one
@@ -67,13 +66,14 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
   again. Calibrating a model that reasons takes longer, because its probes
   reason too, and its goals take longer per call.
 - [changed] On a model that reasons before it answers, a local goal with one
-  editable path and no explicit budget reserves 8 model calls and up to
-  16,384 output tokens, instead of 4 calls and 4,096 tokens. The earlier
-  budget stopped a run after four calls, well inside its 600-second limit,
-  and cut the later calls to 512 output tokens, which the reasoning used up.
-  A multi-path goal on a unified-diff model keeps four calls and gets one
-  calibrated response of output per call. Other models and explicit budgets
-  are unchanged.
+  editable path and no explicit budget reserves one calibrated response of
+  output for each of its 4 model calls, up to 16,384 tokens, instead of
+  4,096 tokens in all. The smaller reserve cut the later calls to 512 output
+  tokens, which the reasoning used up. A multi-path goal on a unified-diff
+  model gets the same reserve. Other models and explicit budgets are
+  unchanged. More calls did not help: in eight laptop runs of `qwen3.5:4b`
+  with 8 calls, 1 of the 75 goals that found a passing candidate needed a
+  fifth call, and a failing goal ran for up to 346 seconds.
 - [changed] On a model that reasons before it answers, when a local goal's
   scope is one existing file of at most 100 lines and the model uses
   search/replace, the first edit and every repair ask for the complete

@@ -412,13 +412,13 @@ and any offline dependency-preparation command. A smaller explicit budget is
 shown as a plan warning and refused before host checks run.
 On a model that reasons before it answers (a calibrated profile in the
 runtime's own thinking mode whose probes returned thinking output), a reviewed
-plan with one editable path and an implicit budget reserves 8 model calls and
-up to 16,384 output tokens (one calibrated response per call), and raises the
-check reserve to cover those calls, up to 32 launches. Reasoning then leaves
-room for the edit, and a failed first attempt for repairs and a restart; the
-600-second wall budget still bounds the run. Other models keep 4 calls and
-4,096 tokens: without reasoning the larger reserve only lengthens a reply
-that runs to its output limit.
+plan with one editable path and an implicit budget keeps its 4 model calls and
+reserves one calibrated response of output for each, up to 16,384 tokens, and
+keeps enough check launches for a baseline and 4 candidates, up to 32.
+Reasoning then leaves room for the edit in every call, a repair or a restart
+included; the 600-second wall budget still bounds the run. Other models keep
+4 calls and 4,096 tokens: without reasoning the larger reserve only lengthens
+a reply that runs to its output limit.
 When a selected model uses SearchReplace, each model response edits one path.
 Reviewed plans with an implicit budget reserve at least one call per editable
 path and scale check/output reserves up to the worker caps. The displayed plan

@@ -840,13 +840,11 @@ fn adjust_reviewed_plan_budget(
     // that ran to an 8,192-token limit used up the whole wall budget.
     let reasons = selection.is_some_and(|selected| selected.reasons);
     if editable <= 1 {
-        // A one-path goal stopped after 4 calls, at a median 41 s of its
-        // 600 s wall budget, with later calls cut to 512 output tokens.
-        // Give repairs and restarts the worker's caps; the wall clock still
-        // bounds the run.
+        // A one-path goal keeps its 4 calls and gets one calibrated response
+        // of output for each. With 8 calls, 1 of 75 laptop passes came after
+        // the fourth call, and a failing goal ran up to 346 s of its 600 s.
         if !explicit_budget && reasons {
             let budget = &mut plan.request.budget;
-            budget.generations = budget.generations.max(8);
             let checks = (budget.generations + 1).saturating_mul(checks_per_candidate);
             budget.check_runs = budget.check_runs.max(checks.min(32));
             let tokens = u64::from(per_call).saturating_mul(u64::from(budget.generations));
@@ -1922,7 +1920,10 @@ mod tests {
             reasons: false,
             profile_sha256: "fixture".into(),
         };
-        let reasoning = ReviewedModelSelection {
+        // A model that reasons, calibrated as on a 16 GB laptop.
+        let laptop = ReviewedModelSelection {
+            context_tokens: 16_384,
+            output_tokens: 4096,
             reasons: true,
             ..selection.clone()
         };
@@ -1967,22 +1968,33 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("above the 32-slot cap")));
 
-        // A one-path goal gets room to reason only on a model that reasons.
+        // A one-path goal gets room to reason only on a model that reasons:
+        // its 4 calls get one calibrated response of output each.
         let mut one = make_plan(1, 1);
-        adjust_reviewed_plan_budget(&mut one, Some(&reasoning), false);
-        assert_eq!(one.request.budget.generations, 8);
+        adjust_reviewed_plan_budget(&mut one, Some(&laptop), false);
+        assert_eq!(one.request.budget.generations, 4);
         assert_eq!(one.request.budget.check_runs, 16);
-        assert_eq!(one.request.budget.generated_tokens, 8192);
+        assert_eq!(one.request.budget.generated_tokens, 16_384);
         assert_eq!(one.request.budget.wall_seconds, 600);
         assert!(one.warnings.is_empty());
 
+        // The check reserve covers a baseline and 4 candidates.
+        let mut one_checked = make_plan(1, 4);
+        adjust_reviewed_plan_budget(&mut one_checked, Some(&laptop), false);
+        assert_eq!(one_checked.request.budget.generations, 4);
+        assert_eq!(one_checked.request.budget.check_runs, 20);
+
+        let laptop_plain = ReviewedModelSelection {
+            reasons: false,
+            ..laptop.clone()
+        };
         let mut one_plain = make_plan(1, 1);
-        adjust_reviewed_plan_budget(&mut one_plain, Some(&selection), false);
+        adjust_reviewed_plan_budget(&mut one_plain, Some(&laptop_plain), false);
         assert_eq!(one_plain.request.budget.generations, 4);
         assert_eq!(one_plain.request.budget.generated_tokens, 4096);
 
         let mut one_explicit = make_plan(1, 1);
-        adjust_reviewed_plan_budget(&mut one_explicit, Some(&reasoning), true);
+        adjust_reviewed_plan_budget(&mut one_explicit, Some(&laptop), true);
         assert_eq!(one_explicit.request.budget.generations, 4);
         assert_eq!(one_explicit.request.budget.generated_tokens, 4096);
 
