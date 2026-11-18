@@ -200,7 +200,10 @@ The small probe output caps do not set the ceiling for a coding goal. The
 saved profile allows up to one quarter of its calibrated context for one
 complete edit or new-file response, then the shared goal budget can reduce
 that reservation. The worker keeps half the remaining token budget for a
-later permitted model call. This is a context-based allowance, not measured
+later permitted model call. A call is charged its whole limit while it runs,
+then the output tokens the runtime reports once it answers, so a short reply
+leaves the rest for later calls; a reply without a count stays charged its
+limit. This is a context-based allowance, not measured
 model generation capacity. A truncated runtime response is still rejected.
 Previously saved profiles retain their smaller ceiling until recalibrated.
 If neither edit format passes, calibration still saves and prints the raw probe
@@ -712,8 +715,13 @@ and following edit each reserve one of the same `generations` model-attempt
 budget, even if admission later stops a chat request; the
 strategy is a proposal, and only the resulting candidate bytes and fixed checks
 can justify review. The edit's actual returned path and source anchor are
-checked before materialization. An interrupted strategy remains pending evidence, not a
-candidate.
+checked before materialization. The edit call usually has a larger output
+limit than the strategy call, so a small symbol the strategy saw as separate
+lines can be one whole-symbol choice in the edit prompt. A one-line anchor
+inside such a symbol binds the edit to the smallest choice that contains it,
+and the candidate's decision reason says so. An anchor that no edit choice
+contains still ends the search. An interrupted strategy remains pending
+evidence, not a candidate.
 Cancellation retains evidence. Reopening an unfinished receipt labels it
 interrupted; it does not silently resume or mark it complete. Inspect the selected
 candidate and its diff before applying it.
