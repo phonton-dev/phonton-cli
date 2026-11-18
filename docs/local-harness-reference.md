@@ -165,7 +165,9 @@ creation probe and 256 for the tool-call probe, or a quarter of the context
 (at most 2,048) when the model may think first. For coding goals, the saved profile
 reserves up to one quarter of that context for each complete edit response;
 the goal's shared token budget can reduce it further. When later attempts are
-allowed, the runner keeps half the remaining token budget for them. This is a
+allowed, the runner keeps half the remaining token budget for them. Each call
+is charged the output tokens the runtime reports once it answers, not its
+whole limit; a reply without a count stays charged its limit. This is a
 generation allowance, not a measured claim that the model can produce a file
 of that size. Existing profiles keep their saved ceiling until recalibrated.
 Calibration first requests `think:false` so a thinking model can spend the

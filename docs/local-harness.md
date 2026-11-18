@@ -200,7 +200,10 @@ The small probe output caps do not set the ceiling for a coding goal. The
 saved profile allows up to one quarter of its calibrated context for one
 complete edit or new-file response, then the shared goal budget can reduce
 that reservation. The worker keeps half the remaining token budget for a
-later permitted model call. This is a context-based allowance, not measured
+later permitted model call. A call is charged its whole limit while it runs,
+then the output tokens the runtime reports once it answers, so a short reply
+leaves the rest for later calls; a reply without a count stays charged its
+limit. This is a context-based allowance, not measured
 model generation capacity. A truncated runtime response is still rejected.
 Previously saved profiles retain their smaller ceiling until recalibrated.
 If neither edit format passes, calibration still saves and prints the raw probe

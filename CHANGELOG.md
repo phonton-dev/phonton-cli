@@ -8,6 +8,16 @@ This project follows pre-1.0 SemVer: minor versions may still include breaking c
 
 ### Fixed
 
+- [fixed] The later model calls of a local goal no longer run short of
+  output after short replies. Each call was charged its whole output limit
+  even when the model wrote far less, and each call keeps half of what is
+  left for later ones, so calls 5 to 8 of an 8-call goal got 1,024, 512, 256
+  and 256 tokens. In a laptop run of 20 exercises with `qwen3.5:4b`, edits
+  that finished wrote a median of 1,057 output tokens, half of them between
+  about 880 and 1,310, and three of the four goals that failed ended with
+  their last calls cut off at 256 to 512 tokens. A call is now charged the output tokens the runtime reports once
+  it answers, and a reply without a count stays charged its whole limit.
+  The receipt's `generated_tokens_reserved` total follows the same rule.
 - [fixed] A local goal on a model that reasons no longer stops after one model
   call when the first reply runs out of output. The baseline restart that
   follows asks for a strategy, a JSON answer of about 100 tokens under a

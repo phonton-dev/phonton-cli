@@ -959,6 +959,8 @@ async fn run_inner(
                 Ok(Err(error)) => Err(format!("Strategy inference failed: {error}")),
                 Err(_) => Err("Run wall-time budget exhausted during strategy inference".into()),
             };
+            let reported = receipt.hypotheses.last().and_then(|h| h.output_tokens);
+            settle_output(&mut receipt, hypothesis_output, reported);
             let evidence = receipt
                 .hypotheses
                 .last_mut()
@@ -1043,8 +1045,9 @@ async fn run_inner(
             receipt.state = "budget_exhausted".into();
             break;
         }
-        // Reservations are charged before inference and never refunded. Leave
-        // half the remaining budget for a later call when one is still allowed.
+        // A call's whole output limit is charged before inference and settled
+        // to the runtime's reported count once it answers. Leave half the
+        // remaining budget for a later call when one is still allowed.
         let calls_left = receipt
             .request
             .budget
@@ -1378,6 +1381,7 @@ async fn run_inner(
                     Some("Run wall-time budget exhausted during generation".into())
             }
         }
+        settle_output(&mut receipt, output, candidate.output_tokens);
         if search::repeats_output(&receipt.candidates, &candidate.raw_output) {
             // Same bytes, same verdict: never spend checks on it again.
             candidate.rejection = Some(search::REPEATED_OUTPUT.into());
@@ -6135,6 +6139,16 @@ fn go_true_flag(arg: &str, flag: &str) -> bool {
 fn remaining_time(request: &LocalRunRequest, started: Instant) -> Duration {
     Duration::from_secs(request.budget.wall_seconds).saturating_sub(started.elapsed())
 }
+/// Once a model call answers, charge the output tokens the runtime reports
+/// instead of the call's whole limit. Without a count the limit stays charged.
+fn settle_output(receipt: &mut LocalRunReceipt, reserved: u32, reported: Option<u64>) {
+    if let Some(reported) = reported {
+        receipt.generated_tokens_reserved = receipt
+            .generated_tokens_reserved
+            .saturating_sub(u64::from(reserved))
+            .saturating_add(reported);
+    }
+}
 fn truncate(text: &str, max: usize) -> String {
     let mut end = text.len().min(max);
     while !text.is_char_boundary(end) {
@@ -9811,7 +9825,9 @@ mod tests {
             assert_eq!(chats, selected_number, "{paths:?}");
             assert_eq!(receipt.model_calls_reserved, selected_number);
             if large_context_budget {
-                assert_eq!(receipt.generated_tokens_reserved, 3072);
+                // The 2,048-token creation reply reported 1,500 tokens and the
+                // 1,298-token edit 50; each is charged its reported count.
+                assert_eq!(receipt.generated_tokens_reserved, 1550);
             }
             assert_eq!(receipt.baseline_checks[0].status, CheckStatus::Failed);
             assert_eq!(
@@ -9856,10 +9872,108 @@ mod tests {
             assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
         }
     }
+    /// A fake Ollama serving one 4,096-token fixture model. `chat` answers
+    /// each `/api/chat` body, given how many chats came before it; the
+    /// server returns every chat body once `done` is sent.
+    async fn fixture_runtime(
+        mut chat: impl FnMut(&serde_json::Value, usize) -> serde_json::Value + Send + 'static,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Vec<serde_json::Value>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut chats = Vec::new();
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    _ = &mut done_rx => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0; 8192];
+                let (path, body) = loop {
+                    let size = stream.read(&mut chunk).await.unwrap();
+                    assert!(size > 0, "Fixture request ended early");
+                    request.extend_from_slice(&chunk[..size]);
+                    let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")?
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        let path = headers.split_whitespace().nth(1).unwrap_or("").to_owned();
+                        break (path, request[end + 4..end + 4 + length].to_vec());
+                    }
+                };
+                let reply = match path.as_str() {
+                    "/api/tags" => serde_json::json!({"models":[{"name":"fixture:small","digest":"fixture-digest","size":1024}]}),
+                    "/api/version" => serde_json::json!({"version":"fixture-version"}),
+                    "/api/show" => serde_json::json!({"model_info":{"general.architecture":"fixture","fixture.context_length":4096},"details":{"format":"gguf"}}),
+                    "/api/ps" => serde_json::json!({"models":[]}),
+                    "/api/chat" => {
+                        let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let reply = chat(&input, chats.len());
+                        chats.push(input);
+                        reply
+                    }
+                    _ => serde_json::json!({"error":"unexpected endpoint"}),
+                }
+                .to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{reply}", reply.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            chats
+        });
+        (endpoint, done_tx, server)
+    }
+
+    /// A Git repository whose `value()` returns 1 while its test expects 2.
+    fn value_fixture(root: &Path) -> PathBuf {
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::write(repository.join("app.py"), "def value():\n    return 1\n").unwrap();
+        std::fs::write(repository.join("test_app.py"), "import unittest\nfrom app import value\n\nclass TestApp(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(value(), 2)\n").unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["add", "app.py", "test_app.py"][..],
+        ] {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.autocrlf=false",
+                    "-C",
+                ])
+                .arg(&repository)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        repository
+    }
+
     #[tokio::test]
     async fn restart_after_an_output_limit_keeps_a_reasoning_run_going() {
         use phonton_types::local::{LocalThinkingMode, ModelProbe, THINKING_OUTPUT_NOTE};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // The first edit reasons past its output limit, which leaves nothing
         // to repair, so the search restarts with a 192-token strategy call.
@@ -9867,109 +9981,33 @@ mod tests {
         // it answers; without one it runs out too, and the restart edit runs
         // without a strategy. Either way the run goes on to a passing edit.
         for off_probe in [CheckStatus::Passed, CheckStatus::Failed] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
-            let server = tokio::spawn(async move {
-                let mut chats = Vec::new();
-                loop {
-                    let (mut stream, _) = tokio::select! {
-                        _ = &mut done_rx => break,
-                        accepted = listener.accept() => accepted.unwrap(),
-                    };
-                    let mut request = Vec::new();
-                    let mut chunk = [0; 8192];
-                    let (path, body) = loop {
-                        let size = stream.read(&mut chunk).await.unwrap();
-                        assert!(size > 0, "Fixture request ended early");
-                        request.extend_from_slice(&chunk[..size]);
-                        let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
-                        else {
-                            continue;
-                        };
-                        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.strip_prefix("content-length:")?
-                                    .trim()
-                                    .parse::<usize>()
-                                    .ok()
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + length {
-                            let path = headers.split_whitespace().nth(1).unwrap_or("").to_owned();
-                            break (path, request[end + 4..end + 4 + length].to_vec());
-                        }
-                    };
-                    let reply = match path.as_str() {
-                        "/api/tags" => serde_json::json!({"models":[{"name":"fixture:small","digest":"fixture-digest","size":1024}]}),
-                        "/api/version" => serde_json::json!({"version":"fixture-version"}),
-                        "/api/show" => serde_json::json!({"model_info":{"general.architecture":"fixture","fixture.context_length":4096},"details":{"format":"gguf"}}),
-                        "/api/ps" => serde_json::json!({"models":[]}),
-                        "/api/chat" => {
-                            let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                            let properties = &input["format"]["properties"];
-                            let anchor = properties["search"]["enum"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|search| search.as_str())
-                                .find(|search| search.contains("return 1"))
-                                .map(str::to_owned);
-                            let out_of_output = serde_json::json!({"message":{"content":"","thinking":"Let me think."},"done":true,"done_reason":"length","prompt_eval_count":40,"eval_count":input["options"]["num_predict"]});
-                            let answer = |content: serde_json::Value| serde_json::json!({"message":{"content":content.to_string()},"done":true,"prompt_eval_count":40,"eval_count":40});
-                            let reply = if chats.is_empty() {
-                                out_of_output
-                            } else if properties["mechanism"].is_object() {
-                                if input["think"] == false {
-                                    answer(serde_json::json!({"path":"app.py","search":anchor,"mechanism":"Use a literal two as the return value","difference":"Edits only the single return line"}))
-                                } else {
-                                    out_of_output
-                                }
-                            } else {
-                                let anchor = anchor.unwrap_or_default();
-                                answer(serde_json::json!({"path":"app.py","search":anchor,"text":anchor.replace("return 1", "return 2")}))
-                            };
-                            chats.push(input);
-                            reply
-                        }
-                        _ => serde_json::json!({"error":"unexpected endpoint"}),
+            let (endpoint, done_tx, server) = fixture_runtime(|input, earlier| {
+                let properties = &input["format"]["properties"];
+                let anchor = properties["search"]["enum"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|search| search.as_str())
+                    .find(|search| search.contains("return 1"))
+                    .map(str::to_owned);
+                let out_of_output = serde_json::json!({"message":{"content":"","thinking":"Let me think."},"done":true,"done_reason":"length","prompt_eval_count":40,"eval_count":input["options"]["num_predict"]});
+                let answer = |content: serde_json::Value| serde_json::json!({"message":{"content":content.to_string()},"done":true,"prompt_eval_count":40,"eval_count":40});
+                if earlier == 0 {
+                    out_of_output
+                } else if properties["mechanism"].is_object() {
+                    if input["think"] == false {
+                        answer(serde_json::json!({"path":"app.py","search":anchor,"mechanism":"Use a literal two as the return value","difference":"Edits only the single return line"}))
+                    } else {
+                        out_of_output
                     }
-                    .to_string();
-                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{reply}", reply.len());
-                    stream.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    let anchor = anchor.unwrap_or_default();
+                    answer(serde_json::json!({"path":"app.py","search":anchor,"text":anchor.replace("return 1", "return 2")}))
                 }
-                chats
-            });
-
+            })
+            .await;
             let root = tempfile::tempdir().unwrap();
-            let repository = root.path().join("repository");
-            std::fs::create_dir(&repository).unwrap();
-            std::fs::write(repository.join("app.py"), "def value():\n    return 1\n").unwrap();
-            std::fs::write(repository.join("test_app.py"), "import unittest\nfrom app import value\n\nclass TestApp(unittest.TestCase):\n    def test_value(self):\n        self.assertEqual(value(), 2)\n").unwrap();
-            for args in [
-                &["init", "--quiet"][..],
-                &["add", "app.py", "test_app.py"][..],
-            ] {
-                let output = std::process::Command::new("git")
-                    .args([
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-c",
-                        "core.autocrlf=false",
-                        "-C",
-                    ])
-                    .arg(&repository)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            let repository = value_fixture(root.path());
             let mut request = request();
             request.goal = "Make value return 2".into();
             request.repository = repository.clone();
@@ -10065,6 +10103,98 @@ mod tests {
                 b"def value():\n    return 1\n"
             );
         }
+    }
+    #[tokio::test]
+    async fn short_replies_leave_later_calls_their_output_limit() {
+        use phonton_types::local::ModelProbe;
+
+        // Three edits finish in 100 tokens and fail the test; the fourth is
+        // right. A call given under 600 tokens is cut off. When each call
+        // was charged its whole limit, calls 2 to 4 got 512, 256 and 256
+        // tokens and the run ended `budget_exhausted` without a candidate.
+        let (endpoint, done_tx, server) = fixture_runtime(|input, earlier| {
+            if input["options"]["num_predict"].as_u64().unwrap_or(0) < 600 {
+                return serde_json::json!({"message":{"content":"{\"path\":\"app.py\""},"done":true,"done_reason":"length","prompt_eval_count":40,"eval_count":input["options"]["num_predict"]});
+            }
+            let anchor = input["format"]["properties"]["search"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|search| search.as_str())
+                .find(|search| search.contains("return "))
+                .unwrap_or("return 0")
+                .to_owned();
+            let digit = anchor.find("return ").unwrap_or(0) + "return ".len();
+            let value = [3, 4, 5, 2][earlier.min(3)];
+            let text = format!("{}{value}{}", &anchor[..digit], &anchor[digit + 1..]);
+            serde_json::json!({"message":{"content":serde_json::json!({"path":"app.py","search":anchor,"text":text}).to_string()},"done":true,"prompt_eval_count":40,"eval_count":100})
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let repository = value_fixture(root.path());
+        let mut request = request();
+        request.goal = "Make value return 2".into();
+        request.repository = repository;
+        request.files = vec!["app.py".into()];
+        request.checks = vec![LocalCheck {
+            program: "python".into(),
+            args: vec!["-m".into(), "unittest".into(), "discover".into()],
+        }];
+        request.approve_host_execution = true;
+        request.budget.generations = 4;
+        request.budget.check_runs = 5;
+        request.budget.wall_seconds = 60;
+        request.budget.generated_tokens = 2048;
+        let profile = ModelProfile {
+            schema: 2,
+            model: "fixture:small".into(),
+            digest: "fixture-digest".into(),
+            runtime_version: "fixture-version".into(),
+            endpoint: endpoint.clone(),
+            context_tokens: 4096,
+            output_tokens: 1024,
+            protocol: Some(EditProtocol::SearchReplace),
+            thinking: Some(phonton_types::local::LocalThinkingMode::Off),
+            probes: vec![ModelProbe {
+                name: "SearchReplace edit".into(),
+                status: CheckStatus::Passed,
+                output: String::new(),
+                detail: "fixture transport".into(),
+                input_tokens: None,
+                output_tokens: None,
+                elapsed_ms: 0,
+            }],
+            hardware: HardwareSnapshot::default(),
+            measured_at_unix: 0,
+        };
+        let hardware = HardwareSnapshot {
+            ram_total_bytes: Some(16 * 1024 * 1024 * 1024),
+            ram_available_bytes: Some(8 * 1024 * 1024 * 1024),
+            ..HardwareSnapshot::default()
+        };
+        let run_dir = root.path().join("33333333-3333-4333-8333-333333333333");
+        let result = run_inner(
+            request,
+            profile,
+            RuntimeGuard::external_unverified(endpoint),
+            &run_dir,
+            |_| {},
+            Some(fixed_hardware(hardware)),
+        )
+        .await;
+        let _ = done_tx.send(());
+        let chats = server.await.unwrap();
+        let receipt = result.unwrap();
+        let limits: Vec<_> = chats
+            .iter()
+            .map(|chat| chat["options"]["num_predict"].as_u64().unwrap_or(0))
+            .collect();
+        // Each call keeps half of what is left for later ones; the last
+        // gets the profile's whole limit.
+        assert_eq!(limits, [1024, 974, 924, 1024], "{receipt:?}");
+        assert_eq!(receipt.state, "review_ready", "{receipt:?}");
+        assert_eq!(receipt.selected_candidate, Some(4));
+        assert_eq!(receipt.generated_tokens_reserved, 400);
     }
     #[tokio::test]
     async fn offline_npm_setup_is_not_a_verification_pass_without_execution() {

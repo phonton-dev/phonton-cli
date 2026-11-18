@@ -323,7 +323,9 @@ pub struct LocalRunReceipt {
     pub hypotheses: Vec<HypothesisEvidence>,
     pub selected_candidate: Option<u32>,
     pub checks_used: u32,
-    /// Missing runtime counters are unknown; admission reserves max output.
+    /// Output tokens charged to the shared budget: each call's whole output
+    /// limit while it runs, then the runtime's reported count once it
+    /// answers. A call without a reported count stays charged its limit.
     pub generated_tokens_reserved: u64,
     /// All reserved model attempts, including those stopped before chat transport.
     #[serde(default, alias = "inference_calls_used")]
